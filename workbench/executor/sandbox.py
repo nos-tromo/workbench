@@ -33,6 +33,19 @@ _KILLED_BY = frozenset({signal.SIGKILL, signal.SIGXCPU})
 _SLOT_KILL_ATTEMPTS = 50
 _SLOT_KILL_PAUSE_S = 0.02
 _HELPER_TIMEOUT_S = 5.0  # a slot process can SIGSTOP the helper once it has become the slot's uid
+_DROP_AND_KILL = """\
+import os, signal, sys
+uid, gid = int(sys.argv[1]), int(sys.argv[2])
+os.setgroups([])
+os.setgid(gid)
+os.setuid(uid)
+if os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid):
+    sys.exit(2)
+try:
+    os.kill(-1, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+"""
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
 
@@ -115,8 +128,12 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-def _is_live_process_of(status: str, uid: int) -> bool:
-    """Tell from the text of ``/proc/<pid>/status`` whether the process is running as ``uid``.
+def _is_live_process_of(status: bytes, uid: int) -> bool:
+    """Tell from the bytes of ``/proc/<pid>/status`` whether the process is running as ``uid``.
+
+    Only the ASCII ``Uid:``, ``State:`` and ``Threads:`` lines are read, and the text is split
+    on newlines alone, which the kernel escapes in the process name. The name itself is whatever
+    bytes the process chose, so it is never decoded.
 
     Args:
         status: The contents of the status file.
@@ -132,10 +149,14 @@ def _is_live_process_of(status: str, uid: int) -> bool:
         ValueError: A number in it is not a number.
         IndexError: One of those lines holds no value.
     """
-    fields = {key: value.split() for key, _, value in (line.partition(":") for line in status.splitlines())}
-    if int(fields["Uid"][0]) != uid:
+    fields: dict[bytes, list[bytes]] = {}
+    for line in status.split(b"\n"):
+        key, _, value = line.partition(b":")
+        if key in (b"Uid", b"State", b"Threads"):
+            fields[key] = value.split()
+    if int(fields[b"Uid"][0]) != uid:
         return False
-    return fields["State"][0] not in _GONE_STATES or int(fields["Threads"][0]) > 1
+    return fields[b"State"][0].decode("ascii") not in _GONE_STATES or int(fields[b"Threads"][0]) > 1
 
 
 def _slot_has_live_processes(uid: int) -> bool:
@@ -157,7 +178,7 @@ def _slot_has_live_processes(uid: int) -> bool:
         pids = [entry.name for entry in entries if entry.name.isdigit()]
     for pid in pids:
         try:
-            status = Path(f"/proc/{pid}/status").read_text()
+            status = Path(f"/proc/{pid}/status").read_bytes()
         except (FileNotFoundError, ProcessLookupError):
             continue
         if _is_live_process_of(status, uid):
@@ -168,32 +189,24 @@ def _slot_has_live_processes(uid: int) -> bool:
 def _kill_as_slot(slot: Slot) -> None:
     """Send ``SIGKILL`` to every process the slot's uid can signal, from a helper that is the slot.
 
-    The helper drops to the slot's ids first, so the signal reaches that uid's processes and
-    nobody else's; ``kill(-1)`` from the supervisor itself would reach everything.
+    The helper is started as root and drops to the slot's ids only inside the program it has
+    already exec'd, so everything it does as the slot's uid falls under the timeout, and on
+    expiry it is killed and reaped as root. Dropping inside ``preexec_fn`` instead would hold
+    ``Popen`` in its start-up read, beyond any timeout, if a slot process stopped the helper.
+    ``kill(-1)`` as the slot reaches that uid's processes and nobody else's; from the
+    supervisor itself it would reach everything.
 
     Args:
         slot: The slot whose processes to kill.
 
     Raises:
-        RuntimeError: The helper could not run, did not become the slot's uid, or did not finish
-            within the time allowed (a surviving slot process can stop it).
+        RuntimeError: The helper could not run, did not become the slot's ids, or did not finish
+            within ``_HELPER_TIMEOUT_S`` (a surviving slot process can stop it).
     """
-
-    def helper() -> None:
-        """Become the slot, kill everything of it, and leave without running a program."""
-        os.setgroups([])
-        os.setgid(slot.gid)
-        os.setuid(slot.uid)
-        if os.getuid() != slot.uid or os.geteuid() != slot.uid:
-            os._exit(1)
-        with contextlib.suppress(ProcessLookupError):  # nothing left to signal is the goal
-            os.kill(-1, signal.SIGKILL)
-        os._exit(0)
-
     try:
         done = subprocess.run(
-            [sys.executable, "-c", ""],
-            preexec_fn=helper,
+            [sys.executable, "-I", "-S", "-c", _DROP_AND_KILL, str(slot.uid), str(slot.gid)],
+            env=dict(CLEAN_ENV),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -213,8 +226,11 @@ def kill_slot_processes(slot: Slot | None) -> None:
     does not reach them; they keep the slot's uid, and the slot's next job would share a uid
     with them. The signal goes out first, unconditionally: whether something runs is judged
     only after it. Then ``/proc`` is checked for a running task of that uid, and the signal is
-    repeated until none is left, to catch a process that forks while it goes out. This blocks
-    for up to a second; call it from a thread. Does nothing without a slot or off Linux.
+    repeated until none is left, to catch a process that forks while it goes out. A pass takes
+    tens of milliseconds, and there are at most 50 of them; the signal helper alone is limited to
+    5 seconds, after which the cleanup fails. So the call is slow only for a slot that keeps
+    getting new processes, and it always ends, in about 50 x 5 s at the very worst. It blocks,
+    so call it from a thread. Does nothing without a slot or off Linux.
 
     Args:
         slot: The slot to clear, or ``None``.
