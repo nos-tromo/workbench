@@ -13,9 +13,8 @@ import re
 import stat
 from pathlib import Path
 
-from workbench.models import Principal
+from workbench.models import VIRTUAL_ROOT, Principal
 
-VIRTUAL_ROOT = "/workspace"
 DEFAULT_CHAT = "default"
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
