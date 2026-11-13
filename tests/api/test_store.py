@@ -841,6 +841,44 @@ def test_remove_is_idempotent_and_clears_an_orphan_row(store: Store, alice: Prin
     store.remove(rec)
 
 
+def test_remove_after_a_move_and_a_new_upload_of_the_old_name_removes_the_moved_file(
+    store: Store, alice: Principal, workspaces: Workspaces, clock: Clock
+) -> None:
+    """A stale record names its file by id: the file that now sits at the old path is not touched."""
+    old = put(store, alice, "q.xlsx", b"old")
+    clock.now += 100
+    (stale,) = store.due(clock.now)
+    moved = store.move(alice, old.virtual_path, "/workspace/chat-1/r.xlsx")
+    fresh = put(store, alice, "q.xlsx", b"new")
+    assert fresh.name == "q.xlsx"
+    store.remove(stale)
+    chat = workspaces.chat_dir(alice)
+    assert disk_names(chat) == ["q.xlsx"]
+    assert (chat / "q.xlsx").read_bytes() == b"new"
+    assert store.files_in_chat(alice) == [fresh]
+    assert store.get(alice, fresh.virtual_path) == fresh
+    assert store.usage(alice) == 3
+    with pytest.raises(NotFound):
+        store.get(alice, moved.virtual_path)
+
+
+def test_remove_after_a_delete_and_a_new_upload_of_the_same_name_changes_nothing(
+    store: Store, alice: Principal, workspaces: Workspaces, clock: Clock
+) -> None:
+    """If the record's file is already gone, a new file of the same name is left alone."""
+    old = put(store, alice, "q.xlsx", b"old")
+    clock.now += 100
+    (stale,) = store.due(clock.now)
+    store.delete(alice, old.virtual_path)
+    fresh = put(store, alice, "q.xlsx", b"new")
+    store.remove(stale)
+    chat = workspaces.chat_dir(alice)
+    assert (chat / "q.xlsx").read_bytes() == b"new"
+    assert disk_names(chat) == ["q.xlsx"]
+    assert store.get(alice, fresh.virtual_path) == fresh
+    assert store.usage(alice) == 3
+
+
 def test_remove_refuses_a_path_that_is_now_a_link(
     store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
 ) -> None:

@@ -854,6 +854,10 @@ class Store:
     def remove(self, record: FileRecord) -> None:
         """Delete a file's bytes and its record; already gone is fine.
 
+        The file is found by ``record.id``, at the path its row has now: a record that
+        went stale (the file was moved or deleted meanwhile) never reaches a file that
+        now sits at its old path.
+
         Args:
             record: A record, for example one ``due`` returned.
 
@@ -861,11 +865,15 @@ class Store:
             PathError: If the file's path now runs through a symlink; nothing is deleted.
             OSError: If the file cannot be deleted; its record stays so a later sweep retries.
         """
-        owner = Principal(record.caller, record.user_id, record.chat_id)
-        real = self._ws.resolve(owner, record.virtual_path)
         with self._lock:
-            _unlink(real)
-            self._delete_row(record.id)
+            with self._db() as db:
+                row = db.execute(f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?", (record.id,)).fetchone()
+            if row is None:
+                return
+            current = _file(row)
+            owner = Principal(current.caller, current.user_id, current.chat_id)
+            _unlink(self._ws.resolve(owner, current.virtual_path))
+            self._delete_row(current.id)
 
     def _delete_row(self, file_id: str) -> None:
         """Delete one record.
