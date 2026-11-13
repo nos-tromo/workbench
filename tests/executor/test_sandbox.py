@@ -4,6 +4,7 @@ import json
 import os
 import resource
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,8 @@ from typing import Any
 
 import pytest
 
-from workbench.executor.sandbox import Slot, clean_env, preexec, run_in_slot
+from workbench.executor import sandbox
+from workbench.executor.sandbox import Slot, clean_env, kill_slot_processes, preexec, run_in_slot
 from workbench.protocol import Limits
 
 pytestmark = pytest.mark.anyio
@@ -35,17 +37,49 @@ async def _run(code: str, cwd: Path, limits: Limits | None = None) -> tuple[str,
     return await run_in_slot([sys.executable, "-I", "-c", code], cwd, None, limits or _limits())
 
 
-def _alive(pid: int) -> bool:
-    """Whether ``pid`` is a running process; a zombie waiting to be reaped is not running."""
+def _stat_state(stat_line: str) -> str:
+    """The state letter of a ``/proc/<pid>/stat`` line; the command name may hold spaces and ``)``."""
+    return stat_line.rpartition(")")[2].split()[0]
+
+
+def _state(pid: int) -> str | None:
+    """The process state letter of ``pid`` (``R``, ``S``, ``Z`` for a zombie, ...), or ``None`` once it is gone."""
     try:
-        os.kill(pid, 0)
         if LINUX:
-            state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
-        else:
-            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-    except (ProcessLookupError, FileNotFoundError):
-        return False
-    return bool(state) and not state.startswith("Z")
+            return _stat_state(Path(f"/proc/{pid}/stat").read_text())
+        ps = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return None
+    return ps.stdout.strip()[:1] or None
+
+
+def _alive(pid: int) -> bool:
+    """Whether ``pid`` is running; a zombie, which only waits to be reaped, is not."""
+    return _state(pid) not in (None, "Z", "X")
+
+
+def _open_to_slot(folder: Path) -> None:
+    """Let a slot uid enter and write ``folder``, as the supervisor will for a job directory."""
+    for parent in (folder, *folder.parents):
+        if parent == Path(tempfile.gettempdir()):
+            break
+        parent.chmod(0o755)
+    folder.chmod(0o777)
+
+
+def _live_pids_of(uid: int) -> list[int]:
+    """Pids of the running (not zombie) processes whose real uid is ``uid``, read from ``/proc``."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = dict(line.split(":", 1) for line in (entry / "status").read_text().splitlines() if ":" in line)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields["Uid"].split()[0]) == uid and fields["State"].split()[0] not in ("Z", "X"):
+            found.append(int(entry.name))
+    return found
 
 
 def _wait_gone(pid: int, seconds: float = 5.0) -> bool:
@@ -95,8 +129,8 @@ async def test_wall_timeout_kills_the_process_group(tmp_path: Path) -> None:
     assert _wait_gone(grandchild), "the grandchild survived its job's wall timeout"
 
 
-async def test_processes_left_behind_by_a_finished_job_are_killed(tmp_path: Path) -> None:
-    """A job that exits but leaves a process running does not keep it, so a slot never carries one over."""
+async def test_processes_left_in_the_group_by_a_finished_job_are_killed(tmp_path: Path) -> None:
+    """A job that exits but leaves a process in its group running does not keep it."""
     code = "import subprocess\np = subprocess.Popen(['sleep', '60'])\nopen('straggler.pid', 'w').write(str(p.pid))\n"
     assert await _run(code, tmp_path) == ("ok", 0)
     assert _wait_gone(int((tmp_path / "straggler.pid").read_text())), "a process outlived its job"
@@ -186,11 +220,7 @@ async def test_process_limit_stops_a_fork_bomb(tmp_path: Path) -> None:
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 async def test_a_slot_job_runs_as_the_slot_with_no_groups_and_no_capabilities(tmp_path: Path) -> None:
     """A job in a slot runs as the slot's ids, belongs to no supplementary group and holds no capability."""
-    for folder in (tmp_path, *tmp_path.parents):
-        if folder == Path(tempfile.gettempdir()):
-            break
-        folder.chmod(0o755)
-    tmp_path.chmod(0o777)
+    _open_to_slot(tmp_path)
     code = (
         "import json, os\n"
         "caps = [line for line in open('/proc/self/status') if line.startswith('Cap')]\n"
@@ -201,6 +231,196 @@ async def test_a_slot_job_runs_as_the_slot_with_no_groups_and_no_capabilities(tm
     uid, euid, gid, groups, caps = json.loads((tmp_path / "ids.json").read_text())
     assert (uid, euid, gid, groups) == (20001, 20001, 20001, [])
     assert all(int(line.split()[1], 16) == 0 for line in caps if line.startswith(("CapEff", "CapPrm")))
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+async def test_a_process_that_left_the_group_dies_with_the_slot_cleanup(tmp_path: Path) -> None:
+    """A descendant in a session of its own survives the group kill, but not the end of a slot job."""
+    _open_to_slot(tmp_path)
+    code = (
+        "import subprocess\n"
+        "p = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+        "open('escaped.pid', 'w').write(str(p.pid))\n"
+    )
+    slot = Slot(index=0, uid=20001, gid=20001)
+    assert await run_in_slot([sys.executable, "-I", "-c", code], tmp_path, slot, _limits()) == ("ok", 0)
+    escaped = int((tmp_path / "escaped.pid").read_text())
+    assert not _alive(escaped), "a process escaped the slot cleanup"
+    assert _live_pids_of(20001) == []
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+async def test_slot_cleanup_also_runs_after_a_wall_timeout(tmp_path: Path) -> None:
+    """The cleanup does not depend on the job ending by itself."""
+    _open_to_slot(tmp_path)
+    code = (
+        "import subprocess, time\n"
+        "p = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+        "open('escaped.pid', 'w').write(str(p.pid))\n"
+        "time.sleep(30)\n"
+    )
+    slot = Slot(index=1, uid=20002, gid=20002)
+    status, _ = await run_in_slot([sys.executable, "-I", "-c", code], tmp_path, slot, _limits(wall_s=2))
+    assert status == "timeout"
+    assert not _alive(int((tmp_path / "escaped.pid").read_text()))
+    assert _live_pids_of(20002) == []
+
+
+def _status(state: str, uid: int, name: str = "python") -> str:
+    """The relevant lines of a ``/proc/<pid>/status`` file."""
+    ids = f"{uid}\t{uid}\t{uid}\t{uid}"
+    return f"Name:\t{name}\nState:\t{state}\nTgid:\t4242\nUid:\t{ids}\nGid:\t{ids}\n"
+
+
+@pytest.mark.parametrize(
+    ("state", "uid", "live"),
+    [
+        ("R (running)", 20001, True),
+        ("S (sleeping)", 20001, True),
+        ("D (disk sleep)", 20001, True),
+        ("T (stopped)", 20001, True),
+        ("t (tracing stop)", 20001, True),
+        ("Z (zombie)", 20001, False),
+        ("X (dead)", 20001, False),
+        ("S (sleeping)", 20002, False),
+        ("S (sleeping)", 0, False),
+    ],
+)
+def test_only_running_processes_of_the_slot_uid_count_as_alive(state: str, uid: int, live: bool) -> None:
+    """A zombie waits only to be reaped by init, so it never keeps a slot from being reused."""
+    assert sandbox._is_live_process_of(_status(state, uid), 20001) is live
+
+
+def test_a_command_name_cannot_pass_for_a_state_or_a_uid() -> None:
+    """The name is user-chosen text; only the ``State:`` and ``Uid:`` lines count."""
+    assert sandbox._is_live_process_of(_status("Z (zombie)", 20001, "State: S (sleeping)"), 20001) is False
+    assert sandbox._is_live_process_of(_status("S (sleeping)", 20002, "Uid: 20001"), 20001) is False
+
+
+def test_the_tests_tell_a_zombie_from_a_running_process() -> None:
+    """``_stat_state`` reads the state after the last ``)``, so a command name cannot confuse it."""
+    assert _stat_state("4242 (sleep) S 1 4242 4242 0 -1 4194304") == "S"
+    assert _stat_state("4242 (sleep) Z 1 4242 4242 0 -1 4194304") == "Z"
+    assert _stat_state("4242 (x) Z y) S 1 4242 4242 0 -1 4194304") == "S"
+    assert _stat_state("4242 (x) S y) Z 1 4242 4242 0 -1 4194304") == "Z"
+
+
+def test_slot_cleanup_does_nothing_without_a_slot_or_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No slot means nothing to clear; off Linux there is no ``/proc`` to check."""
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: pytest.fail("signalled"))
+    kill_slot_processes(None)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+
+
+def test_slot_cleanup_refuses_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``kill(-1)`` as uid 0 would reach every process, so a slot with uid 0 is refused."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: pytest.fail("signalled"))
+    with pytest.raises(ValueError, match="root"):
+        kill_slot_processes(Slot(index=0, uid=0, gid=0))
+
+
+def test_slot_cleanup_gives_up_after_bounded_retries_and_names_only_the_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Processes that will not die raise ``RuntimeError`` after a bounded number of attempts."""
+    kills: list[int] = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: True)
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: kills.append(slot.uid))
+    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError) as raised:
+        kill_slot_processes(Slot(index=3, uid=20004, gid=20004))
+    assert str(raised.value) == "processes of slot 3 survived the cleanup"
+    assert len(kills) == 50
+
+
+def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each pass signals once; the cleanup returns on the first clean look at ``/proc``."""
+    looks = iter([True, True, False])
+    kills: list[int] = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: next(looks))
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: kills.append(slot.uid))
+    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
+    kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+    assert kills == [20001, 20001]
+
+
+@pytest.mark.parametrize("code", ["pass", "import time; time.sleep(10)"])
+async def test_run_in_slot_clears_the_slot_after_the_group_kill(
+    code: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slot is cleared once, after the group kill, whether the job exited or timed out."""
+    events: list[str] = []
+    real_preexec = sandbox.preexec
+    real_kill_group = sandbox._kill_group
+
+    def kill_group(pgid: int) -> None:
+        """Note the group kill, then do it."""
+        events.append("group")
+        real_kill_group(pgid)
+
+    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))  # no uid switch
+    monkeypatch.setattr(sandbox, "_kill_group", kill_group)
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: events.append(f"slot {slot and slot.index}"))
+    status, _ = await run_in_slot(
+        [sys.executable, "-I", "-c", code], tmp_path, Slot(2, 20003, 20003), _limits(wall_s=1)
+    )
+    assert status == ("ok" if code == "pass" else "timeout")
+    assert events == ["group", "slot 2"]
+
+
+async def test_run_in_slot_does_not_clear_without_a_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no slot there is no uid to clear."""
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: pytest.fail("cleared"))
+    assert await _run("pass", tmp_path) == ("ok", 0)
+
+
+async def test_a_failed_slot_cleanup_reaches_the_caller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slot that cannot be cleared must not be reused, so the supervisor has to hear of it."""
+    real_preexec = sandbox.preexec
+
+    def refuse(slot: Slot | None) -> None:
+        """Fail the way an uncleared slot does."""
+        raise RuntimeError("processes of slot 2 survived the cleanup")
+
+    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))
+    monkeypatch.setattr(sandbox, "kill_slot_processes", refuse)
+    with pytest.raises(RuntimeError, match="slot 2"):
+        await run_in_slot([sys.executable, "-I", "-c", "pass"], tmp_path, Slot(2, 20003, 20003), _limits())
+
+
+async def test_what_a_job_creates_is_private_to_its_uid(tmp_path: Path) -> None:
+    """The job runs with umask 077: files are 0600 and directories 0700, whatever the supervisor's umask."""
+    code = "import os; open('made.txt', 'w').close(); os.mkdir('made.d')"
+    previous = os.umask(0o022)
+    try:
+        assert await _run(code, tmp_path) == ("ok", 0)
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((tmp_path / "made.txt").stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "made.d").stat().st_mode) == 0o700
+
+
+async def test_the_job_gets_its_private_tmp_dir_when_one_is_given(tmp_path: Path) -> None:
+    """``TMPDIR``, ``TEMP`` and ``TMP`` point at the job's own temporary directory."""
+    private = tmp_path / "tmp"
+    private.mkdir()
+    code = "import json, os, tempfile; json.dump([dict(os.environ), tempfile.gettempdir()], open('tmp.json', 'w'))"
+    argv = [sys.executable, "-I", "-c", code]
+    assert await run_in_slot(argv, tmp_path, None, _limits(), tmp_dir=private) == ("ok", 0)
+    env, tempdir = json.loads((tmp_path / "tmp.json").read_text())
+    assert (env["TMPDIR"], env["TEMP"], env["TMP"]) == (str(private),) * 3
+    assert Path(tempdir).resolve() == private.resolve()
+
+
+def test_clean_env_sets_the_tmp_variables_only_when_asked() -> None:
+    """Without a private directory the job gets no temporary-directory variable at all."""
+    plain = clean_env(Path("job-dir"))
+    assert not {"TMPDIR", "TEMP", "TMP"} & set(plain)
+    private = clean_env(Path("job-dir"), Path("job-tmp"))
+    assert (private["TMPDIR"], private["TEMP"], private["TMP"]) == ("job-tmp",) * 3
+    assert {k: v for k, v in private.items() if k not in ("TMPDIR", "TEMP", "TMP")} == plain
 
 
 async def test_child_environment_is_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

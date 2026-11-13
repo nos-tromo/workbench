@@ -7,6 +7,7 @@ import resource
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,9 @@ CLEAN_ENV: Mapping[str, str] = MappingProxyType(
 )
 
 _KILLED_BY = frozenset({signal.SIGKILL, signal.SIGXCPU})
+_SLOT_KILL_ATTEMPTS = 50
+_SLOT_KILL_PAUSE_S = 0.02
+_GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
 
 @dataclass(frozen=True)
@@ -46,16 +50,21 @@ class Slot:
     gid: int
 
 
-def clean_env(cwd: Path) -> dict[str, str]:
+def clean_env(cwd: Path, tmp_dir: Path | None = None) -> dict[str, str]:
     """Build the environment of a job: ``CLEAN_ENV`` and ``HOME`` set to the job directory.
 
     Args:
         cwd: The job directory.
+        tmp_dir: The job's private temporary directory. When given, ``TMPDIR``, ``TEMP`` and
+            ``TMP`` point to it, so the job never writes the shared ``/tmp``.
 
     Returns:
         The only variables the job sees; nothing of the supervisor's own environment.
     """
-    return {**CLEAN_ENV, "HOME": str(cwd)}
+    env = {**CLEAN_ENV, "HOME": str(cwd)}
+    if tmp_dir is not None:
+        env.update(TMPDIR=str(tmp_dir), TEMP=str(tmp_dir), TMP=str(tmp_dir))
+    return env
 
 
 def preexec(slot: Slot | None, limits: Limits) -> Callable[[], None]:
@@ -105,6 +114,113 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+def _is_live_process_of(status: str, uid: int) -> bool:
+    """Tell from the text of ``/proc/<pid>/status`` whether the process is running as ``uid``.
+
+    Args:
+        status: The contents of the status file.
+        uid: The user id to look for among the process's real uid.
+
+    Returns:
+        ``True`` when the real uid is ``uid`` and the process is not a zombie or dead; a zombie
+        runs nothing and is only waiting for its parent to reap it.
+    """
+    fields = {key: value.split() for key, _, value in (line.partition(":") for line in status.splitlines())}
+    return int(fields["Uid"][0]) == uid and fields["State"][0] not in _GONE_STATES
+
+
+def _slot_has_live_processes(uid: int) -> bool:
+    """Look through ``/proc`` for a running process whose real uid is ``uid``.
+
+    Args:
+        uid: The slot's user id.
+
+    Returns:
+        Whether one exists. A process that ends while it is looked at counts as gone.
+    """
+    with os.scandir("/proc") as entries:
+        pids = [entry.name for entry in entries if entry.name.isdigit()]
+    for pid in pids:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if _is_live_process_of(status, uid):
+            return True
+    return False
+
+
+def _kill_as_slot(slot: Slot) -> None:
+    """Send ``SIGKILL`` to every process the slot's uid can signal, from a helper that is the slot.
+
+    The helper drops to the slot's ids first, so the signal reaches that uid's processes and
+    nobody else's; ``kill(-1)`` from the supervisor itself would reach everything.
+
+    Args:
+        slot: The slot whose processes to kill.
+
+    Raises:
+        RuntimeError: The helper could not run or did not become the slot's uid.
+    """
+
+    def helper() -> None:
+        """Become the slot, kill everything of it, and leave without running a program."""
+        os.setgroups([])
+        os.setgid(slot.gid)
+        os.setuid(slot.uid)
+        if os.getuid() != slot.uid or os.geteuid() != slot.uid:
+            os._exit(1)
+        with contextlib.suppress(ProcessLookupError):  # nothing left to signal is the goal
+            os.kill(-1, signal.SIGKILL)
+        os._exit(0)
+
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", ""],
+            preexec_fn=helper,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not clear the processes of slot {slot.index}") from exc
+    if done.returncode != 0:
+        raise RuntimeError(f"could not clear the processes of slot {slot.index}")
+
+
+def kill_slot_processes(slot: Slot | None) -> None:
+    """Kill every process the slot's uid still has, however it left the job's process group.
+
+    A job's descendants can leave the group with ``setsid`` or ``setpgid``, so the group kill
+    does not reach them; they keep the slot's uid, and the slot's next job would share a uid
+    with them. Repeats until ``/proc`` shows no running process of that uid, to catch a process
+    that forks while the signal goes out. This blocks for up to a second; call it from a thread.
+    Does nothing without a slot or off Linux.
+
+    Args:
+        slot: The slot to clear, or ``None``.
+
+    Raises:
+        ValueError: The slot's uid is 0, since the signal would reach every process.
+        RuntimeError: Processes of the slot remain after the retries, or the helper failed.
+            The message names only the slot's index. The slot must not be reused.
+    """
+    if slot is None:
+        return
+    if sys.platform != "linux":
+        return
+    if slot.uid <= 0:
+        raise ValueError("a slot must not run as root")
+    for _ in range(_SLOT_KILL_ATTEMPTS):
+        if not _slot_has_live_processes(slot.uid):
+            return
+        _kill_as_slot(slot)
+        time.sleep(_SLOT_KILL_PAUSE_S)
+    if _slot_has_live_processes(slot.uid):
+        raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
+
+
 def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:
     """Classify how a job that ended by itself ended.
 
@@ -123,32 +239,39 @@ def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:
 
 
 async def run_in_slot(
-    argv: list[str], cwd: Path, slot: Slot | None, limits: Limits
+    argv: list[str], cwd: Path, slot: Slot | None, limits: Limits, *, tmp_dir: Path | None = None
 ) -> tuple[Literal["ok", "error", "timeout", "killed"], int]:
     """Run ``argv`` as a fresh process in ``cwd`` under the slot's ids and the limits.
 
-    The process leads its own session. When it ends, by itself, on the wall clock or because
-    this task is cancelled, everything left in its process group is killed with it.
+    The process leads its own session and runs with umask ``077``, so what it creates is
+    private to its uid. When it ends, by itself, on the wall clock or because this task is
+    cancelled, everything left in its process group is killed with it. With a slot, every
+    other process of the slot's uid is killed too, including those that left the group.
 
     Args:
         argv: The command line; ``argv[0]`` should be an absolute path since ``PATH`` is fixed.
         cwd: The job directory; the process starts there and has it as ``HOME``.
         slot: The slot to run as, or ``None`` to keep the current uid (tests and dev).
         limits: Wall time and the kernel limits.
+        tmp_dir: The job's private temporary directory, handed over as ``TMPDIR``, ``TEMP`` and ``TMP``.
 
     Returns:
         The outcome and the exit code (negative for death by a signal). ``timeout`` means the
         wall time ran out and the group was killed.
+
+    Raises:
+        RuntimeError: Processes of the slot survived the cleanup; the slot must be retired.
     """
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
-        env=clean_env(cwd),
+        env=clean_env(cwd, tmp_dir),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         preexec_fn=preexec(slot, limits),
         start_new_session=False,
+        umask=0o077,
     )
     returncode: int | None
     try:
@@ -157,6 +280,9 @@ async def run_in_slot(
         returncode = None
     finally:
         _kill_group(process.pid)
+        reaped = await process.wait()
+        if slot is not None:
+            await asyncio.to_thread(kill_slot_processes, slot)
     if returncode is None:
-        return "timeout", await process.wait()
+        return "timeout", reaped
     return _outcome(returncode), returncode
