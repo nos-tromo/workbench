@@ -62,17 +62,17 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     Args:
         env: The environment to read.
         name: Variable name.
-        default: Value used when the variable is not set.
+        default: Value used when the variable is unset, empty or only whitespace.
 
     Returns:
-        The parsed value, or ``default`` when ``name`` is not in ``env``.
+        The parsed value, or ``default`` when ``name`` is unset or blank.
 
     Raises:
-        ConfigError: The value is set but is not plain digits, or is zero.
+        ConfigError: The value is not plain digits, or is zero.
     """
-    if name not in env:
+    raw = env.get(name, "").strip()
+    if not raw:
         return default
-    raw = env[name].strip()
     if not (raw.isascii() and raw.isdigit()) or int(raw) < 1:
         raise ConfigError(f"{name} must be a whole number above zero")
     return int(raw)
@@ -98,12 +98,13 @@ def _api_key(env: Mapping[str, str]) -> str:
         env: The environment to read.
 
     Returns:
-        The key.
+        The key, without surrounding whitespace.
 
     Raises:
-        ConfigError: The key is missing or shorter than ``MIN_KEY_LENGTH``. The message never holds the value.
+        ConfigError: The key is missing or, once stripped, shorter than ``MIN_KEY_LENGTH``.
+            The message never holds the value.
     """
-    key = env.get(_KEY_VAR, "")
+    key = env.get(_KEY_VAR, "").strip()
     if len(key) < MIN_KEY_LENGTH:
         raise ConfigError(f"{_KEY_VAR} must be set to at least {MIN_KEY_LENGTH} characters")
     return key

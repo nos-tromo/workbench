@@ -100,6 +100,14 @@ def test_api_requires_a_long_key() -> None:
         load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "k" * 31}, role="api")
 
 
+def test_the_key_is_stripped_before_the_length_check() -> None:
+    """Surrounding whitespace such as a trailing newline neither counts toward the length nor is stored."""
+    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
+        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "k" * 31 + "\n"}, role="api")
+    s = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY + "\n"}, role="api")
+    assert s.open_webui_key == KEY
+
+
 def test_the_error_never_carries_the_key() -> None:
     """A refused short key is never echoed back in the error message."""
     short = "s3cret-" + "x" * 10
@@ -115,11 +123,26 @@ def test_executor_needs_no_key() -> None:
 
 
 @pytest.mark.parametrize("name", ["WORKBENCH_EXECUTOR_SLOTS", "WORKBENCH_RETENTION_DAYS", "WORKBENCH_JOB_WALL_S"])
-@pytest.mark.parametrize("value", ["0", "-1", "abc", ""])
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
 def test_non_positive_or_non_numeric_values_are_refused(name: str, value: str) -> None:
     """A WORKBENCH_* number that is not a whole number above zero names the variable in the error."""
     with pytest.raises(ConfigError, match=name):
         load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, name: value}, role="api")
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "default"),
+    [
+        ("WORKBENCH_EXECUTOR_SLOTS", "executor_slots", 4),
+        ("WORKBENCH_RETENTION_DAYS", "retention_days", 7),
+        ("WORKBENCH_JOB_WALL_S", "job_wall_s", 120),
+    ],
+)
+@pytest.mark.parametrize("value", ["", "   ", "\n"])
+def test_empty_values_mean_the_default(name: str, field: str, default: int, value: str) -> None:
+    """An empty or whitespace-only number is treated as not set and takes its default."""
+    s = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, name: value}, role="api")
+    assert getattr(s, field) == default
 
 
 @pytest.mark.parametrize("value", ["1.5", "1_0", "+4", "\u0664"])
