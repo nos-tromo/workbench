@@ -30,19 +30,26 @@ CLEAN_ENV: Mapping[str, str] = MappingProxyType(
 )
 
 _KILLED_BY = frozenset({signal.SIGKILL, signal.SIGXCPU})
-_SLOT_KILL_ATTEMPTS = 50
-_SLOT_KILL_PAUSE_S = 0.02
-_HELPER_TIMEOUT_S = 5.0  # a slot process can SIGSTOP the helper once it has become the slot's uid
+_SLOT_KILL_ATTEMPTS = 6
+_SLOT_KILL_PAUSE_S = 0.1  # before the second pass, doubled before each later one: 3.1 s in all
+# Finite, since a slot process can SIGSTOP the helper once it is the slot's uid. Generous, since
+# busy jobs in other slots slow its start-up down (to 26 s measured, on one CPU next to 192 busy tasks).
+_HELPER_TIMEOUT_S = 30.0
+# Imports only os (frozen) and sys (built in). signal would pull in enum, functools and collections,
+# which an image without .pyc files compiles from source at every start. 9 is SIGKILL, and
+# ProcessLookupError is ESRCH: nothing of the uid is left to signal.
 _DROP_AND_KILL = """\
-import os, signal, sys
+import os, sys
 uid, gid = int(sys.argv[1]), int(sys.argv[2])
+if uid <= 0 or gid <= 0:
+    sys.exit(3)
 os.setgroups([])
 os.setgid(gid)
 os.setuid(uid)
 if os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid):
     sys.exit(2)
 try:
-    os.kill(-1, signal.SIGKILL)
+    os.kill(-1, 9)
 except ProcessLookupError:
     pass
 """
@@ -225,12 +232,19 @@ def kill_slot_processes(slot: Slot | None) -> None:
     A job's descendants can leave the group with ``setsid`` or ``setpgid``, so the group kill
     does not reach them; they keep the slot's uid, and the slot's next job would share a uid
     with them. The signal goes out first, unconditionally: whether something runs is judged
-    only after it. Then ``/proc`` is checked for a running task of that uid, and the signal is
-    repeated until none is left, to catch a process that forks while it goes out. A pass takes
-    tens of milliseconds, and there are at most 50 of them; the signal helper alone is limited to
-    5 seconds, after which the cleanup fails. So the call is slow only for a slot that keeps
-    getting new processes, and it always ends, in about 50 x 5 s at the very worst. It blocks,
-    so call it from a thread. Does nothing without a slot or off Linux.
+    only after it. Then ``/proc`` is checked for a running task of that uid. ``kill(-1)`` reaches
+    all of them in one go (the kernel holds its task list while it signals, and a process with
+    ``SIGKILL`` pending cannot fork), so a later pass is for tasks that are still exiting: it
+    repeats the signal after a pause of 0.1 s, doubled each time, for at most six passes.
+
+    Measured in ``python:3.12-slim``, which has no ``.pyc`` files, with a read-only root: a helper
+    run takes 8-210 ms on an idle host. On one CPU it shares with busy jobs of other slots it takes
+    seconds, varying with the host from one run to the next: 1-19 s next to 64 spinning processes,
+    2-26 s next to 192. A look at ``/proc`` takes milliseconds on an idle host and under a second
+    on such a CPU, given an init that reaps orphans. The helper is killed after 30 s, and the
+    cleanup then fails. So the call always ends: at the very worst after six helper runs of 30 s,
+    3.1 s of pauses and six looks, a little over three minutes. It blocks, so call it from a
+    thread. Does nothing without a slot or off Linux.
 
     Args:
         slot: The slot to clear, or ``None``.
@@ -244,14 +258,15 @@ def kill_slot_processes(slot: Slot | None) -> None:
         return
     if sys.platform != "linux":
         return
-    if slot.uid <= 0:
+    if slot.uid <= 0 or slot.gid <= 0:
         raise RuntimeError(f"slot {slot.index} must not run as root")
     try:
-        for _ in range(_SLOT_KILL_ATTEMPTS):
+        for attempt in range(_SLOT_KILL_ATTEMPTS):
+            if attempt:
+                time.sleep(_SLOT_KILL_PAUSE_S * 2 ** (attempt - 1))
             _kill_as_slot(slot)
             if not _slot_has_live_processes(slot.uid):
                 return
-            time.sleep(_SLOT_KILL_PAUSE_S)
     except (OSError, KeyError, ValueError, IndexError) as exc:
         raise RuntimeError(f"processes of slot {slot.index} could not be checked") from exc
     raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")

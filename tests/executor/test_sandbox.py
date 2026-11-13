@@ -1,5 +1,6 @@
 """The slot sandbox: real child processes under rlimits, a wall clock and a clean environment."""
 
+import ast
 import json
 import os
 import resource
@@ -89,6 +90,19 @@ def _live_tasks_of(uid: int) -> list[str]:
         except (FileNotFoundError, ProcessLookupError):
             continue
     return found
+
+
+def _cpus() -> set[int]:
+    """The CPUs this process may run on; off Linux, as many as the host reports."""
+    if sys.platform == "linux":
+        return os.sched_getaffinity(0)
+    return set(range(os.cpu_count() or 1))
+
+
+def _pin(cpus: set[int]) -> None:
+    """Keep the calling thread, and the threads and processes it starts from now on, on ``cpus`` (Linux only)."""
+    if sys.platform == "linux":
+        os.sched_setaffinity(0, cpus)
 
 
 def _wait_gone(pid: int, seconds: float = 5.0) -> bool:
@@ -332,41 +346,54 @@ def _cleanup_in_thread(slot: Slot, seconds: float) -> tuple[bool, BaseException 
 
 
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+@pytest.mark.skipif(len(_cpus()) < 2, reason="the attacker needs a CPU the helper is not on to stop it in time")
 def test_a_slot_process_that_stops_the_helper_cannot_hang_the_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Slot processes spamming ``SIGSTOP`` at their uid stop the helper; the cleanup still ends, with an error."""
+    """Slot processes spamming ``SIGSTOP`` at their uid stop the helper; the cleanup still ends, with an error.
+
+    The helper is the slot's uid only for the few microseconds between ``setuid`` and ``kill``. On one
+    CPU it runs through them before the attacker is scheduled again, so the two are kept on different
+    CPUs: the helper on the first, the attacker's threads on the others.
+    """
     slot = Slot(index=0, uid=20001, gid=20001)
     monkeypatch.setattr(sandbox, "_HELPER_TIMEOUT_S", 2.0)
+    cpus = _cpus()
+    helper_cpu = {min(cpus)}
 
     def drop() -> None:
-        """Become the slot's uid in the attacker before it execs."""
+        """Move the attacker off the helper's CPU and make it the slot's uid before it execs."""
         os.setsid()
+        _pin(cpus - helper_cpu)
         os.setgroups([])
         os.setgid(slot.gid)
         os.setuid(slot.uid)
 
     reported = False
-    for _ in range(20):
-        attacker = subprocess.Popen(
-            [sys.executable, "-I", "-c", ATTACKER],
-            preexec_fn=drop,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            for _ in range(100):  # until all 12 spinning threads run
-                if b"Threads:\t13" in Path(f"/proc/{attacker.pid}/status").read_bytes():
-                    break
-                time.sleep(0.05)
-            finished, failure = _cleanup_in_thread(slot, 2.0 + 8.0)
-        finally:
-            attacker.kill()
-            attacker.wait()
-        assert finished, "the cleanup hung on a stopped helper"
-        if failure is not None:
-            assert isinstance(failure, RuntimeError)
-            assert str(failure) == "could not clear the processes of slot 0"
-            reported = True
-            break
+    _pin(helper_cpu)  # the cleanup thread and its helper inherit it
+    try:
+        for _ in range(20):
+            attacker = subprocess.Popen(
+                [sys.executable, "-I", "-c", ATTACKER],
+                preexec_fn=drop,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(100):  # until all 12 spinning threads run
+                    if b"Threads:\t13" in Path(f"/proc/{attacker.pid}/status").read_bytes():
+                        break
+                    time.sleep(0.05)
+                finished, failure = _cleanup_in_thread(slot, 2.0 + 8.0)
+            finally:
+                attacker.kill()
+                attacker.wait()
+            assert finished, "the cleanup hung on a stopped helper"
+            if failure is not None:
+                assert isinstance(failure, RuntimeError)
+                assert str(failure) == "could not clear the processes of slot 0"
+                reported = True
+                break
+    finally:
+        _pin(cpus)
     assert reported, "the helper was never stopped, so the timeout path did not run"
     assert _live_tasks_of(20001) == []
 
@@ -465,25 +492,55 @@ def test_slot_cleanup_does_nothing_without_a_slot_or_off_linux(monkeypatch: pyte
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
 
 
-def test_slot_cleanup_refuses_root(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``kill(-1)`` as uid 0 would reach every process, so a slot with uid 0 is refused."""
+@pytest.mark.parametrize(("uid", "gid"), [(0, 0), (0, 20001), (20001, 0)])
+def test_slot_cleanup_refuses_root(uid: int, gid: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``kill(-1)`` as uid 0 would reach every process, so a slot with uid or gid 0 is refused."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: pytest.fail("signalled"))
     with pytest.raises(RuntimeError, match="slot 0 must not run as root"):
-        kill_slot_processes(Slot(index=0, uid=0, gid=0))
+        kill_slot_processes(Slot(index=0, uid=uid, gid=gid))
+
+
+@pytest.mark.parametrize(("uid", "gid"), [("0", "20001"), ("20001", "0"), ("-1", "20001"), ("20001", "-5")])
+def test_the_helper_itself_refuses_root_and_negative_ids(uid: str, gid: str) -> None:
+    """The helper program checks its ids before it drops, so it never runs ``kill(-1)`` as root.
+
+    ``os.kill`` is replaced to exit 9, so a helper missing the check fails the test instead of
+    signalling every process of the runner (as root) or failing on ``setgroups`` (exit 1).
+    """
+    disarmed = "import os\nos.kill = lambda pid, sig: os._exit(9)\n" + sandbox._DROP_AND_KILL
+    done = subprocess.run([sys.executable, "-I", "-S", "-c", disarmed, uid, gid], check=False, capture_output=True)
+    assert done.returncode == 3, done.stderr
+
+
+def test_the_helper_imports_only_what_needs_no_compiling() -> None:
+    """``os`` is frozen and ``sys`` built in; ``signal`` would compile enum, functools and more at every start."""
+    tree = ast.parse(sandbox._DROP_AND_KILL)
+    imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    assert imported == {"os", "sys"}
+    assert not any(isinstance(node, ast.ImportFrom) for node in ast.walk(tree))
 
 
 def test_slot_cleanup_gives_up_after_bounded_retries_and_names_only_the_slot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Processes that will not die raise ``RuntimeError`` after a bounded number of attempts."""
+    """Processes that will not die raise ``RuntimeError`` after six passes, with pauses growing in between."""
     kills: list[int] = []
+    pauses: list[float] = []
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: True)
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: kills.append(slot.uid))
-    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(sandbox.time, "sleep", pauses.append)
     with pytest.raises(RuntimeError) as raised:
         kill_slot_processes(Slot(index=3, uid=20004, gid=20004))
     assert str(raised.value) == "processes of slot 3 survived the cleanup"
-    assert len(kills) == 50
+    assert len(kills) == 6
+    assert pauses == pytest.approx([0.1, 0.2, 0.4, 0.8, 1.6])
+
+
+def test_slot_cleanup_ends_within_its_documented_bound() -> None:
+    """Six helper runs, each killed after 30 s, and 3.1 s of pauses: 183 s at the very worst, before the looks."""
+    pauses = sum(sandbox._SLOT_KILL_PAUSE_S * 2**attempt for attempt in range(sandbox._SLOT_KILL_ATTEMPTS - 1))
+    assert sandbox._HELPER_TIMEOUT_S == 30
+    assert sandbox._SLOT_KILL_ATTEMPTS * sandbox._HELPER_TIMEOUT_S + pauses == pytest.approx(183.1)
 
 
 def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -540,7 +597,7 @@ def test_a_stopped_helper_is_given_up_on_and_the_slot_is_reported(monkeypatch: p
     with pytest.raises(RuntimeError) as raised:
         sandbox._kill_as_slot(Slot(index=3, uid=20004, gid=20005))
     assert str(raised.value) == "could not clear the processes of slot 3"
-    assert 0 < seen["timeout"] <= 10
+    assert seen["timeout"] == 30, "only finite, and generous: busy jobs in other slots slow the helper down"
     assert "preexec_fn" not in seen, "dropping privileges before the exec puts the helper's start-up beyond the timeout"
     assert seen["argv"][-2:] == ["20004", "20005"]
     assert seen["env"] == dict(sandbox.CLEAN_ENV)
