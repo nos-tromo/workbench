@@ -79,16 +79,16 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
 
 
 def _text(env: Mapping[str, str], name: str) -> str | None:
-    """Read ``name``, treating an empty value as not set.
+    """Read ``name`` without surrounding whitespace, treating a blank value as not set.
 
     Args:
         env: The environment to read.
         name: Variable name.
 
     Returns:
-        The value, or ``None`` when it is unset or empty.
+        The stripped value, or ``None`` when it is unset, empty or only whitespace.
     """
-    return env.get(name) or None
+    return env.get(name, "").strip() or None
 
 
 def _api_key(env: Mapping[str, str]) -> str:

@@ -67,20 +67,45 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
     )
 
 
-def test_unset_and_empty_string_values_fall_back_to_the_default() -> None:
-    """An unset or empty path or audit variable means its default, not an error."""
+def test_unset_string_values_fall_back_to_the_default() -> None:
+    """Unset path and audit variables mean their defaults."""
+    s = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="api")
+    assert s.data_dir == Path("/data")
+    assert s.executor_socket == Path("/run/workbench/executor.sock")
+    assert s.audit_output is None
+
+
+@pytest.mark.parametrize("value", ["", "  ", "\n"])
+def test_blank_string_values_fall_back_to_the_default(value: str) -> None:
+    """An empty or whitespace-only path or audit variable means its default, not a blank path."""
     s = load_settings(
         {
             "OPEN_WEBUI_WORKBENCH_KEY": KEY,
-            "WORKBENCH_DATA_DIR": "",
-            "WORKBENCH_EXECUTOR_SOCKET": "",
-            "AUDIT_OUTPUT": "",
+            "WORKBENCH_DATA_DIR": value,
+            "WORKBENCH_EXECUTOR_SOCKET": value,
+            "AUDIT_OUTPUT": value,
         },
         role="api",
     )
     assert s.data_dir == Path("/data")
     assert s.executor_socket == Path("/run/workbench/executor.sock")
     assert s.audit_output is None
+
+
+def test_surrounding_whitespace_on_string_values_is_stripped() -> None:
+    """A real path or audit value keeps its content but not the whitespace around it."""
+    s = load_settings(
+        {
+            "OPEN_WEBUI_WORKBENCH_KEY": KEY,
+            "WORKBENCH_DATA_DIR": " /srv/state\n",
+            "WORKBENCH_EXECUTOR_SOCKET": "\t/run/other/exec.sock ",
+            "AUDIT_OUTPUT": "container\n",
+        },
+        role="api",
+    )
+    assert s.data_dir == Path("/srv/state")
+    assert s.executor_socket == Path("/run/other/exec.sock")
+    assert s.audit_output == "container"
 
 
 def test_settings_are_frozen() -> None:
