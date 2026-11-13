@@ -1,8 +1,10 @@
 """Fixtures for the api tests: the real app on a throwaway data volume, audit lines kept in memory."""
 
 import io
-from collections.abc import Iterator
+import json
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -57,3 +59,27 @@ def client(app: FastAPI) -> Iterator[TestClient]:
     """A client on the started app, so the audit chain is open while the test runs."""
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def audit_lines(audit_stream: io.StringIO) -> Callable[[], list[dict[str, Any]]]:
+    """Read the audit events written so far, parsed, in order."""
+
+    def lines() -> list[dict[str, Any]]:
+        return [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+
+    return lines
+
+
+@pytest.fixture
+def broken_audit(client: TestClient, audit_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every audit write fail from now on, as a full or closed output would.
+
+    Depends on ``client`` so the chain is open first; the patch is undone before the client
+    closes the chain.
+    """
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    monkeypatch.setattr(audit_stream, "write", refuse)

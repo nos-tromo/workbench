@@ -650,6 +650,54 @@ def test_a_deleted_name_can_be_used_again(store: Store, alice: Principal) -> Non
     assert put(store, alice).name == "q.xlsx"
 
 
+# --- open for reading --------------------------------------------------------
+
+
+def test_open_file_gives_the_record_and_the_bytes(store: Store, alice: Principal) -> None:
+    """The file comes back open in binary mode, for the caller to read and close."""
+    rec = put(store, alice, data=b"content")
+    found, src = store.open_file(alice, rec.virtual_path)
+    with src:
+        assert found == rec
+        assert src.read() == b"content"
+
+
+def test_open_file_is_not_found_for_what_is_not_the_users_file(
+    store: Store, alice: Principal, bob: Principal, workspaces: Workspaces
+) -> None:
+    """A folder, a missing file, another user's file and a record whose file is gone are all not found."""
+    rec = put(store, alice)
+    store.mkdir(alice, "/workspace/chat-1/reports")
+    for path in ("/workspace/chat-1/reports", "/workspace/chat-1/missing.txt", "/workspace/chat-2/q.xlsx"):
+        with pytest.raises(NotFound):
+            store.open_file(alice, path)
+    with pytest.raises(NotFound):
+        store.open_file(bob, rec.virtual_path)
+    workspaces.resolve(alice, rec.virtual_path).unlink()
+    with pytest.raises(NotFound):
+        store.open_file(alice, rec.virtual_path)
+
+
+@pytest.mark.parametrize("target", ["/workspace", "/workspace/chat-1", "/workspace/q.xlsx", "/etc/passwd"])
+def test_open_file_refuses_what_is_not_a_file_path(store: Store, alice: Principal, target: str) -> None:
+    """The root and a chat folder are not files, and nothing outside the root is opened."""
+    put(store, alice)
+    with pytest.raises(PathError):
+        store.open_file(alice, target)
+
+
+def test_open_file_never_follows_a_link(store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path) -> None:
+    """A file replaced by a link is refused, whatever it points at."""
+    rec = put(store, alice)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"not yours")
+    real = workspaces.resolve(alice, rec.virtual_path)
+    real.unlink()
+    real.symlink_to(outside)
+    with pytest.raises(PathError):
+        store.open_file(alice, rec.virtual_path)
+
+
 # --- move ---------------------------------------------------------------------
 
 

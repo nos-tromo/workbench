@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors
+from workbench.api import contract, errors, files, tools
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
 from workbench.api.store import Store
@@ -89,6 +89,9 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
     app.state.callers = callers
     errors.install(app)
     app.include_router(contract.router)
+    app.include_router(files.router)
+    app.include_router(files.tool_router)
+    app.include_router(tools.router)
     return app
 
 

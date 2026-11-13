@@ -26,6 +26,9 @@ from workbench.paths import PathError
 H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 KEY_ONLY = {"Authorization": f"Bearer {KEY}"}
 
+#: The one route below ``/files/`` that is a tool: ``display_file``.
+DISPLAY_TOOL = "/files/display"
+
 HIDDEN_FROM_THE_SPEC = (
     "/files/cwd",
     "/files/read",
@@ -120,7 +123,7 @@ def test_openapi_lists_only_tools(client: TestClient) -> None:
     assert "paths" in doc
     for path in doc["paths"]:
         assert path not in HIDDEN_FROM_THE_SPEC
-        assert not path.startswith(("/files/", "/api/"))
+        assert path == DISPLAY_TOOL or not path.startswith(("/files/", "/api/"))
     for path, item in doc["paths"].items():
         for operation in item.values():
             assert TOOL_TAG in operation["tags"], path
@@ -139,7 +142,7 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/hidden", echo, methods=["POST"], tags=[TOOL_TAG], include_in_schema=False, operation_id="hidden_op"
     )
     doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert list(doc["paths"]) == ["/tools/echo"]
+    assert set(doc["paths"]) == {"/tools/list_files", DISPLAY_TOOL, "/tools/echo"}
     assert doc["paths"]["/tools/echo"]["post"]["operationId"] == "echo_tool"
 
 
@@ -284,12 +287,14 @@ def test_read_refuses_paths_outside_the_root(client: TestClient) -> None:
     assert r.status_code == 400
 
 
-def test_read_of_a_stored_file_is_not_served_yet(client: TestClient, store: Store) -> None:
-    """Reading stored files as text arrives with the file browser; until then they are refused, not hidden."""
+def test_read_of_a_stored_text_file_returns_its_content(client: TestClient, store: Store) -> None:
+    """The file browser serves ``/files/read``: a text file answers its content, any other type 415."""
     me = Principal("open-webui", "user-a", "chat-1")
     store.add_upload(me, "/workspace/chat-1", "notes.txt", io.BytesIO(b"hello"), max_bytes=100, quota_bytes=1000)
+    store.add_upload(me, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"PK"), max_bytes=100, quota_bytes=1000)
     r = client.get("/files/read", params={"path": "/workspace/chat-1/notes.txt"}, headers=H)
-    assert r.status_code == 415
+    assert (r.status_code, r.json()) == (200, {"content": "hello"})
+    assert client.get("/files/read", params={"path": "/workspace/chat-1/q.xlsx"}, headers=H).status_code == 415
 
 
 def test_skills_answer_empty(client: TestClient) -> None:

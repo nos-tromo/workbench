@@ -3,9 +3,10 @@
 Open WebUI connects a "terminal server" by calling, in this order: a policy
 probe that must *not* succeed (a 2xx makes it treat the server as an
 orchestrator, so no route exists for it), ``/api/config``, ``/system``,
-``/openapi.json``, ``/files/cwd``, ``/files/read`` for ``AGENTS.md`` and
-``/skills``. They all answer from memory or the metadata store, never from a
-queue and never by parsing a file. None of them is in the tool document.
+``/openapi.json``, ``/files/cwd``, ``/files/read`` for ``AGENTS.md`` (the file
+browser's route, :mod:`workbench.api.files`) and ``/skills``. They all answer from
+memory or the metadata store, never from a queue and never by parsing a file. None
+of them is in the tool document.
 
 Everything not registered answers 404; that allow-list is workbench's own,
 because Open WebUI's proxy forwards every method and path the browser sends.
@@ -155,33 +156,6 @@ def set_cwd(
     """
     store.list_dir(p, body.path)
     return {"cwd": posixpath.normpath(body.path)}
-
-
-@router.get("/files/read")
-def read_file(
-    path: str,
-    p: Annotated[Principal, Depends(require_principal)],
-    store: Annotated[Store, Depends(get_store)],
-) -> dict[str, str]:
-    """Read a file as text. Open WebUI probes ``<home>/AGENTS.md`` for every chat.
-
-    Files live only inside chat folders, so a file directly under home is absent by definition.
-
-    Args:
-        path: The file's virtual path.
-        p: The caller, user and chat.
-        store: The file store.
-
-    Returns:
-        Nothing yet: reading stored files as text arrives with the file browser.
-
-    Raises:
-        HTTPException: 404 if there is no such file, 415 if there is one.
-    """
-    if posixpath.dirname(posixpath.normpath(path)) == VIRTUAL_ROOT:
-        raise HTTPException(status_code=404, detail=NOT_FOUND)
-    store.get(p, path)
-    raise HTTPException(status_code=415, detail="not readable as text")
 
 
 @router.get("/skills", dependencies=[Depends(require_caller)])

@@ -715,6 +715,38 @@ class Store:
             raise NotFound("file not found")
         return rec
 
+    def open_file(self, p: Principal, path: str) -> tuple[FileRecord, BinaryIO]:
+        """Open a file of the user's for reading.
+
+        The file is opened without following a link and checked to be a regular file, so
+        what is read is the file the record is about.
+
+        Args:
+            p: The caller and user.
+            path: ``/workspace/<chat-id>/<name>``.
+
+        Returns:
+            The record, and the file open in binary mode; the caller closes it.
+
+        Raises:
+            PathError: If the path is outside the user's root, is ``/workspace`` or a chat folder,
+                or runs through a symlink.
+            NotFound: If the user has no such file, or it is gone from the disk.
+        """
+        real, chat_id, name = self._file_target(p, path)
+        rec = self._row(p, chat_id, name)
+        try:
+            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise NotFound("file not found") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise NotFound("file not found")
+            return rec, os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+
     def files_in_chat(self, p: Principal) -> list[FileRecord]:
         """List the files of the principal's chat, including those in its folders, oldest first.
 
