@@ -20,6 +20,7 @@ DEFAULT_CHAT = "default"
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _MAX_FILENAME = 200
+_NAME_MAX_BYTES = 255
 _PRIVATE = 0o700
 
 
@@ -56,9 +57,16 @@ def check_filename(name: str) -> str:
         ``name``, unchanged.
 
     Raises:
-        PathError: If it is empty, over 200 characters, holds NUL or ``/``, or is ``.`` or ``..``.
+        PathError: If it is empty, over 200 characters or over 255 bytes in UTF-8 (Linux
+            ``NAME_MAX``), cannot be encoded as UTF-8, holds NUL or ``/``, or is ``.`` or ``..``.
     """
     if not 1 <= len(name) <= _MAX_FILENAME or "\x00" in name or "/" in name or name in {".", ".."}:
+        raise PathError("invalid file name")
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PathError("invalid file name") from exc
+    if len(encoded) > _NAME_MAX_BYTES:
         raise PathError("invalid file name")
     return name
 

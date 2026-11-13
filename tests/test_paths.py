@@ -321,6 +321,19 @@ def test_good_filenames_are_returned_unchanged(good: str) -> None:
     assert check_filename(good) == good
 
 
+def test_filenames_are_limited_to_255_bytes_in_utf_8() -> None:
+    """A name within 200 characters but over 255 bytes is refused; the byte limit is Linux NAME_MAX."""
+    with pytest.raises(PathError):
+        check_filename("é" * 200)
+    assert check_filename("é" * 127) == "é" * 127
+
+
+def test_a_filename_that_is_not_valid_unicode_is_refused() -> None:
+    """A lone surrogate cannot be encoded, so it is a ``PathError`` and not a ``UnicodeEncodeError``."""
+    with pytest.raises(PathError):
+        check_filename("a\ud800b")
+
+
 def test_path_error_is_a_value_error() -> None:
     """Callers may catch ``ValueError``."""
     assert issubclass(PathError, ValueError)
