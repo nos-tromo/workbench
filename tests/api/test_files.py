@@ -7,6 +7,7 @@ file name, a path or a user id.
 import asyncio
 import dataclasses
 import io
+import itertools
 import logging
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -60,6 +61,17 @@ def file_operations(audit_lines: AuditLines) -> list[str]:
 def server_log(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     """The log records of the app and its server; the test client's own request lines are left out."""
     return [record for record in caplog.records if not record.name.startswith("httpx")]
+
+
+def tick(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store's clock advance one second per file, so no two files have the same age."""
+    seconds = itertools.count(1_000_000)
+    monkeypatch.setattr(store, "_clock", lambda: float(next(seconds)))
+
+
+def older_hint(left: int, total: int) -> str:
+    """The start of the hint that says how many older files a cut list leaves out."""
+    return f"{left} older {'file' if left == 1 else 'files'} not listed ({total} in all)"
 
 
 @pytest.fixture
@@ -1054,8 +1066,8 @@ def test_list_files_tool_lists_the_chats_files(client: TestClient, audit_lines: 
     assert no_body.json() == empty_body.json()
     files = no_body.json()["files"]
     assert [(f["path"], f["size"], f["kind"]) for f in files] == [
-        (f"{CHAT}/q.csv", 4, "upload"),
         (f"{CHAT}/reports/notes.txt", 5, "upload"),
+        (f"{CHAT}/q.csv", 4, "upload"),
     ]
     for f in files:
         assert set(f) == {"path", "size", "modified", "kind"}
@@ -1065,8 +1077,11 @@ def test_list_files_tool_lists_the_chats_files(client: TestClient, audit_lines: 
     assert file_operations(audit_lines) == ["file.upload"] * 3
 
 
-def test_list_files_is_capped_at_the_result_limit(limited_client: TestClient, store: Store) -> None:
-    """Entries come until the answer would pass ``result_max_kb``; then it says it was cut and how many are left."""
+def test_list_files_is_capped_at_the_result_limit(
+    limited_client: TestClient, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The newest files come first until the answer would pass ``result_max_kb``; the oldest are left out."""
+    tick(store, monkeypatch)
     for i in range(40):
         put(store, f"file-{i:02d}.txt")
     r = limited_client.post("/tools/list_files", headers=H)
@@ -1074,10 +1089,31 @@ def test_list_files_is_capped_at_the_result_limit(limited_client: TestClient, st
     shown = [f["path"] for f in body["files"]]
     assert len(r.content) <= 1024
     assert body["truncated"] is True
-    assert shown == [f"{CHAT}/file-{i:02d}.txt" for i in range(len(shown))]
+    assert shown == [f"{CHAT}/file-{39 - i:02d}.txt" for i in range(len(shown))]
+    assert shown[0] == f"{CHAT}/file-39.txt"
+    assert f"{CHAT}/file-00.txt" not in shown
     assert 5 < len(shown) < 40
-    assert f"Not shown: {40 - len(shown)} of 40 files." in body["hint"]
+    assert older_hint(40 - len(shown), 40) in body["hint"]
+    assert "newest first" in body["hint"]
     assert "1 KB" in body["hint"]
+
+
+def test_list_files_lists_the_newest_first_and_breaks_ties_by_name(
+    client: TestClient, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Newest first by creation time; files made at the same moment come in name order."""
+    seconds = iter([1_000_001.0, 1_000_003.0, 1_000_002.0, 1_000_003.0, 1_000_003.0])
+    monkeypatch.setattr(store, "_clock", lambda: next(seconds))
+    for name in ("oldest.txt", "tie-b.txt", "middle.txt", "tie-c.txt", "tie-a.txt"):
+        put(store, name)
+    files = client.post("/tools/list_files", headers=H).json()["files"]
+    assert [f["path"] for f in files] == [
+        f"{CHAT}/tie-a.txt",
+        f"{CHAT}/tie-b.txt",
+        f"{CHAT}/tie-c.txt",
+        f"{CHAT}/middle.txt",
+        f"{CHAT}/oldest.txt",
+    ]
 
 
 def test_list_files_says_nothing_is_cut_when_all_fit(client: TestClient, store: Store) -> None:
@@ -1090,19 +1126,23 @@ def test_list_files_says_nothing_is_cut_when_all_fit(client: TestClient, store: 
     assert len(body["files"]) == 2
 
 
-def test_list_files_cap_holds_at_every_length(limited_client: TestClient, store: Store) -> None:
-    """From empty to far over the limit the answer stays within it, is cut only when it must be, and counts add up."""
+def test_list_files_cap_holds_at_every_length(
+    limited_client: TestClient, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From one file to far over the limit the answer stays within it, is cut only when it must be, and adds up."""
+    tick(store, monkeypatch)
     cut_seen = False
     for count in range(1, 26):
         put(store, f"file-{count:02d}.txt")
         r = limited_client.post("/tools/list_files", headers=H)
         body = r.json()
         assert len(r.content) <= 1024, count
+        assert body["files"][0]["path"] == f"{CHAT}/file-{count:02d}.txt", count
         assert body["truncated"] is (len(body["files"]) < count), count
         cut_seen = cut_seen or body["truncated"]
         assert body["truncated"] == cut_seen, count
         if body["truncated"]:
-            assert f"Not shown: {count - len(body['files'])} of {count} files." in body["hint"]
+            assert older_hint(count - len(body["files"]), count) in body["hint"]
     assert cut_seen
 
 
@@ -1121,7 +1161,7 @@ def test_list_files_cap_may_show_no_file_at_all(limited_client: TestClient, stor
     body = limited_client.post("/tools/list_files", headers=H).json()
     assert body["files"] == []
     assert body["truncated"] is True
-    assert "Not shown: 1 of 1 files." in body["hint"]
+    assert older_hint(1, 1) in body["hint"]
 
 
 def test_list_files_tool_is_empty_for_a_new_chat_and_other_users(client: TestClient, store: Store) -> None:
