@@ -32,6 +32,7 @@ CLEAN_ENV: Mapping[str, str] = MappingProxyType(
 _KILLED_BY = frozenset({signal.SIGKILL, signal.SIGXCPU})
 _SLOT_KILL_ATTEMPTS = 50
 _SLOT_KILL_PAUSE_S = 0.02
+_HELPER_TIMEOUT_S = 5.0  # a slot process can SIGSTOP the helper once it has become the slot's uid
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
 
@@ -122,11 +123,19 @@ def _is_live_process_of(status: str, uid: int) -> bool:
         uid: The user id to look for among the process's real uid.
 
     Returns:
-        ``True`` when the real uid is ``uid`` and the process is not a zombie or dead; a zombie
-        runs nothing and is only waiting for its parent to reap it.
+        ``True`` when the real uid is ``uid`` and something of the process still runs. A zombie
+        or dead process runs nothing, unless it is a thread-group leader whose other threads
+        live on: the file then shows the leader's state, but ``Threads`` is above 1.
+
+    Raises:
+        KeyError: The text has no ``Uid``, ``State`` or ``Threads`` line.
+        ValueError: A number in it is not a number.
+        IndexError: One of those lines holds no value.
     """
     fields = {key: value.split() for key, _, value in (line.partition(":") for line in status.splitlines())}
-    return int(fields["Uid"][0]) == uid and fields["State"][0] not in _GONE_STATES
+    if int(fields["Uid"][0]) != uid:
+        return False
+    return fields["State"][0] not in _GONE_STATES or int(fields["Threads"][0]) > 1
 
 
 def _slot_has_live_processes(uid: int) -> bool:
@@ -137,6 +146,12 @@ def _slot_has_live_processes(uid: int) -> bool:
 
     Returns:
         Whether one exists. A process that ends while it is looked at counts as gone.
+
+    Raises:
+        OSError: ``/proc`` cannot be read.
+        KeyError: A process's status has an unexpected shape.
+        ValueError: A number in it is not a number.
+        IndexError: A line in it holds no value.
     """
     with os.scandir("/proc") as entries:
         pids = [entry.name for entry in entries if entry.name.isdigit()]
@@ -160,7 +175,8 @@ def _kill_as_slot(slot: Slot) -> None:
         slot: The slot whose processes to kill.
 
     Raises:
-        RuntimeError: The helper could not run or did not become the slot's uid.
+        RuntimeError: The helper could not run, did not become the slot's uid, or did not finish
+            within the time allowed (a surviving slot process can stop it).
     """
 
     def helper() -> None:
@@ -182,6 +198,7 @@ def _kill_as_slot(slot: Slot) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=_HELPER_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"could not clear the processes of slot {slot.index}") from exc
@@ -194,31 +211,34 @@ def kill_slot_processes(slot: Slot | None) -> None:
 
     A job's descendants can leave the group with ``setsid`` or ``setpgid``, so the group kill
     does not reach them; they keep the slot's uid, and the slot's next job would share a uid
-    with them. Repeats until ``/proc`` shows no running process of that uid, to catch a process
-    that forks while the signal goes out. This blocks for up to a second; call it from a thread.
-    Does nothing without a slot or off Linux.
+    with them. The signal goes out first, unconditionally: whether something runs is judged
+    only after it. Then ``/proc`` is checked for a running task of that uid, and the signal is
+    repeated until none is left, to catch a process that forks while it goes out. This blocks
+    for up to a second; call it from a thread. Does nothing without a slot or off Linux.
 
     Args:
         slot: The slot to clear, or ``None``.
 
     Raises:
-        ValueError: The slot's uid is 0, since the signal would reach every process.
-        RuntimeError: Processes of the slot remain after the retries, or the helper failed.
-            The message names only the slot's index. The slot must not be reused.
+        RuntimeError: The only failure. Processes of the slot remain after the retries, the helper
+            failed or timed out, ``/proc`` could not be checked, or the slot runs as root. The
+            message names only the slot's index. The slot must not be reused.
     """
     if slot is None:
         return
     if sys.platform != "linux":
         return
     if slot.uid <= 0:
-        raise ValueError("a slot must not run as root")
-    for _ in range(_SLOT_KILL_ATTEMPTS):
-        if not _slot_has_live_processes(slot.uid):
-            return
-        _kill_as_slot(slot)
-        time.sleep(_SLOT_KILL_PAUSE_S)
-    if _slot_has_live_processes(slot.uid):
-        raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
+        raise RuntimeError(f"slot {slot.index} must not run as root")
+    try:
+        for _ in range(_SLOT_KILL_ATTEMPTS):
+            _kill_as_slot(slot)
+            if not _slot_has_live_processes(slot.uid):
+                return
+            time.sleep(_SLOT_KILL_PAUSE_S)
+    except (OSError, KeyError, ValueError, IndexError) as exc:
+        raise RuntimeError(f"processes of slot {slot.index} could not be checked") from exc
+    raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
 
 
 def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:

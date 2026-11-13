@@ -67,18 +67,24 @@ def _open_to_slot(folder: Path) -> None:
     folder.chmod(0o777)
 
 
-def _live_pids_of(uid: int) -> list[int]:
-    """Pids of the running (not zombie) processes whose real uid is ``uid``, read from ``/proc``."""
+def _live_tasks_of(uid: int) -> list[str]:
+    """``pid/tid`` of every running (not zombie, not dead) task whose process has real uid ``uid``.
+
+    Looks at each thread, since the leader of a process can be a zombie while its other threads run.
+    """
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             fields = dict(line.split(":", 1) for line in (entry / "status").read_text().splitlines() if ":" in line)
+            if int(fields["Uid"].split()[0]) != uid:
+                continue
+            for task in (entry / "task").iterdir():
+                if _stat_state((task / "stat").read_text()) not in ("Z", "X"):
+                    found.append(f"{entry.name}/{task.name}")
         except (FileNotFoundError, ProcessLookupError):
             continue
-        if int(fields["Uid"].split()[0]) == uid and fields["State"].split()[0] not in ("Z", "X"):
-            found.append(int(entry.name))
     return found
 
 
@@ -246,7 +252,7 @@ async def test_a_process_that_left_the_group_dies_with_the_slot_cleanup(tmp_path
     assert await run_in_slot([sys.executable, "-I", "-c", code], tmp_path, slot, _limits()) == ("ok", 0)
     escaped = int((tmp_path / "escaped.pid").read_text())
     assert not _alive(escaped), "a process escaped the slot cleanup"
-    assert _live_pids_of(20001) == []
+    assert _live_tasks_of(20001) == []
 
 
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
@@ -263,13 +269,38 @@ async def test_slot_cleanup_also_runs_after_a_wall_timeout(tmp_path: Path) -> No
     status, _ = await run_in_slot([sys.executable, "-I", "-c", code], tmp_path, slot, _limits(wall_s=2))
     assert status == "timeout"
     assert not _alive(int((tmp_path / "escaped.pid").read_text()))
-    assert _live_pids_of(20002) == []
+    assert _live_tasks_of(20002) == []
 
 
-def _status(state: str, uid: int, name: str = "python") -> str:
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+async def test_a_zombie_leader_with_a_running_thread_does_not_survive_the_slot_cleanup(tmp_path: Path) -> None:
+    """A process whose main thread has exited keeps running through its other thread; the cleanup kills it."""
+    _open_to_slot(tmp_path)
+    grandchild = (
+        "import ctypes, threading, time\n"
+        "threading.Thread(target=time.sleep, args=(60,)).start()\n"
+        "ctypes.CDLL(None).pthread_exit(None)\n"
+    )
+    code = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-I', '-c', {grandchild!r}], start_new_session=True)\n"
+        "open('zleader.pid', 'w').write(str(p.pid))\n"
+        "for _ in range(100):\n"
+        "    if 'State:\\tZ' in open(f'/proc/{p.pid}/status').read():\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+        "else:\n"
+        "    raise SystemExit(7)\n"
+    )
+    slot = Slot(index=5, uid=20006, gid=20006)
+    assert await run_in_slot([sys.executable, "-I", "-c", code], tmp_path, slot, _limits()) == ("ok", 0)
+    assert _live_tasks_of(20006) == []
+
+
+def _status(state: str, uid: int, name: str = "python", threads: int = 1) -> str:
     """The relevant lines of a ``/proc/<pid>/status`` file."""
     ids = f"{uid}\t{uid}\t{uid}\t{uid}"
-    return f"Name:\t{name}\nState:\t{state}\nTgid:\t4242\nUid:\t{ids}\nGid:\t{ids}\n"
+    return f"Name:\t{name}\nState:\t{state}\nTgid:\t4242\nUid:\t{ids}\nGid:\t{ids}\nThreads:\t{threads}\n"
 
 
 @pytest.mark.parametrize(
@@ -289,6 +320,14 @@ def _status(state: str, uid: int, name: str = "python") -> str:
 def test_only_running_processes_of_the_slot_uid_count_as_alive(state: str, uid: int, live: bool) -> None:
     """A zombie waits only to be reaped by init, so it never keeps a slot from being reused."""
     assert sandbox._is_live_process_of(_status(state, uid), 20001) is live
+
+
+def test_a_zombie_leader_counts_as_alive_while_another_thread_runs() -> None:
+    """The file shows the leader's state; a zombie leader with a second thread is still a running process."""
+    assert sandbox._is_live_process_of(_status("Z (zombie)", 20001, threads=2), 20001) is True
+    assert sandbox._is_live_process_of(_status("Z (zombie)", 20001, threads=1), 20001) is False
+    assert sandbox._is_live_process_of(_status("X (dead)", 20001, threads=3), 20001) is True
+    assert sandbox._is_live_process_of(_status("Z (zombie)", 20002, threads=2), 20001) is False
 
 
 def test_a_command_name_cannot_pass_for_a_state_or_a_uid() -> None:
@@ -317,7 +356,7 @@ def test_slot_cleanup_refuses_root(monkeypatch: pytest.MonkeyPatch) -> None:
     """``kill(-1)`` as uid 0 would reach every process, so a slot with uid 0 is refused."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: pytest.fail("signalled"))
-    with pytest.raises(ValueError, match="root"):
+    with pytest.raises(RuntimeError, match="slot 0 must not run as root"):
         kill_slot_processes(Slot(index=0, uid=0, gid=0))
 
 
@@ -335,7 +374,7 @@ def test_slot_cleanup_gives_up_after_bounded_retries_and_names_only_the_slot(mon
 
 
 def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each pass signals once; the cleanup returns on the first clean look at ``/proc``."""
+    """Each pass signals once and then looks; the cleanup returns on the first clean look at ``/proc``."""
     looks = iter([True, True, False])
     kills: list[int] = []
     monkeypatch.setattr(sys, "platform", "linux")
@@ -343,7 +382,52 @@ def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.Monke
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: kills.append(slot.uid))
     monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
-    assert kills == [20001, 20001]
+    assert kills == [20001, 20001, 20001]
+
+
+def test_slot_cleanup_signals_before_it_looks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a slot that looks empty gets the signal first, since what ``/proc`` shows can be misleading."""
+    events: list[str] = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: events.append("look") or False)
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: events.append("kill"))
+    kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+    assert events == ["kill", "look"]
+
+
+@pytest.mark.parametrize("error", [OSError("no /proc"), KeyError("Threads"), ValueError("x"), IndexError("y")])
+def test_a_slot_that_cannot_be_checked_fails_with_a_runtime_error_naming_only_the_slot(
+    error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever goes wrong reading ``/proc``, the caller sees one failure type and retires the slot."""
+
+    def look(uid: int) -> bool:
+        """Fail as a broken ``/proc`` entry does."""
+        raise error
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", look)
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: None)
+    with pytest.raises(RuntimeError) as raised:
+        kill_slot_processes(Slot(index=1, uid=20002, gid=20002))
+    assert str(raised.value) == "processes of slot 1 could not be checked"
+    assert raised.value.__cause__ is error
+
+
+def test_a_stopped_helper_is_given_up_on_and_the_slot_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A surviving slot process can stop the helper; ``run`` has a timeout, and its expiry is a ``RuntimeError``."""
+    seen: dict[str, Any] = {}
+
+    def run(*args: Any, **kwargs: Any) -> None:
+        """Time out as a stopped helper does, after noting how it was called."""
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    with pytest.raises(RuntimeError) as raised:
+        sandbox._kill_as_slot(Slot(index=3, uid=20004, gid=20004))
+    assert str(raised.value) == "could not clear the processes of slot 3"
+    assert 0 < seen["timeout"] <= 10
 
 
 @pytest.mark.parametrize("code", ["pass", "import time; time.sleep(10)"])
