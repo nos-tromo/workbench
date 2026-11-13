@@ -4,6 +4,7 @@ Every read or change of content is one audit event naming the file by id; no ans
 file name, a path or a user id.
 """
 
+import asyncio
 import dataclasses
 import io
 import logging
@@ -13,9 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
+from starlette.types import Message, Receive, Scope, Send
 
 from tests.api.conftest import KEY
 from workbench.api import store as store_module
@@ -23,6 +25,7 @@ from workbench.api.audit import AuditLog
 from workbench.api.main import create_app
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import NotFound, Store
+from workbench.api.upload_limit import UploadLimit
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import Workspaces
@@ -257,6 +260,103 @@ def test_a_name_never_breaks_out_of_the_content_disposition_header(client: TestC
         rec = put(store, name)
         r = client.get("/files/view", params={"path": rec.virtual_path}, headers=H)
         assert r.headers["content-disposition"] == f"inline; filename*=UTF-8''{encoded}"
+
+
+# --- active content ------------------------------------------------------------------------------------------------
+
+CSP = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'"
+HARDENING = {
+    "content-security-policy": CSP,
+    "x-content-type-options": "nosniff",
+    "cross-origin-resource-policy": "same-origin",
+}
+ACTIVE_FILES = [
+    ("page.html", b"<!doctype html><!-- <script>alert(1)</script> --><script>alert(1)</script>"),
+    ("PAGE.HTM", b"<html><script>alert(1)</script></html>"),
+    ("doc.xhtml", b'<html xmlns="http://www.w3.org/1999/xhtml"><script>alert(1)</script></html>'),
+    ("image.svg", b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+    ("data.xml", b"<?xml version='1.0'?><a/>"),
+    ("app.js", b"alert(1)"),
+]
+ACTIVE_TYPES = [
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "text/xml",
+    "application/xml",
+    "text/javascript",
+    "application/javascript",
+    "Text/HTML; charset=utf-8",
+]
+
+
+@pytest.mark.parametrize(("name", "data"), ACTIVE_FILES)
+def test_active_content_is_served_as_a_text_attachment_under_a_sandbox(
+    client: TestClient, name: str, data: bytes
+) -> None:
+    """A page or image that can run script never comes back inline with its own type."""
+    upload(client, name, data)
+    r = client.get("/files/view", params={"path": f"{CHAT}/{name}"}, headers=H)
+    assert r.status_code == 200
+    assert r.content == data
+    assert r.headers["content-type"] == "text/plain; charset=utf-8"
+    assert r.headers["content-disposition"] == f"attachment; filename*=UTF-8''{name}"
+    for header, value in HARDENING.items():
+        assert r.headers[header] == value, header
+
+
+@pytest.mark.parametrize("mime", ACTIVE_TYPES)
+def test_an_active_type_is_never_inline_whatever_the_name(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, mime: str
+) -> None:
+    """The stored type decides too, so a file named ``notes.dat`` that is stored as HTML is still an attachment."""
+    monkeypatch.setattr(store_module, "_mime", lambda _name: mime)
+    upload(client, "notes.dat", b"<script>alert(1)</script>")
+    r = client.get("/files/view", params={"path": f"{CHAT}/notes.dat"}, headers=H)
+    assert r.headers["content-type"] == "text/plain; charset=utf-8"
+    assert r.headers["content-disposition"] == "attachment; filename*=UTF-8''notes.dat"
+
+
+@pytest.mark.parametrize("name", ["a.html", "a.htm", "a.xhtml", "a.svg", "a.xml", "a.js", "A.JS", "x.tar.html"])
+def test_an_active_name_is_never_inline_whatever_the_stored_type(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The name decides too: each active suffix, stored as an unknown type, is still an attachment."""
+    monkeypatch.setattr(store_module, "_mime", lambda _name: "application/octet-stream")
+    upload(client, name, b"<svg/>")
+    r = client.get("/files/view", params={"path": f"{CHAT}/{name}"}, headers=H)
+    assert r.headers["content-type"] == "text/plain; charset=utf-8"
+    assert r.headers["content-disposition"] == f"attachment; filename*=UTF-8''{name}"
+
+
+@pytest.mark.parametrize(
+    ("name", "mime"),
+    [
+        ("report.pdf", "application/pdf"),
+        ("quarterly-figures.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("photo.png", "image/png"),
+        ("q.csv", "text/csv"),
+        ("notes.txt", "text/plain"),
+    ],
+)
+def test_other_files_keep_their_type_inline_under_the_same_hardening(client: TestClient, name: str, mime: str) -> None:
+    """Only active content is turned into text; the sandbox headers are on every file."""
+    upload(client, name, b"data")
+    r = client.get("/files/view", params={"path": f"{CHAT}/{name}"}, headers=H)
+    assert r.headers["content-type"] == mime
+    assert r.headers["content-disposition"] == f"inline; filename*=UTF-8''{name}"
+    for header, value in HARDENING.items():
+        assert r.headers[header] == value, header
+
+
+def test_display_reports_the_type_that_view_will_serve(client: TestClient) -> None:
+    """Open WebUI shows a file by what display says it is, so an active file is plain text there too."""
+    upload(client, "page.html", b"<script>alert(1)</script>")
+    upload(client, "report.pdf", b"%PDF")
+    page = client.get("/files/display", params={"path": f"{CHAT}/page.html"}, headers=H).json()
+    pdf = client.get("/files/display", params={"path": f"{CHAT}/report.pdf"}, headers=H).json()
+    assert page["mime_type"] == "text/plain"
+    assert pdf["mime_type"] == "application/pdf"
 
 
 # --- file names in real life -------------------------------------------------------------------------------------
@@ -551,6 +651,230 @@ def test_a_full_volume_is_507(client: TestClient, monkeypatch: pytest.MonkeyPatc
     assert r.json() == {"detail": "storage is full"}
 
 
+# --- the upload limit while the body arrives ---------------------------------------------------------------------
+
+BOUND = 2 * MIB  # the limited client's per-file limit (1 MiB) plus the allowance for multipart framing (1 MiB)
+BOUNDARY = "wbtest"
+MULTIPART = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+
+
+class Drive:
+    """What happened when a request went through ``UploadLimit``.
+
+    Attributes:
+        app_calls: How often the wrapped app was called.
+        receives: How often the app (or the middleware) asked for a body chunk.
+        sent: The messages sent to the client.
+        error: The error that came out of the middleware, if any.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing having happened."""
+        self.app_calls = 0
+        self.receives = 0
+        self.sent: list[Message] = []
+        self.error: BaseException | None = None
+
+    @property
+    def status(self) -> int | None:
+        """The status the client was sent, if a response was started."""
+        starts = [m["status"] for m in self.sent if m["type"] == "http.response.start"]
+        return starts[0] if starts else None
+
+
+def drive(
+    *, bound: int = 1000, path: str = "/files/upload", method: str = "POST", declared: int | None, chunks: list[bytes]
+) -> Drive:
+    """Send a request through ``UploadLimit`` in front of an app that reads its whole body and answers 200."""
+    result = Drive()
+    pending = list(chunks)
+
+    async def inner(_scope: Scope, receive: Receive, send: Send) -> None:
+        result.app_calls += 1
+        more = True
+        while more:
+            more = (await receive()).get("more_body", False)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    async def receive() -> Message:
+        result.receives += 1
+        body = pending.pop(0) if pending else b""
+        return {"type": "http.request", "body": body, "more_body": bool(pending)}
+
+    async def send(message: Message) -> None:
+        result.sent.append(message)
+
+    headers = [] if declared is None else [(b"content-length", str(declared).encode())]
+    scope: Scope = {"type": "http", "method": method, "path": path, "headers": headers}
+
+    async def run() -> None:
+        try:
+            await UploadLimit(inner, max_body=bound)(scope, receive, send)
+        except HTTPException as exc:
+            result.error = exc
+
+    asyncio.run(run())
+    return result
+
+
+def test_a_declared_length_over_the_bound_is_refused_before_any_body_is_read() -> None:
+    """The answer is 413 straight away: the body is never asked for and the app never runs."""
+    r = drive(declared=1001, chunks=[b"x" * 1001])
+    assert r.status == 413
+    assert r.app_calls == 0
+    assert r.receives == 0
+    assert b'"file too large"' in r.sent[1]["body"]
+
+
+def test_a_declared_length_at_the_bound_goes_through() -> None:
+    """The bound itself is allowed."""
+    r = drive(declared=1000, chunks=[b"x" * 1000])
+    assert (r.status, r.app_calls, r.error) == (200, 1, None)
+
+
+def test_a_body_without_a_declared_length_is_counted_as_it_arrives() -> None:
+    """A chunked body has no length to trust: reading stops at the first chunk that passes the bound."""
+    r = drive(declared=None, chunks=[b"x" * 400, b"x" * 400, b"x" * 201, b"x" * 400, b"x" * 400])
+    assert isinstance(r.error, HTTPException)
+    assert (r.error.status_code, r.error.detail) == (413, "file too large")
+    assert r.receives == 3
+    assert r.status is None
+
+
+def test_a_chunked_body_up_to_the_bound_goes_through() -> None:
+    """The count includes every chunk and the bound itself is allowed."""
+    r = drive(declared=None, chunks=[b"x" * 400, b"x" * 400, b"x" * 200])
+    assert (r.status, r.app_calls, r.error, r.receives) == (200, 1, None, 3)
+
+
+def test_a_declared_length_that_lies_is_caught_by_the_count() -> None:
+    """A small declared length does not excuse a larger body."""
+    r = drive(declared=10, chunks=[b"x" * 600, b"x" * 600])
+    assert isinstance(r.error, HTTPException)
+    assert r.error.status_code == 413
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("POST", "/files/mkdir"), ("GET", "/files/upload"), ("POST", "/files/upload/x"), ("POST", "/files")],
+)
+def test_only_post_to_the_upload_route_is_limited(method: str, path: str) -> None:
+    """Every other route and method passes untouched, however large."""
+    r = drive(method=method, path=path, declared=5000, chunks=[b"x" * 5000])
+    assert (r.status, r.app_calls, r.error) == (200, 1, None)
+
+
+def test_a_body_that_is_not_http_is_left_alone() -> None:
+    """Lifespan and websocket scopes go straight to the app."""
+    seen: list[str] = []
+
+    async def inner(scope: Scope, _receive: Receive, _send: Send) -> None:
+        seen.append(scope["type"])
+
+    async def never_received() -> Message:
+        raise AssertionError("not called")
+
+    async def never_sent(_message: Message) -> None:
+        raise AssertionError("not called")
+
+    asyncio.run(UploadLimit(inner, max_body=1)({"type": "lifespan"}, never_received, never_sent))
+    assert seen == ["lifespan"]
+
+
+def multipart_chunks(file_chunks: list[bytes]) -> Iterator[bytes]:
+    """Yield a multipart upload of ``file_chunks`` one chunk at a time, so it is sent chunked."""
+    yield (
+        f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="secret-name-big.bin"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    yield from file_chunks
+    yield f"\r\n--{BOUNDARY}--\r\n".encode()
+
+
+def test_an_oversized_declared_upload_is_refused_and_never_reaches_the_endpoint(
+    limited_client: TestClient,
+    store: Store,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Over the bound by ``Content-Length``: 413, no store call, no file, no audit event, nothing logged."""
+    calls: list[str] = []
+    monkeypatch.setattr(store, "add_upload", lambda *_a, **_k: calls.append("add_upload"))
+    caplog.set_level(logging.DEBUG)
+    r = upload(limited_client, "secret-name-big.bin", b"x" * (BOUND + 1))
+    assert r.status_code == 413
+    assert r.json() == {"detail": "file too large"}
+    assert calls == []
+    assert file_operations(audit_lines) == []
+    assert store.files_in_chat(ME) == []
+    logged = " ".join(record.getMessage() for record in server_log(caplog))
+    assert "secret-name" not in logged
+    assert "/files/upload" not in logged
+    assert [record for record in server_log(caplog) if record.exc_info] == []
+
+
+def test_an_oversized_streamed_upload_is_refused_while_it_arrives(
+    limited_client: TestClient,
+    store: Store,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A chunked body has no ``Content-Length``; the count stops it (where it stops reading: see the ASGI tests)."""
+    calls: list[str] = []
+    monkeypatch.setattr(store, "add_upload", lambda *_a, **_k: calls.append("add_upload"))
+    caplog.set_level(logging.DEBUG)
+    chunks = [b"x" * (256 * 1024)] * 24  # 6 MiB in all, three times the bound
+    r = limited_client.post(
+        "/files/upload",
+        params={"directory": CHAT},
+        headers={**H, **MULTIPART},
+        content=multipart_chunks(chunks),
+    )
+    assert "content-length" not in r.request.headers
+    assert r.request.headers["transfer-encoding"] == "chunked"
+    assert r.status_code == 413
+    assert r.json() == {"detail": "file too large"}
+    assert calls == []
+    assert file_operations(audit_lines) == []
+    assert store.files_in_chat(ME) == []
+    logged = " ".join(record.getMessage() for record in server_log(caplog))
+    assert "secret-name" not in logged
+    assert [record for record in server_log(caplog) if record.exc_info] == []
+
+
+def test_uploads_under_the_limit_succeed_declared_and_streamed(limited_client: TestClient, store: Store) -> None:
+    """The guard does not get in the way: a file at the per-file limit, and a chunked upload below it."""
+    assert upload(limited_client, "exact.bin", b"x" * MIB).status_code == 200
+    r = limited_client.post(
+        "/files/upload",
+        params={"directory": CHAT},
+        headers={**H, **MULTIPART},
+        content=multipart_chunks([b"y" * (128 * 1024)] * 4),
+    )
+    assert r.status_code == 200
+    assert r.json() == {"path": f"{CHAT}/secret-name-big.bin", "size": 512 * 1024}
+    assert [rec.size for rec in store.files_in_chat(ME)] == [MIB, 512 * 1024]
+
+
+def test_a_file_over_the_per_file_limit_but_within_the_bound_is_still_refused_by_the_store(
+    limited_client: TestClient, store: Store
+) -> None:
+    """The bound only allows for framing; the exact per-file limit stays the store's."""
+    r = upload(limited_client, "big.bin", b"x" * (MIB + 1))
+    assert r.status_code == 413
+    assert r.json() == {"detail": "file too large"}
+    assert store.files_in_chat(ME) == []
+
+
+def test_other_routes_are_not_limited_by_the_upload_bound(limited_client: TestClient) -> None:
+    """A large body to another route reaches the route, which answers for itself."""
+    r = limited_client.post("/files/mkdir", json={"path": "x" * (BOUND + 1)}, headers=H)
+    assert r.status_code == 400
+
+
 # --- hostile input -------------------------------------------------------------------------------------------------
 
 BAD_PATHS = [
@@ -736,14 +1060,75 @@ def test_list_files_tool_lists_the_chats_files(client: TestClient, audit_lines: 
     for f in files:
         assert set(f) == {"path", "size", "modified", "kind"}
         assert datetime.fromisoformat(f["modified"]).tzinfo is not None
-    assert set(no_body.json()) == {"files"}
+    assert set(no_body.json()) == {"files", "truncated"}
+    assert no_body.json()["truncated"] is False
     assert file_operations(audit_lines) == ["file.upload"] * 3
+
+
+def test_list_files_is_capped_at_the_result_limit(limited_client: TestClient, store: Store) -> None:
+    """Entries come until the answer would pass ``result_max_kb``; then it says it was cut and how many are left."""
+    for i in range(40):
+        put(store, f"file-{i:02d}.txt")
+    r = limited_client.post("/tools/list_files", headers=H)
+    body = r.json()
+    shown = [f["path"] for f in body["files"]]
+    assert len(r.content) <= 1024
+    assert body["truncated"] is True
+    assert shown == [f"{CHAT}/file-{i:02d}.txt" for i in range(len(shown))]
+    assert 5 < len(shown) < 40
+    assert f"Not shown: {40 - len(shown)} of 40 files." in body["hint"]
+    assert "1 KB" in body["hint"]
+
+
+def test_list_files_says_nothing_is_cut_when_all_fit(client: TestClient, store: Store) -> None:
+    """A list that fits is whole, and has no hint."""
+    put(store, "a.txt")
+    put(store, "b.txt")
+    body = client.post("/tools/list_files", headers=H).json()
+    assert body["truncated"] is False
+    assert "hint" not in body
+    assert len(body["files"]) == 2
+
+
+def test_list_files_cap_holds_at_every_length(limited_client: TestClient, store: Store) -> None:
+    """From empty to far over the limit the answer stays within it, is cut only when it must be, and counts add up."""
+    cut_seen = False
+    for count in range(1, 26):
+        put(store, f"file-{count:02d}.txt")
+        r = limited_client.post("/tools/list_files", headers=H)
+        body = r.json()
+        assert len(r.content) <= 1024, count
+        assert body["truncated"] is (len(body["files"]) < count), count
+        cut_seen = cut_seen or body["truncated"]
+        assert body["truncated"] == cut_seen, count
+        if body["truncated"]:
+            assert f"Not shown: {count - len(body['files'])} of {count} files." in body["hint"]
+    assert cut_seen
+
+
+def test_list_files_cap_counts_bytes_not_characters(limited_client: TestClient, store: Store) -> None:
+    """Names with umlauts take two bytes a character in the answer, and the limit is in bytes."""
+    for i in range(20):
+        put(store, f"{'\u00dc' * 60}-{i:02d}.txt")
+    r = limited_client.post("/tools/list_files", headers=H)
+    assert len(r.content) <= 1024
+    assert r.json()["truncated"] is True
+
+
+def test_list_files_cap_may_show_no_file_at_all(limited_client: TestClient, store: Store) -> None:
+    """A single entry larger than the limit is left out, and the hint still counts it."""
+    put(store, "\x01" * 190 + ".txt")
+    body = limited_client.post("/tools/list_files", headers=H).json()
+    assert body["files"] == []
+    assert body["truncated"] is True
+    assert "Not shown: 1 of 1 files." in body["hint"]
 
 
 def test_list_files_tool_is_empty_for_a_new_chat_and_other_users(client: TestClient, store: Store) -> None:
     """Nothing is made by asking, and another user's files are not listed."""
-    assert client.post("/tools/list_files", headers=H).json() == {"files": []}
+    nothing: dict[str, Any] = {"files": [], "truncated": False}
+    assert client.post("/tools/list_files", headers=H).json() == nothing
     put(store, "q.csv")
-    assert client.post("/tools/list_files", headers=H_B).json() == {"files": []}
-    assert client.post("/tools/list_files", headers={**H, "X-Session-Id": "chat-2"}).json() == {"files": []}
+    assert client.post("/tools/list_files", headers=H_B).json() == nothing
+    assert client.post("/tools/list_files", headers={**H, "X-Session-Id": "chat-2"}).json() == nothing
     assert len(client.post("/tools/list_files", headers=H).json()["files"]) == 1

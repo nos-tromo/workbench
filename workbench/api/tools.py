@@ -12,7 +12,7 @@ from typing import Literal
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from workbench.api.deps import PrincipalDep, StoreDep
+from workbench.api.deps import PrincipalDep, SettingsDep, StoreDep
 from workbench.api.openapi import TOOL_TAG
 
 router = APIRouter(tags=[TOOL_TAG])
@@ -39,9 +39,69 @@ class FileList(BaseModel):
 
     Attributes:
         files: The files of the chat, oldest first.
+        truncated: Whether files were left out to keep the answer within the result limit.
+        hint: When ``truncated``, how many files were left out.
     """
 
     files: list[FileInfo]
+    truncated: bool = Field(default=False, description="True if more files exist than are listed here.")
+    hint: str | None = Field(default=None, description="When truncated, how many files are not shown.")
+
+
+def _json_size(model: BaseModel) -> int:
+    """Measure a model as the answer sends it: compact JSON, in bytes, without the hint if there is none.
+
+    Args:
+        model: The model.
+
+    Returns:
+        The size in bytes of its JSON.
+    """
+    return len(model.model_dump_json(exclude_none=True).encode())
+
+
+def _notice(left: int, total: int, limit_kb: int) -> str:
+    """Say how many files an answer leaves out.
+
+    Args:
+        left: Files not shown.
+        total: Files in the chat.
+        limit_kb: The result limit in kilobytes.
+
+    Returns:
+        The hint.
+    """
+    return (
+        f"Not shown: {left} of {total} files. The list is cut at {limit_kb} KB, oldest first; "
+        "ask the user which file they mean, or to delete files they no longer need."
+    )
+
+
+def _fit(files: list[FileInfo], limit_kb: int) -> FileList:
+    """Keep as many files, oldest first, as the answer can hold within the result limit.
+
+    Args:
+        files: Every file of the chat.
+        limit_kb: The result limit, in kilobytes.
+
+    Returns:
+        All the files if the answer fits, else the longest run from the start that fits together
+        with the notice that says how many were left out.
+    """
+    limit = limit_kb * 1024
+    everything = FileList(files=files)
+    if _json_size(everything) <= limit:
+        return everything
+    total = len(files)
+    used = _json_size(FileList(files=[], truncated=True, hint=_notice(total, total, limit_kb)))
+    kept: list[FileInfo] = []
+    for info in files:
+        added = _json_size(info) + (1 if kept else 0)
+        if used + added > limit:
+            break
+        used += added
+        kept.append(info)
+    return FileList(files=kept, truncated=True, hint=_notice(total - len(kept), total, limit_kb))
 
 
 @router.post(
@@ -51,29 +111,31 @@ class FileList(BaseModel):
     description=(
         "List every file in this conversation's workspace, the user's uploads and the files "
         "tools made, with path, size, date and kind. Takes no arguments. Call it first to see "
-        "what there is to work with."
+        "what there is to work with. A very long list is cut: truncated is then true, and hint says "
+        "how many files are left out."
     ),
+    response_model_exclude_none=True,
 )
-def list_files(p: PrincipalDep, store: StoreDep) -> FileList:
-    """List the files of the principal's chat.
+def list_files(p: PrincipalDep, settings: SettingsDep, store: StoreDep) -> FileList:
+    """List the files of the principal's chat, within the result limit.
 
     Listing is the user's own metadata and is not recorded (spec section 7).
 
     Args:
         p: The caller, user and chat.
+        settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
 
     Returns:
-        The files of the chat, oldest first.
+        The files of the chat, oldest first, cut with a hint if they would not fit the limit.
     """
-    return FileList(
-        files=[
-            FileInfo(
-                path=rec.virtual_path,
-                size=rec.size,
-                modified=datetime.fromtimestamp(rec.created_at, tz=UTC).isoformat(timespec="seconds"),
-                kind=rec.kind,
-            )
-            for rec in store.files_in_chat(p)
-        ]
-    )
+    files = [
+        FileInfo(
+            path=rec.virtual_path,
+            size=rec.size,
+            modified=datetime.fromtimestamp(rec.created_at, tz=UTC).isoformat(timespec="seconds"),
+            kind=rec.kind,
+        )
+        for rec in store.files_in_chat(p)
+    ]
+    return _fit(files, settings.result_max_kb)

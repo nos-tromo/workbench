@@ -45,6 +45,28 @@ _MIB: Final = 1024 * 1024
 _CHUNK: Final = _MIB
 _TEXT_SUFFIXES: Final = (".md", ".csv")
 
+#: Types that can run script when a browser opens them. They are never served as themselves.
+_ACTIVE_TYPES: Final = frozenset(
+    {
+        "text/html",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "text/xml",
+        "application/xml",
+        "text/javascript",
+        "application/javascript",
+    }
+)
+_ACTIVE_SUFFIXES: Final = (".html", ".htm", ".xhtml", ".svg", ".xml", ".js")
+_PLAIN: Final = "text/plain"
+
+#: Sent with every file: no script, no navigation, no request out, and no other origin may embed it.
+_FILE_HEADERS: Final = {
+    "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
+    "X-Content-Type-Options": "nosniff",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
 
 class MkdirRequest(BaseModel):
     """Body of ``POST /files/mkdir``.
@@ -75,13 +97,13 @@ class DisplayedFile(BaseModel):
         path: The file's path.
         exists: Whether the user has such a file.
         name: The file's own name, without its folder; ``None`` if there is no such file.
-        mime_type: The file's media type; ``None`` if there is no such file.
+        mime_type: The media type the file is served as; ``None`` if there is no such file.
     """
 
     path: str = Field(description="The file's absolute path.")
     exists: bool = Field(description="False if the user has no such file; then there is nothing to show.")
     name: str | None = Field(description="The file's own name, without its folder.")
-    mime_type: str | None = Field(description="The file's media type.")
+    mime_type: str | None = Field(description="The media type the file is shown as; active content is plain text.")
 
 
 def _chunks(src: BinaryIO) -> Iterator[bytes]:
@@ -112,17 +134,47 @@ def _is_text(rec: FileRecord) -> bool:
     return rec.mime.startswith("text/") or rec.name.lower().endswith(_TEXT_SUFFIXES)
 
 
-def _disposition(rec: FileRecord) -> str:
-    """Build the ``Content-Disposition`` of a file: inline, with its own name in RFC 5987 form.
+def _is_active(rec: FileRecord) -> bool:
+    """Tell whether a file can run script when a browser opens it: HTML, SVG, XML and JavaScript.
+
+    The stored type and the name each decide, so neither a wrong name nor a wrong type lets
+    such a file through.
 
     Args:
         rec: The file's record.
 
     Returns:
-        The header value. The name is percent-encoded UTF-8, so no character of it can end the
-        header or start another.
+        ``True`` if it must not be served as itself.
     """
-    return f"inline; filename*=UTF-8''{quote(posixpath.basename(rec.name), safe='')}"
+    media_type = rec.mime.partition(";")[0].strip().lower()
+    return media_type in _ACTIVE_TYPES or rec.name.lower().endswith(_ACTIVE_SUFFIXES)
+
+
+def _media_type(rec: FileRecord) -> str:
+    """Return the media type a file is shown as: its own, or plain text if it is active content.
+
+    Args:
+        rec: The file's record.
+
+    Returns:
+        The media type, without parameters.
+    """
+    return _PLAIN if _is_active(rec) else rec.mime
+
+
+def _disposition(rec: FileRecord) -> str:
+    """Build the ``Content-Disposition`` of a file, with its own name in RFC 5987 form.
+
+    Args:
+        rec: The file's record.
+
+    Returns:
+        The header value: ``inline``, or ``attachment`` for active content so a browser saves
+        it instead of rendering it. The name is percent-encoded UTF-8, so no character of it
+        can end the header or start another.
+    """
+    how = "attachment" if _is_active(rec) else "inline"
+    return f"{how}; filename*=UTF-8''{quote(posixpath.basename(rec.name), safe='')}"
 
 
 def _save_upload(
@@ -208,6 +260,10 @@ def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> S
     Open WebUI may add ``preview=true`` to ask for a rendering of an Office file; it is ignored,
     so the browser gets the file itself and renders it.
 
+    A file that can run script (HTML, SVG, XML, JavaScript) is sent as plain text and an
+    attachment instead, so opening it can never run it at Open WebUI's origin. Every file
+    carries a sandboxing ``Content-Security-Policy``.
+
     Args:
         path: The file's virtual path.
         p: The caller, user and chat.
@@ -225,10 +281,10 @@ def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> S
         src.close()
         raise
     headers = {
-        "Content-Type": rec.mime,
+        **_FILE_HEADERS,
+        "Content-Type": f"{_PLAIN}; charset=utf-8" if _is_active(rec) else rec.mime,
         "Content-Length": str(size),
         "Content-Disposition": _disposition(rec),
-        "X-Content-Type-Options": "nosniff",
     }
     return StreamingResponse(_chunks(src), headers=headers)
 
@@ -348,4 +404,6 @@ def display_file(
     except NotFound:
         return DisplayedFile(path=path, exists=False, name=None, mime_type=None)
     audit.record("display", p, file_ids=[rec.id])
-    return DisplayedFile(path=rec.virtual_path, exists=True, name=posixpath.basename(rec.name), mime_type=rec.mime)
+    return DisplayedFile(
+        path=rec.virtual_path, exists=True, name=posixpath.basename(rec.name), mime_type=_media_type(rec)
+    )
