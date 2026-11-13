@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # Pinned to an immutable commit SHA (v3.22): strict-config + make/common.mk +
+    # bundle-lib + audit-library drift-checks; nos-tromo style tuning:
+    # line-length=120, ANN401 ignored, local pyrefly hook. Canonical configs at
+    # nos-tromo/.github/configs/{python-strict,make-common,bundle,audit}/.
+    # docker-build stays off until the images exist (Task 9 turns it on).
+    uses: nos-tromo/.github/.github/workflows/python-app-ci.yml@2715bedabe594a449e411182393e68da59c791f3 # v3.22
+    with:
+      python-versions: '["3.12"]'
+      uv-sync-args: '--locked --group dev --extra executor'
+      docker-build: false
