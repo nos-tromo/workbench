@@ -15,6 +15,7 @@ from workbench import __version__
 from workbench.api import contract, errors, files, tools
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
+from workbench.api.hardening import ViewHardening
 from workbench.api.store import Store
 from workbench.api.upload_limit import UploadLimit, body_limit
 from workbench.config import Settings, load_settings
@@ -90,6 +91,7 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
     app.state.callers = callers
     errors.install(app)
     app.add_middleware(UploadLimit, max_body=body_limit(settings))
+    app.add_middleware(ViewHardening)
     app.include_router(contract.router)
     app.include_router(files.router)
     app.include_router(files.tool_router)

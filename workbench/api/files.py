@@ -60,13 +60,6 @@ _ACTIVE_TYPES: Final = frozenset(
 _ACTIVE_SUFFIXES: Final = (".html", ".htm", ".xhtml", ".svg", ".xml", ".js")
 _PLAIN: Final = "text/plain"
 
-#: Sent with every file: no script, no navigation, no request out, and no other origin may embed it.
-_FILE_HEADERS: Final = {
-    "Content-Security-Policy": "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
-    "X-Content-Type-Options": "nosniff",
-    "Cross-Origin-Resource-Policy": "same-origin",
-}
-
 
 class MkdirRequest(BaseModel):
     """Body of ``POST /files/mkdir``.
@@ -120,6 +113,22 @@ def _chunks(src: BinaryIO) -> Iterator[bytes]:
             yield chunk
     finally:
         src.close()
+
+
+def _in_folder_of(p: Principal, rec: FileRecord) -> Principal:
+    """Return the principal acting in the chat folder a file lives in.
+
+    The browser sets ``X-Session-Id`` freely, so the chat of the request says nothing about the
+    file; the audit event names the folder the file is in.
+
+    Args:
+        p: The caller, user and the chat of the request.
+        rec: The record of the file the action touches.
+
+    Returns:
+        The same caller and user, in the file's chat folder.
+    """
+    return dataclasses.replace(p, chat_id=rec.chat_id)
 
 
 def _is_text(rec: FileRecord) -> bool:
@@ -205,7 +214,7 @@ def _save_upload(
         quota_bytes=settings.workspace_max_mb * _MIB,
     )
     try:
-        audit.record("upload", p, file_ids=[rec.id])
+        audit.record("upload", _in_folder_of(p, rec), file_ids=[rec.id])
     except AuditWriteError:
         store.remove(rec)
         raise
@@ -261,8 +270,8 @@ def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> S
     so the browser gets the file itself and renders it.
 
     A file that can run script (HTML, SVG, XML, JavaScript) is sent as plain text and an
-    attachment instead, so opening it can never run it at Open WebUI's origin. Every file
-    carries a sandboxing ``Content-Security-Policy``.
+    attachment instead, so opening it can never run it at Open WebUI's origin. Every answer of
+    this route, refusals included, carries the sandboxing headers of :mod:`workbench.api.hardening`.
 
     Args:
         path: The file's virtual path.
@@ -275,13 +284,12 @@ def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> S
     """
     rec, src = store.open_file(p, path)
     try:
-        audit.record("view", p, file_ids=[rec.id])
+        audit.record("view", _in_folder_of(p, rec), file_ids=[rec.id])
         size = os.fstat(src.fileno()).st_size
     except BaseException:
         src.close()
         raise
     headers = {
-        **_FILE_HEADERS,
         "Content-Type": f"{_PLAIN}; charset=utf-8" if _is_active(rec) else rec.mime,
         "Content-Length": str(size),
         "Content-Disposition": _disposition(rec),
@@ -319,7 +327,7 @@ def read_file(path: str, p: PrincipalDep, settings: SettingsDep, store: StoreDep
         data = src.read(limit + 1)
     if len(data) > limit:
         raise HTTPException(status_code=413, detail="file too large to read here")
-    audit.record("read", p, file_ids=[rec.id])
+    audit.record("read", _in_folder_of(p, rec), file_ids=[rec.id])
     return {"content": data.decode("utf-8", errors="replace")}
 
 
@@ -337,7 +345,7 @@ def delete_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) ->
         The path that was deleted.
     """
     rec = store.get(p, path)
-    audit.record("delete", p, file_ids=[rec.id])
+    audit.record("delete", _in_folder_of(p, rec), file_ids=[rec.id])
     store.remove(rec)  # by id, so the file recorded is the file removed
     return {"path": rec.virtual_path}
 
@@ -403,7 +411,7 @@ def display_file(
         rec = store.get(p, path)
     except NotFound:
         return DisplayedFile(path=path, exists=False, name=None, mime_type=None)
-    audit.record("display", p, file_ids=[rec.id])
+    audit.record("display", _in_folder_of(p, rec), file_ids=[rec.id])
     return DisplayedFile(
         path=rec.virtual_path, exists=True, name=posixpath.basename(rec.name), mime_type=_media_type(rec)
     )

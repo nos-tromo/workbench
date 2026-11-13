@@ -103,6 +103,13 @@ def test_record_writes_a_verifiable_chain(log: AuditLog, stream: Stream, alice: 
     assert "purpose" not in last
 
 
+def test_the_container_is_the_chat_of_the_principal_given(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """The caller says which chat folder the event is about, by the principal it passes; a header is not consulted."""
+    log.record("view", dataclasses.replace(alice, chat_id="chat-2"), file_ids=["f1"])
+
+    assert stream.events()[-1]["target"]["container"] == "chat:chat-2"
+
+
 def test_chain_starts_with_the_start_event_and_the_config(log: AuditLog, stream: Stream) -> None:
     """The chain opens with ``lifecycle`` / ``start`` and a system ``admin`` / ``config.audit`` carrying the config."""
     first, config = stream.events()

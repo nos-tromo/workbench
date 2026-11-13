@@ -361,6 +361,51 @@ def test_other_files_keep_their_type_inline_under_the_same_hardening(client: Tes
         assert r.headers[header] == value, header
 
 
+@pytest.mark.parametrize(
+    ("params", "headers", "status"),
+    [
+        ({"path": f"{CHAT}/missing.txt"}, H, 404),
+        ({"path": "/workspace/chat-1/../../x"}, H, 400),
+        ({"path": CHAT}, H, 400),
+        ({"path": f"{CHAT}/q.csv"}, KEY_ONLY, 400),
+        ({"path": f"{CHAT}/q.csv"}, {"X-User-Id": "user-a"}, 401),
+        ({}, H, 422),
+    ],
+)
+def test_the_hardening_headers_are_on_every_view_answer_errors_included(
+    client: TestClient, params: dict[str, str], headers: dict[str, str], status: int
+) -> None:
+    """A refusal from ``/files/view`` carries the sandbox headers too, whichever handler wrote it."""
+    upload(client, "q.csv")
+    r = client.get("/files/view", params=params, headers=headers)
+    assert r.status_code == status
+    for header, value in HARDENING.items():
+        assert r.headers[header] == value, header
+    assert len(r.headers.get_list("content-security-policy")) == 1
+
+
+def test_the_hardening_headers_are_on_a_view_that_cannot_be_recorded(
+    client: TestClient, broken_audit: None, store: Store
+) -> None:
+    """The 500 for a failed audit write is a view answer as well."""
+    rec = put(store, "q.csv")
+    r = client.get("/files/view", params={"path": rec.virtual_path}, headers=H)
+    assert r.status_code == 500
+    for header, value in HARDENING.items():
+        assert r.headers[header] == value, header
+
+
+def test_the_hardening_headers_are_only_for_view(client: TestClient) -> None:
+    """The other routes answer JSON for the caller, not files for a browser, and carry none of them."""
+    upload(client, "q.csv")
+    for r in (
+        client.get("/files/list", params={"directory": CHAT}, headers=H),
+        client.get("/files/display", params={"path": f"{CHAT}/q.csv"}, headers=H),
+        client.get("/files/read", params={"path": f"{CHAT}/q.csv"}, headers=H),
+    ):
+        assert "content-security-policy" not in r.headers
+
+
 def test_display_reports_the_type_that_view_will_serve(client: TestClient) -> None:
     """Open WebUI shows a file by what display says it is, so an active file is plain text there too."""
     upload(client, "page.html", b"<script>alert(1)</script>")
@@ -437,6 +482,35 @@ def test_no_audit_line_contains_a_file_name(
     assert all(e["target"]["container"] == "chat:chat-1" for e in events)
     assert "secret-name" not in audit_stream.getvalue()
     assert "secret-notes" not in audit_stream.getvalue()
+
+
+def test_the_audit_container_is_the_files_chat_folder_not_the_session_chat(
+    client: TestClient, audit_lines: AuditLines
+) -> None:
+    """The browser sets ``X-Session-Id`` freely; the record names the folder the file is in, not the header."""
+    assert H["X-Session-Id"] == "chat-1"
+    uploaded = upload(client, "x.txt", b"hi", directory="/workspace/chat-2")
+    path = uploaded.json()["path"]
+    assert path == "/workspace/chat-2/x.txt"
+    client.get("/files/view", params={"path": path}, headers=H)
+    client.get("/files/read", params={"path": path}, headers=H)
+    client.get("/files/display", params={"path": path}, headers=H)
+    client.post("/files/mkdir", json={"path": "/workspace/chat-3/reports"}, headers=H)
+    nested = upload(client, "y.txt", b"hi", directory="/workspace/chat-3/reports").json()["path"]
+    client.get("/files/view", params={"path": nested}, headers=H)
+    client.delete("/files/delete", params={"path": path}, headers=H)
+    client.delete("/files/delete", params={"path": nested}, headers=H)
+    events = [line for line in audit_lines() if line["operation"].startswith("file.")]
+    assert [(e["operation"], e["target"]["container"]) for e in events] == [
+        ("file.upload", "chat:chat-2"),
+        ("file.view", "chat:chat-2"),
+        ("file.read", "chat:chat-2"),
+        ("file.display", "chat:chat-2"),
+        ("file.upload", "chat:chat-3"),
+        ("file.view", "chat:chat-3"),
+        ("file.delete", "chat:chat-2"),
+        ("file.delete", "chat:chat-3"),
+    ]
 
 
 def test_list_mkdir_and_move_are_not_recorded_and_absent_files_leave_no_event(

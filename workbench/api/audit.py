@@ -1,7 +1,7 @@
 """The api's data-protection audit chain.
 
 Every file and tool action is recorded by reference: file ids, counts and the
-chat as container. Never content and never a file name, so nothing here takes
+chat folder the files are in as container. Never content and never a file name, so nothing here takes
 one. One emitter, and so one hash chain, per process; the lifespan opens it with
 :meth:`AuditLog.open` and ends it with :meth:`AuditLog.close`.
 
@@ -112,7 +112,8 @@ class AuditLog:
 
         Args:
             key: The action, a key of :data:`OPERATIONS`.
-            p: The caller, the user and the chat the action ran in.
+            p: The caller, the user and the chat folder of the files the event names; for an
+                action on a file that is the folder the file lives in, never the chat of the request.
             file_ids: Ids of the files the action touched; never names.
             outcome: ``ok``, ``denied`` or ``error``.
             criteria: The action's parameters, never content. ``caller`` is
