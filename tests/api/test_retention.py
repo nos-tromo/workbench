@@ -751,9 +751,11 @@ def test_one_entry_that_cannot_be_looked_at_never_stops_the_prune(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A chat subfolder of mode 0600 is skipped with a warning, by the error's type alone.
+    """Chat subfolders that cannot be looked into (mode 0600) or listed (0300) are skipped with a warning, by type.
 
-    The other users, the staging residue, the checkpoint and the gauges still get their turn, every interval.
+    Only those entries: the orphan beside them in the same chat folder is recorded and removed, and the other users,
+    the staging residue, the checkpoint and the gauges still get their turn, every interval. The mode 0600 folder's
+    entries cannot be looked at; the mode 0300 folder runs ``os.walk``'s error hook.
     """
     checkpoints: list[int] = []
     monkeypatch.setattr(store, "checkpoint", lambda: checkpoints.append(1) or True)
@@ -761,25 +763,78 @@ def test_one_entry_that_cannot_be_looked_at_never_stops_the_prune(
     put(store, "quarterly-figures.xlsx")
     clock.now = time.time()
     workspaces = settings.data_dir / "workspaces" / "open-webui"
-    sealed = workspaces / "user-a" / "chat-1" / "sealed"
+    chat = workspaces / "user-a" / "chat-1"
+    sealed, unlisted = chat / "sealed", chat / "unlisted"
     orphan(sealed / "inside.txt", clock.now)
+    orphan(unlisted / "hidden.txt", clock.now)
+    beside = orphan(chat / "lost-draft.docx", clock.now)
     lost = orphan(workspaces / "user-b" / "chat-1" / "lost-report.docx", clock.now)
     residue = orphan(settings.data_dir / "staging" / ("a" * 32) / "harbour-chart.png", clock.now)
     age(residue.parent, 2 * HOUR, clock.now)
     sealed.chmod(0o600)
+    unlisted.chmod(0o300)
     try:
         with caplog.at_level(logging.WARNING):
             assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
     finally:
         sealed.chmod(0o700)
-    assert not lost.exists() and not residue.parent.exists()
-    assert (sealed / "inside.txt").exists()
+        unlisted.chmod(0o700)
+    assert not beside.exists() and not lost.exists() and not residue.parent.exists()
+    assert (sealed / "inside.txt").exists() and (unlisted / "hidden.txt").exists()
     assert checkpoints == [1]
     assert metrics.registry.get_sample_value("workbench_files_total") == 0
-    assert "PermissionError" in caplog.text
-    assert "sealed" not in caplog.text and "inside" not in caplog.text
+    assert "could not look at (PermissionError)" in caplog.text
+    assert "could not list (PermissionError)" in caplog.text
+    assert [name for name in ("sealed", "inside", "unlisted", "hidden", "lost-draft") if name in caplog.text] == []
+    orphans = [event for event in sweeps(audit_lines) if event["criteria"].get("rule") == "orphan"]
+    assert sorted(event["criteria"]["owner"] for event in orphans) == ["user-a", "user-b"]
     rules = sorted(event["criteria"].get("rule", "period") for event in sweeps(audit_lines))
-    assert rules == ["orphan", "period", "staging"]
+    assert rules == ["orphan", "orphan", "period", "staging"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root looks into a folder whatever its mode")
+def test_a_staging_folder_that_cannot_be_looked_at_is_skipped_with_a_warning(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``staging`` of mode 0600 lists its job folders, but none can be looked at: each is skipped, logged by type."""
+    clock.now = time.time()
+    staging = settings.data_dir / "staging"
+    residue = orphan(staging / ("a" * 32) / "harbour-chart.png", clock.now)
+    age(residue.parent, 2 * HOUR, clock.now)
+    staging.chmod(0o600)
+    try:
+        with caplog.at_level(logging.WARNING):
+            sweeper.sweep_once()
+    finally:
+        staging.chmod(0o700)
+    assert residue.exists()
+    assert sweeps(audit_lines) == []
+    assert "could not look at (PermissionError)" in caplog.text
+    assert "a" * 32 not in caplog.text and "harbour" not in caplog.text
+
+
+def test_a_staging_folder_gone_before_it_is_looked_at_is_skipped_silently(
+    sweeper: Sweeper,
+    settings: Settings,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A job folder the queue removed between the listing and the look is no reason for a warning."""
+    clock.now = time.time()
+    residue = orphan(settings.data_dir / "staging" / ("a" * 32) / "harbour-chart.png", clock.now)
+    age(residue.parent, 2 * HOUR, clock.now)
+    lstat = os.lstat
+
+    def gone(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == "a" * 32:
+            raise FileNotFoundError(2, "synthetic")
+        return lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", gone)
+    with caplog.at_level(logging.WARNING):
+        sweeper.sweep_once()
+    assert caplog.text == ""
 
 
 def test_a_stop_during_the_prune_ends_it_before_the_next_user(
@@ -810,6 +865,34 @@ def test_a_stop_during_the_prune_ends_it_before_the_next_user(
     assert sorted(path.exists() for path in lost) == [False, True]
     assert residue.exists()
     assert len(sweeps(audit_lines)) == 1
+
+
+def test_a_stop_ends_a_users_orphans_between_two_batches(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Within one user too, a cancel ends the walk before its next record.
+
+    The second batch of 200 waits for the next sweep, and so do the folders the first left empty.
+    """
+    clock.now = time.time()
+    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    for n in range(201):
+        orphan(chat / f"{n:032x}.part", clock.now)
+    age(chat, 2 * HOUR, clock.now)
+    stop = threading.Event()
+    record = sweeper._record_orphans
+
+    def then_stop(*args: Any) -> None:
+        try:
+            record(*args)
+        finally:
+            stop.set()
+
+    monkeypatch.setattr(sweeper, "_record_orphans", then_stop)
+    sweeper.sweep_once(stop)
+    (event,) = sweeps(audit_lines)
+    assert event["target"]["count"] == 200
+    assert len(list(chat.iterdir())) == 1
 
 
 def test_a_stop_during_the_prune_ends_it_before_the_next_staging_folder(

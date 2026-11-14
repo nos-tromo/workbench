@@ -296,11 +296,12 @@ class _List:
 # python-docx internals this writer relies on, below the library's public api, to stay fast (a test names each, so an
 # upgrade that drops one fails clearly): ``Paragraph._p``, ``Document._body``; a paragraph's ``CT_P.style`` and
 # ``get_or_add_pPr``, ``CT_PPr.numPr`` and ``get_or_add_numPr``, ``CT_NumPr.numId``, ``get_or_add_ilvl`` and
-# ``get_or_add_numId``, and a style's ``CT_Style.pPr``; the numbering's ``CT_Numbering.num_lst``, ``_insert_num`` and
-# ``num_having_numId``, ``CT_Num.new``, ``numId``, ``abstractNumId`` and ``add_lvlOverride``, and
-# ``CT_NumLvl.add_startOverride``; a table's ``CT_Tbl.new_tbl``, ``tblPr``, ``tblGrid`` and ``add_tr``,
-# ``CT_TblPr.style``, ``CT_TblGrid.gridCol_lst``, ``CT_TblGridCol.w``, ``CT_Row.add_tc``, ``CT_Tc.width`` and
-# ``docx.table._Cell``.
+# ``get_or_add_numId``, and a style's ``CT_Style.pPr``; the numbering part, ``DocumentPart.numbering_part`` (a
+# ``lazyproperty``), and its ``CT_Numbering.num_lst``, ``_insert_num`` and ``num_having_numId``, ``CT_Num.new``,
+# ``numId``, ``abstractNumId`` and ``add_lvlOverride``, and ``CT_NumLvl.add_startOverride``; ``CT_DecimalNumber.val``,
+# the value of a ``numId``, ``abstractNumId`` and ``ilvl``; a table's ``CT_Tbl.new_tbl``, ``tblPr``, ``tblGrid`` and
+# ``add_tr``, ``CT_TblPr.style``, ``CT_TblGrid.gridCol_lst``, ``CT_TblGridCol.w``, ``CT_Row.add_tc``, ``CT_Tc.width``
+# and ``docx.table._Cell``.
 class _Word:
     """Writes Markdown's tokens into a Word document.
 

@@ -564,9 +564,24 @@ def after_a_drop(action: Callable[[FrameType], None], when: Callable[[], bool] =
         monitoring.free_tool_id(tool)
 
 
+def _threads() -> int:
+    """Count this process's threads: the kernel's own count where ``/proc`` has one, else Python's."""
+    try:
+        return len(os.listdir("/proc/self/task"))
+    except OSError:
+        return threading.active_count()
+
+
 @contextmanager
 def alarm_held() -> Iterator[None]:
-    """Hold ``SIGALRM`` back in this thread, so that the only place a deadline is handled is where a test lands it."""
+    """Hold ``SIGALRM`` back in this thread, so that the only place a deadline is handled is where a test lands it.
+
+    A blocked signal is held back only in the thread that blocks it: the kernel hands the timer's signal to any other
+    thread, and Python then handles it in this one, wherever it is. So the process must have no other thread
+    (``tests/conftest.py`` keeps numpy from starting its BLAS pool).
+    """
+    threads = _threads()
+    assert threads == 1, f"alarm_held needs this process's only thread, and it has {threads}: the signal would go there"
     before = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     try:
         yield

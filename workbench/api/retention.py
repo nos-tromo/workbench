@@ -154,11 +154,14 @@ def _folder(path: Path, device: int) -> os.stat_result | None:
 
     Returns:
         Its ``lstat`` if it is a folder of the volume; ``None`` for a link, anything but a folder, a folder of
-        another filesystem, or nothing.
+        another filesystem, nothing, or what cannot be looked at, which is logged by the error's type.
     """
     try:
         st = os.lstat(path)
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _log.warning("retention skipped a path it could not look at (%s)", type(exc).__name__)
         return None
     if not stat.S_ISDIR(st.st_mode) or st.st_dev != device:
         return None
@@ -456,7 +459,7 @@ class Sweeper:
 
         Args:
             untouched_before: A file or folder last changed before this may go.
-            stop: Ends the prune before the next user's root or staging folder.
+            stop: Ends the prune before the next user's root, batch of a user's orphans, or staging folder.
         """
         data = self._settings.data_dir
         try:
@@ -472,7 +475,12 @@ class Sweeper:
                     record = functools.partial(self._record_orphans, caller.name, user.name)
                     try:
                         _, failed = self._store.sweep_user(
-                            caller.name, user.name, untouched_before=untouched_before, device=device, record=record
+                            caller.name,
+                            user.name,
+                            untouched_before=untouched_before,
+                            device=device,
+                            record=record,
+                            stop=stop,
                         )
                     except PathError:
                         continue  # not a folder the store made, or a link in its path: left alone

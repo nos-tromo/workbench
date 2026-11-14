@@ -527,14 +527,17 @@ class Supervisor:
         self._cleanup_pool = ThreadPoolExecutor(max_workers=settings.executor_slots, thread_name_prefix="slot-cleanup")
         self._jobs = settings.data_dir / JOBS
         self._staging = settings.data_dir / STAGING
+        # The device and inode of the socket this supervisor bound, so that it removes only its own.
+        self._bound: tuple[int, int] | None = None
 
     async def serve(self) -> None:
         """Answer jobs on ``executor_socket`` until cancelled, or until no slot is left.
 
         Job folders an earlier run left behind are removed first. The socket gets mode ``0660``
         and the api's group, and is bound before it listens, so nobody else ever connects. It is
-        removed again when serving ends, however it ends (a kill leaves it, and the next start
-        replaces it).
+        removed again when serving ends, however it ends, if it is still the one this supervisor
+        bound: a socket a later start bound in its place stays (a kill leaves it, and the next
+        start replaces it).
 
         Raises:
             NoUsableSlot: Every slot is retired. The request that retired the last one is still
@@ -555,7 +558,7 @@ class Supervisor:
             server.close()
             self._cleanup_pool.shutdown(wait=False)
             with contextlib.suppress(OSError, RuntimeError):  # what is not our socket stays; the answer goes on
-                self._remove_socket()
+                self._remove_socket(only=self._bound)
         count = self._settings.executor_slots
         raise NoUsableSlot(f"every slot is retired ({count} of {count}); exiting so the container restarts")
 
@@ -1017,8 +1020,12 @@ class Supervisor:
         if stale:
             _log.info("removed %d job folder%s left from an earlier run", len(stale), "" if len(stale) == 1 else "s")
 
-    def _remove_socket(self) -> None:
+    def _remove_socket(self, *, only: tuple[int, int] | None = None) -> None:
         """Remove the socket from its place, if a socket is there; anything else is left as it is.
+
+        Args:
+            only: The device and inode of the one socket to remove; another socket in the place stays. ``None``
+                removes whichever socket is there.
 
         Raises:
             RuntimeError: The socket's folder is a symlink, not a folder, not root's, or open to others' writes; or
@@ -1038,11 +1045,13 @@ class Supervisor:
         ):
             raise RuntimeError("the socket's folder must be root's alone")
         try:
-            found = os.lstat(path).st_mode
+            found = os.lstat(path)
         except FileNotFoundError:
             return
-        if not stat.S_ISSOCK(found):
+        if not stat.S_ISSOCK(found.st_mode):
             raise RuntimeError("the socket's place holds something that is not a socket")
+        if only is not None and (found.st_dev, found.st_ino) != only:
+            return
         os.unlink(path)
 
     def _bind(self) -> socket.socket:
@@ -1051,7 +1060,8 @@ class Supervisor:
         The socket's folder must be root's alone, so nobody can swap the socket or its name once
         it is checked. The mode comes from the umask in force while the socket is made, ``0660``,
         never from a later change through its path; only the group is set afterwards, without
-        following a link.
+        following a link. Its device and inode are kept, so that the end of serving removes this
+        socket and no other.
 
         Returns:
             The bound socket, not yet listening.
@@ -1071,9 +1081,11 @@ class Supervisor:
             finally:
                 os.umask(previous)
             os.chown(path, self._owners.root[0], self._owners.api[1], follow_symlinks=False)
+            bound = os.lstat(path)
         except BaseException:
             sock.close()
             raise
+        self._bound = (bound.st_dev, bound.st_ino)
         return sock
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

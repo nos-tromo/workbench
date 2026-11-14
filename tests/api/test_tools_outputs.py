@@ -511,3 +511,34 @@ def test_a_tables_rules_are_one_module_both_sides_call() -> None:
     assert tools_output.table_problem is tables.table_problem
     assert runner.table_problem is tables.table_problem
     assert runner.word_table_problem is tables.word_table_problem
+
+
+# --- what a 422 says ----------------------------------------------------------------------------------------------
+
+
+def test_a_422_quotes_no_part_of_the_value(client: TestClient, fake_executor: Local) -> None:
+    """FastAPI's own answer quotes every input that failed back to the model; this one names the field and the rule."""
+    r = document(client, markdown=("harbour-plan " * 20_000)[:200_001])
+    assert r.status_code == 422
+    assert "harbour" not in r.text
+    assert r.json() == {
+        "detail": [
+            {
+                "type": "string_too_long",
+                "loc": ["body", "markdown"],
+                "msg": "String should have at most 200000 characters",
+            }
+        ]
+    }
+    assert fake_executor.requests == []
+
+
+def test_a_422_lists_at_most_20_errors_and_counts_the_rest(client: TestClient, fake_executor: Local) -> None:
+    """Every error of a 100 000-row table would fill the model's context; 20 are named, the rest are counted."""
+    r = table(client, columns=list(range(25)))
+    assert r.status_code == 422
+    body = r.json()
+    assert [error["loc"] for error in body["detail"]] == [["body", "columns", n] for n in range(20)]
+    assert body["more_errors"] == 5
+    assert {key for error in body["detail"] for key in error} == {"type", "loc", "msg"}
+    assert fake_executor.requests == []

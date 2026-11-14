@@ -10,14 +10,16 @@ import os
 import subprocess
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import yaml
 
 PROJECT = os.environ.get("WORKBENCH_TEST_PROJECT", "workbench-test")
 API_URL = os.environ.get("WORKBENCH_TEST_API", "http://127.0.0.1:18100")
-SOCKET = "/run/workbench/executor.sock"
+COMPOSE_FILE = Path(__file__).resolve().parents[2] / "docker" / "compose.yaml"
 _SETTLE_S = 60.0
 
 
@@ -83,6 +85,18 @@ def environment(info: dict[str, Any]) -> dict[str, str]:
     return dict(entry.partition("=")[::2] for entry in info["Config"]["Env"] or [])
 
 
+def listening_probe() -> list[str]:
+    """The executor's healthcheck, as ``docker/compose.yaml`` has it: a socket listens on the supervisor's path.
+
+    Returns:
+        The command, without compose's ``CMD``.
+    """
+    compose = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+    test = compose["services"]["executor"]["healthcheck"]["test"]
+    assert test[0] == "CMD", test
+    return list(test[1:])
+
+
 def _settled(container: str) -> str | None:
     """Tell why the executor is not yet serving, if it is not.
 
@@ -90,16 +104,16 @@ def _settled(container: str) -> str | None:
         container: The executor's id.
 
     Returns:
-        ``None`` once it runs, has never restarted and its socket is there; else the reason.
+        ``None`` once it runs, has never restarted and its healthcheck's probe finds the socket listening; else the
+        reason. A socket file alone is not enough: it outlives a supervisor that was killed.
     """
     info = inspect(container)
     if info["RestartCount"]:
         return f"the executor restarted {info['RestartCount']} times"
     if not info["State"]["Running"]:
         return f"the executor is {info['State']['Status']}"
-    probe = f"import os, stat, sys; sys.exit(not stat.S_ISSOCK(os.lstat({SOCKET!r}).st_mode))"
-    found = subprocess.run(["docker", "exec", container, "python", "-c", probe], capture_output=True, timeout=60)
-    return None if found.returncode == 0 else "the executor's socket is not there"
+    found = subprocess.run(["docker", "exec", container, *listening_probe()], capture_output=True, timeout=60)
+    return None if found.returncode == 0 else "no socket listens on the executor's path"
 
 
 @pytest.fixture(scope="session")

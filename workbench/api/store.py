@@ -1048,7 +1048,14 @@ class Store:
         return busy == 0
 
     def sweep_user(
-        self, caller: str, user_id: str, *, untouched_before: float, device: int, record: OrphanRecord
+        self,
+        caller: str,
+        user_id: str,
+        *,
+        untouched_before: float,
+        device: int,
+        record: OrphanRecord,
+        stop: threading.Event | None = None,
     ) -> tuple[int, int]:
         """Remove the files of a user's root that have no record, then the folders left empty, all under the lock.
 
@@ -1058,7 +1065,8 @@ class Store:
         lock, which every rename into place holds until its row is committed, so a file on its way in is never taken
         for one. Each chat folder's orphans are recorded first, by ``record``, still under the lock, at most
         ``MAX_IDS`` to a record so that no id is cut; those that could not be removed are recorded again as an error.
-        If ``record`` raises, nothing more is removed and the error goes on.
+        If ``record`` raises, nothing more is removed and the error goes on. Once ``stop`` is set, the sweep ends before
+        its next batch: nothing more is recorded or removed, empty folders included, and the next sweep finds the rest.
 
         Then every folder below the root, deepest first, the chat folders too, and the root itself go if they are
         empty and were last changed before ``untouched_before``. Their ages are taken before anything is removed, so
@@ -1072,6 +1080,7 @@ class Store:
             untouched_before: A file or folder last changed before this may go.
             device: The data volume's device.
             record: Records one chat folder's orphans before they go.
+            stop: When set, ends the sweep before its next batch of orphans.
 
         Returns:
             How many orphans were removed, and how many could not be.
@@ -1116,6 +1125,8 @@ class Store:
                 for chat in sorted(candidates):
                     orphans = [path for name, path in candidates[chat] if (chat, name) not in known]
                     for start in range(0, len(orphans), MAX_IDS):
+                        if stop is not None and stop.is_set():
+                            return removed, failed
                         batch = orphans[start : start + MAX_IDS]
                         record(chat, _part_ids(batch), len(batch), "ok")
                         stayed: list[Path] = []

@@ -1552,6 +1552,26 @@ async def test_serve_leaves_what_is_not_its_socket_when_it_ends(served: Path, mo
     assert _sock(served).read_text() == "not a socket"
 
 
+async def test_serve_leaves_another_supervisors_socket_when_it_ends(
+    served: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A socket bound in its place meanwhile, as a supervisor started after this one binds its own, stays."""
+    _runner(monkeypatch, "pass")
+    other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        async with _serving(Supervisor(_settings(served), use_slots=False)):
+            await _ask(_sock(served), encode(_request()))
+            _sock(served).unlink()
+            other.bind(str(_sock(served)))
+            other.listen()
+            theirs = os.lstat(_sock(served))
+        left = os.lstat(_sock(served))
+    finally:
+        other.close()
+
+    assert (left.st_dev, left.st_ino) == (theirs.st_dev, theirs.st_ino)
+
+
 def _health_probe(path: Path) -> str:
     """The executor's healthcheck from ``docker/compose.yaml``, aimed at ``path`` instead of the real socket."""
     compose = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker" / "compose.yaml").read_text("utf-8"))

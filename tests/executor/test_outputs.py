@@ -436,10 +436,12 @@ def test_a_table_of_40000_rows_is_written_well_inside_the_budget(job: Job) -> No
 def test_the_python_docx_internals_the_writer_uses_are_there() -> None:
     """The writer reaches below python-docx's public api to stay fast; an upgrade that drops one fails here, by name."""
     from docx.oxml.numbering import CT_Num, CT_Numbering, CT_NumLvl, CT_NumPr
+    from docx.oxml.shared import CT_DecimalNumber
     from docx.oxml.styles import CT_Style
     from docx.oxml.table import CT_Row, CT_Tbl, CT_TblGrid, CT_TblGridCol, CT_TblPr, CT_Tc
     from docx.oxml.text.paragraph import CT_P
     from docx.oxml.text.parfmt import CT_PPr
+    from docx.parts.document import DocumentPart
     from docx.table import _Cell
 
     def has(cls: type, name: str) -> bool:
@@ -468,6 +470,8 @@ def test_the_python_docx_internals_the_writer_uses_are_there() -> None:
         "CT_Numbering.num_lst": has(CT_Numbering, "num_lst"),
         "CT_Numbering._insert_num": can(CT_Numbering, "_insert_num"),
         "CT_Numbering.num_having_numId": can(CT_Numbering, "num_having_numId"),
+        "DocumentPart.numbering_part": "numbering_part" in vars(DocumentPart),  # a lazyproperty, not a property
+        "CT_DecimalNumber.val": has(CT_DecimalNumber, "val"),
         "CT_Tbl.new_tbl": can(CT_Tbl, "new_tbl"),
         "CT_Tbl.tblPr": has(CT_Tbl, "tblPr"),
         "CT_Tbl.tblGrid": has(CT_Tbl, "tblGrid"),

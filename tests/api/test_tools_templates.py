@@ -29,11 +29,12 @@ from workbench.api.jobs import JobQueue, RequestTooLarge
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.openapi import TOOL_TAG
+from workbench.api.routing import MAX_DEPTH
 from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.models import FileRecord, Principal
-from workbench.protocol import MAX_LINE, JobRequest, JobResult, OutputFile, encode
+from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_request, encode
 
 ASSISTANT: dict[str, Any] = {"kind": "assistant"}
 
@@ -593,3 +594,72 @@ def test_the_tools_need_the_callers_key(client: TestClient) -> None:
     """No key, no tool."""
     assert client.post("/tools/inspect_template", json={"path": f"{CHAT}/a.docx"}).status_code == 401
     assert client.post("/tools/fill_template", json={"path": f"{CHAT}/a.docx", "values": {}}).status_code == 401
+
+
+# --- what a body may hold -----------------------------------------------------------------------------------------
+
+
+def nested_json(depth: int) -> str:
+    """A list holding a list, ``depth`` lists deep, a string at the bottom, as JSON text."""
+    return "[" * depth + '"x"' + "]" * depth
+
+
+def fill_body(value_json: str) -> str:
+    """A ``fill_template`` body for ``form.docx`` whose one value is the JSON text given: three levels above it."""
+    value = f'{{"value": {value_json}, "source": {{"kind": "assistant"}}}}'
+    return f'{{"path": "{CHAT}/form.docx", "values": {{"x": {value}}}}}'
+
+
+@pytest.mark.parametrize("depth", [300, 5000], ids=["past the serializer", "past the parser"])
+def test_a_value_nested_too_deeply_is_a_422_and_nothing_runs(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, depth: int
+) -> None:
+    """A list of lists of lists was a 500 when the job was encoded, or past the parser a 400; it is refused as read."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    body = fill_body(nested_json(depth))
+    r = client.post("/tools/fill_template", content=body, headers={**H, "Content-Type": "application/json"})
+    assert (r.status_code, r.json()) == (422, {"detail": "request nested too deeply"})
+    assert fake_executor.requests == []
+
+
+def test_a_body_as_deep_as_allowed_reaches_the_job(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
+    """The limit is the body's own depth, objects and arrays together: one level more is refused, this many is not."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    headers = {**H, "Content-Type": "application/json"}
+    deepest = client.post("/tools/fill_template", content=fill_body(nested_json(MAX_DEPTH - 3)), headers=headers)
+    assert deepest.json() != {"detail": "request nested too deeply"}
+    assert len(fake_executor.requests) == 1
+    deeper = client.post("/tools/fill_template", content=fill_body(nested_json(MAX_DEPTH - 2)), headers=headers)
+    assert deeper.json() == {"detail": "request nested too deeply"}
+
+
+def test_a_request_as_deep_as_the_api_takes_is_one_the_executor_reads() -> None:
+    """The protocol's reader takes 200 levels and pydantic writes 255: a body the api lets through goes both ways."""
+    args = json.loads(nested_json(MAX_DEPTH - 1))
+    req = JobRequest(
+        job_id="0" * 32,
+        tool="fill_template",
+        args={"values": args},
+        caller="open-webui",
+        user_id="user-a",
+        chat_id="chat-1",
+        input_files=[],
+        limits=Limits(wall_s=1, cpu_s=1, memory_mb=1, file_mb=1),
+        max_chars=1,
+    )
+    assert decode_request(encode(req)) == req
+
+
+def test_a_422_cuts_what_it_names_of_the_request(client: TestClient, store: Store, fake_executor: Local) -> None:
+    """The field and the message are kept, cut where they would quote a long part of the request: a key, a tag."""
+    key, tag = "harbour-key-" * 500, "harbour-tag-" * 500
+    values = {key: {"value": 1, "source": ASSISTANT}, "x": {"value": 1, "source": {"kind": tag}}}
+    r = client.post("/tools/fill_template", json={"path": f"{CHAT}/form.docx", "values": values}, headers=H)
+    assert r.status_code == 422
+    errors = r.json()["detail"]
+    assert {error["type"] for error in errors} == {"string_too_long", "union_tag_invalid"}
+    assert len(r.text) < 2000
+    assert key[:400] not in r.text and tag[:400] not in r.text
+    assert fake_executor.requests == []

@@ -5,6 +5,7 @@ Compose's settings and shape, the images' bases, ``.env.example``, the bundle sc
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -344,6 +345,42 @@ def test_nuke_asks_for_the_word_workbench_and_stops_at_anything_else(tmp_path: P
         assert "aborted" in done.stdout + done.stderr, answer
         assert not calls.exists(), answer
     assert "Type 'workbench' to confirm" in _make("-n", "nuke").stdout
+
+
+def test_nuke_answered_workbench_takes_the_project_down_then_removes_its_volume(tmp_path: Path) -> None:
+    """The confirming answer runs exactly the two commands, in order.
+
+    The stand-in docker is the only docker the run can find: the PATH is its folder and a folder of links to the few
+    tools make needs, checked before the run, so no answer here could reach a real one.
+    """
+    calls = tmp_path / "calls"
+    fake = tmp_path / "bin" / "docker"
+    fake.parent.mkdir()
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n', encoding="utf-8")
+    fake.chmod(0o755)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for tool in ("make", "tr", "cat", "date", "git"):
+        if (found := shutil.which(tool)) is not None:
+            (tools / tool).symlink_to(found)
+    path = os.pathsep.join([str(fake.parent), str(tools)])
+    assert shutil.which("docker", path=path) == str(fake)
+    assert [folder for folder in path.split(os.pathsep) if shutil.which("docker", path=folder)] == [str(fake.parent)]
+    done = _make("nuke", stdin="workbench\n", env={**os.environ, "PATH": path})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "compose --env-file .env -f docker/compose.yaml down",
+        "volume rm workbench-data",
+    ]
+
+
+def test_the_examples_workbench_settings_are_all_commented_out() -> None:
+    """``# KEY=value`` shows a default without setting it, so a host that copies the file still follows compose's."""
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    found = [re.match(r"\s*(#\s*)?(WORKBENCH_[A-Z0-9_]*)=", line) for line in lines]
+    settings = [match for match in found if match is not None]
+    assert len(settings) >= len(SPEC_DEFAULTS)
+    assert [match.group(2) for match in settings if match.group(1) is None] == []
 
 
 def test_health_shows_the_containers_and_asks_the_api() -> None:

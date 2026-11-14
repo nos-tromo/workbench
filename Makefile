@@ -59,7 +59,7 @@ help:
 
 ### Container status, then the api's /healthz asked from inside its container:
 ### production publishes no port. Both services report (healthy) in the status
-### once their healthchecks pass (the executor's: its socket is there).
+### once their healthchecks pass (the executor's: a socket listens on its path).
 .PHONY: health
 health:
 	@$(COMPOSE) ps --format '{{.Name}}\t{{.State}}\t{{.Status}}'
