@@ -1642,11 +1642,18 @@ while time.time() < end and not os.path.exists(spec["args"]["held"]):
 result = {"uid": os.getuid(), "shmid": ident}
 """
 ATTACH_JOB = """
-import ctypes
+import ctypes, struct
 libc = ctypes.CDLL(None, use_errno=True)
 libc.shmat.restype = ctypes.c_void_p
-at = libc.shmat(int(spec["args"]["shmid"]), None, 0)
-result = {"uid": os.getuid(), "attached": at not in (None, ctypes.c_void_p(-1).value)}
+ident, failed = int(spec["args"]["shmid"]), (None, ctypes.c_void_p(-1).value)
+plain = libc.shmat(ident, None, 0)
+perm = ctypes.create_string_buffer(512)
+struct.pack_into("III", perm, 4, os.getuid(), os.getgid(), os.getuid())
+struct.pack_into("I", perm, 20, 0o600)
+restored = libc.shmctl(ident, 1, perm)
+at = libc.shmat(ident, None, 0)
+content = None if at in failed else ctypes.string_at(at, 4096)
+result = {"uid": os.getuid(), "plain": plain not in failed, "restored": restored == 0, "zeros": content == bytes(4096)}
 """
 
 
@@ -1654,7 +1661,7 @@ result = {"uid": os.getuid(), "attached": at not in (None, ctypes.c_void_p(-1).v
 async def test_as_root_a_segment_another_slot_keeps_attached_neither_retires_the_slot_nor_reaches_its_next_job(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The segment is marked for destruction and closed to everyone; the slot stays usable."""
+    """The segment is emptied, marked for destruction and closed; even reopened by its creator it holds nothing."""
     _chat(root_volume)
     (root_volume / "workspaces" / CALLER / "user-c" / CHAT).mkdir(parents=True)
     held = Path(tempfile.mkdtemp(dir=root_volume.parent))
@@ -1671,5 +1678,5 @@ async def test_as_root_a_segment_another_slot_keeps_attached_neither_retires_the
     holding = await holder
 
     assert (sharer.status, sharer.result["uid"]) == ("ok", 20002)
-    assert (after.status, after.result) == ("ok", {"uid": 20002, "attached": False})
+    assert (after.status, after.result) == ("ok", {"uid": 20002, "plain": False, "restored": True, "zeros": True})
     assert (holding.status, holding.result) == ("ok", {"uid": 20001})

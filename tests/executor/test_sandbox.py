@@ -1233,6 +1233,19 @@ def _run_as(slot: Slot, code: str, *args: str) -> int:
     return process.wait(timeout=120)
 
 
+def _output_as(slot: Slot, code: str, *args: str) -> str:
+    """Run ``code`` as the slot's uid and return what it printed; it must succeed."""
+
+    def drop() -> None:
+        """Become the slot."""
+        os.setgroups([])
+        os.setgid(slot.gid)
+        os.setuid(slot.uid)
+
+    command = [sys.executable, "-I", "-c", code, *args]
+    return subprocess.run(command, preexec_fn=drop, check=True, capture_output=True, text=True, timeout=120).stdout
+
+
 TRAPS = """\
 import os, pathlib, sys
 top = "/dev/shm/wb-" + sys.argv[1]
@@ -1344,12 +1357,21 @@ libc.shmat.restype = ctypes.c_void_p
 at = libc.shmat(libc.shmget(int(sys.argv[1]), 0, 0), None, 0)
 time.sleep(60)
 """
+# What the slot's next job can try on a marked segment it made: attach it, or first give it back a
+# mode as its creator (IPC_SET needs no IPC_STAT), then attach it and read it.
 ATTACH = """\
-import ctypes, sys
+import ctypes, json, os, struct, sys
 libc = ctypes.CDLL(None, use_errno=True)
 libc.shmat.restype = ctypes.c_void_p
-at = libc.shmat(int(sys.argv[1]), None, 0)
-sys.exit(0 if at in (None, ctypes.c_void_p(-1).value) else 7)
+ident, failed = int(sys.argv[1]), (None, ctypes.c_void_p(-1).value)
+plain = libc.shmat(ident, None, 0)
+perm = ctypes.create_string_buffer(512)
+struct.pack_into("III", perm, 4, os.getuid(), os.getgid(), os.getuid())
+struct.pack_into("I", perm, 20, 0o600)
+restored = libc.shmctl(ident, 1, perm)
+at = libc.shmat(ident, None, 0)
+content = None if at in failed else ctypes.string_at(at, 4096)
+print(json.dumps({"plain": plain not in failed, "restored": restored == 0, "zeros": content == bytes(4096)}))
 """
 
 
@@ -1376,11 +1398,11 @@ def _shm_row_by_id(ident: int) -> dict[str, int] | None:
 
 
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
-def test_as_root_a_segment_another_slot_keeps_attached_is_destroyed_and_closed_not_a_failure() -> None:
-    """``IPC_RMID`` cannot destroy an attached segment; it is marked so, and its mode is cleared first.
+def test_as_root_a_segment_another_slot_keeps_attached_is_emptied_marked_and_closed_not_a_failure() -> None:
+    """``IPC_RMID`` cannot destroy an attached segment, only mark it; so its content is zeroed first.
 
-    Linux lets an owner attach a marked segment by its id, so without the cleared mode the slot's next job
-    could still read it while the other slot holds it.
+    Linux lets the owner or creator attach a marked segment by its id, and the creator can give it back a
+    mode with ``IPC_SET``; the slot's next job, as that creator, must find nothing in it.
     """
     slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
     key = 0x57C0
@@ -1400,9 +1422,86 @@ def test_as_root_a_segment_another_slot_keeps_attached_is_destroyed_and_closed_n
         assert marked is not None
         assert marked["perms"] & 0o1000, "marked for destruction"
         assert marked["perms"] & 0o777 == 0, "no one may attach it any more"
-        assert _run_as(slot, ATTACH, str(row["shmid"])) == 0, "the slot's next job attached the marked segment"
+        tried = json.loads(_output_as(slot, ATTACH, str(row["shmid"])))
+        assert tried == {"plain": False, "restored": True, "zeros": True}
     finally:
         holder.kill()
         holder.wait()
         kill_slot_processes(other)
     assert _shm_row_by_id(row["shmid"]) is None
+
+
+FILL_AND_QUEUE = """\
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+limit, victim = int(sys.argv[1]), int(sys.argv[2])
+n = 0
+while len(os.listdir("/dev/shm")) < limit:
+    os.close(os.open("/dev/shm/wb-fill-%d" % n, os.O_CREAT | os.O_WRONLY, 0o600))
+    n += 1
+for q in range(3):
+    assert libc.mq_open(("/wb-fill-q%d" % q).encode(), os.O_CREAT | os.O_RDWR, 0o600, None) >= 0
+import struct
+ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+perm = ctypes.create_string_buffer(512)
+assert libc.shmctl(ident, 2, perm) == 0
+struct.pack_into("I", perm, 4, victim)
+assert libc.shmctl(ident, 1, perm) == 0
+"""
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_full_dev_shm_and_another_slots_queues_do_not_fail_a_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each folder is held to the limit on its own: ``/dev/shm`` by its inode limit, ``/dev/mqueue`` by its queues.
+
+    Counted together, another slot could fill ``/dev/shm`` to the limit, add a queue, and fail this cleanup.
+    """
+    victim, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 40)
+    assert _run_as(other, FILL_AND_QUEUE, "40", str(victim.uid)) == 0
+    assert len(os.listdir("/dev/shm")) == 40
+    assert len([n for n in os.listdir("/dev/mqueue") if n.startswith("wb-fill-q")]) == 3
+    try:
+        kill_slot_processes(victim)
+    finally:
+        monkeypatch.undo()
+        kill_slot_processes(other)
+        kill_slot_processes(victim)
+    assert _ipc_of(other.uid) == [] and _ipc_of(victim.uid) == []
+
+
+SHARED_FOLDER = """\
+import os, pathlib
+os.mkdir("/dev/shm/wb-shared")
+os.chmod("/dev/shm/wb-shared", 0o1777)
+pathlib.Path("/dev/shm/wb-shared/others-note").write_text("synthetic note of user b")
+os.mkdir("/dev/shm/wb-shared/others-folder")
+"""
+INTO_SHARED_FOLDER = """\
+import os, pathlib
+pathlib.Path("/dev/shm/wb-shared/note").write_text("synthetic note of user a")
+os.mkdir("/dev/shm/wb-shared/mine")
+pathlib.Path("/dev/shm/wb-shared/mine/note").write_text("synthetic note of user a")
+os.chmod("/dev/shm/wb-shared/mine", 0)
+"""
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_the_slots_entries_in_another_slots_shared_folder_are_cleared_and_nothing_else() -> None:
+    """Under umask 077 the folder's owner cannot read the slot's file there, but the slot's next job could."""
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    assert _run_as(other, SHARED_FOLDER) == 0
+    assert _run_as(slot, INTO_SHARED_FOLDER) == 0
+    assert sandbox._folder_holds("/dev/shm", slot.uid) is True
+    try:
+        kill_slot_processes(slot)
+
+        assert sorted(os.listdir("/dev/shm/wb-shared")) == ["others-folder", "others-note"]
+        assert Path("/dev/shm/wb-shared/others-note").read_text() == "synthetic note of user b"
+        assert sandbox._folder_holds("/dev/shm", slot.uid) is False
+        assert _ipc_of(slot.uid) == []
+    finally:
+        kill_slot_processes(other)
+    assert not os.path.lexists("/dev/shm/wb-shared")
