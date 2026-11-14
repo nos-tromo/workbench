@@ -881,6 +881,54 @@ async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is
     assert queue.tracked_users == 0
 
 
+def _chat_folder(settings: Settings, p: Principal) -> Path:
+    """Where the store keeps a chat's files: ``workspaces/<caller>/<user>/<chat>`` on the volume."""
+    return settings.data_dir / "workspaces" / p.caller / p.user_id / p.chat_id
+
+
+async def test_outputs_kept_before_a_failed_job_record_are_removed(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller gets the store's failure and records no event, so no file the job made may stay behind."""
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    break_finish(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(sqlite3.OperationalError):
+        await queue.submit(me, "run_python", ARGS, [])
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The original error is the answer even when an output cannot be removed; the log names no file."""
+    executor.files = {"a.txt": b"a"}
+    break_finish(store, monkeypatch)
+
+    def refuse(_record: FileRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    queue = queue_for(settings, executor, store, metrics)
+    with caplog.at_level(logging.DEBUG), pytest.raises(sqlite3.OperationalError):
+        await queue.submit(user("user-a"), "run_python", ARGS, [])
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+    assert "a.txt" not in caplog.text
+    assert str(settings.data_dir) not in caplog.text
+
+
 # --- the client ------------------------------------------------------------
 
 

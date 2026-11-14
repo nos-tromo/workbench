@@ -21,10 +21,11 @@ import linecache
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Final, override
@@ -40,7 +41,8 @@ VIRTUAL_ROOT: Final = "/workspace"
 
 _DEFAULT_BUDGET_S: Final = 60.0
 
-#: The longest path Linux takes; a cut that keeps text on both sides of a gap backs off to a line end this close.
+#: The longest path Linux takes. Each stream keeps this much more than it shows on each side of a gap, so that
+#: every path that reaches into what is shown is whole where it is rewritten.
 _PATH_MAX: Final = 4096
 
 #: A character that can go on a folder name here: a longer name is another folder.
@@ -60,7 +62,9 @@ class _Capture(io.TextIOBase):
     """A text stream that keeps the first and the last ``keep`` characters written to it and counts the rest.
 
     Writing costs at most two slices of what is written, whatever its size, so code that prints without end
-    uses no more memory than the one string it prints.
+    uses no more memory than the one string it prints. Code may write from many threads at once: each write is
+    whole. The lock is reentrant, so a signal handler of the code's that prints while the thread it interrupted
+    is writing cannot deadlock it.
 
     Attributes:
         encoding: The stream's encoding, for code that asks before it writes.
@@ -76,6 +80,7 @@ class _Capture(io.TextIOBase):
             keep: Characters kept at the start, and as many at the end.
         """
         super().__init__()
+        self._lock = threading.RLock()
         self._keep = keep
         self._head: list[str] = []
         self._head_size = 0
@@ -111,20 +116,21 @@ class _Capture(io.TextIOBase):
         if self.closed:
             raise ValueError("I/O operation on closed file.")
         size = len(s)
-        self.written += size
-        start = 0
-        room = self._keep - self._head_size
-        if room > 0 and size:
-            piece = s[:room]
-            self._head.append(piece)
-            self._head_size += len(piece)
-            start = len(piece)
-        if start < size:
-            piece = s[max(start, size - self._keep) :]
-            self._tail.append(piece)
-            self._tail_size += len(piece)
-            while self._tail_size - len(self._tail[0]) >= self._keep:
-                self._tail_size -= len(self._tail.popleft())
+        with self._lock:
+            self.written += size
+            start = 0
+            room = self._keep - self._head_size
+            if room > 0 and size:
+                piece = s[:room]
+                self._head.append(piece)
+                self._head_size += len(piece)
+                start = len(piece)
+            if start < size:
+                piece = s[max(start, size - self._keep) :]
+                self._tail.append(piece)
+                self._tail_size += len(piece)
+                while self._tail_size - len(self._tail[0]) >= self._keep:
+                    self._tail_size -= len(self._tail.popleft())
         return size
 
     def parts(self) -> tuple[str, str, int]:
@@ -133,66 +139,107 @@ class _Capture(io.TextIOBase):
         Returns:
             The head, the tail, and how many characters written between them are not kept.
         """
-        head = "".join(self._head)
-        tail = "".join(self._tail)[-self._keep :] if self._tail else ""
-        return head, tail, self.written - len(head) - len(tail)
+        with self._lock:
+            head = "".join(self._head)
+            tail = "".join(self._tail)[-self._keep :] if self._tail else ""
+            return head, tail, self.written - len(head) - len(tail)
 
 
-def _rewriter(work_dir: Path, chat_id: str) -> Callable[[str], str]:
-    """Make the function that writes the job's real paths as the code and the model see them.
+class _Rewriter:
+    """Writes the job's real paths as the code and the model see them, also for a piece of a longer text.
 
-    The working folder is ``<data>/jobs/<id>/workspace/<chat>`` (the supervisor's layout).
-
-    Args:
-        work_dir: The job's working folder.
-        chat_id: The chat it holds.
-
-    Returns:
-        A function of a text that returns it with every real path rewritten.
+    The working folder is ``<data>/jobs/<id>/workspace/<chat>`` (the supervisor's layout). The rules are one
+    pattern, tried in order at each place: the chat folder, the job's ``workspace``, the job folder, then any path
+    on the data volume. A rewritten path is always kept whole, so where a text is cut a path is either in it whole
+    and rewritten or not in it at all.
     """
-    job = work_dir.parent.parent
-    data = job.parent.parent
-    rules = [
-        (re.compile(re.escape(str(work_dir)) + _NAME_GOES_ON), f"{VIRTUAL_ROOT}/{chat_id}"),
-        (re.compile(re.escape(str(work_dir.parent)) + _NAME_GOES_ON), VIRTUAL_ROOT),
-        (re.compile(re.escape(str(job)) + _NAME_GOES_ON), "<job>"),
-    ]
-    if data != data.parent:
-        rules.append((re.compile(r"(?<![\w.:/-])" + re.escape(str(data)) + _NAME_GOES_ON + r"[^\s'\"]*"), "<data>"))
 
-    def rewrite(text: str) -> str:
-        for pattern, virtual in rules:
-            text = pattern.sub(virtual, text)
-        return text
+    def __init__(self, work_dir: Path, chat_id: str) -> None:
+        """Build the rules for one job.
 
-    return rewrite
+        Args:
+            work_dir: The job's working folder.
+            chat_id: The chat it holds.
+        """
+        job = work_dir.parent.parent
+        data = job.parent.parent
+        rules = [
+            (re.escape(str(work_dir)) + _NAME_GOES_ON, f"{VIRTUAL_ROOT}/{chat_id}"),
+            (re.escape(str(work_dir.parent)) + _NAME_GOES_ON, VIRTUAL_ROOT),
+            (re.escape(str(job)) + _NAME_GOES_ON, "<job>"),
+        ]
+        if data != data.parent:
+            rules.append((r"(?<![\w.:/-])" + re.escape(str(data)) + _NAME_GOES_ON + r"[^\s'\"]*", "<data>"))
+        self._pattern = re.compile("|".join(f"({pattern})" for pattern, _ in rules))
+        self._virtual = [virtual for _, virtual in rules]
 
+    def _pieces(self, text: str) -> Iterator[tuple[int, int, str, bool]]:
+        """Split a text into the stretches between real paths and the real paths, each with what it becomes.
 
-def _clean_gap(head: str, tail: str, gap: int) -> tuple[str, str, int]:
-    """Cut the text on both sides of a gap back to whole lines, so that no path is split by it.
+        Args:
+            text: The text.
 
-    A path holds no line break and is at most ``_PATH_MAX`` long, so one that a gap cut in two is dropped with
-    the rest of its line; a line longer than that is left as it is.
+        Yields:
+            ``(start, end, output, is_path)`` in order; ``output`` is the stretch itself or the path rewritten.
+        """
+        at = 0
+        for match in self._pattern.finditer(text):
+            if match.start() > at:
+                yield at, match.start(), text[at : match.start()], False
+            yield match.start(), match.end(), self._virtual[(match.lastindex or 1) - 1], True
+            at = match.end()
+        if at < len(text):
+            yield at, len(text), text[at:], False
 
-    Args:
-        head: What is kept before the gap.
-        tail: What is kept after it.
-        gap: How much was not kept between them.
+    def __call__(self, text: str) -> str:
+        """Rewrite a whole text.
 
-    Returns:
-        The head and the tail, and the gap with what was cut from them.
-    """
-    if not gap:
-        return head, tail, gap
-    end = head.rfind("\n", max(0, len(head) - _PATH_MAX))
-    if end >= 0:
-        gap += len(head) - end - 1
-        head = head[: end + 1]
-    start = tail.find("\n", 0, _PATH_MAX)
-    if start >= 0:
-        gap += start + 1
-        tail = tail[start + 1 :]
-    return head, tail, gap
+        Args:
+            text: The text.
+
+        Returns:
+            It with every real path rewritten.
+        """
+        return "".join(output for _, _, output, _ in self._pieces(text))
+
+    def before(self, text: str, end: int) -> tuple[str, int]:
+        """Rewrite the start of a text, up to ``end``, keeping a path that begins before ``end`` whole.
+
+        Args:
+            text: The text, with every path that begins before ``end`` whole in it.
+            end: Where the start ends, in ``text``.
+
+        Returns:
+            The start rewritten, and where in ``text`` it ends.
+        """
+        kept: list[str] = []
+        reached = 0
+        for start, stop, output, is_path in self._pieces(text):
+            if start >= end:
+                break
+            kept.append(output if is_path else output[: end - start])
+            reached = stop if is_path else min(stop, end)
+        return "".join(kept), reached
+
+    def after(self, text: str, begin: int) -> tuple[str, int]:
+        """Rewrite the end of a text, from ``begin`` on, keeping a path that ends after ``begin`` whole.
+
+        Args:
+            text: The text, with every path that ends after ``begin`` whole in it.
+            begin: Where the end begins, in ``text``.
+
+        Returns:
+            The end rewritten, and where in ``text`` it begins.
+        """
+        kept: list[str] = []
+        begun = len(text)
+        for start, stop, output, is_path in self._pieces(text):
+            if stop <= begin:
+                continue
+            first = start if is_path else max(start, begin)
+            kept.append(output if is_path else output[first - start :])
+            begun = min(begun, first)
+        return "".join(kept), begun
 
 
 def _marked(head: str, tail: str, cut: int) -> str:
@@ -224,25 +271,35 @@ def _encodable(text: str) -> str:
     return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
-def _kept(capture: _Capture, rewrite: Callable[[str], str], limit: int) -> tuple[str, bool]:
+def _kept(capture: _Capture, rewrite: _Rewriter, limit: int) -> tuple[str, bool]:
     """Turn what a stream kept into the text of the answer, within ``limit`` as the job writes it.
 
+    The stream keeps ``_PATH_MAX`` characters more than ``limit`` at each end. Nothing written was left out: the
+    text is rewritten whole, so no path is ever split where the two ends meet. Some was: the first ``limit``
+    characters of the head and the last ``limit`` of the tail are rewritten from the ends as kept, which hold every
+    path that reaches into them whole; the margin beyond is left out. Only then is the rewritten text cut, in the
+    middle, to the limit.
+
     Args:
-        capture: The stream.
+        capture: The stream; it keeps ``limit + _PATH_MAX`` characters at each end.
         rewrite: Writes real paths as virtual ones.
         limit: Most characters of the text's JSON, escapes included (the job writes ASCII JSON).
 
     Returns:
         The text, and whether some of it was cut.
     """
-    head, tail, gap = _clean_gap(*capture.parts())
-    head, tail = rewrite(_encodable(head)), rewrite(_encodable(tail))
+    head, tail, gap = capture.parts()
     if not gap:
-        whole = head + tail
+        whole = rewrite(_encodable(head + tail))
         if len(json.dumps(whole)) <= limit:
             return whole, False
         middle = len(whole) // 2
         head, tail = whole[:middle], whole[middle:]
+    else:
+        raw_head, raw_tail = _encodable(head), _encodable(tail)
+        head, reached = rewrite.before(raw_head, max(0, len(raw_head) - _PATH_MAX))
+        tail, begun = rewrite.after(raw_tail, min(len(raw_tail), _PATH_MAX))
+        gap += len(raw_head) - reached + begun
     best = _marked("", "", gap + len(head) + len(tail))
     low, high = 0, max(len(head), len(tail))
     while low <= high:
@@ -394,9 +451,9 @@ def run_python(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     code = str(args["code"])
     budget = float(args.get("budget_s", _DEFAULT_BUDGET_S))
     keep = max(1, ctx.max_chars // 2)
-    rewrite = _rewriter(ctx.work_dir, ctx.chat_id)
+    rewrite = _Rewriter(ctx.work_dir, ctx.chat_id)
     _use_agg()
-    out, err = _Capture(keep), _Capture(keep)
+    out, err = _Capture(keep + _PATH_MAX), _Capture(keep + _PATH_MAX)
     pid = os.getpid()
     error = _run(code, ctx.work_dir, budget, out, err)
     if os.getpid() != pid:

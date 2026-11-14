@@ -249,6 +249,8 @@ class JobQueue:
             Busy: The queue is full, the user's share of it is, the turn did not come in time,
                 or the executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
+            Exception: Whatever the store raises, such as a failure to settle the job's record.
+                Files the job made are removed again first: the caller gets none of them to record.
         """
         if tool not in TOOLS:
             raise ValueError("unknown tool")
@@ -347,6 +349,7 @@ class JobQueue:
         job = await asyncio.to_thread(self._store.add_job, p, tool)
         status = "error"
         completed = False
+        files: list[FileRecord] = []
         try:
             req = JobRequest(
                 job_id=job.id,
@@ -365,7 +368,6 @@ class JobQueue:
                 max_chars=settings.result_max_kb * 1024,
             )
             result = await self._execute(req)
-            files: list[FileRecord] = []
             if result.status == "ok":
                 result, files = await self._keep(p, job.id, result)
             result = result.model_copy(update={"outputs": []})  # staged paths are gone once the job settles
@@ -379,7 +381,24 @@ class JobQueue:
             status = "cancelled"
             raise
         finally:
-            await self._settle(job.id, status, pending=not completed)
+            try:
+                await self._settle(job.id, status, pending=not completed)
+            except BaseException:
+                # The caller gets this error and records no event, so no file the job made may stay.
+                await asyncio.to_thread(self._discard, files)
+                raise
+
+    def _discard(self, files: Sequence[FileRecord]) -> None:
+        """Remove the outputs of a job that could not be settled; a failure is logged and never raised.
+
+        Args:
+            files: The outputs already moved into the chat folder.
+        """
+        for rec in files:
+            try:
+                self._store.remove(rec)
+            except Exception as exc:
+                _log.warning("could not remove an output of a job that was not settled (%s)", type(exc).__name__)
 
     async def _settle(self, job_id: str, status: str, *, pending: bool) -> None:
         """Record the job's final status and remove its staging folder; the folder always goes.

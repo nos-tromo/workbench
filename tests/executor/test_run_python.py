@@ -7,8 +7,10 @@ as its own process, as the supervisor does.
 
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 import tracemalloc
 from dataclasses import dataclass
@@ -18,7 +20,7 @@ from typing import Any
 import pytest
 
 from workbench.executor.runners import JobContext
-from workbench.executor.runners.python import run_python
+from workbench.executor.runners.python import _Capture, run_python
 from workbench.protocol import JobResult, encode
 
 JOB_ID = "0123456789abcdef0123456789abcdef"
@@ -352,3 +354,113 @@ def test_many_small_writes_keep_the_start_and_the_end(tmp_job: Job) -> None:
     assert lines[-2:] == ["99998", "99999"]
     assert result["truncated"] is True
     assert len(json.dumps(result["stdout"])) <= KEEP
+
+
+# --- no real path survives a cut, wherever it falls -------------------------------------------------------------
+
+PRINT_A_PATH = 'import pathlib\np = str(pathlib.Path("f.csv").resolve())\n'
+VIRTUAL = f"/workspace/{CHAT}/f.csv"
+MARK = re.compile(r"\n\[… (\d+) characters cut …\]\n")
+
+
+def _fragments(text: str) -> list[str]:
+    """The words of ``text`` that hold a path and are not ``VIRTUAL`` or a piece of it a cut left.
+
+    A cut of the virtual path leaves its start or its end; anything else with a ``/`` in it is the job's real
+    path, whole or in part.
+    """
+    return [word for word in text.split() if "/" in word and not (VIRTUAL.startswith(word) or VIRTUAL.endswith(word))]
+
+
+def test_a_path_across_the_split_of_a_stream_below_twice_the_cap_is_rewritten(tmp_job: Job) -> None:
+    """A stream between the cap and twice it is kept whole; a real path across the cap's mark is rewritten whole."""
+    real = str(tmp_job.ctx.work_dir / "f.csv")
+    for start in range(KEEP - len(real) + 1, KEEP):
+        line = f'print("x" * {start - 1} + " " + p + " " + "x" * 100)'
+        stdout = tmp_job.run(PRINT_A_PATH + line)["stdout"]
+        assert _fragments(stdout) == [], start
+        assert VIRTUAL in stdout, start
+
+
+@pytest.mark.parametrize("side", ["start", "end"])
+def test_a_path_at_either_cut_edge_of_a_long_line_never_leaves_a_fragment(tmp_job: Job, side: str) -> None:
+    """One line far over the cap, a real path at every place near where the start or the end is cut."""
+    real = str(tmp_job.ctx.work_dir / "f.csv")
+    for at in range(KEEP // 2 - len(real), KEEP + 4096 + len(real), 41):
+        line = (
+            f'print("x" * {at} + " " + p + " " + "x" * 60_000)'
+            if side == "start"
+            else f'print("x" * 60_000 + " " + p + " " + "x" * {at})'
+        )
+        result = tmp_job.run(PRINT_A_PATH + line)
+        assert result["truncated"] is True
+        assert _fragments(result["stdout"]) == [], at
+
+
+def test_paths_packed_up_to_the_cut_never_leave_a_fragment(tmp_job: Job) -> None:
+    """Rewriting shortens what is kept, so the text near a cut is shown; a path the cut went through is not in it."""
+    real = str(tmp_job.ctx.work_dir / "f.csv")
+    for lead in range(0, len(real) + 1, 3):
+        line = f'print("x" * {lead} + " " + " ".join([p] * 400) + " " + "x" * {lead})'
+        result = tmp_job.run(PRINT_A_PATH + line)
+        assert result["truncated"] is True
+        assert _fragments(result["stdout"]) == [], lead
+        assert str(tmp_job.data) not in result["stdout"], lead
+
+
+# --- writes from threads -----------------------------------------------------------------------------------------
+
+
+def test_writes_from_many_threads_at_once_keep_exact_counts() -> None:
+    """Every write is whole: the head and the tail are full, and what is dropped is counted to the character."""
+    capture = _Capture(4096)
+    errors: list[BaseException] = []
+
+    def chatter() -> None:
+        try:
+            for _ in range(10_000):
+                capture.write("abcd\n")
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=chatter) for _ in range(8)]
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    head, tail, dropped = capture.parts()
+    assert errors == []
+    assert capture.written == 8 * 10_000 * 5
+    assert (len(head), len(tail)) == (4096, 4096)
+    assert dropped == capture.written - 8192
+    assert set(head + tail) == set("abcd\n")
+
+
+def test_threads_printing_at_once_through_the_runner(tmp_job: Job) -> None:
+    """Code that writes from eight threads gets no error from the capture, and the mark counts what is cut."""
+    code = """
+import sys, threading
+sys.setswitchinterval(1e-6)
+def chatter():
+    for _ in range(20_000):
+        sys.stdout.write("abcd\\n")
+threads = [threading.Thread(target=chatter) for _ in range(8)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+"""
+    interval = sys.getswitchinterval()
+    try:
+        result = tmp_job.run(code)
+    finally:
+        sys.setswitchinterval(interval)
+    assert result["stderr"] == ""
+    (cut,) = MARK.findall(result["stdout"])
+    kept = MARK.sub("", result["stdout"])
+    assert int(cut) + len(kept) == 8 * 20_000 * 5
