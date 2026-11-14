@@ -64,6 +64,10 @@ _ACTIVE_TYPES: Final = frozenset(
 _ACTIVE_SUFFIXES: Final = (".html", ".htm", ".xhtml", ".svg", ".xml", ".js")
 _PLAIN: Final = "text/plain"
 
+#: A whole message or web archive: served as itself, but only ever as an attachment, never shown inline.
+_ARCHIVE_TYPES: Final = frozenset({"message/rfc822", "multipart/related"})
+_ARCHIVE_SUFFIXES: Final = (".eml", ".mht", ".mhtml", ".nws")
+
 
 class MkdirRequest(BaseModel):
     """Body of ``POST /files/mkdir``.
@@ -175,6 +179,19 @@ def _media_type(rec: FileRecord) -> str:
     return _PLAIN if _is_active(rec) else rec.mime
 
 
+def _is_archive(rec: FileRecord) -> bool:
+    """Tell whether a file is a whole message or web archive (``.eml``, ``.mht``): by its type or by its name.
+
+    Args:
+        rec: The file's record.
+
+    Returns:
+        ``True`` if it must only ever be downloaded.
+    """
+    media_type = rec.mime.partition(";")[0].strip().lower()
+    return media_type in _ARCHIVE_TYPES or rec.name.lower().endswith(_ARCHIVE_SUFFIXES)
+
+
 def _disposition(rec: FileRecord) -> str:
     """Build the ``Content-Disposition`` of a file, with its own name in RFC 5987 form.
 
@@ -182,11 +199,11 @@ def _disposition(rec: FileRecord) -> str:
         rec: The file's record.
 
     Returns:
-        The header value: ``inline``, or ``attachment`` for active content so a browser saves
-        it instead of rendering it. The name is percent-encoded UTF-8, so no character of it
-        can end the header or start another.
+        The header value: ``inline``, or ``attachment`` for active content and for a message or
+        web archive, so a browser saves it instead of rendering it. The name is percent-encoded
+        UTF-8, so no character of it can end the header or start another.
     """
-    how = "attachment" if _is_active(rec) else "inline"
+    how = "attachment" if _is_active(rec) or _is_archive(rec) else "inline"
     return f"{how}; filename*=UTF-8''{quote(posixpath.basename(rec.name), safe='')}"
 
 

@@ -151,6 +151,12 @@ def test_the_executor_image_strips_setuid_and_setgid_bits() -> None:
     assert runtime.index("chmod a-s") < runtime.index("USER 0:0")
 
 
+def test_the_images_leave_out_what_neither_runs() -> None:
+    """R1 M-10: the contract's stub model, the tests, the docs and the build helpers stay out of both images."""
+    ignored = set((ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines())
+    assert {"contract/", "docs/", "**/tests/", "docker/", "make/", "Makefile"} <= ignored
+
+
 def _health_probe() -> str:
     """The executor healthcheck's Python."""
     test = compose()["services"]["executor"]["healthcheck"]["test"]
@@ -205,7 +211,7 @@ def test_only_the_dev_overlay_publishes_a_port() -> None:
     assert [name for name, service in compose()["services"].items() if "ports" in service] == []
     override = compose("compose.override.yaml")["services"]
     assert list(override) == ["api"]
-    assert override["api"]["ports"] == ["${WORKBENCH_HOST_PORT:-8100}:8000"]
+    assert override["api"]["ports"] == ["127.0.0.1:${WORKBENCH_HOST_PORT:-8100}:8000"]
 
 
 def test_restart_policies() -> None:

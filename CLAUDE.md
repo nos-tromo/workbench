@@ -232,7 +232,7 @@ open-webui-service's.
   numpy, as every job has them: the timer tests hold `SIGALRM` back in one
   thread, and another thread would take the signal.
 - **A bare `docker compose` from `docker/` publishes the api.** It loads
-  `compose.override.yaml` on its own, which publishes `:8100` on all interfaces.
+  `compose.override.yaml` on its own, which publishes `127.0.0.1:8100`.
   Use `make`, or `docker compose --env-file .env -f docker/compose.yaml` from the
   repo root.
 - **`WORKBENCH_EXECUTOR_CPUS` must not pass the host's CPUs.** Docker refuses to

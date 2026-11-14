@@ -10,4 +10,5 @@
 services:
   api:
     ports:
-      - "${WORKBENCH_HOST_PORT:-8100}:8000"
+      # Loopback only: /healthz and /metrics need no key.
+      - "127.0.0.1:${WORKBENCH_HOST_PORT:-8100}:8000"

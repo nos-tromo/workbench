@@ -145,17 +145,17 @@ The formulas, for other slot counts or job memory:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKBENCH_HOST_PORT` | 8100 | Host port of the api in the dev overlay (`make up-dev`). |
+| `WORKBENCH_HOST_PORT` | 8100 | Host port of the api in the dev overlay (`make up-dev`), on `127.0.0.1`. |
 
 ### The `compose.override.yaml` gotcha
 
 `docker/compose.override.yaml` publishes the api's port 8000 on
-`WORKBENCH_HOST_PORT`, on every interface of the host. `make up-dev` layers it
-on purpose; `make up` runs `docker/compose.yaml` alone, the production shape
-with no host port. A bare `docker compose` run from `docker/` loads
-`compose.override.yaml` on its own, since that is compose's default override
-file name, and so publishes `:8100` on all interfaces, without the root `.env`
-either. Use `make`, or `docker compose --env-file .env -f docker/compose.yaml`
+`WORKBENCH_HOST_PORT` of the host's loopback, `127.0.0.1` only: `/healthz` and
+`/metrics` need no key. `make up-dev` layers it on purpose; `make up` runs
+`docker/compose.yaml` alone, the production shape with no host port. A bare
+`docker compose` run from `docker/` loads `compose.override.yaml` on its own,
+since that is compose's default override file name, and so publishes
+`127.0.0.1:8100`, without the root `.env` either. Use `make`, or `docker compose --env-file .env -f docker/compose.yaml`
 from the repo root.
 
 ## Not exposed

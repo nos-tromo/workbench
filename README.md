@@ -38,8 +38,8 @@ make health                   # both services, then the api's /healthz
 ```
 
 `make up-dev` (or `make dev`, which builds first) also publishes the api on port
-8100 of every interface of the host, for local work; use it only where that is
-safe ([docs/configuration.md](docs/configuration.md#the-composeoverrideyaml-gotcha)). Open WebUI's side of the connection is set up
+8100 of the host's loopback, `127.0.0.1`, for local work
+([docs/configuration.md](docs/configuration.md#the-composeoverrideyaml-gotcha)). Open WebUI's side of the connection is set up
 in open-webui-service. `make help` lists every target.
 
 ## Development

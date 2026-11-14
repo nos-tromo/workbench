@@ -362,6 +362,27 @@ def test_active_content_is_served_as_a_text_attachment_under_a_sandbox(
         assert r.headers[header] == value, header
 
 
+@pytest.mark.parametrize("name", ["minutes.eml", "harbour-report.mht", "harbour-report.MHTML", "notes.nws"])
+def test_a_message_or_web_archive_is_served_only_as_an_attachment(client: TestClient, name: str) -> None:
+    """R1 M-8: a whole message keeps its type, but a browser saves it and never renders it inline."""
+    data = b"From: user-a@example.invalid\r\nSubject: synthetic\r\n\r\nbody\r\n"
+    upload(client, name, data)
+    r = client.get("/files/view", params={"path": f"{CHAT}/{name}"}, headers=H)
+    assert (r.status_code, r.content) == (200, data)
+    assert r.headers["content-disposition"] == f"attachment; filename*=UTF-8''{name}"
+    for header, value in HARDENING.items():
+        assert r.headers[header] == value, header
+
+
+def test_a_message_type_under_another_name_is_an_attachment_too(client: TestClient, store: Store) -> None:
+    """The stored type decides as much as the name does."""
+    rec = put(store, "letter.txt", b"x")
+    with store._db() as db:
+        db.execute("UPDATE files SET mime = 'message/rfc822' WHERE id = ?", (rec.id,))
+    r = client.get("/files/view", params={"path": rec.virtual_path}, headers=H)
+    assert r.headers["content-disposition"].startswith("attachment;")
+
+
 @pytest.mark.parametrize("mime", ACTIVE_TYPES)
 def test_an_active_type_is_never_inline_whatever_the_name(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, mime: str

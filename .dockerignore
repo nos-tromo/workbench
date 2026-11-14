@@ -77,6 +77,12 @@ README.md
 .workbench-version
 docker/
 
+# Not for either image: the contract stack's stub model, the docs, the build helpers
+contract/
+docs/
+make/
+Makefile
+
 # Exceptions
 !workbench/api/system_prompt.md
 # pyproject.toml declares both; building the package reads them.
