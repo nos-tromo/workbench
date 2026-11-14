@@ -73,21 +73,34 @@ except ProcessLookupError:
 # go at once with IPC_RMID, messages and values included. A shared memory segment another slot keeps
 # attached is only marked by IPC_RMID, and Linux still lets its owner or creator attach a marked
 # segment by id, after giving it back a mode with IPC_SET if need be. So each segment is emptied
-# first: IPC_SET (1) gives it the uid and mode 0600, IPC_STAT (2) reads that back to confirm the
-# layout (uid at offset 4, mode at offset 20 of struct ipc_perm, 64-bit little-endian Linux), the
-# helper attaches it and punches out its pages with madvise(MADV_REMOVE, 9), which every mapping then
-# reads as zeros and which needs no memory (memset if the kernel refuses), detaches, sets mode 0 and
-# removes it. A segment the uid made that could not be emptied fails the helper (exit 5).
-# Below the folders, entries the uid owns are removed and folders it owns are entered, by
-# descriptor, never by path, so neither a mode the job set nor a depth past PATH_MAX stops it: each
-# folder gets 0700 through an O_PATH handle before it is listed, and the walk climbs back through
-# ".." of the folder it is in, which nobody else can move, so it keeps one folder open at a time.
-# A folder of another uid that the slot can list, met at the top or in a folder of the slot's, is
-# looked into as it is (no mode change, its parent held open to return to), and only the slot's own
-# entries in it are removed or entered; folders of other uids inside it are not entered. Each folder
-# is held to the entry limit on its own, so /dev/shm (bounded by its inode limit) and /dev/mqueue
-# (bounded by fs.mqueue.queues_max) never add up; past the limit the helper fails (exit 4). Other
-# errors are left for the supervisor's second look to find.
+# first. IPC_SET (1) is written blind, from the layout of struct ipc_perm on 64-bit little-endian
+# Linux (uid at offset 4, gid at 8, mode at 20), and gives the segment the uid and mode 0600; IPC_STAT
+# (2) then reads uid and mode back, which shows the write landed where that layout says (on another
+# layout they would not match, and the segment is not emptied). The helper attaches the segment and
+# punches out its pages with madvise(MADV_REMOVE, 9), which every mapping then reads as zeros and
+# which needs no memory. Where the kernel refuses that, only a segment the uid made, and of at most
+# 256 MiB, is overwritten with memset; a bigger one, or one another uid made, is left as it is. Then
+# it detaches, sets mode 0 and removes the segment. A segment the uid made that was not emptied
+# fails the helper (exit 5) if it still exists after IPC_RMID, so is attached elsewhere; one that
+# vanished on the way, or that IPC_RMID destroyed, is gone: IPC_STAT then fails with EINVAL (22) or
+# EIDRM (43).
+# Below the folders, the slot's own tree is cleared: its entries at the top, and every folder it
+# owns, entered by descriptor, never by path, so neither a mode the job set nor a depth past PATH_MAX
+# stops it. Each such folder gets 0700 through an O_PATH handle before it is listed, so nobody else
+# can change it from then on, and the walk climbs back through ".." of the folder it is in, which
+# nobody else can move, so it keeps one folder open at a time (from a folder of the slot's inside
+# another uid's folder, which that uid can make unreadable, it returns to the descriptor it kept
+# of that folder instead). The tree is held to the entry limit
+# per folder: the slot's own entries at the top, and the listing of each folder it owns. Past it the
+# helper fails (exit 4), which only the slot's own job can bring about.
+# Folders of other uids that the slot can list, met at the top or in a folder of the slot's, are
+# looked into as they are (no mode change, their parent held open to return to), and only the slot's
+# own entries in them are removed or entered; folders of other uids inside them are not entered.
+# Their owners can change them at will, renaming and refilling them while they are looked at, so
+# that pass is best effort: each folder opened and each entry looked at there is taken from a budget
+# of the entry limit per top, and once it is spent no further entry of theirs is looked at. Nothing
+# found, missed or changed there fails the helper. Both walks go in listing order, as the
+# supervisor's second look does. Other errors are left for that look to find.
 _DROP_AND_CLEAR = (
     _DROP
     + """\
@@ -108,7 +121,7 @@ for table, column in (("shm", "shmid"), ("msg", "msqid"), ("sem", "semid")):
 unemptied = 0
 if doomed:
     import ctypes
-    libc = ctypes.CDLL(None)
+    libc = ctypes.CDLL(None, use_errno=True)
     libc.shmat.restype = ctypes.c_void_p
     libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
     libc.shmdt.argtypes = [ctypes.c_void_p]
@@ -119,6 +132,8 @@ if doomed:
         state[4:12] = uid.to_bytes(4, "little") + gid.to_bytes(4, "little")
         state[20:24] = mode.to_bytes(4, "little")
         return state
+    def gone(ident):
+        return libc.shmctl(ident, 2, ctypes.create_string_buffer(512)) != 0 and ctypes.get_errno() in (22, 43)
     for table, ident, creator, size in doomed:
         if table == "shm":
             emptied = False
@@ -131,13 +146,15 @@ if doomed:
             ):
                 at = libc.shmat(ident, None, 0)
                 if at not in failed:
-                    if libc.madvise(at, size, 9) != 0:
+                    if libc.madvise(at, size, 9) == 0:
+                        emptied = True
+                    elif creator == uid and size <= 256 << 20:
                         ctypes.memset(at, 0, size)
-                    emptied = True
+                        emptied = True
                     libc.shmdt(at)
             libc.shmctl(ident, 1, perm(0))
             libc.shmctl(ident, 0, None)
-            if creator == uid and not emptied:
+            if creator == uid and not emptied and not gone(ident):
                 unemptied += 1
         elif table == "msg":
             libc.msgctl(ident, 0, None)
@@ -149,14 +166,14 @@ for top in tops:
         here = os.open(top, FOLDER)
     except OSError:
         continue
-    names = os.listdir(here)
-    seen = len(names)
-    mine = True
-    levels = []
+    names = os.listdir(here)[::-1]
+    own, budget, mine, levels = 0, limit, True, []
     while True:
-        if seen > limit:
-            sys.exit(4)
+        if names and not mine and budget <= 0:
+            names = []
         if names:
+            if not mine:
+                budget -= 1
             name = names.pop()
             try:
                 st = os.stat(name, dir_fd=here, follow_symlinks=False)
@@ -164,21 +181,25 @@ for top in tops:
                 continue
             folder = st.st_mode & 0o170000 == 0o040000
             if st.st_uid != uid:
-                if not folder or not mine:
+                if not folder or not mine or budget <= 0:
                     continue
+                budget -= 1
                 try:
                     inner = os.open(name, FOLDER, dir_fd=here)
                 except OSError:
                     continue
                 try:
-                    inner_names = os.listdir(inner)
+                    inner_names = os.listdir(inner)[::-1]
                 except OSError:
                     os.close(inner)
                     continue
-                seen += len(inner_names)
-                levels.append((names, name, here, mine))
+                levels.append((names, name, here, mine, False))
                 here, names, mine = inner, inner_names, False
                 continue
+            if not levels:
+                own += 1
+                if own > limit:
+                    sys.exit(4)
             if not folder:
                 try:
                     os.unlink(name, dir_fd=here)
@@ -199,27 +220,32 @@ for top in tops:
             finally:
                 os.close(handle)
             try:
-                inner_names = os.listdir(inner)
+                inner_names = os.listdir(inner)[::-1]
             except OSError:
                 os.close(inner)
                 continue
-            seen += len(inner_names)
-            levels.append((names, name, None, mine))
-            os.close(here)
+            if len(inner_names) > limit:
+                sys.exit(4)
+            if mine:
+                levels.append((names, name, None, True, True))
+                os.close(here)
+            else:
+                levels.append((names, name, here, False, True))
             here, names, mine = inner, inner_names, True
         elif levels:
-            names, name, kept, mine = levels.pop()
-            if kept is not None:
+            names, name, kept, mine, ours = levels.pop()
+            if kept is None:
+                parent = os.open("..", FOLDER, dir_fd=here)
+                os.close(here)
+                here = parent
+            else:
                 os.close(here)
                 here = kept
-                continue
-            parent = os.open("..", FOLDER, dir_fd=here)
-            os.close(here)
-            here = parent
-            try:
-                os.rmdir(name, dir_fd=here)
-            except OSError:
-                pass
+            if ours:
+                try:
+                    os.rmdir(name, dir_fd=here)
+                except OSError:
+                    pass
         else:
             os.close(here)
             break
@@ -230,11 +256,14 @@ if unemptied:
 # Where the kernel keeps IPC that outlives processes, as files: POSIX shared memory and semaphores,
 # and POSIX message queues where their file system is mounted.
 _IPC_FOLDERS = ("/dev/shm", "/dev/mqueue")
-# Most entries a look at one of those folders, or the helper's walk below one, goes through; past it
-# the slot is not clear. Each folder has its own count. The supervisor refuses to start unless
-# /dev/shm can hold at most this many files (tmpfs counts every name, hard links included, against
-# its inode limit), and /dev/mqueue holds at most fs.mqueue.queues_max queues, 256 by default, so no
-# job can fill either past the limit to fail another slot's cleanup.
+# Most entries of a slot's own tree the helper clears per folder: its own entries at the top of one
+# of those folders, and the listing of each folder it owns. Past it the slot is not clear. It is
+# also the budget, per top, for looking into other uids' folders, which is best effort: their owners
+# can rename and refill them while they are looked at (and a listing then meets moved entries
+# again), so nothing in them counts against a slot, and once the budget is spent no further entry of
+# theirs is looked at. The supervisor refuses to start unless /dev/shm can hold at most this many
+# files (tmpfs counts every name, hard links included, against its inode limit), and /dev/mqueue
+# holds at most fs.mqueue.queues_max queues, 256 by default, so no folder of a slot's ever reaches it.
 IPC_ENTRY_LIMIT = 100_000
 _IPC_ENTRY_LIMIT = IPC_ENTRY_LIMIT
 _SYSVIPC = Path("/proc/sysvipc")
@@ -552,52 +581,78 @@ def _folder_holds(top: str, uid: int) -> bool:
 
     Whatever a slot leaves below such a folder starts with an entry of its own at the top, or in a
     folder of another uid the slot could write to, a file or a folder; the helper looks in the same
-    places. The look goes through at most ``_IPC_ENTRY_LIMIT`` entries.
+    places, in the same order. Every entry at the top is looked at: no other uid can move or add an
+    entry of the slot's there. The look into other uids' folders is best effort, from a budget of
+    ``_IPC_ENTRY_LIMIT`` per top, as the helper's is (``_foreign_folder_holds``).
 
     Args:
         top: A folder, such as ``/dev/shm``, opened without following a link.
         uid: The user id to look for.
 
     Returns:
-        Whether an entry belongs to ``uid``, or the folder holds more entries than the limit and
-        so cannot be judged clear. A missing folder holds nothing.
+        Whether an entry that belongs to ``uid`` was found. Nothing else makes the folder unclear:
+        not how many entries it or another uid's folder holds, nor a folder of another uid that
+        vanished, changed or could not be read while it was looked into. A missing ``top`` holds
+        nothing.
 
     Raises:
-        OSError: The folder is a link or cannot be read.
+        OSError: ``top`` is a link or cannot be read.
     """
     try:
         fd = os.open(top, DIR_FLAGS)
     except FileNotFoundError:
         return False
-    seen = 0
+    budget = _IPC_ENTRY_LIMIT
     with closing(fd), os.scandir(fd) as entries:
         for entry in entries:
-            seen += 1
-            if seen > _IPC_ENTRY_LIMIT:
-                return True
             try:
                 st = entry.stat(follow_symlinks=False)
             except FileNotFoundError:
                 continue
             if st.st_uid == uid:
                 return True
-            if not stat.S_ISDIR(st.st_mode):
-                continue
-            try:
-                inner = os.open(entry.name, DIR_FLAGS, dir_fd=fd)
-            except OSError:  # gone or swapped for a link since: another uid's doing, not this slot's
-                continue
-            with closing(inner), os.scandir(inner) as nested:
-                for item in nested:
-                    seen += 1
-                    if seen > _IPC_ENTRY_LIMIT:
-                        return True
-                    try:
-                        if item.stat(follow_symlinks=False).st_uid == uid:
-                            return True
-                    except FileNotFoundError:
-                        continue
+            if budget > 0 and stat.S_ISDIR(st.st_mode):
+                found, budget = _foreign_folder_holds(fd, entry.name, uid, budget)
+                if found:
+                    return True
     return False
+
+
+def _foreign_folder_holds(parent: int, name: str, uid: int, budget: int) -> tuple[bool, int]:
+    """Look, best effort, into a folder of another uid for an entry ``uid`` owns.
+
+    The folder's owner can rename it, refill it or remove it while it is looked at, and a listing
+    then meets moved entries again; so nothing seen, or not seen, here makes the slot unclear,
+    except an entry of the slot's that is actually found. Opening the folder and each entry looked
+    at take one from ``budget``; when it is spent, the look stops.
+
+    Args:
+        parent: The descriptor of the folder that holds it.
+        name: Its name there.
+        uid: The user id to look for.
+        budget: How many more entries of other uids' folders may be looked at; above 0.
+
+    Returns:
+        Whether an entry of ``uid`` was found, and the budget left. A folder that vanished, became a
+        link or cannot be read counts as empty from where the look got to.
+    """
+    budget -= 1
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError:
+        return False, budget
+    try:
+        with closing(fd), os.scandir(fd) as entries:
+            for entry in entries:
+                if budget <= 0:
+                    break
+                budget -= 1
+                with contextlib.suppress(OSError):
+                    if entry.stat(follow_symlinks=False).st_uid == uid:
+                        return True, budget
+    except OSError:  # removed or made unreadable while it was scanned
+        pass
+    return False, budget
 
 
 def _sysv_holds(uid: int, judge: Callable[[bytes, str], bool]) -> bool:

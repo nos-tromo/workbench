@@ -204,8 +204,8 @@ def startup_problem(
         ``fs.protected_hardlinks`` and ``fs.protected_symlinks`` both read 1 (the host's kernel
         settings, which a container cannot change), ``/dev/mqueue`` is a mounted mqueue file
         system (without it a job's queues can be neither listed nor removed), and ``/dev/shm``
-        holds at most ``IPC_ENTRY_LIMIT`` files (so no job can fill it past what the slot
-        cleanup looks through, and so fail every other slot's cleanup).
+        holds at most ``IPC_ENTRY_LIMIT`` files (so no folder of a slot's there can hold more
+        than the slot cleanup clears per folder, and every look at it stays bounded).
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return "the supervisor must run as root"

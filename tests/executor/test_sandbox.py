@@ -1,6 +1,7 @@
 """The slot sandbox: real child processes under rlimits, a wall clock and a clean environment."""
 
 import ast
+import ctypes
 import json
 import os
 import resource
@@ -1134,16 +1135,105 @@ def test_a_slot_entry_is_found_at_the_top_of_an_ipc_folder(tmp_path: Path) -> No
     assert sandbox._folder_holds(str(tmp_path), me + 12345) is False
 
 
-def test_the_look_at_an_ipc_folder_is_bounded_and_counts_as_dirty_past_its_limit(
+def test_other_uids_entries_never_make_an_ipc_folder_unclear_however_many(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """More entries than the limit are not looked through; the slot is then not clear."""
+    """Past the limit, at the top or in another uid's folder, the look still finds nothing of the slot's: clear.
+
+    Another slot can rename its entries while they are listed, and a listing then meets them again, so
+    a count of them would let it fail this slot's cleanup at will.
+    """
     monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 3)
-    for n in range(3):
+    for n in range(5):
         (tmp_path / f"other-{n}").write_text("")
+    for n in range(3):
+        (tmp_path / f"others-folder-{n}").mkdir()
+        for k in range(5):
+            (tmp_path / f"others-folder-{n}" / f"note-{k}").write_text("")
     assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is False
-    (tmp_path / "other-3").write_text("")
-    assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is True
+
+
+def test_the_look_into_other_uids_folders_stops_once_its_budget_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening such a folder and each entry looked at in it cost one; then no further folder is opened."""
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 6)
+    for n in range(4):
+        (tmp_path / f"others-folder-{n}").mkdir()
+        for k in range(2):
+            (tmp_path / f"others-folder-{n}" / f"note-{k}").write_text("")
+    opened: list[str] = []
+    real_open = os.open
+
+    def counting_open(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        """Note every folder opened inside the top, then open it."""
+        if dir_fd is not None:
+            opened.append(path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sandbox.os, "open", counting_open)
+    assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is False
+    monkeypatch.undo()
+    assert len(opened) == 2  # 1 + 2 entries, twice: the budget of 6 is spent
+
+
+class _VanishingScan:
+    """Stands in for a scan of a folder that is removed after its first entry."""
+
+    def __init__(self, scan: Any, folder: Path | None) -> None:
+        """Wrap ``scan``; with ``folder``, remove it for real after the first entry, else fail as Linux does."""
+        self.scan, self.folder, self.started = scan, folder, False
+
+    def __enter__(self) -> "_VanishingScan":
+        """Start the scan."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """End the scan."""
+        self.scan.close()
+
+    def __iter__(self) -> "_VanishingScan":
+        """Be the iterator."""
+        return self
+
+    def __next__(self) -> os.DirEntry[str]:
+        """Give the first entry, then remove the folder; a later read fails with ``FileNotFoundError``."""
+        if self.started and self.folder is None:
+            raise FileNotFoundError(2, "No such file or directory")
+        entry = next(self.scan)
+        if not self.started and self.folder is not None:
+            for item in self.folder.iterdir():
+                item.unlink()
+            self.folder.rmdir()
+        self.started = True
+        return entry
+
+
+@pytest.mark.parametrize("real", [False, True])
+def test_another_uids_folder_removed_while_it_is_looked_into_counts_as_empty(
+    real: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its owner may remove it at any moment; that is no reason to call the slot unclear, nor to fail the look."""
+    if real and not LINUX:
+        pytest.skip("only Linux fails the next read of a removed folder")
+    folder = tmp_path / "others-folder"
+    folder.mkdir()
+    for n in range(3000 if real else 3):  # more than one read's worth, so a read follows the removal
+        (folder / f"note-{n}").write_text("")
+    real_scandir = os.scandir
+    scans: list[Any] = []
+
+    def scandir(path: Any) -> Any:
+        """Scan the top as it is, and the folder inside it as one that vanishes."""
+        scans.append(path)
+        scan = real_scandir(path)
+        return scan if len(scans) == 1 else _VanishingScan(scan, folder if real else None)
+
+    monkeypatch.setattr(sandbox.os, "scandir", scandir)
+    assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is False
+    monkeypatch.undo()
+    assert len(scans) == 2
+    assert folder.exists() is not real
 
 
 def test_an_ipc_folder_that_is_a_symlink_is_not_looked_through(tmp_path: Path) -> None:
@@ -1421,7 +1511,7 @@ def test_as_root_a_segment_another_slot_keeps_attached_is_emptied_marked_and_clo
         marked = _shm_row_by_id(row["shmid"])
         assert marked is not None
         assert marked["perms"] & 0o1000, "marked for destruction"
-        assert marked["perms"] & 0o777 == 0, "no one may attach it any more"
+        assert marked["perms"] & 0o777 == 0, "mode 0: a plain attach is refused, though its creator may restore a mode"
         tried = json.loads(_output_as(slot, ATTACH, str(row["shmid"])))
         assert tried == {"plain": False, "restored": True, "zeros": True}
     finally:
@@ -1500,8 +1590,299 @@ def test_as_root_the_slots_entries_in_another_slots_shared_folder_are_cleared_an
 
         assert sorted(os.listdir("/dev/shm/wb-shared")) == ["others-folder", "others-note"]
         assert Path("/dev/shm/wb-shared/others-note").read_text() == "synthetic note of user b"
+        assert stat.S_IMODE(os.lstat("/dev/shm/wb-shared").st_mode) == 0o1777, "another uid's folder keeps its mode"
         assert sandbox._folder_holds("/dev/shm", slot.uid) is False
         assert _ipc_of(slot.uid) == []
     finally:
         kill_slot_processes(other)
     assert not os.path.lexists("/dev/shm/wb-shared")
+
+
+# Another slot's folders at the top of /dev/shm, renamed or refilled while they are looked into. Its
+# k folders are made in order, each followed by `fill` files of its own at the top (time for the
+# attacker between two folders); the middle one holds m files. "folder": whenever someone opens the
+# folder that holds them, it is renamed onto a folder nobody has opened yet. "files": whenever someone
+# closes it, its files are moved into such a folder. A walk that adds up what it sees in other uids'
+# folders then meets the same entries again. It also hands the victim a segment, so its helper runs.
+# A renamed folder changes its place in a tmpfs listing, so "folder" runs without fillers: the whole
+# top then comes in one read, and the second look meets the renamed folder under the names it read.
+HOPPER = """\
+import ctypes, os, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+prefix, how = sys.argv[1], sys.argv[5]
+k, m, fill, victim = (int(arg) for arg in (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[6]))
+names = ["/dev/shm/%s-%d" % (prefix, i) for i in range(k)]
+for i, name in enumerate(names):
+    os.mkdir(name)
+    os.chmod(name, 0o755)
+    for j in range(fill):
+        os.close(os.open("%s-fill-%d" % (name, j), os.O_CREAT | os.O_WRONLY, 0o600))
+current = names[k // 2]
+notes = ["note-%d" % j for j in range(m)]
+for note in notes:
+    os.close(os.open(current + "/" + note, os.O_CREAT | os.O_WRONLY, 0o600))
+ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+state = ctypes.create_string_buffer(512)
+assert libc.shmctl(ident, 2, state) == 0
+struct.pack_into("I", state, 4, victim)
+assert libc.shmctl(ident, 1, state) == 0
+watch = libc.inotify_init1(0)
+where = {libc.inotify_add_watch(watch, name.encode(), 0x20 | 0x10): name for name in names}  # IN_OPEN, IN_CLOSE_NOWRITE
+holder = next(wd for wd, name in where.items() if name == current)
+print("ready", flush=True)
+opened, hops = [], 0
+while True:
+    data = os.read(watch, 65536)
+    at = 0
+    while at < len(data):
+        wd, mask, cookie, size = struct.unpack_from("iIII", data, at)
+        at += 16 + size
+        if wd not in where:
+            continue
+        if mask & 0x20:
+            opened.append(where[wd])
+        if wd != holder or not mask & (0x20 if how == "folder" else 0x10):
+            continue
+        spare = [name for name in names if name not in opened and name != current]
+        if not spare:
+            continue
+        target = spare[0] if opened[0] == names[0] else spare[-1]
+        if how == "folder":
+            os.rename(current, target)
+            where[holder] = target
+        else:
+            for note in notes:
+                os.rename(current + "/" + note, target + "/" + note)
+            holder = next(wd for wd, name in where.items() if name == target)
+        current = target
+        hops += 1
+        print("hop", hops, flush=True)
+"""
+
+
+@pytest.mark.parametrize("how", ["folder", "files"])
+@pytest.mark.parametrize("who", ["helper", "second look"])
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_another_slot_moving_its_entries_under_the_walk_cannot_fail_a_cleanup(
+    how: str, who: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Other uids' folders are looked into best effort; however their owner moves things, it never counts."""
+    victim, attacker = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    fill, limit = {"folder": (0, 1_500), "files": (4000, 41_500)}[how]  # a walk that counted all meets 3 hops
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", limit)
+
+    def drop() -> None:
+        """Become the attacker."""
+        os.setgroups([])
+        os.setgid(attacker.gid)
+        os.setuid(attacker.uid)
+
+    command = [sys.executable, "-I", "-c", HOPPER, "wb-hop", "10", "500", str(fill), how, str(victim.uid)]
+    process = subprocess.Popen(command, preexec_fn=drop, stdout=subprocess.PIPE, text=True)
+    try:
+        assert process.stdout is not None and process.stdout.readline().strip() == "ready"
+        if who == "helper":
+            kill_slot_processes(victim)
+        else:
+            assert sandbox._slot_left_ipc(victim.uid) is False
+        time.sleep(0.2)
+    finally:
+        process.kill()
+        out, _ = process.communicate()
+        monkeypatch.undo()
+        kill_slot_processes(attacker)
+        kill_slot_processes(victim)
+    assert "hop 1" in out, "the attacker never moved anything"
+    assert _ipc_of(attacker.uid) == [] and _ipc_of(victim.uid) == []
+
+
+# Two folders of another slot: the one listed first gets 30 notes, the other is left open to all
+# (printed); and 25 files of its own at the top. The slot is handed a segment, so its helper runs.
+BEYOND_BUDGET = """\
+import ctypes, os, pathlib, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+for n in range(25):
+    pathlib.Path("/dev/shm/wb-top-%d" % n).write_text("synthetic note of user b")
+for name in ("wb-x0", "wb-x1"):
+    os.mkdir("/dev/shm/" + name)
+    os.chmod("/dev/shm/" + name, 0o755)
+big, open_ = [name for name in os.listdir("/dev/shm") if name in ("wb-x0", "wb-x1")]
+for n in range(30):
+    pathlib.Path("/dev/shm/%s/note-%d" % (big, n)).write_text("synthetic note of user b")
+os.chmod("/dev/shm/" + open_, 0o1777)
+ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+state = ctypes.create_string_buffer(512)
+assert libc.shmctl(ident, 2, state) == 0
+struct.pack_into("I", state, 4, int(sys.argv[1]))
+assert libc.shmctl(ident, 1, state) == 0
+print("/dev/shm/" + open_)
+"""
+INTO_OPEN_FOLDER = """\
+import pathlib, sys
+pathlib.Path(sys.argv[1] + "/note").write_text("synthetic note of user a")
+pathlib.Path("/dev/shm/wb-mine").write_text("synthetic note of user a")
+"""
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_the_look_into_other_slots_folders_stops_at_its_budget_and_never_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the budget, another slot's folders are no longer looked into, by the helper or the second look.
+
+    The slot's own entries at the top are cleared all the same, and the other slot's entries there,
+    more than the limit, count for nothing. What the slot put into another slot's folder beyond the
+    budget stays: the accepted residual, which only its own job can create.
+    """
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    open_folder = _output_as(other, BEYOND_BUDGET, str(slot.uid)).strip()
+    assert _run_as(slot, INTO_OPEN_FOLDER, open_folder) == 0
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 20)  # spent on the first folder: 1 + 19 of its 30 notes
+    try:
+        kill_slot_processes(slot)
+        assert not os.path.lexists("/dev/shm/wb-mine")
+        assert os.path.lexists(open_folder + "/note")
+        monkeypatch.undo()
+        kill_slot_processes(slot)
+        assert not os.path.lexists(open_folder + "/note")
+    finally:
+        monkeypatch.undo()
+        kill_slot_processes(slot)
+        kill_slot_processes(other)
+    assert _ipc_of(slot.uid) == [] and _ipc_of(other.uid) == []
+
+
+# Run before the IPC helper, as root: the shared memory table it reads is replaced by the given
+# rows, and the other tables are missing, so it acts on exactly that segment.
+FAKE_SHM_TABLE = """\
+import builtins, io
+_open = builtins.open
+def _fake(path, *args, **kwargs):
+    if path == "/proc/sysvipc/shm":
+        return io.StringIO(ROWS)
+    if path.startswith("/proc/sysvipc/"):
+        raise FileNotFoundError(path)
+    return _open(path, *args, **kwargs)
+builtins.open = _fake
+"""
+# Run before the IPC helper, as root: madvise(MADV_REMOVE) is refused, and memset, when FORBID is
+# set, ends the helper with exit 8.
+REFUSE_MADVISE = """\
+import ctypes, os
+_CDLL, _memset = ctypes.CDLL, ctypes.memset
+def _refused(*args):
+    return -1
+class _Libc:
+    def __init__(self, *args, **kwargs):
+        self.__dict__["real"] = _CDLL(*args, **kwargs)
+    def __getattr__(self, name):
+        return _refused if name == "madvise" else getattr(self.real, name)
+ctypes.CDLL = _Libc
+ctypes.memset = lambda at, value, size: os._exit(8) if FORBID else _memset(at, value, size)
+"""
+
+
+def _clear_with(slot: Slot, prefix: str) -> int:
+    """Run the IPC helper for the slot, with no folders, after ``prefix``; return its exit code."""
+    program = prefix + sandbox._DROP_AND_CLEAR
+    argv = [sys.executable, "-I", "-S", "-c", program, str(slot.uid), str(slot.gid), str(sandbox._IPC_ENTRY_LIMIT)]
+    return subprocess.run(argv, env=dict(sandbox.CLEAN_ENV), check=False, timeout=60).returncode
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_segment_that_vanished_before_the_helper_reached_it_is_gone_not_a_failure() -> None:
+    """The table lists a segment the slot made, but it is gone by the time the helper acts: ``EINVAL``."""
+    slot = Slot(index=6, uid=20007, gid=20007)
+    libc = ctypes.CDLL(None, use_errno=True)
+    ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+    assert ident >= 0
+    assert libc.shmctl(ident, 0, None) == 0  # nothing attached: destroyed at once, its id names nothing now
+    row = f"     0 {ident:>10}   600   4096   1   1   0 {slot.uid} {slot.gid} {slot.uid} {slot.gid}   0\n"
+    rows = SHM_HEAD.decode() + row
+    assert _clear_with(slot, f"ROWS = {rows!r}\n" + FAKE_SHM_TABLE) == 0
+
+
+MAKE_SEGMENT = """\
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+ident = libc.shmget(0, ctypes.c_size_t(int(sys.argv[1])), 0o1000 | 0o666)
+assert ident >= 0
+ctypes.memmove(libc.shmat(ident, None, 0), b"synthetic note of user a", 24)
+print(ident)
+"""
+# Attaches segment argv[1], says so, and on a line of input says whether its first page reads as zeros.
+WATCH_SEGMENT = """\
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+at = libc.shmat(int(sys.argv[1]), None, 0)
+assert at not in (None, ctypes.c_void_p(-1).value)
+print("held", flush=True)
+sys.stdin.readline()
+print(ctypes.string_at(at, 4096) == bytes(4096), flush=True)
+"""
+GIVE_SEGMENT = """\
+import ctypes, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+ident = int(sys.argv[1])
+state = ctypes.create_string_buffer(512)
+assert libc.shmctl(ident, 2, state) == 0
+struct.pack_into("I", state, 4, int(sys.argv[2]))
+assert libc.shmctl(ident, 1, state) == 0
+"""
+
+
+@pytest.mark.parametrize(
+    ("maker", "size", "held", "code", "zeros"),
+    [
+        ("slot", 4096, True, 0, True),  # the slot's own and small: overwritten with memset
+        ("slot", 300 << 20, True, 5, False),  # too big to overwrite, and still attached elsewhere
+        ("slot", 300 << 20, False, 0, None),  # too big, but IPC_RMID destroyed it: gone
+        ("other", 4096, True, 0, False),  # another slot made it and handed it over: never overwritten
+    ],
+)
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_segment_madvise_cannot_empty_is_overwritten_only_if_the_slot_made_it_and_it_is_small(
+    maker: str, size: int, held: bool, code: int, zeros: bool | None
+) -> None:
+    """``memset`` pulls every page into memory, so it is kept to the slot's own segments of at most 256 MiB.
+
+    A segment of the slot's that could be emptied neither way, and that outlives ``IPC_RMID``, fails the
+    helper: the slot retires itself.
+    """
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    ident = int(_output_as(slot if maker == "slot" else other, MAKE_SEGMENT, str(size)))
+    if maker == "other":
+        assert _run_as(other, GIVE_SEGMENT, str(ident), str(slot.uid)) == 0
+    forbid = not (maker == "slot" and size <= 256 << 20)
+
+    def drop() -> None:
+        """Become the other slot."""
+        os.setgroups([])
+        os.setgid(other.gid)
+        os.setuid(other.uid)
+
+    command = [sys.executable, "-I", "-c", WATCH_SEGMENT, str(ident)]
+    with subprocess.Popen(
+        command, preexec_fn=drop, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    ) as watcher:
+        try:
+            assert watcher.stdout is not None and watcher.stdin is not None
+            if held:
+                assert watcher.stdout.readline().strip() == "held"
+            else:
+                watcher.kill()
+                watcher.wait()
+            assert _clear_with(slot, f"FORBID = {forbid}\n" + REFUSE_MADVISE) == code
+            if held:
+                watcher.stdin.write("\n")
+                watcher.stdin.flush()
+                assert (watcher.stdout.readline().strip() == "True") is zeros
+            else:
+                assert _shm_row_by_id(ident) is None
+        finally:
+            watcher.kill()
+            kill_slot_processes(other)
+            kill_slot_processes(slot)
+    assert _shm_row_by_id(ident) is None
