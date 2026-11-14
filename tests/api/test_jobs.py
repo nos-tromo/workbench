@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import shutil
 import socket
+import sqlite3
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
@@ -13,12 +14,12 @@ from typing import Any, override
 
 import pytest
 
-from workbench.api.jobs import Busy, ExecutorClient, ExecutorUnavailable, JobQueue
+from workbench.api.jobs import Busy, ExecutorClient, ExecutorUnavailable, JobQueue, RequestTooLarge
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, Store
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
-from workbench.paths import Workspaces
+from workbench.paths import PathError, Workspaces
 from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, OutputFile, decode_request, encode
 
 pytestmark = pytest.mark.anyio
@@ -293,6 +294,73 @@ async def test_user_gates_do_not_accumulate(
     assert queue.tracked_users == 0
 
 
+async def test_one_user_cannot_fill_the_queue(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A user has ``queue_max // executor_slots`` calls waiting; the next is refused at once, theirs only."""
+    executor.hold = {"open-webui/user-a", "open-webui/user-b", "open-webui/user-c"}
+    queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_max=4, jobs_per_user=1)
+    a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 1)
+    a_waiting = [asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [])) for n in (2, 3)]
+    await until(lambda: sample(metrics, "workbench_queue_length") == 2)
+    b1 = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 2)
+    c1 = asyncio.create_task(queue.submit(user("user-c"), "run_python", ARGS, []))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 3)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await queue.submit(user("user-a", "chat-4"), "run_python", ARGS, [])
+    assert refused.value.reason == "queue_full"
+    assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
+    assert sample(metrics, "workbench_queue_length") == 3
+    executor.gate.set()
+    await asyncio.gather(a1, *a_waiting, b1, c1)
+    assert len(executor.requests) == 5
+    assert sample(metrics, "workbench_queue_length") == 0
+
+
+async def test_the_users_share_of_the_queue_is_at_least_one(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """With more slots than queue places the share rounds up to one, and a waiter that leaves gives it back."""
+    executor.hold = {"open-webui/user-a"}
+    queue = queue_for(settings, executor, store, metrics, executor_slots=4, queue_max=2, jobs_per_user=1)
+    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 1)
+    waiter = asyncio.create_task(queue.submit(user("user-a", "chat-2"), "run_python", ARGS, []))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await queue.submit(user("user-a", "chat-3"), "run_python", ARGS, [])
+    assert refused.value.reason == "queue_full"
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert sample(metrics, "workbench_queue_length") == 0
+    again = asyncio.create_task(queue.submit(user("user-a", "chat-4"), "run_python", ARGS, []))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    executor.gate.set()
+    await asyncio.gather(first, again)
+
+
+async def test_the_default_share_is_four_waiting_calls(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """16 places over 4 slots: one running and four waiting calls of a user, and the sixth is refused."""
+    executor.hold = {"open-webui/user-a"}
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 1)
+    waiting = [asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [])) for n in range(4)]
+    await until(lambda: sample(metrics, "workbench_queue_length") == 4)
+    with pytest.raises(Busy) as refused:
+        await queue.submit(user("user-a", "chat-9"), "run_python", ARGS, [])
+    assert refused.value.reason == "queue_full"
+    executor.gate.set()
+    await asyncio.gather(running, *waiting)
+
+
 # --- the request -----------------------------------------------------------
 
 
@@ -334,6 +402,159 @@ async def test_the_job_is_recorded_and_finished(
     assert sample(metrics, "workbench_job_duration_seconds_count", tool="run_python") == 1
 
 
+def jobs_recorded(settings: Settings) -> int:
+    """How many job records the volume's database holds."""
+    db = sqlite3.connect(settings.data_dir / "workbench.db")
+    try:
+        return int(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "/etc/passwd",
+        "/workspace/chat-1/a.txt",
+        "../x.txt",
+        "a/../b.txt",
+        "a//b.txt",
+        "",
+        ".",
+        "a/",
+        "x\x00y",
+        "n" * 201,
+    ],
+)
+async def test_an_invalid_input_path_is_refused_before_a_job_exists(
+    bad: str,
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every input is a relative path of plain names; a bad one is a ``PathError``, with no record and no log line."""
+    queue = queue_for(settings, executor, store, metrics)
+    with caplog.at_level(logging.DEBUG), pytest.raises(PathError):
+        await queue.submit(user("user-a"), "read_document", {}, ["fine.txt", bad])
+    assert executor.requests == []
+    assert jobs_recorded(settings) == 0
+    assert [r for r in caplog.records if r.name == "workbench.api.jobs"] == []
+    assert queue.tracked_users == 0
+
+
+async def test_too_many_input_files_are_refused_before_a_job_exists(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The protocol takes 1000 input files; one more is refused as a bad request, not as a failed job."""
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(PathError):
+        await queue.submit(user("user-a"), "read_document", {}, [f"f{n}.txt" for n in range(1001)])
+    assert jobs_recorded(settings) == 0
+    await queue.submit(user("user-a"), "search_files", {}, [f"f{n}.txt" for n in range(1000)])
+
+
+async def test_valid_input_paths_pass(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
+    """Plain names, folders and odd but legal characters are sent as they are."""
+    queue = queue_for(settings, executor, store, metrics)
+    names = ["a.txt", "reports/q 3 (final).docx", "dir/sub/b-c_d.xlsx", "ä.csv"]
+    await queue.submit(user("user-a"), "read_document", {}, names)
+    assert executor.requests[0].input_files == names
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "read_document",
+        "search_files",
+        "run_python",
+        "inspect_template",
+        "fill_template",
+        "write_table",
+        "write_document",
+    ],
+)
+async def test_the_known_tools_are_accepted(
+    tool: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The allow-list is the seven tools of version 1."""
+    queue = queue_for(settings, executor, store, metrics)
+    job, _, _ = await queue.submit(user("user-a"), tool, ARGS, [])
+    assert job.tool == tool
+
+
+@pytest.mark.parametrize("tool", ["", "echo", "run_python ", "READ_DOCUMENT", "tool-" + "x" * 50])
+async def test_an_unknown_tool_is_a_programming_error(
+    tool: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A tool name that is not on the list never reaches the executor, the metrics' labels or the job table."""
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(ValueError, match="unknown tool"):
+        await queue.submit(user("user-a"), tool, ARGS, [])
+    assert executor.requests == []
+    assert jobs_recorded(settings) == 0
+    assert sample(metrics, "workbench_job_duration_seconds_count", tool=tool) == 0
+    assert queue.tracked_users == 0
+
+
+# --- the size of a request --------------------------------------------------
+
+
+def padded_request(size: int) -> JobRequest:
+    """A valid request whose encoding, newline included, is exactly ``size`` bytes."""
+    req = request_for()
+    base = len(encode(req.model_copy(update={"args": {"pad": ""}})))
+    return req.model_copy(update={"args": {"pad": "x" * (size - base)}})
+
+
+async def test_a_request_over_the_line_limit_is_not_sent(sock_dir: Path) -> None:
+    """The client refuses before it connects: with no socket, the error is the size, not an unreachable executor."""
+    too_big = padded_request(MAX_LINE + 1)
+    assert len(encode(too_big)) == MAX_LINE + 1
+    with pytest.raises(RequestTooLarge):
+        await ExecutorClient(sock_dir / "none.sock").run(too_big, timeout_s=5)
+    assert not issubclass(RequestTooLarge, (Busy, ExecutorUnavailable, OSError))
+
+
+async def test_a_request_of_exactly_the_line_limit_is_sent(sock_dir: Path) -> None:
+    """The limit is the largest line the executor accepts, newline included."""
+    seen: list[JobRequest] = []
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        req = decode_request(await reader.readline())
+        seen.append(req)
+        writer.write(encode(sample_result(req.job_id)))
+        await writer.drain()
+        writer.close()
+
+    path = sock_dir / "e.sock"
+    biggest = padded_request(MAX_LINE)
+    assert len(encode(biggest)) == MAX_LINE
+    async with serve(path, handler):
+        result = await ExecutorClient(path).run(biggest, timeout_s=5)
+    assert result.status == "ok"
+    assert seen == [biggest]
+
+
+async def test_a_request_too_large_is_not_a_refusal(
+    settings: Settings, store: Store, metrics: Metrics, sock_dir: Path
+) -> None:
+    """Through the queue it is its own error, not ``Busy``: no refusal is counted, and the job ends as an error."""
+    queue = JobQueue(settings, ExecutorClient(sock_dir / "none.sock"), store, metrics)
+    p = user("user-a")
+    with pytest.raises(RequestTooLarge):
+        await queue.submit(p, "run_python", {"code": "x" * MAX_LINE}, [])
+    for reason in ("queue_full", "wait_timeout", "executor_busy"):
+        assert sample(metrics, "workbench_job_refusals_total", reason=reason) == 0
+    db = sqlite3.connect(settings.data_dir / "workbench.db")
+    try:
+        assert db.execute("SELECT status FROM jobs").fetchall() == [("error",)]
+    finally:
+        db.close()
+    assert queue.tracked_users == 0
+
+
 # --- results ---------------------------------------------------------------
 
 
@@ -360,6 +581,7 @@ async def test_outputs_are_registered_as_files(
     assert (folder / "summary.docx").read_bytes() == b"doc"
     assert not (settings.data_dir / "staging" / job.id).exists()
     assert result.message == ""
+    assert result.outputs == []
 
 
 async def test_a_name_clash_gets_a_numbered_name(
@@ -396,6 +618,7 @@ async def test_a_failed_job_is_returned_without_registering_outputs(
     p = user("user-a")
     job, result, files = await queue.submit(p, "run_python", ARGS, [])
     assert (result.status, result.message, files) == (status, "the job did not finish", [])
+    assert result.outputs == []
     assert chat_files(store, p) == []
     assert store.get_job(p, job.id).status == status
     assert not (settings.data_dir / "staging" / job.id).exists()
@@ -527,6 +750,7 @@ async def test_an_output_that_is_not_in_the_jobs_staging_folder_is_not_registere
     assert chat_files(store, p) == []
     assert secret.read_bytes() == b"not an output"
     assert result.message == "2 outputs could not be kept (invalid)"
+    assert result.outputs == []
 
 
 async def test_an_answer_for_another_job_is_refused(settings: Settings, store: Store, metrics: Metrics) -> None:
@@ -562,6 +786,99 @@ async def test_an_unexpected_failure_finishes_the_job_as_an_error(
         await queue.submit(user("user-a"), "run_python", ARGS, [])
     assert store.get_job(user("user-a"), executor.requests[0].job_id).status == "error"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+def break_finish(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store fail to settle a job record."""
+
+    def explode(_job_id: str, _status: str) -> None:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(store, "finish_job", explode)
+
+
+async def test_a_failed_job_record_does_not_hide_a_busy_executor(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``Busy`` is what the caller must see, the staging folder is cleared, and the log names no path."""
+    executor.status = "busy"
+    executor.files = {"half.txt": b"x"}
+    break_finish(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    with caplog.at_level(logging.DEBUG), pytest.raises(Busy) as refused:
+        await queue.submit(user("user-a"), "run_python", ARGS, [])
+    assert refused.value.reason == "executor_busy"
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+    assert "synthetic" not in caplog.text
+    assert str(settings.data_dir) not in caplog.text
+
+
+async def test_a_failed_job_record_does_not_hide_the_original_error(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error that ended the job is the one raised, and the staging folder is cleared all the same."""
+    executor.files = {"a.txt": b"a"}
+
+    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str) -> FileRecord:
+        raise RuntimeError("the original failure")
+
+    monkeypatch.setattr(store, "register_output", explode)
+    break_finish(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(RuntimeError, match="the original failure"):
+        await queue.submit(user("user-a"), "run_python", ARGS, [])
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_a_failed_job_record_does_not_hide_a_cancellation(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client that goes away is still cancelled, its slot is freed and its staging folder cleared."""
+    executor.hold = {"open-webui/user-a"}
+    break_finish(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics, executor_slots=1)
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 1)
+    job_id = executor.requests[0].job_id
+    executor.staged(job_id, "left.txt").parent.mkdir(parents=True)
+    executor.staged(job_id, "left.txt").write_bytes(b"x")
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert not (settings.data_dir / "staging" / job_id).exists()
+    executor.hold = set()
+    monkeypatch.undo()
+    await queue.submit(user("user-b"), "run_python", ARGS, [])
+
+
+async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is_cleared(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing else pending, the store's failure is the answer; it is never swallowed silently."""
+    executor.files = {"a.txt": b"a"}
+    break_finish(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(sqlite3.OperationalError):
+        await queue.submit(user("user-a"), "run_python", ARGS, [])
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+    assert queue.tracked_users == 0
 
 
 # --- the client ------------------------------------------------------------

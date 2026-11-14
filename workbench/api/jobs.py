@@ -9,14 +9,18 @@ is sent:
 - one user (a caller's own user id) has ``jobs_per_user`` jobs running at once; their further
   jobs wait, and while they do they hold no slot, so they never keep another user from one;
 - at most ``queue_max`` jobs wait; one more is refused at once (``queue_full``);
+- one user has at most ``queue_max // executor_slots`` calls waiting (at least one), so a user
+  who sends many calls fills their own share of the queue and no more; their next call is
+  refused at once (``queue_full``), and the other users are not affected;
 - a job waits at most ``queue_wait_s`` for its turn (``wait_timeout``);
 - an executor with no free slot, or one that cannot be reached, is a refusal too
   (``executor_busy``).
 
-Every refusal is :class:`Busy`, which the api answers as ``503``, "busy, retry later". The
-queue is the only user of the staging folder: it moves what a job wrote into the chat folder
-(:meth:`~workbench.api.store.Store.register_output`) and removes the job's staging folder
-afterwards, whatever came of the job.
+Every refusal is :class:`Busy`, which the api answers as ``503``, "busy, retry later". A request
+that is too large for the protocol's line is not a refusal and not worth a retry:
+:class:`RequestTooLarge`, ``422``. The queue is the only user of the staging folder: it moves what
+a job wrote into the chat folder (:meth:`~workbench.api.store.Store.register_output`) and removes
+the job's staging folder afterwards, whatever came of the job.
 """
 
 import asyncio
@@ -34,7 +38,7 @@ from workbench.api.store import QuotaExceeded, StorageFull, Store, StoreError
 from workbench.config import Settings
 from workbench.models import FileRecord, JobRecord, Principal
 from workbench.paths import PathError, check_filename
-from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, decode_result, encode
+from workbench.protocol import MAX_INPUT_FILES, MAX_LINE, JobRequest, JobResult, Limits, decode_result, encode
 
 _log = logging.getLogger(__name__)
 
@@ -47,6 +51,19 @@ _READ_GRACE_S: Final = 300
 
 #: Why a job was refused.
 Reason = Literal["queue_full", "wait_timeout", "executor_busy"]
+
+#: The tools a job may run; it keeps the metrics' ``tool`` label and the job table to a fixed set.
+TOOLS: Final = frozenset(
+    {
+        "read_document",
+        "search_files",
+        "run_python",
+        "inspect_template",
+        "fill_template",
+        "write_table",
+        "write_document",
+    }
+)
 
 
 class Busy(Exception):
@@ -65,6 +82,13 @@ class Busy(Exception):
         """
         super().__init__(reason)
         self.reason: Reason = reason
+
+
+class RequestTooLarge(Exception):
+    """The request does not fit the protocol's line, so it was not sent; retrying it cannot help.
+
+    The message is a short fixed text; it never holds the request.
+    """
 
 
 class ExecutorUnavailable(Exception):
@@ -98,14 +122,19 @@ class ExecutorClient:
             The executor's answer. A ``busy`` answer is returned, not raised.
 
         Raises:
+            RequestTooLarge: The encoded request, newline included, is longer than ``MAX_LINE``;
+                nothing is sent.
             ExecutorUnavailable: There is no socket, the connection was refused or dropped, no
                 answer came in time, or the answer is not a result.
         """
+        line = encode(req)
+        if len(line) > MAX_LINE:
+            raise RequestTooLarge("request too large")
         writer: asyncio.StreamWriter | None = None
         try:
             async with asyncio.timeout(timeout_s):
                 reader, writer = await asyncio.open_unix_connection(str(self._path), limit=MAX_LINE)
-                writer.write(encode(req))
+                writer.write(line)
                 await writer.drain()
                 line = await reader.readline()
         except (OSError, ValueError) as exc:  # a timeout is an OSError; so is a refused connection
@@ -129,6 +158,7 @@ class _UserGate:
     Attributes:
         running: Held while a job of the user runs.
         refs: Calls of the user that are waiting or running; the gate is dropped at zero.
+        waiting: Calls of the user that are waiting for their turn or a slot.
     """
 
     def __init__(self, size: int) -> None:
@@ -139,6 +169,26 @@ class _UserGate:
         """
         self.running = asyncio.Semaphore(size)
         self.refs = 0
+        self.waiting = 0
+
+
+def _check_inputs(input_files: Sequence[str]) -> None:
+    """Refuse input files the executor would refuse, before a job record exists.
+
+    Args:
+        input_files: Paths relative to the chat folder.
+
+    Raises:
+        PathError: There are more than ``MAX_INPUT_FILES`` of them, or one is absolute or holds a
+            segment that is not a plain file name.
+    """
+    if len(input_files) > MAX_INPUT_FILES:
+        raise PathError("too many input files")
+    for path in input_files:
+        if path.startswith("/"):
+            raise PathError("invalid file name")
+        for segment in path.split("/"):
+            check_filename(segment)
 
 
 class JobQueue:
@@ -164,6 +214,7 @@ class JobQueue:
         self._slots = asyncio.Semaphore(settings.executor_slots)
         self._gates: dict[tuple[str, str], _UserGate] = {}
         self._waiting = 0
+        self._user_waiting_max = max(1, settings.queue_max // settings.executor_slots)
         self._staging = settings.data_dir / _STAGING
         for reason in get_args(Reason):
             metrics.job_refusals_total.labels(reason)
@@ -187,14 +238,21 @@ class JobQueue:
         Returns:
             The job record with its final status, the executor's answer and the files the job
             made, now in the chat folder. ``ok`` is the only status that keeps files. The answer's
-            message names outputs that could not be kept; its ``outputs`` still list the staged
-            ones, whose paths no longer exist.
+            message names outputs that could not be kept; its ``outputs`` are empty, since the
+            staged files are gone: the returned files are what the job made.
 
         Raises:
-            Busy: The queue is full, the turn did not come in time, or the executor has no free
-                slot or cannot be reached.
-            PathError: The caller, user or chat id is not a safe id.
+            ValueError: ``tool`` is not one of :data:`TOOLS`; that is a programming error.
+            PathError: An input file is not a plain path below the chat folder, there are more
+                than ``MAX_INPUT_FILES`` of them, or the caller, user or chat id is not a safe id.
+                No job record is made for a request refused for its input files.
+            Busy: The queue is full, the user's share of it is, the turn did not come in time,
+                or the executor has no free slot or cannot be reached.
+            RequestTooLarge: The request does not fit the protocol's line.
         """
+        if tool not in TOOLS:
+            raise ValueError("unknown tool")
+        _check_inputs(input_files)
         key = (p.caller, p.user_id)
         gate = self._gates.get(key)
         if gate is None:
@@ -228,21 +286,24 @@ class JobQueue:
         """Wait for the user's turn, then for a slot; hold both on return.
 
         A call that can start at once does not count as waiting. One that cannot is counted
-        against ``queue_max`` until it starts or gives up. The user's turn comes before the slot,
-        so a user's second job waits without holding a slot another user could use.
+        against ``queue_max``, and against the user's own share of it, until it starts or gives up.
+        The user's turn comes before the slot, so a user's second job waits without holding a slot
+        another user could use.
 
         Args:
             gate: The calling user's gate.
 
         Raises:
-            Busy: ``queue_full`` at once when ``queue_max`` calls wait already; ``wait_timeout``
+            Busy: ``queue_full`` at once when ``queue_max`` calls wait already, or when the user's
+                share (``queue_max // executor_slots``, at least one) is used up; ``wait_timeout``
                 after ``queue_wait_s`` seconds.
         """
         waits = gate.running.locked() or self._slots.locked()
         if waits:
-            if self._waiting >= self._settings.queue_max:
+            if self._waiting >= self._settings.queue_max or gate.waiting >= self._user_waiting_max:
                 raise self._refuse("queue_full")
             self._waiting += 1
+            gate.waiting += 1
             self.metrics.queue_length.set(self._waiting)
         began = time.monotonic()
         holds_turn = False
@@ -260,6 +321,7 @@ class JobQueue:
                 gate.running.release()
             if waits:
                 self._waiting -= 1
+                gate.waiting -= 1
                 self.metrics.queue_length.set(self._waiting)
             self.metrics.queue_wait_seconds.observe(time.monotonic() - began)
 
@@ -279,10 +341,12 @@ class JobQueue:
 
         Raises:
             Busy: The executor has no free slot or cannot be reached.
+            RequestTooLarge: The request does not fit the protocol's line.
         """
         settings = self._settings
         job = await asyncio.to_thread(self._store.add_job, p, tool)
         status = "error"
+        completed = False
         try:
             req = JobRequest(
                 job_id=job.id,
@@ -304,7 +368,9 @@ class JobQueue:
             files: list[FileRecord] = []
             if result.status == "ok":
                 result, files = await self._keep(p, job.id, result)
+            result = result.model_copy(update={"outputs": []})  # staged paths are gone once the job settles
             status = result.status
+            completed = True
             return dataclasses.replace(job, status=status), result, files
         except Busy:
             status = "busy"
@@ -313,8 +379,28 @@ class JobQueue:
             status = "cancelled"
             raise
         finally:
-            await asyncio.to_thread(self._store.finish_job, job.id, status)
-            await asyncio.to_thread(self._clear_staging, job.id)
+            await self._settle(job.id, status, pending=not completed)
+
+    async def _settle(self, job_id: str, status: str, *, pending: bool) -> None:
+        """Record the job's final status and remove its staging folder; the folder always goes.
+
+        A record that cannot be written is the answer only when the job itself went well. When an
+        error or a cancellation is on its way to the caller, that is what the caller must see, so the
+        failure is logged and not raised.
+
+        Args:
+            job_id: The job's id.
+            status: The final status.
+            pending: Whether an error or a cancellation is already on its way out of :meth:`_run`.
+        """
+        try:
+            await asyncio.to_thread(self._store.finish_job, job_id, status)
+        except Exception as exc:
+            if not pending:
+                raise
+            _log.warning("could not settle a job's record (%s)", type(exc).__name__)
+        finally:
+            await asyncio.to_thread(self._clear_staging, job_id)
 
     async def _execute(self, req: JobRequest) -> JobResult:
         """Send the job to the executor and check the answer is its own.

@@ -27,7 +27,7 @@ class Settings:
         executor_slots: Jobs the executor runs at once; at most the uid pool.
         queue_max: Jobs that may wait for a free slot.
         queue_wait_s: Seconds a job may wait for a free slot.
-        jobs_per_user: Jobs one user may have queued or running.
+        jobs_per_user: Jobs one user may have running at once; their further calls wait.
         job_wall_s: Wall-clock seconds a job may run.
         job_memory_mb: Memory a job may use, in megabytes.
         result_max_kb: Largest result returned inline, in kilobytes.

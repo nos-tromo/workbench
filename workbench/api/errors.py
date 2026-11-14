@@ -9,7 +9,8 @@ A failed audit write is a 500 of the same kind: the action is not done, and the 
 output stream) is not logged either.
 
 A job the queue refuses (``Busy``) is a 503 with one fixed text, whatever the reason: the model is
-told to retry later, and which limit was hit is for the metrics, not for the model.
+told to retry later, and which limit was hit is for the metrics, not for the model. A request too
+large for the executor's protocol (``RequestTooLarge``) is a 422: retrying it cannot help.
 """
 
 from typing import Final
@@ -17,7 +18,7 @@ from typing import Final
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from workbench.api.jobs import Busy
+from workbench.api.jobs import Busy, RequestTooLarge
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, StoreError, TooLarge
 from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
@@ -27,6 +28,9 @@ NOT_FOUND: Final = "not found"
 
 #: The detail of every 503.
 BUSY: Final = "busy, retry later"
+
+#: The detail of every 422 for a request the executor's protocol cannot carry.
+TOO_LARGE: Final = "request too large"
 
 #: Each error, its status, and the detail to send; ``None`` sends the error's own message.
 _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
@@ -38,11 +42,12 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
     (StorageFull, 507, None),
     (AuditWriteError, 500, "audit unavailable"),
     (Busy, 503, BUSY),
+    (RequestTooLarge, 422, TOO_LARGE),
 )
 
 
 async def _answer(_request: Request, exc: Exception) -> JSONResponse:
-    """Turn a path, store, audit or queue error into its short answer, without logging it.
+    """Turn a path, store, audit, queue or request-size error into its short answer, without logging it.
 
     Args:
         _request: The request that failed.
@@ -67,3 +72,4 @@ def install(app: FastAPI) -> None:
     app.add_exception_handler(StoreError, _answer)
     app.add_exception_handler(AuditWriteError, _answer)
     app.add_exception_handler(Busy, _answer)
+    app.add_exception_handler(RequestTooLarge, _answer)

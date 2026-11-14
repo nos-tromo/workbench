@@ -68,6 +68,8 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: JobQu
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         """Open the audit chain and measure the data volume on start; end the chain on shutdown.
 
+        A start that fails once the chain is open ends the chain too.
+
         Args:
             _app: The application.
 
@@ -75,8 +77,8 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: JobQu
             Once the chain is open.
         """
         audit.start(_audit_config(settings))
-        app_metrics.refresh(files=store.count_files())
         try:
+            app_metrics.refresh(files=store.count_files())
             yield
         finally:
             audit.close()

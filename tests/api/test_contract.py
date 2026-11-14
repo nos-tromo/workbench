@@ -409,6 +409,22 @@ def test_lifespan_records_the_limits_and_never_the_key(
     assert KEY not in audit_stream.getvalue()
 
 
+def test_a_start_that_fails_after_the_chain_opened_closes_it(
+    app: FastAPI, store: Store, audit_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The volume cannot be counted: the app does not start, and the chain that was opened ends with its shutdown."""
+
+    def broken() -> int:
+        raise OSError("synthetic database failure")
+
+    monkeypatch.setattr(store, "count_files", broken)
+    with pytest.raises(OSError, match="synthetic database failure"):
+        with TestClient(app):
+            pass
+    events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+    assert [event["operation"] for event in events] == ["start", "config.audit", "shutdown"]
+
+
 def test_app_factory_builds_the_app_from_the_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

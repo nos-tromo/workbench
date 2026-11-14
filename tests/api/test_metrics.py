@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import logging
 import shutil
 from collections import namedtuple
 from pathlib import Path
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import KEY
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import Busy, ExecutorClient, JobQueue, Reason
+from workbench.api.jobs import Busy, ExecutorClient, JobQueue, Reason, RequestTooLarge
 from workbench.api.main import app_factory, create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store
@@ -162,3 +163,20 @@ def test_busy_is_a_503_the_caller_can_retry(client: TestClient, app: FastAPI, re
     response = client.get("/refuse")
     assert response.status_code == 503
     assert response.json() == {"detail": "busy, retry later"}
+
+
+def test_a_request_too_large_is_a_422_and_not_a_busy(
+    client: TestClient, app: FastAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The caller is told the request is too large, not to retry; nothing about it is logged."""
+
+    async def refuse() -> None:
+        raise RequestTooLarge("synthetic: /data/secret-path")
+
+    app.add_api_route("/refuse", refuse)
+    caplog.set_level(logging.DEBUG)
+    response = client.get("/refuse")
+    assert response.status_code == 422
+    assert response.json() == {"detail": "request too large"}
+    assert "secret-path" not in caplog.text
+    assert [record for record in caplog.records if record.exc_info] == []
