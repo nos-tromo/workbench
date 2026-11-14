@@ -5,14 +5,19 @@ they prove what the kernel enforces, not only what the compose file asks for. Th
 run code go through the ``run_python`` tool, as the model would.
 """
 
+import io
 import json
 import stat
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
+import openpyxl
 import pytest
+from docx import Document
 
+from tests.fixtures import make_templates as mt
 from tests.isolation.conftest import docker, environment, inspect, run_python, stdout_of
 
 pytestmark = pytest.mark.isolation
@@ -333,3 +338,85 @@ def test_another_chats_files_are_not_there_and_the_answer_says_why(api: httpx.Cl
     body = answer.json()
     assert "FileNotFoundError" in body["stderr"]
     assert "only this chat's files are available" in body["hint"].lower()
+
+
+# --- the template tools, end to end ------------------------------------------------------------------------------
+
+TEMPLATES_CHAT = "chat-templates"
+TEMPLATE_HEADERS = {"X-User-Id": "user-a", "X-Session-Id": TEMPLATES_CHAT}
+
+
+def _template_tool(api: httpx.Client, tool: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call a template tool in the templates' chat, and take its answer."""
+    answer = api.post(f"/tools/{tool}", json=body, headers=TEMPLATE_HEADERS)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _download(api: httpx.Client, path: str) -> bytes:
+    """Fetch a file's bytes through the file browser."""
+    answer = api.get("/files/view", params={"path": path}, headers=TEMPLATE_HEADERS)
+    assert answer.status_code == 200, answer.text
+    return answer.content
+
+
+def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, tmp_path: Path) -> None:
+    """A Word form, the same as a .dotx, a {{ }} document and a workbook: inspected and filled by real jobs (R45).
+
+    The jobs run as slot uids with a read-only root and no network, in the shipped image, so this also proves that
+    python-docx, docxtpl, Jinja and openpyxl are there and work as the job runs them.
+    """
+    built = {
+        "form.docx": mt.make_controls_docx(tmp_path / "form.docx"),
+        "letter.docx": mt.make_jinja_docx(tmp_path / "letter.docx"),
+        "summary.xlsx": mt.make_placeholder_xlsx(tmp_path / "summary.xlsx"),
+    }
+    built["form.dotx"] = mt.as_dotx(built["form.docx"], tmp_path / "form.dotx")
+    names = {name: _upload(api, name, path.read_bytes(), chat=TEMPLATES_CHAT) for name, path in built.items()}
+    where = {name: f"/workspace/{TEMPLATES_CHAT}/{stored}" for name, stored in names.items()}
+
+    kinds = {
+        name: _template_tool(api, "inspect_template", {"path": path})["template_kind"] for name, path in where.items()
+    }
+    assert kinds == {
+        "form.docx": "content_controls",
+        "form.dotx": "content_controls",
+        "letter.docx": "placeholders",
+        "summary.xlsx": "placeholders",
+    }
+
+    said = {"kind": "user", "note": "said in the chat"}
+    form = {
+        "customer": {"value": "Invented Harbour Ltd", "source": said},
+        "status": {"value": "closed", "source": {"kind": "assistant"}},
+        "approved": {"value": True, "source": {"kind": "assistant"}},
+    }
+    for name in ("form.docx", "form.dotx"):
+        filled = _template_tool(api, "fill_template", {"path": where[name], "values": form})
+        assert filled["path"].endswith(".docx"), filled
+        assert (filled["filled"], filled["warnings"]) == (3, [])
+        document = Document(io.BytesIO(_download(api, filled["path"])))
+        rows = [[cell.text for cell in row.cells] for row in document.tables[-1].rows]
+        assert rows[0] == ["field", "value", "source kind", "reference"]
+        assert rows[1] == ["customer", "Invented Harbour Ltd", "user", "said in the chat"]
+
+    letter = {
+        "customer": {"value": "Invented Harbour Ltd", "source": said},
+        "rows": {"value": [{"item": "Dredging", "total": 118}], "source": {"kind": "assistant"}},
+    }
+    filled = _template_tool(api, "fill_template", {"path": where["letter.docx"], "values": letter})
+    document = Document(io.BytesIO(_download(api, filled["path"])))
+    assert document.paragraphs[0].text == "Customer: Invented Harbour Ltd"
+    assert [cell.text for cell in document.tables[0].rows[1].cells] == ["Dredging", "118"]
+
+    summary = {
+        "total": {"value": 469.5, "source": {"kind": "assistant"}},
+        "rows": {"value": [["Dredging", 118], ["Piers", "=1+1"]], "source": {"kind": "assistant"}},
+    }
+    filled = _template_tool(api, "fill_template", {"path": where["summary.xlsx"], "values": summary})
+    assert filled["path"] == f"/workspace/{TEMPLATES_CHAT}/summary-filled.xlsx"
+    book = openpyxl.load_workbook(io.BytesIO(_download(api, filled["path"])))
+    sheet = book["Summary"]
+    assert (sheet["B2"].value, sheet["A6"].value, sheet["B7"].value) == (469.5, "Dredging", "=1+1")
+    assert sheet["B7"].data_type == "s"
+    assert [cell.value for cell in book["Sources"][1]] == ["field", "value", "source kind", "reference"]

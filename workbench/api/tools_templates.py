@@ -16,12 +16,12 @@ removed again.
 
 import dataclasses
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Annotated, Any, Final, Literal
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
@@ -29,6 +29,7 @@ from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, Sto
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
     MAX_HINT,
+    _capped,
     _clean,
     _join,
     _json_size,
@@ -62,6 +63,44 @@ _OBJECT: Final[JsonDict] = {"type": "object"}
 _ANY: Final[JsonDict] = {"type": ["string", "number", "boolean", "array", "object"]}
 _PATH: Final = "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it."
 
+#: The longest place an answer names.
+MAX_LOCATION: Final = 300
+
+
+def _cut_to(limit: int) -> Callable[[object], object]:
+    """Make a validator that cuts a text to its bound instead of refusing it.
+
+    A runner's answer that is too long in one place must never cost the model the rest of it, or a file that was
+    filled: this is the api's backstop behind the runner's own bounds.
+
+    Args:
+        limit: The most characters.
+
+    Returns:
+        The validator; anything but a string passes as it is.
+    """
+
+    def cut(value: object) -> object:
+        return value[:limit] if isinstance(value, str) else value
+
+    return cut
+
+
+def _nameable(fields: object) -> object:
+    """Leave out the fields a value could never be given for: their names are longer than a value's name may be.
+
+    Args:
+        fields: The runner's fields.
+
+    Returns:
+        The others; anything but a list passes as it is.
+    """
+    if not isinstance(fields, list):
+        return fields
+    return [
+        f for f in fields if not (isinstance(f, dict) and isinstance(f.get("name"), str) and len(f["name"]) > MAX_NAME)
+    ]
+
 
 class InspectTemplateRequest(BaseModel):
     """Body of ``inspect_template``.
@@ -84,7 +123,7 @@ class TemplateField(BaseModel):
         location: Where it sits.
     """
 
-    name: str = Field(max_length=MAX_NAME + 45, description="The field's name: give its value under it.")
+    name: str = Field(max_length=MAX_NAME, description="The field's name: give its value under it.")
     kind: Literal["content_control", "form_field", "placeholder", "table"] = Field(description="What it is.")
     type: Literal["text", "rich_text", "date", "dropdown", "checkbox", "table"] = Field(
         description=(
@@ -93,7 +132,9 @@ class TemplateField(BaseModel):
         )
     )
     options: list[str] | None = Field(description="A dropdown's entries, exactly as the value must be written.")
-    location: str = Field(max_length=300, description="Where it sits: body, paragraph 3; body, table 2, row 4; B7.")
+    location: Annotated[str, BeforeValidator(_cut_to(MAX_LOCATION))] = Field(
+        max_length=MAX_LOCATION, description="Where it sits: body, paragraph 3; body, table 2, row 4; B7."
+    )
 
 
 class TemplateInfo(BaseModel):
@@ -128,10 +169,10 @@ class _Inspected(BaseModel):
     """
 
     template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none"]
-    fields: list[TemplateField]
+    fields: Annotated[list[TemplateField], BeforeValidator(_nameable)]
     total: int = Field(ge=0)
     truncated: bool
-    hint: str | None = Field(default=None, max_length=MAX_HINT)
+    hint: Annotated[str | None, BeforeValidator(_cut_to(MAX_HINT))] = Field(default=None, max_length=MAX_HINT)
 
 
 class FileSource(BaseModel):
@@ -269,7 +310,7 @@ class _Filled(BaseModel):
 
     filled: list[str]
     unfilled: list[str]
-    warnings: list[Annotated[str, StringConstraints(max_length=MAX_HINT)]]
+    warnings: list[Annotated[str, BeforeValidator(_cut_to(MAX_HINT)), StringConstraints(max_length=MAX_HINT)]]
 
 
 def _output_extension(name: str) -> str:
@@ -438,7 +479,8 @@ def _fit_inspection(answer: TemplateInfo, total: int, limit_kb: int) -> Template
             f"Only {len(kept)} of {total} fields are listed: the answer is cut at the result limit ({limit_kb} KB). "
             "Plan with these, and ask the user about the rest."
         )
-        return answer.model_copy(update={"fields": kept, "truncated": True, "hint": _join(answer.hint, note)})
+        hint = _capped(_join(answer.hint, note), MAX_HINT)
+        return answer.model_copy(update={"fields": kept, "truncated": True, "hint": hint})
 
     whole = told(answer.fields)
     if _json_size(whole) <= limit:

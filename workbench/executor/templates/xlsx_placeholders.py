@@ -221,6 +221,30 @@ def _check_room(sheet: Any, spot: _Spot, rows: Sequence[Sequence[object]]) -> No
                 )
 
 
+def _claim(claimed: dict[tuple[str, int, int], str], spot: _Spot, rows: Sequence[Sequence[object]]) -> None:
+    """Take the cells a table writes, refusing one that another table or a placeholder writes too.
+
+    Args:
+        claimed: The cells taken so far, by sheet, row and column, with the field that takes each.
+        spot: The table's anchor.
+        rows: The table.
+
+    Raises:
+        Refusal: A cell is taken already; the message names both fields and the cell.
+    """
+    for down, row in enumerate(rows):
+        for right in range(len(row)):
+            key = (spot.sheet, spot.row + down, spot.column + right)
+            other = claimed.get(key)
+            if other is not None:
+                where = f"{pg.column_letters(key[2])}{key[1]}"
+                raise Refusal(
+                    "invalid_value",
+                    f"{spot.name} would write {where}, which {other} writes too; the tables would overwrite each other",
+                )
+            claimed[key] = spot.name
+
+
 def fill(book: Any, values: Mapping[str, object], warnings: list[str]) -> list[str]:
     """Fill every placeholder and table anchor; every value is checked before any cell changes.
 
@@ -235,10 +259,14 @@ def fill(book: Any, values: Mapping[str, object], warnings: list[str]) -> list[s
         The names of the fields filled.
 
     Raises:
-        Refusal: A field does not take its value, or a table has no room.
+        Refusal: A field does not take its value, or a table has no room: a cell it would write holds something,
+            or another table or placeholder writes it too.
     """
     spots = _spots(book)
     tables: dict[str, list[list[object]]] = {}
+    claimed: dict[tuple[str, int, int], str] = {
+        (spot.sheet, spot.row, spot.column): spot.name for spot in spots if spot.kind != "table"
+    }
     for spot in spots:
         if spot.name not in values:
             continue
@@ -246,6 +274,7 @@ def fill(book: Any, values: Mapping[str, object], warnings: list[str]) -> list[s
         if spot.kind == "table":
             tables[spot.name] = _rows(spot.name, value)
             _check_room(book[spot.sheet], spot, tables[spot.name])
+            _claim(claimed, spot, tables[spot.name])
         elif not _scalar(value):
             raise Refusal("invalid_value", f"{spot.name} takes a single value: text, a number or true/false")
 

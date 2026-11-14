@@ -679,6 +679,81 @@ def test_what_openpyxl_does_not_keep_is_warned(job: Job) -> None:
     assert any("drawings" in warning for warning in answer["warnings"])
 
 
+def _workbook(path: Path, cells: dict[str, str]) -> Path:
+    """Write a workbook whose sheet ``S`` holds ``cells``."""
+    book = openpyxl.Workbook()
+    sheet = book.active
+    assert sheet is not None
+    sheet.title = "S"
+    for where, text in cells.items():
+        sheet[where] = text
+    book.save(path)
+    return path
+
+
+def test_tables_whose_cells_cross_are_refused(job: Job) -> None:
+    """Two tables that would both write a cell: a 422 naming the later one and the cell, and no file.
+
+    ``down`` runs from B1 over B3, ``across`` from A3 over B3; the second used to overwrite the first without a word.
+    """
+    _workbook(job.path("cross.xlsx"), {"B1": "{{ table:down }}", "A3": "{{ table:across }}"})
+    values = {"down": [["d1"], ["d2"], ["d3"]], "across": [["a1", "a2", "a3"]]}
+    error = job.fill("cross.xlsx", values)["error"]
+    assert error.startswith("invalid_value: across ")
+    assert "B3" in error
+    assert "down" in error
+    assert list(job.ctx.out_dir.iterdir()) == []
+    assert "error" not in job.fill("cross.xlsx", {"down": [["d1"], ["d2"]], "across": [["a1", "a2", "a3"]]})
+
+
+# --- what a template or a value may hold, and never a 500 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("code", ["0001", "D800", "FFFE"])
+def test_a_check_box_state_xml_cannot_hold_shows_the_usual_glyph(job: Job, code: str) -> None:
+    """A checked state that names a control character, a surrogate or a non-character: the box shows the usual one."""
+    box = mt.checkbox_control("ok").replace('w14:checkedState w14:val="2612"', f'w14:checkedState w14:val="{code}"')
+    mt.make_controls_body(job.path("box.docx"), [box])
+    assert "error" not in job.fill("box.docx", {"ok": True})
+    (control,) = sdt(part(job.output("box-filled.docx"), "word/document.xml"), "ok")
+    assert [t.text for t in control.iter(f"{W}t")] == ["☒"]
+
+
+def test_jinja_nested_deeper_than_the_parser_goes_is_an_invalid_template(job: Job) -> None:
+    """Code nested three thousand deep is a 422 that names the template, never a RecursionError."""
+    mt.make_jinja_docx(job.path("deep.docx"), extra="{{ " + "(" * 3000 + "customer" + ")" * 3000 + " }}")
+    for answer in (job.inspect("deep.docx"), job.fill("deep.docx", {"customer": "x"})):
+        assert answer["error"].startswith("invalid_template: "), answer
+
+
+def test_a_field_whose_name_is_too_long_to_be_given_a_value_is_left_out(job: Job) -> None:
+    """A value's name may have 255 characters: a longer field is not listed, its neighbour is, and the hint says so."""
+    _workbook(job.path("long.xlsx"), {"A1": "{{ " + "n" * 320 + " }}", "A2": "{{ short }}"})
+    answer = job.inspect("long.xlsx")
+    assert [f["name"] for f in answer["fields"]] == ["short"]
+    assert "1 field has a name longer than 255 characters" in answer["hint"]
+    filled = job.fill("long.xlsx", {"short": 1})
+    assert (filled["filled"], filled["unfilled"]) == (["short"], [])
+    assert any("longer than 255 characters" in warning for warning in filled["warnings"])
+
+
+def test_long_warnings_are_cut_and_the_filled_file_stays(job: Job) -> None:
+    """A date format of 2100 characters and eight unknown names of 255: every warning fits the api's bound."""
+    pattern = "dd.MM.yyyy " + "q" * 2100
+    mt.make_controls_body(job.path("date.docx"), [mt.date_control("when", pattern)])
+    answer = job.fill("date.docx", {"when": "2026-03-07"})
+    assert answer["warnings"]
+    assert all(len(warning) <= 2000 for warning in answer["warnings"])
+    assert job.output("date-filled.docx").exists()
+    mt.make_controls_body(job.path("one.docx"), [mt.text_control("customer")])
+    unknown = {f"{n}" + "u" * 254: "y" for n in range(8)}
+    answer = job.fill("one.docx", {"customer": "x", **unknown})
+    (warning,) = answer["warnings"]
+    assert len(warning) <= 2000
+    assert "more" in warning
+    assert job.output("one-filled.docx").exists()
+
+
 # --- sources ------------------------------------------------------------------------------------------------------
 
 

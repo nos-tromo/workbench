@@ -89,12 +89,17 @@ def parse(template: DocxTemplate, env: SandboxedEnvironment) -> list[tuple[str, 
         Each part's name and its code, parsed.
 
     Raises:
-        Refusal: The code of a part does not compile; the message names the part and the line, and quotes it.
+        Refusal: The code of a part does not compile (the message names the part and the line, and quotes it), or
+            is nested deeper than the parser goes, or cannot be read otherwise.
     """
     parsed: list[tuple[str, nodes.Template]] = []
     for name, code in _code(template):
         try:
             parsed.append((name, env.parse(code)))
+        except MemoryError:
+            raise
+        except RecursionError:
+            raise Refusal("invalid_template", f"the {{{{ }}}} code of the {name} is nested too deeply") from None
         except TemplateSyntaxError as exc:
             line = exc.lineno or 1
             lines = code.splitlines()
@@ -105,7 +110,31 @@ def parse(template: DocxTemplate, env: SandboxedEnvironment) -> list[tuple[str, 
                 f"the {{{{ }}}} code of the {name} does not compile at line {line}, which reads {shown!r}: "
                 f"{exc.message}",
             ) from None
+        except Exception as exc:
+            raise Refusal(
+                "invalid_template", f"the {{{{ }}}} code of the {name} cannot be read ({type(exc).__name__})"
+            ) from None
     return parsed
+
+
+def _names(story: str, tree: nodes.Template) -> tuple[set[str], set[str]]:
+    """Find the names a part's code uses without setting them, and those a ``for`` loop runs over.
+
+    Args:
+        story: The part's name.
+        tree: Its code, parsed.
+
+    Returns:
+        The names it does not set, and the names a loop runs over.
+
+    Raises:
+        Refusal: The code is nested too deeply to walk.
+    """
+    try:
+        loops = {loop.iter.name for loop in tree.find_all(nodes.For) if isinstance(loop.iter, nodes.Name)}
+        return set(meta.find_undeclared_variables(tree)), loops
+    except RecursionError:
+        raise Refusal("invalid_template", f"the {{{{ }}}} code of the {story} is nested too deeply") from None
 
 
 def fields(template: DocxTemplate, env: SandboxedEnvironment) -> list[Field]:
@@ -125,8 +154,9 @@ def fields(template: DocxTemplate, env: SandboxedEnvironment) -> list[Field]:
     names: dict[str, str] = {}
     tables: set[str] = set()
     for story, tree in parse(template, env):
-        tables |= {loop.iter.name for loop in tree.find_all(nodes.For) if isinstance(loop.iter, nodes.Name)}
-        for name in sorted(meta.find_undeclared_variables(tree)):
+        undeclared, loops = _names(story, tree)
+        tables |= loops
+        for name in sorted(undeclared):
             if name not in env.globals:
                 names.setdefault(name, story)
     found: list[Field] = []

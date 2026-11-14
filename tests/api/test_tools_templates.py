@@ -401,6 +401,49 @@ def test_a_fill_whose_output_was_not_kept_says_so(
     assert events(audit_lines, "fill_template") == []
 
 
+def test_unknown_names_the_model_sends_never_cost_the_filled_file(
+    client: TestClient, store: Store, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """Eight value names of 255 characters that are no field: one warning, within its bound; the file stays."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    unknown = {f"{n}" + "u" * 254: "y" for n in range(8)}
+    r = fill(client, f"{CHAT}/form.docx", {"customer": "x", **unknown})
+    assert r.status_code == 200, r.text
+    assert all(len(warning) <= 2000 for warning in r.json()["warnings"])
+    assert [rec.name for rec in outputs(store)] == ["form-filled.docx"]
+    assert len(events(audit_lines, "fill_template")) == 1
+
+
+def test_a_runners_answer_over_the_apis_bounds_is_cut_never_a_500(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
+    """The backstop: an over-long warning is cut and the file kept; a field no value can name is left out."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    fake_executor.files = {"form-filled.docx": b"PK"}
+    fake_executor.payload = {"filled": ["customer"], "unfilled": [], "warnings": ["w" * 5000]}
+    r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
+    assert r.status_code == 200, r.text
+    assert r.json()["warnings"] == ["w" * 2000]
+    assert [rec.name for rec in outputs(store)] == ["form-filled.docx"]
+
+    def field(name: str, location: str = "body, paragraph 1") -> dict[str, Any]:
+        return {"name": name, "kind": "placeholder", "type": "text", "options": None, "location": location}
+
+    fake_executor.files = {}
+    fake_executor.payload = {
+        "template_kind": "placeholders",
+        "fields": [field("n" * 400), field("short", "l" * 500)],
+        "total": 2,
+        "truncated": False,
+        "hint": "h" * 3000,
+    }
+    r = inspect(client, f"{CHAT}/form.docx")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(f["name"], len(f["location"])) for f in body["fields"]] == [("short", 300)]
+    assert len(body["hint"]) <= 2000
+
+
 def test_a_busy_executor_is_a_503(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:
     """Nothing ran; retry later."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)

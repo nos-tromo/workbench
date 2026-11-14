@@ -33,6 +33,7 @@ from workbench.executor.templates import (
     as_text,
     format_date,
     safe_text,
+    xml_safe,
 )
 
 _W: Final = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -82,6 +83,7 @@ _NOT_FILLED: Final = frozenset(
 )
 
 _PLACEHOLDER_STYLE: Final = "placeholdertext"
+_PATTERN_SHOWN: Final = 60
 _CHECKED: Final = "2612"
 _UNCHECKED: Final = "2610"
 _NUMBER: Final = re.compile(r"(\d+)")
@@ -541,12 +543,15 @@ def _fill_control(spot: _Spot, value: object, warnings: list[str]) -> None:
             box.insert(0, checked)
         checked.set(f"{_W14}val", "1" if value else "0")
         state = box.find(f"{_W14}checkedState" if value else f"{_W14}uncheckedState")
-        code = (state.get(f"{_W14}val") if state is not None else None) or (_CHECKED if value else _UNCHECKED)
+        usual = chr(int(_CHECKED if value else _UNCHECKED, 16))
+        code = state.get(f"{_W14}val") if state is not None else None
         font = state.get(f"{_W14}font") if state is not None else None
         try:
-            glyph = chr(int(code, 16))
+            glyph, unwritable = xml_safe(chr(int(code or "", 16)))
         except (ValueError, OverflowError):
-            glyph = chr(int(_CHECKED if value else _UNCHECKED, 16))
+            glyph, unwritable = usual, False
+        if unwritable:
+            glyph, font = usual, None  # a state XML cannot hold (a control character, a surrogate): the usual box
         _show(control, glyph, rich=False, font=font)
         return
     if kind == "date":
@@ -558,8 +563,8 @@ def _fill_control(spot: _Spot, value: object, warnings: list[str]) -> None:
         if text is None:
             text = value.isoformat()
             warnings.append(
-                f"{name}: the control's date format {pattern!r} is not one version 1 writes; the date is shown as "
-                f"{text}"
+                f"{name}: the control's date format {_quoted(pattern)} is not one version 1 writes; the date is shown "
+                f"as {text}"
             )
         _show(control, text, rich=False)
         return
@@ -575,6 +580,19 @@ def _fill_control(spot: _Spot, value: object, warnings: list[str]) -> None:
         safe_text(name, str(value), warnings).replace("\r\n", "\n").replace("\r", "\n"),
         rich=kind == "rich_text",
     )
+
+
+def _quoted(pattern: str | None) -> str:
+    """Quote a date format for a warning, its start only if it is long.
+
+    Args:
+        pattern: The format.
+
+    Returns:
+        At most about 60 characters.
+    """
+    text = pattern or ""
+    return repr(text if len(text) <= _PATTERN_SHOWN else text[: _PATTERN_SHOWN - 1] + "…")
 
 
 def _field_runs(begin: Any) -> tuple[Any | None, Any] | None:
@@ -639,7 +657,8 @@ def _fill_form(spot: _Spot, value: object, warnings: list[str]) -> bool:
         if text is None:
             text = value.isoformat()
             warnings.append(
-                f"{name}: the field's date format {pattern!r} is not one version 1 writes; the date is shown as {text}"
+                f"{name}: the field's date format {_quoted(pattern)} is not one version 1 writes; the date is shown as "
+                f"{text}"
             )
     else:
         text = safe_text(name, str(value), warnings).replace("\r\n", "\n").replace("\r", "\n")

@@ -37,8 +37,15 @@ TEMPLATES: Final = {".docx": "docx", ".dotx": "docx", ".xlsx": "xlsx"}
 #: The answer's fields may take this many times ``max_chars`` as the job writes them; the api cuts them to its limit.
 FIELDS_ROOM: Final = 3
 
-#: Most names a warning or ``unfilled`` lists one by one.
+#: Most names a warning or ``unfilled`` lists one by one, and most characters a list of names in a warning takes.
 LISTED: Final = 20
+LISTED_ROOM: Final = 400
+
+#: The api's bounds: the longest name a value is given under, warning and location. A field whose name is longer
+#: cannot be filled and is not listed; a warning or a location is cut.
+MAX_NAME: Final = 255
+WARNING_MAX: Final = 2000
+LOCATION_MAX: Final = 300
 
 _DEFAULT_BUDGET_S: Final = 60.0
 _TYPES: Final = "{http://schemas.openxmlformats.org/package/2006/content-types}"
@@ -253,16 +260,56 @@ def _input(args: Mapping[str, Any], ctx: JobContext) -> tuple[Path, str]:
 
 
 def _listed(names: list[str]) -> str:
-    """List names for a sentence, at most :data:`LISTED` of them.
+    """List names for a sentence: at most :data:`LISTED` of them, in at most :data:`LISTED_ROOM` characters.
 
     Args:
         names: The names.
 
     Returns:
-        For example ``a, b and 3 more``.
+        For example ``a, b and 3 more``; the first name always, however long.
     """
-    shown = ", ".join(names[:LISTED])
-    return shown + (f" and {len(names) - LISTED} more" if len(names) > LISTED else "")
+    shown: list[str] = []
+    used = 0
+    for name in names[:LISTED]:
+        if shown and used + len(name) + 2 > LISTED_ROOM:
+            break
+        shown.append(name)
+        used += len(name) + 2
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more else "")
+
+
+def _nameable(fields: list[Field]) -> tuple[list[Field], str | None]:
+    """Leave out the fields whose names are longer than a value's name may be: they cannot be filled.
+
+    Args:
+        fields: The template's fields, each name once.
+
+    Returns:
+        The others, and a sentence on those left out, if any.
+    """
+    kept = [field for field in fields if len(field.name) <= MAX_NAME]
+    left = len(fields) - len(kept)
+    if not left:
+        return kept, None
+    names = "field has a name" if left == 1 else "fields have names"
+    return kept, (
+        f"{left} {names} longer than {MAX_NAME} characters, which no value can be given under, and "
+        f"{'is' if left == 1 else 'are'} not listed: rename {'it' if left == 1 else 'them'} in the template."
+    )
+
+
+def _cut(text: str, limit: int) -> str:
+    """Cut a text to at most ``limit`` characters, marking the cut.
+
+    Args:
+        text: The text.
+        limit: The most characters.
+
+    Returns:
+        The text, or its start and an ellipsis.
+    """
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _docx_fields(template: Any) -> tuple[list[Field], list[str]]:
@@ -276,10 +323,10 @@ def _docx_fields(template: Any) -> tuple[list[Field], list[str]]:
     """
     from workbench.executor.templates import docx_controls, docx_jinja
 
-    found = docx_controls.find(template.docx)
+    found = _library(lambda: docx_controls.find(template.docx))
     places = [spot.field for spot in found.spots]
-    if docx_jinja.has_code(template):
-        places += docx_jinja.fields(template, docx_jinja.environment())
+    if _library(lambda: docx_jinja.has_code(template)):
+        places += _library(lambda: docx_jinja.fields(template, docx_jinja.environment()))
     notes: list[str] = []
     if found.unnamed_controls:
         count = found.unnamed_controls
@@ -335,9 +382,13 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         else:
             from workbench.executor.templates import xlsx_placeholders
 
-            places = xlsx_placeholders.fields(_open_xlsx(path, ctx))
-        fields = merge(places)
-        kind = _kind(fields)
+            book = _open_xlsx(path, ctx)
+            places = _library(lambda: xlsx_placeholders.fields(book))
+        merged = merge(places)
+        fields, long_names = _nameable(merged)
+        if long_names is not None:
+            notes.append(long_names)
+        kind = _kind(merged)
         if kind == "none":
             notes.insert(
                 0, f"This template has no content controls, no form fields and no {{{{ }}}} placeholders: {NEEDS}."
@@ -345,7 +396,7 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         room = FIELDS_ROOM * ctx.max_chars
         listed: list[dict[str, Any]] = []
         for field in fields:
-            entry = field.as_dict()
+            entry = {**field.as_dict(), "location": _cut(field.location, LOCATION_MAX)}
             room -= len(json.dumps(entry)) + 2  # and the ", " before the next
             if room < 0:
                 break
@@ -353,7 +404,7 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         truncated = len(listed) < len(fields)  # the api says how many of how many it lists
         answer: dict[str, Any] = {"template_kind": kind, "fields": listed, "total": len(fields), "truncated": truncated}
         if notes:
-            answer["hint"] = " ".join(notes)
+            answer["hint"] = _cut(" ".join(notes), WARNING_MAX)
         return answer
 
     return _answered(work, budget)
@@ -382,10 +433,10 @@ def _fill_docx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
     if not names:
         raise Refusal("unsupported_template", _NO_FIELDS)
     env = docx_jinja.environment()
-    if docx_jinja.has_code(template):
+    if _library(lambda: docx_jinja.has_code(template)):
         _library(lambda: docx_jinja.render(template, values, env, warned))
     document = template.docx
-    docx_controls.fill(document, values, warned)
+    _library(lambda: docx_controls.fill(document, values, warned))
     return document, names
 
 
@@ -407,10 +458,10 @@ def _fill_xlsx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
     from workbench.executor.templates import xlsx_placeholders
 
     book = _open_xlsx(path, ctx)
-    names = [field.name for field in xlsx_placeholders.fields(book)]
+    names = [field.name for field in _library(lambda: xlsx_placeholders.fields(book))]
     if not names:
         raise Refusal("unsupported_template", _NO_FIELDS)
-    xlsx_placeholders.fill(book, values, warned)
+    _library(lambda: xlsx_placeholders.fill(book, values, warned))
     if xlsx_placeholders.unkept_parts(path):
         warned.append(
             "The template has charts, pivot tables, pictures or other drawings: the filled workbook may not keep them "
@@ -448,7 +499,14 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         values = {name: entry.get("value") for name, entry in entries.items()}
         sheets = sources.check(entries, ctx)
         warned: list[str] = []
-        filled_file, names = (_fill_docx if family == "docx" else _fill_xlsx)(path, ctx, values, warned)
+        filled_file, every = (_fill_docx if family == "docx" else _fill_xlsx)(path, ctx, values, warned)
+        names = [name for name in every if len(name) <= MAX_NAME]
+        if len(names) < len(every):
+            left = len(every) - len(names)
+            warned.append(
+                f"{left} {'field has a name' if left == 1 else 'fields have names'} longer than {MAX_NAME} characters "
+                "and cannot be filled."
+            )
         filled = [name for name in names if name in values]
         known = set(names)
         unused = [name for name in values if name not in known]
@@ -470,6 +528,6 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             unfilled = unfilled[: LISTED * 10]
         if len(warned) > LISTED:
             warned[LISTED - 1 :] = [f"{len(warned) - LISTED + 1} more warnings are not shown."]
-        return {"filled": filled, "unfilled": unfilled, "warnings": warned}
+        return {"filled": filled, "unfilled": unfilled, "warnings": [_cut(warning, WARNING_MAX) for warning in warned]}
 
     return _answered(work, budget)
