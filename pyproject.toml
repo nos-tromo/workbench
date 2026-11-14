@@ -23,13 +23,13 @@ executor = [
     "cryptography>=50.0.2",
     "docxtpl>=0.20.2",
     "lxml>=6.1.3",
-    "markdown-it-py>=4.2.0",
+    "markdown-it-py>=4.3.0",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "odfpy>=1.4.1",
     "openpyxl>=3.1.5",
     "pandas>=3.1.1",
-    "pypdf>=7.0.0",
+    "pypdf>=7.0.1",
     "python-docx>=1.2.0",
     "python-pptx>=1.0.2",
     "scipy>=1.18.1",
@@ -99,3 +99,6 @@ ignore-missing-imports = ["*"]
 
 [tool.uv]
 package = true
+# Security fixes are exempt from the 7-day cooldown. soupsieve comes with
+# beautifulsoup4: 4.1 fixes GHSA-f3mv-fm3p-593v, 4.1.1 GHSA-98qm-p6jx-5wj2.
+constraint-dependencies = ["soupsieve>=4.1.1"]
