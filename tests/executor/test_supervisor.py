@@ -8,6 +8,7 @@ import os
 import socket
 import stat
 import sys
+import tempfile
 import textwrap
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -18,10 +19,10 @@ from typing import Any
 import pytest
 
 from workbench.config import Settings, load_settings
-from workbench.executor import supervisor
+from workbench.executor import sandbox, supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
 from workbench.executor.sandbox import Slot
-from workbench.executor.supervisor import MAX_OUTPUTS, Supervisor, make_slots, startup_problem
+from workbench.executor.supervisor import MAX_OUTPUTS, NoUsableSlot, Supervisor, make_slots, startup_problem
 from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_result, encode
 
 pytestmark = pytest.mark.anyio
@@ -816,6 +817,20 @@ def _memory_max(tmp_path: Path, value: str) -> Path:
     return path
 
 
+MOUNTINFO = (
+    "105 92 0:51 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755\n"
+    "109 105 0:54 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw\n"
+    "112 105 0:61 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,nr_inodes=4096\n"
+)
+
+
+def _mountinfo(tmp_path: Path, content: str = MOUNTINFO) -> Path:
+    """A ``/proc/self/mountinfo`` holding ``content``."""
+    path = tmp_path / "mountinfo"
+    path.write_text(content)
+    return path
+
+
 def _sysctls(tmp_path: Path, hardlinks: str | None = "1", symlinks: str | None = "1") -> Path:
     """A ``/proc/sys/fs`` with the two link protections set as given; ``None`` leaves one out."""
     folder = tmp_path / "fs"
@@ -837,6 +852,8 @@ def test_a_well_set_up_host_passes_the_start_up_checks(memory: str | None, tmp_p
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=memory_max,
         sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=0,
     )
 
@@ -852,6 +869,8 @@ def test_too_little_container_memory_refuses_to_start(tmp_path: Path) -> None:
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=_memory_max(tmp_path, str(4 * 1536 * MB - 1)),
         sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=0,
     )
 
@@ -867,6 +886,8 @@ def test_missing_slot_users_refuse_to_start(tmp_path: Path) -> None:
         passwd=_passwd(tmp_path, range(20001, 20004)),
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=0,
     )
 
@@ -882,6 +903,8 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
         passwd=_passwd(tmp_path, range(20001, 20018)),
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=0,
     )
 
@@ -896,6 +919,8 @@ def test_a_supervisor_that_is_not_root_refuses_to_start(tmp_path: Path) -> None:
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=tmp_path / "x",
         sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=1000,
     )
 
@@ -920,10 +945,105 @@ def test_a_host_without_link_protection_refuses_to_start(
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path, hardlinks, symlinks),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=4096,
         euid=0,
     )
 
     assert found == problem
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        MOUNTINFO.replace("/dev/mqueue", "/dev/other"),
+        MOUNTINFO.replace("- mqueue mqueue", "- tmpfs tmpfs"),
+        "",
+    ],
+    ids=["not-mounted", "not-mqueue", "empty"],
+)
+def test_a_dev_mqueue_that_is_not_a_mounted_mqueue_refuses_to_start(content: str, tmp_path: Path) -> None:
+    """Without the mount, POSIX message queues a job leaves can be neither listed nor removed."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path, content),
+        shm_files=4096,
+        euid=0,
+    )
+
+    assert problem == "/dev/mqueue must be a mounted mqueue file system, so the slots' queues can be cleared"
+
+
+def test_unreadable_mount_information_refuses_to_start(tmp_path: Path) -> None:
+    """What cannot be checked is not taken on trust."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=tmp_path / "absent-mountinfo",
+        shm_files=4096,
+        euid=0,
+    )
+
+    assert problem == "/dev/mqueue must be a mounted mqueue file system, so the slots' queues can be cleared"
+
+
+@pytest.mark.parametrize("files", [0, sandbox.IPC_ENTRY_LIMIT + 1, 1_529_122])
+def test_a_dev_shm_that_can_hold_more_files_than_the_cleanup_looks_at_refuses_to_start(
+    files: int, tmp_path: Path
+) -> None:
+    """A job could fill an unbounded ``/dev/shm`` past the cleanup's limit and so fail every other slot."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=files,
+        euid=0,
+    )
+
+    assert problem == "/dev/shm must hold at most 100000 files (mount it with nr_inodes), so no job can fill it"
+
+
+def test_a_dev_shm_up_to_the_limit_passes(tmp_path: Path) -> None:
+    """The limit itself is allowed."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm_files=sandbox.IPC_ENTRY_LIMIT,
+        euid=0,
+    )
+
+    assert problem is None
+
+
+def test_main_exits_with_one_short_line_when_no_slot_is_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With every slot retired the process ends, non-zero, so its restart brings fresh IPC and slots."""
+
+    async def exhausted(self: Supervisor) -> None:
+        """End as serving does once the last slot is retired."""
+        raise NoUsableSlot("every slot is retired (2 of 2); exiting so the container restarts")
+
+    monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
+    monkeypatch.setattr(Supervisor, "serve", exhausted)
+
+    assert supervisor.main() == 1
+
+    assert capsys.readouterr().err == (
+        "workbench executor: every slot is retired (2 of 2); exiting so the container restarts\n"
+    )
 
 
 def test_main_refuses_to_start_with_one_short_line(
@@ -1056,6 +1176,32 @@ async def test_a_malformed_request_gets_an_error_line_and_nothing_is_logged(
     assert "quarterly" not in caplog.text
     assert "chat-1" not in caplog.text
     assert _entries(served / "jobs") == []
+
+
+async def test_serve_ends_when_its_last_slot_is_retired(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The request that retired the last slot is still answered; then serving ends with ``NoUsableSlot``."""
+    _fake_run(monkeypatch, [RuntimeError("processes of slot 0 survived the cleanup")])
+    sup = Supervisor(_settings(served, WORKBENCH_EXECUTOR_SLOTS="1"), use_slots=False)
+
+    serving = asyncio.create_task(sup.serve())
+    answer = decode_result(await _ask(_sock(served), encode(_request())))
+    with pytest.raises(NoUsableSlot) as ended:
+        await asyncio.wait_for(serving, 10)
+
+    assert answer.message == "the job's processes could not be stopped"
+    assert str(ended.value) == "every slot is retired (1 of 1); exiting so the container restarts"
+
+
+async def test_serve_goes_on_while_a_slot_is_usable(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One retired slot of two leaves the executor serving on the other."""
+    _fake_run(monkeypatch, [RuntimeError("x"), None])
+    sup = Supervisor(_settings(served), use_slots=False)
+
+    async with _serving(sup):
+        first = decode_result(await _ask(_sock(served), encode(_request())))
+        second = decode_result(await _ask(_sock(served), encode(_request())))
+
+    assert (first.status, second.status) == ("error", "ok")
 
 
 async def test_a_stale_socket_is_replaced(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1385,3 +1531,145 @@ async def test_as_root_a_socket_folder_the_api_owns_stops_serve(root_volume: Pat
 
     with pytest.raises(RuntimeError, match="the socket's folder must be root's alone"):
         await asyncio.wait_for(Supervisor(_settings(root_volume)).serve(), 10)
+
+
+HAND_OVER_JOB = """
+import ctypes, struct, time
+libc = ctypes.CDLL(None, use_errno=True)
+target, how, end = int(spec["args"]["target"]), spec["args"]["how"], time.time() + float(spec["args"]["secs"])
+me = os.getuid()
+def owner(ident, uid):
+    state = ctypes.create_string_buffer(512)
+    if libc.shmctl(ident, 2, state) == 0:
+        struct.pack_into("I", state, 4, uid)
+        libc.shmctl(ident, 1, state)
+live = []
+while time.time() < end:
+    if how == "give":
+        ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+        if ident >= 0:
+            owner(ident, target)
+            live.append(ident)
+        if len(live) > 64:
+            libc.shmctl(live.pop(0), 0, None)
+    else:
+        if not live:
+            live = [libc.shmget(0, 4096, 0o1000 | 0o600) for _ in range(16)]
+        for ident in live:
+            owner(ident, target)
+            owner(ident, me)
+result = {"uid": me}
+"""
+QUICK = 'result = {"uid": os.getuid()}'
+
+
+@pytest.mark.parametrize("how", ["give", "flip"])
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_in_another_slot_cannot_retire_a_slot_through_ipc_set(
+    how: str, root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Handing segments to another slot's uid, or flipping their owner back and forth, retires nothing."""
+    _chat(root_volume)
+    sup = Supervisor(_settings(root_volume))
+    _runner(monkeypatch, HAND_OVER_JOB)
+    attacker = asyncio.create_task(sup.run_job(_request(args={"target": 20002, "how": how, "secs": 6})))
+    await asyncio.sleep(1)
+    _runner(monkeypatch, QUICK)
+
+    victims = [await sup.run_job(_request()) for _ in range(5)]
+    attack = await attacker
+    both = await asyncio.gather(sup.run_job(_request()), sup.run_job(_request()))
+
+    assert [(v.status, v.result) for v in victims] == [("ok", {"uid": 20002})] * 5
+    assert attack.status == "ok"
+    assert sorted(a.result["uid"] for a in both) == [20001, 20002]
+
+
+TRAPS_JOB = """
+os.mkdir("/dev/shm/wb-locked")
+pathlib.Path("/dev/shm/wb-locked/note").write_text("synthetic note of user a")
+os.chmod("/dev/shm/wb-locked", 0)
+os.mkdir("/dev/shm/wb-deep")
+os.chdir("/dev/shm/wb-deep")
+for _ in range(2100):
+    os.mkdir("d")
+    os.chdir("d")
+pathlib.Path("note").write_text("synthetic note of user a")
+result = {"uid": os.getuid()}
+"""
+LOOK_FOR_TRAPS = 'result = {"uid": os.getuid(), "left": sorted(os.listdir("/dev/shm"))}'
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_cannot_retire_its_own_slot_with_a_locked_or_deep_folder(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder its owner made unreadable and a chain deeper than ``PATH_MAX`` are both cleared."""
+    _chat(root_volume)
+    (root_volume / "workspaces" / CALLER / "user-b" / CHAT).mkdir(parents=True)
+    sup = Supervisor(_settings(root_volume, WORKBENCH_EXECUTOR_SLOTS="1"))
+
+    _runner(monkeypatch, TRAPS_JOB)
+    first = await sup.run_job(_request())
+    _runner(monkeypatch, LOOK_FOR_TRAPS)
+    second = await sup.run_job(_request(user_id="user-b"))
+
+    assert (first.status, first.result) == ("ok", {"uid": 20001})
+    assert (second.status, second.result) == ("ok", {"uid": 20001, "left": []})
+
+
+HOLD_JOB = """
+import ctypes, time
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+end = time.time() + 20
+while time.time() < end and (ident := libc.shmget(0x57D0, 0, 0)) < 0:
+    time.sleep(0.01)
+libc.shmat(ident, None, 0)
+pathlib.Path(spec["args"]["held"]).write_text("held")
+time.sleep(float(spec["args"]["secs"]))
+result = {"uid": os.getuid()}
+"""
+SHARE_JOB = """
+import ctypes, time
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+ident = libc.shmget(0x57D0, 4096, 0o1000 | 0o666)
+ctypes.memmove(libc.shmat(ident, None, 0), b"synthetic note of user a\\0", 25)
+end = time.time() + 20
+while time.time() < end and not os.path.exists(spec["args"]["held"]):
+    time.sleep(0.01)
+result = {"uid": os.getuid(), "shmid": ident}
+"""
+ATTACH_JOB = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+at = libc.shmat(int(spec["args"]["shmid"]), None, 0)
+result = {"uid": os.getuid(), "attached": at not in (None, ctypes.c_void_p(-1).value)}
+"""
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_segment_another_slot_keeps_attached_neither_retires_the_slot_nor_reaches_its_next_job(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The segment is marked for destruction and closed to everyone; the slot stays usable."""
+    _chat(root_volume)
+    (root_volume / "workspaces" / CALLER / "user-c" / CHAT).mkdir(parents=True)
+    held = Path(tempfile.mkdtemp(dir=root_volume.parent))
+    held.chmod(0o777)
+    sup = Supervisor(_settings(root_volume))
+
+    _runner(monkeypatch, HOLD_JOB)
+    holder = asyncio.create_task(sup.run_job(_request(args={"held": str(held / "held"), "secs": 4})))
+    await asyncio.sleep(0.5)
+    _runner(monkeypatch, SHARE_JOB)
+    sharer = await sup.run_job(_request(args={"held": str(held / "held")}))
+    _runner(monkeypatch, ATTACH_JOB)
+    after = await sup.run_job(_request(user_id="user-c", args={"shmid": sharer.result["shmid"]}))
+    holding = await holder
+
+    assert (sharer.status, sharer.result["uid"]) == ("ok", 20002)
+    assert (after.status, after.result) == ("ok", {"uid": 20002, "attached": False})
+    assert (holding.status, holding.result) == ("ok", {"uid": 20001})

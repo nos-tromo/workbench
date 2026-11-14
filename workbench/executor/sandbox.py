@@ -15,6 +15,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
+from workbench.executor.fs import DIR_FLAGS, closing
 from workbench.protocol import Limits
 
 MB = 1024 * 1024
@@ -65,15 +66,23 @@ except ProcessLookupError:
     pass
 """
 )
-# Removes, as the slot, what outlives its processes. SysV objects whose owner or creator is the uid
-# get IPC_RMID (0), which only their owner or creator may send without CAP_IPC_OWNER; ctypes is
-# loaded only when there are any. Files, folders, POSIX semaphores and shared memory below the
-# folders named after the ids (/dev/shm, and /dev/mqueue for message queues) are unlinked when
-# the uid owns them, deepest first; links are removed, never followed. Errors are left for the
-# supervisor's second look to find.
+# Removes, as the slot, what outlives its processes; argv[3] is the entry limit, argv[4:] the folders.
+# SysV objects the uid owns or made get IPC_RMID (0), which only their owner or creator may send
+# without CAP_IPC_OWNER; ctypes is loaded only when there are any. A shared memory segment first
+# gets mode 0 through IPC_STAT (2) and IPC_SET (1): if another slot keeps it attached, IPC_RMID only
+# marks it, and Linux would still let its owner attach a marked segment by id. The mode is the
+# 16 bits at offset 20 of struct ipc_perm on 64-bit little-endian Linux; the uid read back at offset 4
+# confirms that layout before anything is written.
+# Below the folders, entries the uid owns are removed and folders it owns are entered, by
+# descriptor, never by path, so neither a mode the job set nor a depth past PATH_MAX stops it: each
+# folder gets 0700 through an O_PATH handle before it is listed, and the walk climbs back through
+# ".." of the folder it is in, which nobody else can move, so it keeps one folder open at a time.
+# Others' entries are never entered. Past the entry limit the helper fails (exit 4). Other errors
+# are left for the supervisor's second look to find.
 _DROP_AND_CLEAR = (
     _DROP
     + """\
+limit, tops = int(sys.argv[3]), sys.argv[4:]
 doomed = []
 for table, column in (("shm", "shmid"), ("msg", "msqid"), ("sem", "semid")):
     try:
@@ -83,53 +92,96 @@ for table, column in (("shm", "shmid"), ("msg", "msqid"), ("sem", "semid")):
             for row in rows:
                 cells = row.split()
                 if uid in (int(cells[owner]), int(cells[creator])):
-                    doomed.append((table, int(cells[at])))
+                    doomed.append((table, int(cells[at]), int(cells[owner])))
     except FileNotFoundError:
         pass
 if doomed:
     import ctypes
     libc = ctypes.CDLL(None)
-    for table, ident in doomed:
+    state = ctypes.create_string_buffer(512)
+    for table, ident, owner in doomed:
         if table == "shm":
+            if libc.shmctl(ident, 2, state) == 0 and int.from_bytes(state.raw[4:8], "little") == owner:
+                state[20:22] = bytes(2)
+                libc.shmctl(ident, 1, state)
             libc.shmctl(ident, 0, None)
         elif table == "msg":
             libc.msgctl(ident, 0, None)
         else:
             libc.semctl(ident, 0, 0)
-for top in sys.argv[3:]:
-    folders, mine = [top], []
-    while folders:
-        folder = folders.pop()
-        try:
-            names = os.listdir(folder)
-        except OSError:
-            continue
-        for name in names:
-            path = folder + "/" + name
+FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+seen = 0
+for top in tops:
+    try:
+        here = os.open(top, FOLDER)
+    except OSError:
+        continue
+    names = os.listdir(here)
+    seen += len(names)
+    levels = []
+    while True:
+        if seen > limit:
+            sys.exit(4)
+        if names:
+            name = names.pop()
             try:
-                st = os.lstat(path)
+                st = os.stat(name, dir_fd=here, follow_symlinks=False)
             except OSError:
                 continue
-            if st.st_mode & 0o170000 == 0o040000:
-                folders.append(path)
-                if st.st_uid == uid:
-                    mine.append(path)
-            elif st.st_uid == uid:
+            if st.st_uid != uid:
+                continue
+            if st.st_mode & 0o170000 != 0o040000:
                 try:
-                    os.unlink(path)
+                    os.unlink(name, dir_fd=here)
                 except OSError:
                     pass
-    for path in reversed(mine):
-        try:
-            os.rmdir(path)
-        except OSError:
-            pass
+                continue
+            try:
+                handle = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=here)
+            except OSError:
+                continue
+            try:
+                if os.fstat(handle).st_uid != uid:
+                    continue
+                os.chmod("/proc/self/fd/%d" % handle, 0o700)
+                inner = os.open(".", FOLDER, dir_fd=handle)
+            except OSError:
+                continue
+            finally:
+                os.close(handle)
+            try:
+                inner_names = os.listdir(inner)
+            except OSError:
+                os.close(inner)
+                continue
+            seen += len(inner_names)
+            levels.append((names, name))
+            os.close(here)
+            here, names = inner, inner_names
+        elif levels:
+            names, name = levels.pop()
+            parent = os.open("..", FOLDER, dir_fd=here)
+            os.close(here)
+            here = parent
+            try:
+                os.rmdir(name, dir_fd=here)
+            except OSError:
+                pass
+        else:
+            os.close(here)
+            break
 """
 )
 # Where the kernel keeps IPC that outlives processes, as files: POSIX shared memory and semaphores,
 # and POSIX message queues where their file system is mounted.
 _IPC_FOLDERS = ("/dev/shm", "/dev/mqueue")
+# Most entries a look at those folders, or the helper's walk below them, goes through; past it the
+# slot is not clear. The supervisor refuses to start unless /dev/shm holds fewer files than this, so
+# no job can fill it past the limit to fail another slot's cleanup.
+IPC_ENTRY_LIMIT = 100_000
+_IPC_ENTRY_LIMIT = IPC_ENTRY_LIMIT
 _SYSVIPC = Path("/proc/sysvipc")
+_SHM_DEST = 0o1000  # in the perms of /proc/sysvipc/shm: removed, but still attached somewhere
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
 
@@ -369,86 +421,167 @@ def _clear_ipc_as_slot(slot: Slot) -> None:
         RuntimeError: The helper failed or timed out (``_run_as_slot``).
     """
     folders = [folder for folder in _IPC_FOLDERS if os.path.isdir(folder)]
-    _run_as_slot(_DROP_AND_CLEAR, slot, folders, f"could not clear the IPC objects of slot {slot.index}")
+    extra = [str(_IPC_ENTRY_LIMIT), *folders]
+    _run_as_slot(_DROP_AND_CLEAR, slot, extra, f"could not clear the IPC objects of slot {slot.index}")
 
 
-def _sysv_table_holds(table: bytes, uid: int) -> bool:
-    """Tell from a ``/proc/sysvipc`` table whether ``uid`` owns or created one of its objects.
+def _sysv_rows(table: bytes) -> list[dict[bytes, int]]:
+    """Read a ``/proc/sysvipc`` table.
 
     Args:
-        table: The table's contents: a header naming the columns, then one object per line.
-        uid: The user id to look for.
+        table: Its contents: a header naming the columns, then one object per line.
 
     Returns:
-        Whether a row's ``uid`` or ``cuid`` is ``uid``.
+        One mapping per object from column name to value; ``perms`` is read as octal.
 
     Raises:
-        ValueError: The header has no ``uid`` or ``cuid`` column, or a cell is not a number.
-        IndexError: A row is shorter than the header.
+        ValueError: A row's length differs from the header's, or a cell is not a number.
     """
     lines = table.split(b"\n")
     head = lines[0].split()
-    owner, creator = head.index(b"uid"), head.index(b"cuid")
+    rows = []
     for line in lines[1:]:
         cells = line.split()
-        if cells and uid in (int(cells[owner]), int(cells[creator])):
+        if cells:
+            pairs = zip(head, cells, strict=True)
+            rows.append({name: int(cell, 8 if name == b"perms" else 10) for name, cell in pairs})
+    return rows
+
+
+def _sysv_table_holds(table: bytes, uid: int) -> bool:
+    """Tell whether a ``/proc/sysvipc`` table holds an object ``uid`` owns or made: the first look.
+
+    Args:
+        table: The table's contents.
+        uid: The user id to look for.
+
+    Returns:
+        Whether a row's ``uid`` or ``cuid`` is ``uid``; either may hold what the slot's job wrote.
+
+    Raises:
+        KeyError: The header has no ``uid`` or ``cuid`` column.
+        ValueError: The table has an unexpected shape.
+    """
+    return any(uid in (row[b"uid"], row[b"cuid"]) for row in _sysv_rows(table))
+
+
+def _sysv_table_left(table: bytes, uid: int, *, shm: bool) -> bool:
+    """Tell whether a ``/proc/sysvipc`` table still holds an object ``uid`` made: the second look.
+
+    Only the creator counts. Another slot's job can hand objects it made to any uid with
+    ``IPC_SET``, at any moment, so judging by owner would let it fail this slot's cleanup at will;
+    the creator never changes, and only the slot's own processes, all gone now, could have made one.
+    What another slot made and handed over cannot hold anything of this slot's last job unless
+    that job wrote it there while it ran, and the other slot, as its creator, can read it anyway.
+
+    Args:
+        table: The table's contents.
+        uid: The user id to look for.
+        shm: Whether this is the shared memory table, where a segment marked ``SHM_DEST`` is
+            already removed and kept only for the other slot that still has it attached.
+
+    Returns:
+        Whether an object ``uid`` made is still there.
+
+    Raises:
+        KeyError: The header has no ``cuid`` or ``perms`` column.
+        ValueError: The table has an unexpected shape.
+    """
+    return any(row[b"cuid"] == uid and not (shm and row[b"perms"] & _SHM_DEST) for row in _sysv_rows(table))
+
+
+def _folder_holds(top: str, uid: int) -> bool:
+    """Look at the entries directly in ``top`` for one ``uid`` owns.
+
+    Whatever a slot leaves below such a folder starts with an entry of its own here, a file or a
+    folder, so the top is enough. The helper enters only folders the slot owns, for the same reason.
+    The look goes through at most ``_IPC_ENTRY_LIMIT`` entries.
+
+    Args:
+        top: A folder, such as ``/dev/shm``, opened without following a link.
+        uid: The user id to look for.
+
+    Returns:
+        Whether an entry belongs to ``uid``, or the folder holds more entries than the limit and
+        so cannot be judged clear. A missing folder holds nothing.
+
+    Raises:
+        OSError: The folder is a link or cannot be read.
+    """
+    try:
+        fd = os.open(top, DIR_FLAGS)
+    except FileNotFoundError:
+        return False
+    with closing(fd), os.scandir(fd) as entries:
+        for count, entry in enumerate(entries, start=1):
+            if count > _IPC_ENTRY_LIMIT:
+                return True
+            try:
+                if entry.stat(follow_symlinks=False).st_uid == uid:
+                    return True
+            except FileNotFoundError:
+                continue
+    return False
+
+
+def _sysv_holds(uid: int, judge: Callable[[bytes, str], bool]) -> bool:
+    """Apply ``judge`` to each ``/proc/sysvipc`` table there is.
+
+    Args:
+        uid: The slot's user id; only for the caller's judge.
+        judge: Called with a table's contents and its name.
+
+    Returns:
+        Whether ``judge`` holds for any table.
+
+    Raises:
+        OSError: A table cannot be read.
+    """
+    for name in ("shm", "msg", "sem"):
+        try:
+            content = (_SYSVIPC / name).read_bytes()
+        except FileNotFoundError:
+            continue
+        if judge(content, name):
             return True
     return False
 
 
-def _folder_holds(top: str, uid: int) -> bool:
-    """Look below ``top`` for anything ``uid`` owns, without following links.
-
-    Args:
-        top: A folder, such as ``/dev/shm``.
-        uid: The user id to look for.
-
-    Returns:
-        Whether a file, folder or link below ``top`` belongs to ``uid``. A folder that vanishes
-        while it is looked at counts as empty.
-
-    Raises:
-        OSError: A folder could not be read for another reason.
-    """
-    folders = [top]
-    while folders:
-        try:
-            entries = list(os.scandir(folders.pop()))
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        for entry in entries:
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            if st.st_uid == uid:
-                return True
-            if entry.is_dir(follow_symlinks=False):
-                folders.append(entry.path)
-    return False
-
-
 def _slot_has_ipc(uid: int) -> bool:
-    """Look for IPC the uid left: SysV objects it owns or made, and files below ``_IPC_FOLDERS``.
+    """The first look: IPC the uid owns or made, or an entry of its below ``_IPC_FOLDERS``.
 
     Args:
         uid: The slot's user id.
 
     Returns:
-        Whether there is any.
+        Whether there is any, so the helper must run.
 
     Raises:
         OSError: A table or folder could not be read.
+        KeyError: A table lacks a column.
         ValueError: A table has an unexpected shape.
-        IndexError: A row of a table is short.
     """
-    for table in ("shm", "msg", "sem"):
-        try:
-            content = (_SYSVIPC / table).read_bytes()
-        except FileNotFoundError:
-            continue
-        if _sysv_table_holds(content, uid):
-            return True
+    if _sysv_holds(uid, lambda table, name: _sysv_table_holds(table, uid)):
+        return True
+    return any(_folder_holds(folder, uid) for folder in _IPC_FOLDERS)
+
+
+def _slot_left_ipc(uid: int) -> bool:
+    """The second look: IPC the uid made (``_sysv_table_left``), or an entry of its below ``_IPC_FOLDERS``.
+
+    Args:
+        uid: The slot's user id.
+
+    Returns:
+        Whether any is left, so the slot is not clear.
+
+    Raises:
+        OSError: A table or folder could not be read.
+        KeyError: A table lacks a column.
+        ValueError: A table has an unexpected shape.
+    """
+    if _sysv_holds(uid, lambda table, name: _sysv_table_left(table, uid, shm=name == "shm")):
+        return True
     return any(_folder_holds(folder, uid) for folder in _IPC_FOLDERS)
 
 
@@ -474,9 +607,10 @@ def kill_slot_processes(slot: Slot | None) -> None:
     Then the IPC: a SysV shared memory segment, message queue or semaphore set, or a file in
     ``/dev/shm`` or ``/dev/mqueue``, outlives the job, and the slot's next job, perhaps another
     user's, would run as its owner. Once no process of the uid is left, so none can make more,
-    the tables in ``/proc/sysvipc`` and those folders are searched for anything of the uid. If
-    there is, a second helper, run like the first, removes it as the slot (``_DROP_AND_CLEAR``),
-    and a second look must find nothing. That adds at most one more helper run of 30 s.
+    the tables in ``/proc/sysvipc`` and those folders are searched for anything the uid owns or
+    made (``_slot_has_ipc``). If there is, a second helper, run like the first, removes it as the
+    slot (``_DROP_AND_CLEAR``), and a second look must find nothing the uid made: objects by
+    creator, entries by owner (``_slot_left_ipc``). That adds at most one more helper run of 30 s.
 
     It blocks, so call it from a thread. Does nothing without a slot or off Linux.
 
@@ -485,8 +619,9 @@ def kill_slot_processes(slot: Slot | None) -> None:
 
     Raises:
         RuntimeError: The only failure. Processes or IPC of the slot remain after the cleanup, a
-            helper failed or timed out, ``/proc`` could not be checked, or the slot runs as root.
-            The message names only the slot's index. The slot must not be reused.
+            helper failed or timed out, ``/proc`` or the IPC could not be checked, or the slot runs
+            as root. The message says which, naming only the slot's index. The slot must not be
+            reused.
     """
     if slot is None:
         return
@@ -503,12 +638,15 @@ def kill_slot_processes(slot: Slot | None) -> None:
                 break
         else:
             raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
-        if _slot_has_ipc(slot.uid):
-            _clear_ipc_as_slot(slot)
-            if _slot_has_ipc(slot.uid):
-                raise RuntimeError(f"IPC objects of slot {slot.index} survived the cleanup")
     except (OSError, KeyError, ValueError, IndexError) as exc:
         raise RuntimeError(f"processes of slot {slot.index} could not be checked") from exc
+    try:
+        if _slot_has_ipc(slot.uid):
+            _clear_ipc_as_slot(slot)
+            if _slot_left_ipc(slot.uid):  # a RuntimeError passes the handler below unchanged
+                raise RuntimeError(f"IPC objects of slot {slot.index} survived the cleanup")
+    except (OSError, KeyError, ValueError, IndexError) as exc:
+        raise RuntimeError(f"IPC objects of slot {slot.index} could not be checked") from exc
 
 
 def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:

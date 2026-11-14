@@ -944,36 +944,36 @@ async def test_a_failed_drop_is_cleared_on_the_given_pool_too(tmp_path: Path, mo
 # --- what a slot leaves besides processes: SysV IPC, /dev/shm, /dev/mqueue ---------------------
 
 
-def _linux_cleanup(monkeypatch: pytest.MonkeyPatch, events: list[str], *, ipc: list[bool]) -> None:
-    """Stand in for every step of the slot cleanup, noting the order; ``ipc`` answers the IPC looks."""
-    answers = iter(ipc)
+def _linux_cleanup(monkeypatch: pytest.MonkeyPatch, events: list[str], *, found: bool, left: bool = False) -> None:
+    """Stand in for every step of the slot cleanup, noting the order; ``found`` and ``left`` answer the two looks."""
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: events.append("kill"))
     monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: events.append("look") or False)
-    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: events.append("ipc?") or next(answers))
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: events.append("ipc?") or found)
     monkeypatch.setattr(sandbox, "_clear_ipc_as_slot", lambda slot: events.append("clear"))
+    monkeypatch.setattr(sandbox, "_slot_left_ipc", lambda uid: events.append("left?") or left)
 
 
 def test_slot_cleanup_clears_ipc_once_no_process_is_left_and_looks_again(monkeypatch: pytest.MonkeyPatch) -> None:
     """IPC is cleared after the last process is gone, so nothing can make more; a second look verifies it."""
     events: list[str] = []
-    _linux_cleanup(monkeypatch, events, ipc=[True, False])
+    _linux_cleanup(monkeypatch, events, found=True)
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
-    assert events == ["kill", "look", "ipc?", "clear", "ipc?"]
+    assert events == ["kill", "look", "ipc?", "clear", "left?"]
 
 
 def test_slot_cleanup_runs_no_ipc_helper_when_the_slot_left_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """The common case costs one look and no second helper."""
     events: list[str] = []
-    _linux_cleanup(monkeypatch, events, ipc=[False])
+    _linux_cleanup(monkeypatch, events, found=False)
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
     assert events == ["kill", "look", "ipc?"]
 
 
 def test_ipc_that_survives_the_clear_fails_the_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Whatever stays behind could reach the slot's next job, another user's perhaps: the slot is retired."""
+    """Whatever the slot made and left could reach its next job, another user's perhaps: the slot is retired."""
     events: list[str] = []
-    _linux_cleanup(monkeypatch, events, ipc=[True, True])
+    _linux_cleanup(monkeypatch, events, found=True, left=True)
     with pytest.raises(RuntimeError) as raised:
         kill_slot_processes(Slot(index=2, uid=20003, gid=20003))
     assert str(raised.value) == "IPC objects of slot 2 survived the cleanup"
@@ -990,20 +990,24 @@ def test_ipc_is_not_touched_while_processes_survive(monkeypatch: pytest.MonkeyPa
         kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
 
 
+@pytest.mark.parametrize("which", ["_slot_has_ipc", "_slot_left_ipc"])
 @pytest.mark.parametrize("error", [OSError("no /proc/sysvipc"), ValueError("x"), IndexError("y")])
-def test_ipc_that_cannot_be_checked_fails_the_cleanup(error: Exception, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A look that fails is not a clean look."""
+def test_ipc_that_cannot_be_checked_fails_the_cleanup_and_says_so(
+    which: str, error: Exception, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A look that fails is not a clean look; the message says it was the IPC, naming only the slot."""
 
     def look(uid: int) -> bool:
         """Fail as an unreadable table does."""
         raise error
 
     events: list[str] = []
-    _linux_cleanup(monkeypatch, events, ipc=[])
-    monkeypatch.setattr(sandbox, "_slot_has_ipc", look)
+    _linux_cleanup(monkeypatch, events, found=True)
+    monkeypatch.setattr(sandbox, which, look)
     with pytest.raises(RuntimeError) as raised:
         kill_slot_processes(Slot(index=1, uid=20002, gid=20002))
-    assert str(raised.value) == "processes of slot 1 could not be checked"
+    assert str(raised.value) == "IPC objects of slot 1 could not be checked"
+    assert raised.value.__cause__ is error
 
 
 @pytest.mark.parametrize("outcome", ["exit 1", "timeout"])
@@ -1025,7 +1029,8 @@ def test_an_ipc_helper_that_fails_or_hangs_fails_the_cleanup(outcome: str, monke
     assert seen["timeout"] == 30
     assert "preexec_fn" not in seen
     assert seen["argv"][4] == sandbox._DROP_AND_CLEAR
-    assert seen["argv"][5:7] == ["20004", "20005"]
+    assert seen["argv"][5:8] == ["20004", "20005", str(sandbox._IPC_ENTRY_LIMIT)]
+    assert sandbox._IPC_ENTRY_LIMIT == 100_000
     assert seen["env"] == dict(sandbox.CLEAN_ENV)
 
 
@@ -1078,18 +1083,76 @@ SYSV_SEM = (
     ],
 )
 def test_sysv_objects_of_a_slot_are_found_by_owner_or_creator(table: bytes, uid: int, held: bool) -> None:
-    """``IPC_SET`` can hand an object's owner to another uid; the creator stays, so both columns count."""
+    """The first look sends the helper for anything the uid owns or made: it may hold the job's data."""
     assert sandbox._sysv_table_holds(table, uid) is held
 
 
-def test_a_slot_file_is_found_anywhere_below_an_ipc_folder(tmp_path: Path) -> None:
-    """A folder is walked through, without following links; ownership is what counts."""
+SHM_HEAD = b"       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime\n"
+MSG_HEAD = b"       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime\n"
+
+
+def _shm_table(perms: str, uid: int, cuid: int) -> bytes:
+    """A one-segment ``/proc/sysvipc/shm`` with the given perms (octal), owner and creator."""
+    return (
+        SHM_HEAD
+        + f"     22337          5 {perms:>5}  4096     8     0      1 {uid} {uid} {cuid} {cuid}      0\n".encode()
+    )
+
+
+def _msg_table(perms: str, uid: int, cuid: int) -> bytes:
+    """A one-queue ``/proc/sysvipc/msg`` with the given perms (octal), owner and creator."""
+    return (
+        MSG_HEAD
+        + f"     22338          0 {perms:>5}      0      0     0     0 {uid} {uid} {cuid} {cuid}      0\n".encode()
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "shm", "uid", "left"),
+    [
+        (_shm_table("600", 20009, 20001), True, 20001, True),  # made by the slot, handed away: still the slot's
+        (_shm_table("600", 20001, 20009), True, 20001, False),  # handed to the slot by its maker: the maker's
+        (_shm_table("1000", 20002, 20002), True, 20002, False),  # destroy-pending, attached elsewhere: gone
+        (_shm_table("1600", 20002, 20002), True, 20002, False),
+        (_shm_table("600", 20002, 20002), True, 20002, True),
+        (_msg_table("1600", 20003, 20003), False, 20003, True),  # the destroy bit means nothing for queues
+        (_msg_table("600", 20003, 20003), False, 20001, False),
+    ],
+)
+def test_the_second_look_judges_sysv_objects_by_their_creator(table: bytes, shm: bool, uid: int, left: bool) -> None:
+    """Another slot can hand its own objects to any uid at will, but can never make one the slot made."""
+    assert sandbox._sysv_table_left(table, uid, shm=shm) is left
+
+
+def test_a_slot_entry_is_found_at_the_top_of_an_ipc_folder(tmp_path: Path) -> None:
+    """Whatever a slot makes there starts with an entry of its own at the top, file or folder."""
     me = os.getuid()
     assert sandbox._folder_holds(str(tmp_path), me) is False
     assert sandbox._folder_holds(str(tmp_path / "missing"), me) is False
     (tmp_path / "a" / "b").mkdir(parents=True)
-    assert sandbox._folder_holds(str(tmp_path), me) is True  # the folders are the uid's too
+    assert sandbox._folder_holds(str(tmp_path), me) is True
     assert sandbox._folder_holds(str(tmp_path), me + 12345) is False
+
+
+def test_the_look_at_an_ipc_folder_is_bounded_and_counts_as_dirty_past_its_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """More entries than the limit are not looked through; the slot is then not clear."""
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 3)
+    for n in range(3):
+        (tmp_path / f"other-{n}").write_text("")
+    assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is False
+    (tmp_path / "other-3").write_text("")
+    assert sandbox._folder_holds(str(tmp_path), os.getuid() + 12345) is True
+
+
+def test_an_ipc_folder_that_is_a_symlink_is_not_looked_through(tmp_path: Path) -> None:
+    """The top folders are opened without following a link."""
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "f").write_text("")
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    with pytest.raises(OSError):
+        sandbox._folder_holds(str(tmp_path / "link"), os.getuid())
 
 
 MAKE_IPC = """\
@@ -1150,3 +1213,196 @@ def test_as_root_a_slot_cleanup_removes_its_ipc_and_nothing_of_others() -> None:
     finally:
         kill_slot_processes(other)
     assert _ipc_of(other.uid) == []
+
+
+def _start_as(slot: Slot, code: str, *args: str) -> subprocess.Popen[bytes]:
+    """Start ``code`` as the slot's uid in the background."""
+
+    def drop() -> None:
+        """Become the slot."""
+        os.setgroups([])
+        os.setgid(slot.gid)
+        os.setuid(slot.uid)
+
+    return subprocess.Popen([sys.executable, "-I", "-c", code, *args], preexec_fn=drop)
+
+
+def _run_as(slot: Slot, code: str, *args: str) -> int:
+    """Run ``code`` as the slot's uid and return its exit code."""
+    process = _start_as(slot, code, *args)
+    return process.wait(timeout=120)
+
+
+TRAPS = """\
+import os, pathlib, sys
+top = "/dev/shm/wb-" + sys.argv[1]
+os.mkdir(top + "-locked")
+pathlib.Path(top + "-locked/note").write_text("synthetic note")
+os.mkdir(top + "-locked/inner")
+pathlib.Path(top + "-locked/inner/note").write_text("synthetic note")
+os.chmod(top + "-locked/inner", 0)
+os.chmod(top + "-locked", 0)
+os.mkdir(top + "-deep")
+os.chdir(top + "-deep")
+for _ in range(2100):
+    os.mkdir("d")
+    os.chdir("d")
+pathlib.Path("note").write_text("synthetic note")
+"""
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_locked_folder_and_a_chain_deeper_than_path_max_are_cleared() -> None:
+    """A job cannot keep its own leftovers out of reach: modes are reset and the walk needs no long paths."""
+    slot = Slot(index=6, uid=20007, gid=20007)
+    assert _run_as(slot, TRAPS, "traps") == 0
+    assert os.path.isdir("/dev/shm/wb-traps-locked") and os.path.isdir("/dev/shm/wb-traps-deep")
+
+    kill_slot_processes(slot)
+
+    assert not os.path.lexists("/dev/shm/wb-traps-locked")
+    assert not os.path.lexists("/dev/shm/wb-traps-deep")
+    assert _ipc_of(slot.uid) == []
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_the_ipc_helper_gives_up_past_its_entry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The walk is bounded; a slot whose leftovers exceed it is not clear and must be retired."""
+    slot = Slot(index=6, uid=20007, gid=20007)
+    many = "import pathlib\nfor n in range(8):\n    pathlib.Path(f'/dev/shm/wb-many-{n}').write_text('')\n"
+    assert _run_as(slot, many) == 0
+    monkeypatch.setattr(sandbox, "_IPC_ENTRY_LIMIT", 5)
+    try:
+        with pytest.raises(RuntimeError, match="could not clear the IPC objects of slot 6"):
+            kill_slot_processes(slot)
+    finally:
+        monkeypatch.undo()
+        kill_slot_processes(slot)
+    assert _ipc_of(slot.uid) == []
+
+
+HAND_OVER = """\
+import ctypes, struct, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+target, me, how, end = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], time.time() + float(sys.argv[4])
+def owner(ident, uid):
+    state = ctypes.create_string_buffer(512)
+    if libc.shmctl(ident, 2, state) == 0:
+        struct.pack_into("I", state, 4, uid)
+        libc.shmctl(ident, 1, state)
+live = []
+while time.time() < end:
+    if how == "give":
+        ident = libc.shmget(0, 4096, 0o1000 | 0o600)
+        if ident >= 0:
+            owner(ident, target)
+            live.append(ident)
+        if len(live) > 64:
+            libc.shmctl(live.pop(0), 0, None)
+    else:
+        if not live:
+            live = [libc.shmget(0, 4096, 0o1000 | 0o600) for _ in range(16)]
+        for ident in live:
+            owner(ident, target)
+            owner(ident, me)
+"""
+
+
+@pytest.mark.parametrize("how", ["give", "flip"])
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_another_slot_cannot_fail_a_cleanup_by_handing_over_its_objects(how: str) -> None:
+    """``IPC_SET`` lets any process give its objects to any uid, or flip them back and forth; that never retires."""
+    victim, attacker = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    process = _start_as(attacker, HAND_OVER, str(victim.uid), str(attacker.uid), how, "30")
+    try:
+        deadline = time.monotonic() + 10
+        while not any(str(victim.uid) in row for row in Path("/proc/sysvipc/shm").read_text().splitlines()[1:]):
+            assert time.monotonic() < deadline, "the attacker never handed anything over"
+            time.sleep(0.01)
+        for _ in range(25):
+            kill_slot_processes(victim)
+    finally:
+        process.kill()
+        process.wait()
+        kill_slot_processes(attacker)
+    kill_slot_processes(victim)
+    assert _ipc_of(attacker.uid) == []
+
+
+MAKE_SHARED = """\
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+ident = libc.shmget(int(sys.argv[1]), 4096, 0o1000 | 0o666)
+at = libc.shmat(ident, None, 0)
+ctypes.memmove(at, b"synthetic note of user a\\0", 25)
+"""
+HOLD = """\
+import ctypes, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+at = libc.shmat(libc.shmget(int(sys.argv[1]), 0, 0), None, 0)
+time.sleep(60)
+"""
+ATTACH = """\
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+at = libc.shmat(int(sys.argv[1]), None, 0)
+sys.exit(0 if at in (None, ctypes.c_void_p(-1).value) else 7)
+"""
+
+
+def _shm_row(key: int) -> dict[str, int] | None:
+    """The ``/proc/sysvipc/shm`` row of the segment with ``key``, by column name."""
+    rows = Path("/proc/sysvipc/shm").read_text().splitlines()
+    head = rows[0].split()
+    for row in rows[1:]:
+        values = dict(zip(head, row.split(), strict=True))
+        if int(values["key"]) == key:
+            return {name: int(value, 8 if name == "perms" else 10) for name, value in values.items()}
+    return None
+
+
+def _shm_row_by_id(ident: int) -> dict[str, int] | None:
+    """The ``/proc/sysvipc/shm`` row of segment ``ident``, by column name."""
+    rows = Path("/proc/sysvipc/shm").read_text().splitlines()
+    head = rows[0].split()
+    for row in rows[1:]:
+        values = dict(zip(head, row.split(), strict=True))
+        if int(values["shmid"]) == ident:
+            return {name: int(value, 8 if name == "perms" else 10) for name, value in values.items()}
+    return None
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_segment_another_slot_keeps_attached_is_destroyed_and_closed_not_a_failure() -> None:
+    """``IPC_RMID`` cannot destroy an attached segment; it is marked so, and its mode is cleared first.
+
+    Linux lets an owner attach a marked segment by its id, so without the cleared mode the slot's next job
+    could still read it while the other slot holds it.
+    """
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    key = 0x57C0
+    assert _run_as(slot, MAKE_SHARED, str(key)) == 0
+    row = _shm_row(key)
+    assert row is not None
+    holder = _start_as(other, HOLD, str(key))
+    try:
+        deadline = time.monotonic() + 10
+        while (_shm_row_by_id(row["shmid"]) or {}).get("nattch") != 1:
+            assert time.monotonic() < deadline, "the other slot never attached"
+            time.sleep(0.01)
+
+        kill_slot_processes(slot)
+
+        marked = _shm_row_by_id(row["shmid"])
+        assert marked is not None
+        assert marked["perms"] & 0o1000, "marked for destruction"
+        assert marked["perms"] & 0o777 == 0, "no one may attach it any more"
+        assert _run_as(slot, ATTACH, str(row["shmid"])) == 0, "the slot's next job attached the marked segment"
+    finally:
+        holder.kill()
+        holder.wait()
+        kill_slot_processes(other)
+    assert _shm_row_by_id(row["shmid"]) is None

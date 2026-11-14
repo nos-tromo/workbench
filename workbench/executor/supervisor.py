@@ -50,7 +50,7 @@ from workbench.executor.fs import (
     write_all,
 )
 from workbench.executor.prepare_volume import API_UID, JOBS, STAGING, WORKSPACES, Owners
-from workbench.executor.sandbox import Slot, run_in_slot
+from workbench.executor.sandbox import IPC_ENTRY_LIMIT, Slot, run_in_slot
 from workbench.paths import PathError, check_filename
 from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_request, encode
 
@@ -73,6 +73,9 @@ _LAST_SLOT_UID = 65533
 _PASSWD = Path("/etc/passwd")
 _MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
 _SYSCTLS = Path("/proc/sys/fs")
+_MOUNTINFO = Path("/proc/self/mountinfo")
+_SHM = "/dev/shm"
+_CLOSE_GRACE_S = 5.0  # for the answer to the request that retired the last slot
 # Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
 # the api's database, which root would then stage. Symlinks: a link a job leaves in a sticky,
 # world-writable folder (/dev/shm, /dev/mqueue) is not followed by anyone else.
@@ -84,6 +87,10 @@ _LINK_PROTECTIONS = (
 _log = logging.getLogger("workbench.executor")
 
 Status = Literal["ok", "error", "timeout", "killed", "busy"]
+
+
+class NoUsableSlot(Exception):
+    """Every slot is retired; the process ends so that its restart brings fresh slots and IPC."""
 
 
 class _SetupError(Exception):
@@ -175,6 +182,8 @@ def startup_problem(
     passwd: Path = _PASSWD,
     memory_max: Path = _MEMORY_MAX,
     sysctls: Path = _SYSCTLS,
+    mountinfo: Path = _MOUNTINFO,
+    shm_files: int | None = None,
     euid: int | None = None,
 ) -> str | None:
     """Find a reason the supervisor must not start.
@@ -184,13 +193,19 @@ def startup_problem(
         passwd: The image's user list.
         memory_max: The container's cgroup memory limit, if it has one.
         sysctls: The kernel's ``fs`` settings, ``/proc/sys/fs``.
+        mountinfo: The process's mount table, ``/proc/self/mountinfo``.
+        shm_files: How many files ``/dev/shm`` can hold (``f_files`` of ``statvfs``, 0 for no
+            limit); read from ``/dev/shm`` by default.
         euid: The effective uid to judge; the process's own by default.
 
     Returns:
         A short reason, or ``None`` when root runs it, the slot pool is sound (``make_slots``),
         every slot uid is a user of the image, the memory limit holds every slot's job memory,
-        and ``fs.protected_hardlinks`` and ``fs.protected_symlinks`` both read 1 (the host's
-        kernel settings, which a container cannot change).
+        ``fs.protected_hardlinks`` and ``fs.protected_symlinks`` both read 1 (the host's kernel
+        settings, which a container cannot change), ``/dev/mqueue`` is a mounted mqueue file
+        system (without it a job's queues can be neither listed nor removed), and ``/dev/shm``
+        holds at most ``IPC_ENTRY_LIMIT`` files (so no job can fill it past what the slot
+        cleanup looks through, and so fail every other slot's cleanup).
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return "the supervisor must run as root"
@@ -215,7 +230,38 @@ def startup_problem(
             value = ""
         if value != "1":
             return f"fs.{name} must be 1, {why}"
+    if not _mqueue_mounted(mountinfo):
+        return "/dev/mqueue must be a mounted mqueue file system, so the slots' queues can be cleared"
+    if shm_files is None:
+        try:
+            shm_files = os.statvfs(_SHM).f_files
+        except OSError:
+            shm_files = 0
+    if not 0 < shm_files <= IPC_ENTRY_LIMIT:
+        return f"/dev/shm must hold at most {IPC_ENTRY_LIMIT} files (mount it with nr_inodes), so no job can fill it"
     return None
+
+
+def _mqueue_mounted(mountinfo: Path) -> bool:
+    """Tell from a mount table whether ``/dev/mqueue`` is a mounted mqueue file system.
+
+    Args:
+        mountinfo: A ``/proc/<pid>/mountinfo`` file: the mount point is the fifth field, the file
+            system type the first after the ``-`` separator.
+
+    Returns:
+        Whether it is; ``False`` when the table cannot be read.
+    """
+    try:
+        lines = mountinfo.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        fields, _, rest = line.partition(" - ")
+        mount = fields.split()
+        if len(mount) >= 5 and mount[4] == "/dev/mqueue" and rest.split()[:1] == ["mqueue"]:
+            return True
+    return False
 
 
 def _read_result(job: int, limit: int) -> dict[str, Any] | None:
@@ -401,17 +447,21 @@ class Supervisor:
         self._owners = Owners() if use_slots else Owners(root=me, api=me)
         self._free = list(range(settings.executor_slots))
         self._retired: set[int] = set()
+        self._exhausted = asyncio.Event()
         self._cleanup_pool = ThreadPoolExecutor(max_workers=settings.executor_slots, thread_name_prefix="slot-cleanup")
         self._jobs = settings.data_dir / JOBS
         self._staging = settings.data_dir / STAGING
 
     async def serve(self) -> None:
-        """Answer jobs on ``executor_socket`` until cancelled.
+        """Answer jobs on ``executor_socket`` until cancelled, or until no slot is left.
 
         Job folders an earlier run left behind are removed first. The socket gets mode ``0660``
         and the api's group, and is bound before it listens, so nobody else ever connects.
 
         Raises:
+            NoUsableSlot: Every slot is retired. The request that retired the last one is still
+                answered, for up to 5 s; then the process should end, so that its restart brings
+                a fresh IPC namespace, ``/dev/shm`` and slots, and the start-up sweep runs.
             RuntimeError: The socket's folder is not root's alone, or something other than a
                 socket is where the socket belongs.
             OSError: The socket cannot be bound.
@@ -419,10 +469,15 @@ class Supervisor:
         await asyncio.to_thread(self._sweep_stale_jobs)
         server = await asyncio.start_unix_server(self._handle, sock=self._bind(), limit=MAX_LINE)
         try:
-            await server.serve_forever()
+            await self._exhausted.wait()
+            server.close()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(server.wait_closed(), _CLOSE_GRACE_S)
         finally:
             server.close()
             self._cleanup_pool.shutdown(wait=False)
+        count = self._settings.executor_slots
+        raise NoUsableSlot(f"every slot is retired ({count} of {count}); exiting so the container restarts")
 
     async def run_job(self, req: JobRequest) -> JobResult:
         """Run one job in a free slot and answer it.
@@ -498,6 +553,8 @@ class Supervisor:
         """
         self._retired.add(index)
         _log.warning("slot %d retired", index)
+        if not self._slots_left():
+            self._exhausted.set()
 
     def _bounded(self, limits: Limits) -> Limits:
         """Cap a job's limits at the executor's own settings.
@@ -975,7 +1032,7 @@ def main() -> int:
 
     Returns:
         ``1`` after a one-line reason on stderr when it must not start, including a socket it may
-        not bind; ``0`` when serving ends.
+        not bind, or once every slot is retired (counts only); ``0`` when serving ends.
     """
     try:
         settings = load_settings(os.environ, role="executor")
@@ -989,6 +1046,9 @@ def main() -> int:
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
     try:
         asyncio.run(Supervisor(settings).serve())
+    except NoUsableSlot as exc:
+        print(f"workbench executor: {exc}", file=sys.stderr)
+        return 1
     except RuntimeError as exc:  # serve's own refusals: the socket's folder or place
         print(f"workbench executor: refusing to start: {exc}", file=sys.stderr)
         return 1
