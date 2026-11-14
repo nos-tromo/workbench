@@ -134,6 +134,15 @@ def test_executor_memory_cannot_swap_past_its_limit() -> None:
     assert default_of(executor["cpus"]) == ("WORKBENCH_EXECUTOR_CPUS", "4")
 
 
+def test_the_api_is_bounded_in_memory_and_processes() -> None:
+    """The api holds every user's requests: its memory, swap included, and its processes have limits (R74)."""
+    api = compose()["services"]["api"]
+    assert default_of(api["mem_limit"]) == ("WORKBENCH_API_MEM_LIMIT", "2g")
+    assert api["memswap_limit"] == api["mem_limit"]
+    assert default_of(api["pids_limit"]) == ("WORKBENCH_API_PIDS_LIMIT", "128")
+    assert "/tmp:size=512m" in api["tmpfs"]
+
+
 def _health_probe() -> str:
     """The executor healthcheck's Python."""
     test = compose()["services"]["executor"]["healthcheck"]["test"]

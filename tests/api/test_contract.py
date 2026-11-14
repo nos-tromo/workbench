@@ -1,20 +1,23 @@
 """The terminal handshake Open WebUI runs, the key and header checks, and the tool-only OpenAPI document."""
 
+import asyncio
 import dataclasses
 import hmac
 import io
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.types import Message, Receive, Scope, Send
 
 from tests.api.conftest import KEY, unrecorded
 from workbench.api import auth
 from workbench.api.audit import AuditLog
-from workbench.api.auth import ALL_TOOLS, CallerRegistry
+from workbench.api.auth import ALL_TOOLS, CallerRegistry, KeyGate
 from workbench.api.contract import system_prompt
 from workbench.api.main import app_factory, create_app
 from workbench.api.openapi import TOOL_TAG, tool_openapi
@@ -194,7 +197,7 @@ def test_the_scheme_is_matched_without_regard_to_case(client: TestClient) -> Non
 
 
 def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The presented key goes through ``hmac.compare_digest``, never ``==``."""
+    """The presented key goes through ``hmac.compare_digest``, never ``==``: at the gate, then at the route."""
     seen: list[tuple[bytes, bytes]] = []
     compare_digest = hmac.compare_digest
 
@@ -204,7 +207,7 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     assert client.get("/api/config", headers=KEY_ONLY).status_code == 200
-    assert seen == [(KEY.encode(), KEY.encode())]
+    assert seen == [(KEY.encode(), KEY.encode())] * 2
 
 
 def test_the_key_is_checked_before_the_user(client: TestClient) -> None:
@@ -349,9 +352,86 @@ def test_skills_answer_empty(client: TestClient) -> None:
     ],
 )
 def test_unknown_paths_are_not_found(client: TestClient, path: str) -> None:
-    """The allow-list is workbench's: everything not listed answers 404."""
+    """The allow-list is workbench's: everything not listed answers 404 to a caller, 401 to anyone without the key."""
     assert client.get(path, headers=H).status_code == 404
-    assert client.get(path).status_code == 404
+    assert client.get(path).status_code == 401
+
+
+#: A path no route serves, a route's other method, and routes that read a JSON body.
+GATED = [
+    ("GET", "/files/archive"),
+    ("PUT", "/files/mkdir"),
+    ("POST", "/files/mkdir"),
+    ("POST", "/tools/run_python"),
+    ("POST", "/files/upload"),
+]
+
+
+@pytest.mark.parametrize(("method", "path"), GATED)
+def test_without_a_key_every_request_is_401_whatever_its_body(client: TestClient, method: str, path: str) -> None:
+    """A malformed body, an unknown path or method: no key, no 404, 405 or 422 that would map the routes (R1 M-7)."""
+    nothing: dict[str, str] = {}
+    for headers in (nothing, {"Authorization": "Bearer wrong-key-of-thirty-two-characters!!"}):
+        r = client.request(method, path, content=b"{not json", headers={**headers, "Content-Type": "application/json"})
+        assert (r.status_code, r.json()) == (401, {"detail": "missing or invalid key"})
+        assert r.headers["www-authenticate"] == "Bearer"
+
+
+def test_the_gate_reads_no_body_without_a_key(settings: Settings) -> None:
+    """The refusal comes before the first body chunk is asked for, however large the body says it is."""
+    asked: list[str] = []
+
+    async def inner(_scope: Scope, _receive: Receive, _send: Send) -> None:
+        asked.append("app")
+
+    async def receive() -> Message:
+        asked.append("body")
+        return {"type": "http.request", "body": b"x" * 1024, "more_body": True}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/tools/run_python",
+        "headers": [(b"content-length", str(40 * 1024 * 1024).encode())],
+    }
+    asyncio.run(KeyGate(inner, callers=CallerRegistry.from_settings(settings))(scope, receive, send))
+    assert asked == []
+    assert sent[0]["status"] == 401
+
+
+@pytest.mark.parametrize("path", ["/healthz", "/metrics"])
+def test_the_service_routes_need_no_key(client: TestClient, path: str) -> None:
+    """The healthcheck and obs-plane's scraper have no key."""
+    assert client.get(path).status_code == 200
+
+
+def test_a_request_body_over_2_mib_is_413_and_never_parsed(client: TestClient) -> None:
+    """With the key, a body past the request bound is refused as it arrives: declared or chunked (R74)."""
+    big = b'{"path": "' + b"x" * (2 * 1024 * 1024) + b'"}'
+    r = client.post("/files/mkdir", content=big, headers={**H, "Content-Type": "application/json"})
+    assert (r.status_code, r.json()) == (413, {"detail": "request too large"})
+
+    def chunks() -> Iterator[bytes]:
+        yield b'{"path": "'
+        for _ in range(3):
+            yield b"x" * (1024 * 1024)
+        yield b'"}'
+
+    r = client.post("/files/mkdir", content=chunks(), headers={**H, "Content-Type": "application/json"})
+    assert (r.status_code, r.json()) == (413, {"detail": "request too large"})
+
+
+def test_a_request_body_of_2_mib_is_read(client: TestClient) -> None:
+    """The bound itself is allowed: the route answers, here with its own refusal of the folder's name."""
+    body = b'{"path": "/workspace/chat-1/' + b"x" * 300 + b'"}'
+    padded = body + b" " * (2 * 1024 * 1024 - len(body))
+    r = client.post("/files/mkdir", content=padded, headers={**H, "Content-Type": "application/json"})
+    assert r.status_code == 400
 
 
 def test_healthz_needs_no_key(client: TestClient) -> None:

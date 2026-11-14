@@ -161,7 +161,7 @@ def test_busy_is_a_503_the_caller_can_retry(client: TestClient, app: FastAPI, re
         raise Busy(reason)
 
     app.add_api_route("/refuse", refuse)
-    response = client.get("/refuse")
+    response = client.get("/refuse", headers={"Authorization": f"Bearer {KEY}"})
     assert response.status_code == 503
     assert response.json() == {"detail": "busy, retry later"}
 
@@ -176,7 +176,7 @@ def test_a_request_too_large_is_a_422_and_not_a_busy(
 
     app.add_api_route("/refuse", refuse)
     caplog.set_level(logging.DEBUG)
-    response = client.get("/refuse")
+    response = client.get("/refuse", headers={"Authorization": f"Bearer {KEY}"})
     assert response.status_code == 422
     assert response.json() == {"detail": "request too large"}
     assert "secret-path" not in caplog.text

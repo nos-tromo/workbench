@@ -24,10 +24,10 @@ from starlette.types import Message, Receive, Scope, Send
 from tests.api.conftest import KEY, unrecorded
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
+from workbench.api.body_limit import BodyLimit
 from workbench.api.main import create_app
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import NotFound, StorageFull, Store
-from workbench.api.upload_limit import UploadLimit
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, Workspaces
@@ -922,7 +922,7 @@ MULTIPART = {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
 
 
 class Drive:
-    """What happened when a request went through ``UploadLimit``.
+    """What happened when a request went through ``BodyLimit``.
 
     Attributes:
         app_calls: How often the wrapped app was called.
@@ -946,9 +946,15 @@ class Drive:
 
 
 def drive(
-    *, bound: int = 1000, path: str = "/files/upload", method: str = "POST", declared: int | None, chunks: list[bytes]
+    *,
+    bound: int = 1000,
+    request_max: int = 10_000,
+    path: str = "/files/upload",
+    method: str = "POST",
+    declared: int | None,
+    chunks: list[bytes],
 ) -> Drive:
-    """Send a request through ``UploadLimit`` in front of an app that reads its whole body and answers 200."""
+    """Send a request through ``BodyLimit`` in front of an app that reads its whole body and answers 200."""
     result = Drive()
     pending = list(chunks)
 
@@ -973,7 +979,7 @@ def drive(
 
     async def run() -> None:
         try:
-            await UploadLimit(inner, max_body=bound)(scope, receive, send)
+            await BodyLimit(inner, upload_max=bound, request_max=request_max)(scope, receive, send)
         except HTTPException as exc:
             result.error = exc
 
@@ -1020,12 +1026,18 @@ def test_a_declared_length_that_lies_is_caught_by_the_count() -> None:
 
 @pytest.mark.parametrize(
     ("method", "path"),
-    [("POST", "/files/mkdir"), ("GET", "/files/upload"), ("POST", "/files/upload/x"), ("POST", "/files")],
+    [("POST", "/files/mkdir"), ("GET", "/files/upload"), ("POST", "/files/upload/x"), ("POST", "/tools/run_python")],
 )
-def test_only_post_to_the_upload_route_is_limited(method: str, path: str) -> None:
-    """Every other route and method passes untouched, however large."""
+def test_every_other_request_has_the_request_bound_not_the_uploads(method: str, path: str) -> None:
+    """Up to the request bound a body passes, whatever the upload's bound; past it, 413 ``request too large``."""
     r = drive(method=method, path=path, declared=5000, chunks=[b"x" * 5000])
     assert (r.status, r.app_calls, r.error) == (200, 1, None)
+    r = drive(method=method, path=path, declared=10_001, chunks=[b"x" * 10_001])
+    assert (r.status, r.app_calls, r.receives) == (413, 0, 0)
+    assert b'"request too large"' in r.sent[1]["body"]
+    r = drive(method=method, path=path, declared=None, chunks=[b"x" * 6000, b"x" * 6000])
+    assert isinstance(r.error, HTTPException)
+    assert (r.error.status_code, r.error.detail) == (413, "request too large")
 
 
 def test_a_body_that_is_not_http_is_left_alone() -> None:
@@ -1041,7 +1053,7 @@ def test_a_body_that_is_not_http_is_left_alone() -> None:
     async def never_sent(_message: Message) -> None:
         raise AssertionError("not called")
 
-    asyncio.run(UploadLimit(inner, max_body=1)({"type": "lifespan"}, never_received, never_sent))
+    asyncio.run(BodyLimit(inner, upload_max=1)({"type": "lifespan"}, never_received, never_sent))
     assert seen == ["lifespan"]
 
 
@@ -1132,10 +1144,12 @@ def test_a_file_over_the_per_file_limit_but_within_the_bound_is_still_refused_by
     assert store.files_in_chat(ME) == []
 
 
-def test_other_routes_are_not_limited_by_the_upload_bound(limited_client: TestClient) -> None:
-    """A large body to another route reaches the route, which answers for itself."""
-    r = limited_client.post("/files/mkdir", json={"path": "x" * (BOUND + 1)}, headers=H)
+def test_other_routes_have_the_request_bound_not_the_uploads(limited_client: TestClient) -> None:
+    """Within the request bound a large body reaches the route, which answers for itself; past it, 413."""
+    r = limited_client.post("/files/mkdir", json={"path": "x" * (BOUND - 100)}, headers=H)
     assert r.status_code == 400
+    r = limited_client.post("/files/mkdir", json={"path": "x" * (BOUND + 1)}, headers=H)
+    assert (r.status_code, r.json()) == (413, {"detail": "request too large"})
 
 
 # --- hostile input -------------------------------------------------------------------------------------------------

@@ -1,8 +1,9 @@
 """The workbench api application.
 
-Run it as ``uvicorn --factory workbench.api.main:app_factory``. Authentication
-is per route (:mod:`workbench.api.auth`), not middleware, so a path that is not
-registered answers 404 whatever the request carries.
+Run it as ``uvicorn --factory workbench.api.main:app_factory``. The caller key is
+checked before any body is read (:class:`~workbench.api.auth.KeyGate`), and again
+per route; a path that is not registered answers 404 to a caller with the key and
+401 to anyone else.
 """
 
 import asyncio
@@ -16,13 +17,13 @@ from fastapi import FastAPI
 from workbench import __version__
 from workbench.api import contract, errors, files, metrics, tools, tools_output, tools_templates  # noqa: F401 (routes)
 from workbench.api.audit import AuditLog
-from workbench.api.auth import CallerRegistry
+from workbench.api.auth import CallerRegistry, KeyGate
+from workbench.api.body_limit import BodyLimit, upload_limit
 from workbench.api.hardening import ViewHardening
 from workbench.api.jobs import ExecutorClient, JobQueue
 from workbench.api.metrics import Metrics
 from workbench.api.retention import Sweeper
 from workbench.api.store import Store
-from workbench.api.upload_limit import UploadLimit, body_limit
 from workbench.config import Settings, load_settings
 from workbench.layout import DATABASE
 from workbench.paths import Workspaces
@@ -118,9 +119,11 @@ def create_app(
     app.state.metrics = app_metrics
     app.state.callers = callers
     errors.install(app)
-    # Each add wraps the ones before it, so a request meets ViewHardening, QuietErrors, UploadLimit, then the app. An
-    # error nothing else answers becomes QuietErrors' 500, which still gets the viewing headers.
-    app.add_middleware(UploadLimit, max_body=body_limit(settings))
+    # Each add wraps the ones before it, so a request meets ViewHardening, QuietErrors, KeyGate, BodyLimit, then the
+    # app: no body is read before the key is checked, and none past its bound. An error nothing else answers becomes
+    # QuietErrors' 500, which still gets the viewing headers.
+    app.add_middleware(BodyLimit, upload_max=upload_limit(settings))
+    app.add_middleware(KeyGate, callers=callers)
     app.add_middleware(errors.QuietErrors)
     app.add_middleware(ViewHardening)
     app.include_router(contract.router)

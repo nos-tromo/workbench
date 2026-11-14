@@ -113,6 +113,15 @@ services:
           - workbench-api
     expose:
       - "8000"
+    # One process and its /tmp tmpfs together: up to 512 MiB of uploads being
+    # spooled, and the rest for the process. A body past 2 MiB (an upload past
+    # its limit) is refused as it arrives, and only after the caller's key.
+    # Memory and swap together are the same limit.
+    mem_limit: ${WORKBENCH_API_MEM_LIMIT:-2g}
+    memswap_limit: ${WORKBENCH_API_MEM_LIMIT:-2g}
+    # Threads of the one process: 40 for the routes' blocking work, up to 32 for
+    # the queue's and the sweep's, and a few more.
+    pids_limit: ${WORKBENCH_API_PIDS_LIMIT:-128}
     depends_on:
       volume-permissions:
         condition: service_completed_successfully

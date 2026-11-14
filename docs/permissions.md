@@ -64,7 +64,10 @@ no file content and are not recorded (`workbench/api/contract.py`,
 ### The user is the boundary; the chat is a folder
 
 - A caller is known by its bearer key, compared in constant time
-  (`workbench/api/auth.py:CallerRegistry.authenticate`). The user is the
+  (`workbench/api/auth.py:CallerRegistry.authenticate`). The key is checked
+  before anything of a request's body is read, whatever its path: without it a
+  request answers `401`, never `404`, `405` or `422` (`auth.py:KeyGate`), and
+  `/healthz` and `/metrics` are the only routes that need none. The user is the
   caller's `X-User-Id`, trusted because only a caller with the key reaches the
   api (`workbench/api/auth.py:require_principal`). Every route that touches
   files needs it.

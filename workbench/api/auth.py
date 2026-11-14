@@ -8,6 +8,11 @@ both go through :func:`~workbench.paths.check_id`.
 The headers are read from the request itself, not declared as parameters, so no
 route that depends on them lists them in its OpenAPI operation, where the model
 would see them as tool arguments.
+
+The key is checked twice: by :class:`KeyGate`, before anything of the request's
+body is read, and again by each route's dependency. Without a valid key a request
+answers ``401`` whatever its path, method or body, so a peer without the key can
+neither map the routes nor make the api read a body.
 """
 
 import hmac
@@ -16,6 +21,8 @@ from dataclasses import dataclass, field
 from typing import Annotated, Final, Self
 
 from fastapi import Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
@@ -37,6 +44,12 @@ ALL_TOOLS: Final = frozenset(
 )
 
 _BEARER: Final = "bearer"
+
+#: The detail of every 401.
+UNAUTHORIZED: Final = "missing or invalid key"
+
+#: The paths answered without a key: the compose healthcheck and obs-plane's scraper.
+OPEN_PATHS: Final = frozenset({"/healthz", "/metrics"})
 
 
 @dataclass(frozen=True)
@@ -152,8 +165,46 @@ async def require_caller(request: Request) -> Caller:
     token = _bearer_token(request.headers.get("authorization"))
     caller = registry.authenticate(token) if token is not None else None
     if caller is None:
-        raise HTTPException(status_code=401, detail="missing or invalid key", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(status_code=401, detail=UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
     return caller
+
+
+class KeyGate:
+    """Pure ASGI middleware: no request without a caller's key gets past it, and it reads no body.
+
+    Every path but :data:`OPEN_PATHS` needs the key, a path no route serves included, so a peer without it learns
+    nothing of the routes: neither a 404, nor a 405, nor a 422 that names a body's fields. The key is the
+    ``Authorization`` header's, read as the routes read it.
+    """
+
+    def __init__(self, app: ASGIApp, *, callers: CallerRegistry) -> None:
+        """Wrap ``app``.
+
+        Args:
+            app: The application.
+            callers: The callers whose keys open the gate.
+        """
+        self.app = app
+        self.callers = callers
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Answer 401 to a request without a valid key, before its body is read; pass everything else on.
+
+        Args:
+            scope: The ASGI scope.
+            receive: Receives the request body; never called here.
+            send: Sends the response.
+        """
+        if scope["type"] != "http" or scope["path"] in OPEN_PATHS:
+            await self.app(scope, receive, send)
+            return
+        authorization = next((value for name, value in scope["headers"] if name == b"authorization"), None)
+        token = _bearer_token(None if authorization is None else authorization.decode("latin-1"))
+        if token is None or self.callers.authenticate(token) is None:
+            refusal = JSONResponse({"detail": UNAUTHORIZED}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
+            await refusal(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 async def require_principal(request: Request, caller: Annotated[Caller, Depends(require_caller)]) -> Principal:

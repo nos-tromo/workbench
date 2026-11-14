@@ -83,8 +83,33 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKBENCH_UPLOAD_MAX_MB` | 50 | Largest upload, per file, in MB. A larger one answers `413`. A request whose body passes this plus 1 MiB is refused while it arrives (`workbench/api/upload_limit.py`). It also bounds each file a job writes and a job's outputs together. |
+| `WORKBENCH_UPLOAD_MAX_MB` | 50 | Largest upload, per file, in MB. A larger one answers `413`. A request whose body passes this plus 1 MiB is refused while it arrives (`workbench/api/body_limit.py`). It also bounds each file a job writes and a job's outputs together. |
 | `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads and the files tools made, in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. |
+
+### Request bodies
+
+Every other request is held to 2 MiB of body: a larger one answers `413`
+`{"detail": "request too large"}` while it arrives and is never parsed
+(`workbench/api/body_limit.py:BodyLimit`). A tool request could not pass the
+executor's 1 MiB line anyway. A request without a valid caller key answers
+`401` before any of its body is read, whatever its path
+(`workbench/api/auth.py:KeyGate`); only `/healthz` and `/metrics` need no key.
+
+## The api container
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WORKBENCH_API_MEM_LIMIT` | `2g` | Memory of the api container, swap included (`mem_limit` and `memswap_limit`). |
+| `WORKBENCH_API_PIDS_LIMIT` | 128 | Processes and threads of the api container (`pids_limit`). |
+
+- **Memory:** the api's `/tmp` is a tmpfs of 512 MiB that holds uploads while
+  they arrive, and counts against the limit; the rest is the process, which
+  holds the requests in hand (each at most 2 MiB of body, or one upload). Past
+  the limit the kernel stops the api, and `restart: unless-stopped` brings it
+  back; the host's other services keep their memory.
+- **Processes:** the api runs one process (`--workers 1`) with 40 threads for
+  the routes' blocking work, up to 32 for the queue's and the sweep's, and a
+  few more: about 80 in all.
 
 ## The executor container
 
