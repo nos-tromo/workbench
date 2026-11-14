@@ -7,13 +7,14 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.fixtures import make_fixtures as fx
-from workbench.executor import timer
+from workbench.executor import readers, timer
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.executor.runners import documents as docs
 
@@ -219,6 +220,131 @@ def test_the_reader_deadline_still_fires_after_a_regex_budget_was_spent_inside_i
     assert time.monotonic() - began < 6
     assert len(result["hits"]) == 5
     assert result["skipped"] == [{"path": f"/workspace/{CHAT}/b-ledger.xlsx", "reason": "reading took longer than 1 s"}]
+
+
+def test_a_files_deadline_cuts_a_catastrophic_match_short_and_the_search_goes_on(work: Path) -> None:
+    """The file's own deadline (1 s) comes before the regex budget (2 s) is spent: it stops the match mid-way.
+
+    The file is named, its hits before that line are kept, and the next file is searched with what is left.
+    """
+    (work / "a.txt").write_text("aaaa\n" + "a" * 40 + "b\n", encoding="utf-8")
+    (work / "b.txt").write_text("aaaa\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "(a+)+$", regex=True, budget_s=3)
+    assert 0.9 < time.monotonic() - began < 4
+    assert [(h["path"].rsplit("/", 1)[1], h["location"]) for h in result["hits"]] == [
+        ("a.txt", "line 1"),
+        ("b.txt", "line 1"),
+    ]
+    assert result["skipped"] == [{"path": f"/workspace/{CHAT}/a.txt", "reason": "reading took longer than 1 s"}]
+    assert "hint" not in result
+    assert result["truncated"] is False
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert timer._limits == []
+
+
+def slow_to_read(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make the text reader take ``seconds`` before the lines of a file whose name ends in ``-slow.txt``."""
+    from workbench.executor.readers import text
+
+    original = text.units
+
+    def units(path: Path) -> Iterator[readers.Part]:
+        if path.name.endswith("-slow.txt"):
+            time.sleep(seconds)
+        yield from original(path)
+
+    monkeypatch.setattr(text, "units", units)
+
+
+def wait_for_a_time_limit() -> None:
+    """Run pure Python until a time limit's error lands in it; fail if none does within five seconds."""
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        pass
+    pytest.fail("no time limit landed")
+
+
+def hold_the_first_match_until_its_files_deadline(monkeypatch: pytest.MonkeyPatch, where: str) -> None:
+    """Keep the first match of a file inside ``Meter.stop`` until the file's own deadline lands there.
+
+    ``begins``: as ``stop()`` begins; ``clock``: just after its clock read. Those are where a file's
+    ``ReadTimeout`` was found to land during a short match, in about one file of four that ran out of time.
+    """
+    held: list[bool] = []
+
+    def hold() -> bool:
+        if held or readers._deadline is None:  # the compile runs the meter too, with no file being read
+            return False
+        held.append(True)
+        return True
+
+    if where == "begins":
+        original = timer.Meter.stop
+
+        def stop(self: timer.Meter) -> None:
+            if hold():
+                wait_for_a_time_limit()
+            original(self)
+
+        monkeypatch.setattr(timer.Meter, "stop", stop)
+        return
+    code = timer.Meter.stop.__code__
+    real = time.monotonic
+
+    class Clock:
+        """The timer module's clock, which waits in ``stop()`` right after it has been read."""
+
+        @staticmethod
+        def monotonic() -> float:
+            now = real()
+            if sys._getframe(1).f_code is code and hold():
+                wait_for_a_time_limit()
+            return now
+
+    monkeypatch.setattr(timer, "time", Clock)
+
+
+def spend_without_stopping_meters(limit: timer._Limit) -> type[timer.TimeLimit]:
+    """The timer's ``_spend`` as it was, which left a meter that was running alone: only the search stops it."""
+    limit.fired = True
+    if limit.meter is not None:
+        limit.meter.left = 0.0
+        limit.meter.until = None
+    return limit.error
+
+
+@pytest.mark.parametrize(("where", "timer_stops_it"), [("begins", True), ("clock", True), ("begins", False)])
+def test_a_files_deadline_that_lands_as_a_match_ends_does_not_spend_the_regex_budget_later(
+    work: Path, monkeypatch: pytest.MonkeyPatch, where: str, timer_stops_it: bool
+) -> None:
+    """The first file's deadline lands in ``Meter.stop``, and the slow file after it is still searched, and the next.
+
+    The second file takes longer to read than the regex budget had left. The meter used to be left running with
+    its end near: that reading then raised ``RegexTimeout``, and the search answered "regex budget exhausted" with
+    no hits and the last two files not searched. The timer stops the meter before it raises; with that taken
+    away (``timer_stops_it`` false), the search's own stop at the end of each file still does.
+    """
+    monkeypatch.setattr(docs, "REGEX_BUDGET_S", 1.25)
+    if not timer_stops_it:
+        monkeypatch.setattr(timer, "_spend", spend_without_stopping_meters)
+    hold_the_first_match_until_its_files_deadline(monkeypatch, where)
+    slow_to_read(monkeypatch, 0.5)
+    (work / "a.txt").write_text("nothing to see here\n" * 3, encoding="utf-8")
+    (work / "b-slow.txt").write_text("needle 2\n", encoding="utf-8")
+    (work / "c.txt").write_text("needle 3\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, r"need(le)? \d", regex=True, budget_s=3)
+    elapsed = time.monotonic() - began
+    assert "hint" not in result
+    assert result["truncated"] is False
+    assert [(h["path"].rsplit("/", 1)[1], h["location"]) for h in result["hits"]] == [
+        ("b-slow.txt", "line 1"),
+        ("c.txt", "line 1"),
+    ]
+    assert result["skipped"] == [{"path": f"/workspace/{CHAT}/a.txt", "reason": "reading took longer than 1 s"}]
+    assert 1.4 < elapsed < 4
+    assert timer._limits == []
 
 
 def test_snippets_are_at_most_200_characters_around_the_match(work: Path) -> None:

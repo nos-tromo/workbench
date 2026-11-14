@@ -3,10 +3,12 @@
 import os
 import random
 import signal
+import sys
 import threading
 import time
-from collections.abc import Callable
-from types import FrameType
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from types import CodeType, FrameType
 from typing import Any
 
 import pytest
@@ -486,4 +488,98 @@ def test_a_spent_meter_raises_on_entering() -> None:
     with pytest.raises(Spent):
         with timer.limit_spending(meter, Spent):
             pytest.fail("not entered")
+    assert timer._limits == []
+
+
+@contextmanager
+def handled_at(code: CodeType, at: int, steps: list[int]) -> Iterator[None]:
+    """Handle ``SIGALRM`` in ``code`` before its step number ``at``, as CPython does when the signal comes then.
+
+    The steps are the function's start (0) and each instruction it runs, in order; their offsets are appended to
+    ``steps``. CPython itself looks for signals at fewer places (a function's start, after a call, a jump back),
+    all of them among these. With ``at`` not among the steps run, nothing is handled.
+    """
+    monitoring = sys.monitoring
+    tool = next((t for t in (3, 4) if monitoring.get_tool(t) is None), None)
+    if tool is None:
+        pytest.skip("no free sys.monitoring tool id")
+
+    def step(_code: CodeType, offset: int) -> None:
+        steps.append(offset)
+        if len(steps) == at + 1:
+            timer._fire(signal.SIGALRM, sys._getframe(1))
+
+    events = monitoring.events.PY_START | monitoring.events.INSTRUCTION
+    monitoring.use_tool_id(tool, "test_timer")
+    try:
+        monitoring.register_callback(tool, monitoring.events.PY_START, step)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, step)
+        monitoring.set_local_events(tool, code, events)
+        yield
+    finally:
+        monitoring.set_local_events(tool, code, 0)
+        monitoring.register_callback(tool, monitoring.events.PY_START, None)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+
+
+@pytest.mark.parametrize("method", ["start", "stop"])
+def test_a_deadline_that_lands_anywhere_in_starting_or_stopping_a_meter_leaves_it_stopped_and_charged(
+    method: str,
+) -> None:
+    """A deadline's error lands as the method begins, then before each of its instructions in turn.
+
+    Among them are the two places a per-file deadline was found to land during a short match: as ``stop()``
+    begins, and just after its clock read. Each time the meter is stopped afterwards and charged for what it ran,
+    and reading that goes on for three times its budget, with the meter stopped, is not cut off by its limit.
+    It used to be left running with its end in the past or near; the next file's reading then ran it out.
+    """
+    code = timer.Meter.start.__code__ if method == "start" else timer.Meter.stop.__code__
+    path: list[int] = []
+    with handled_at(code, -1, path):
+        run(timer.Meter(1.0), 0.0)
+    assert len(path) >= 8
+    for at in range(len(path)):
+        meter = timer.Meter(0.015)
+        steps: list[int] = []
+        with timer.limit_spending(meter, Spent):
+            with pytest.raises(Inner):
+                with limit_until(time.monotonic() + 0.002, Inner), timer.shielded():
+                    time.sleep(0.003)  # the deadline passes; its signal waits for the end of the shield
+                    with handled_at(code, at, steps):
+                        run(meter, 0.003)
+            assert steps == path[: at + 1]
+            assert meter.until is None
+            if method == "stop":
+                assert 0 < meter.left <= 0.012
+            else:
+                assert 0.0149 < meter.left <= 0.015
+            left = meter.left
+            meter.stop()  # what the search does at the end of every file: a stopped meter stays as it is
+            spin(0.05)
+            assert meter.left == left
+        assert timer._limits == []
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_deadlines_that_land_among_short_runs_of_a_meter_never_leave_it_running() -> None:
+    """A deadline lands wherever CPython handles its signal in a loop of runs a few microseconds long, 300 times.
+
+    The meter is stopped after every one. Before, about one landing in five or six left it running.
+    """
+    rng = random.Random(5)
+    meter = timer.Meter(60.0)
+    running = 0
+    with timer.limit_spending(meter, Spent):
+        for _ in range(300):
+            began = time.monotonic()
+            with suppress(Inner), limit_until(began + 0.0005 + rng.random() * 0.002, Inner):
+                while time.monotonic() < began + 1.0:
+                    run(meter, 0.0)
+                pytest.fail("the deadline did not land")
+            if meter.until is not None:
+                running += 1
+                meter.stop()
+    assert running == 0
+    assert 59 < meter.left < 60
     assert timer._limits == []

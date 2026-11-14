@@ -25,6 +25,8 @@ Limits nest and share the one real-time interval timer of the process:
   is raised even if the code that got the first swallows it. A signal that comes while a ``__del__`` is running
   is put off for a moment: an exception raised in a finalizer is printed and dropped, and the code that was to be
   stopped would run on.
+- Every meter that is running is stopped, charged up to that moment, before any limit's error is raised: the
+  error ends the work the meter times, and it can land in the very code that would stop the meter.
 - A block's bookkeeping runs with ``SIGALRM`` blocked, so that a signal never arrives between the limit
   being listed and the timer being armed (it is delivered when the signal is unblocked, inside the block's own
   ``try``). When the last limit leaves, the timer is disarmed.
@@ -71,6 +73,9 @@ class TimeLimit(BaseException):
 class Meter:
     """Seconds that are spent only while the meter runs, between :meth:`start` and :meth:`stop`.
 
+    The code it times must let a :class:`TimeLimit` through: when a limit's error is raised, every meter that is
+    running is stopped, since that code is taken to end there.
+
     Attributes:
         left: The seconds left when it was last stopped; zero or less once they are spent.
         until: While it runs, the :func:`time.monotonic` time at which it runs out; ``None`` while stopped.
@@ -96,11 +101,21 @@ class Meter:
         return self.left <= 0
 
     def start(self) -> None:
-        """Start spending."""
+        """Start spending.
+
+        A limit's error that lands once ``until`` is stored, before the caller's ``try`` that stops the meter, stops
+        it on the way out (:func:`_spend`).
+        """
         self.until = time.monotonic() + self.left
 
     def stop(self) -> None:
-        """Stop spending, and keep what is left."""
+        """Stop spending, and keep what is left; a stopped meter stays as it is.
+
+        A limit's error can land anywhere in here, as it begins or just after the clock read among other places,
+        and the rest of it is then not run. ``left`` is stored before ``until`` is cleared, so at every such point
+        the meter is either still running, and the handler stops and charges it before it raises (:func:`_spend`),
+        or stopped with its time charged.
+        """
         until = self.until
         if until is not None:
             self.left = until - time.monotonic()
@@ -229,7 +244,12 @@ def _in_finalizer(frame: FrameType | None) -> bool:
 
 
 def _spend(limit: _Limit) -> type[TimeLimit]:
-    """Mark a limit as fired, and its meter as run out.
+    """Mark a limit as fired and its meter as run out, and stop every meter that is running, charged up to now.
+
+    The error is about to be raised in the code that is running, and a meter runs only around work that the error
+    goes through and ends. The code that would stop the meter can be where the error lands (:meth:`Meter.stop` as
+    it begins, or just after its clock read), and a meter left running would go on being charged while it is not
+    used, until its limit fired in whatever ran next: the reading of the next file.
 
     Args:
         limit: A limit that is due.
@@ -237,6 +257,10 @@ def _spend(limit: _Limit) -> type[TimeLimit]:
     Returns:
         Its error, to raise.
     """
+    for each in _limits:
+        running = each.meter
+        if running is not None:
+            running.stop()
     limit.fired = True
     meter = limit.meter
     if meter is not None:

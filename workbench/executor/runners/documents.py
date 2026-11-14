@@ -244,6 +244,11 @@ class Matcher:
         finally:
             budget.stop()
 
+    def stop(self) -> None:
+        """Stop the budget's meter if a match was cut off while it ran; a stopped meter stays as it is."""
+        if self.budget is not None:
+            self.budget.stop()
+
     def _first(self, text: str) -> list[re.Match[str]]:
         """Find the first non-empty matches in a text.
 
@@ -368,9 +373,12 @@ class _Search:
                 self.skipped.append({"path": virtual, "reason": f"reading took longer than {self.per_file:g} s"})
             return
         finally:
-            # The generator is left suspended inside the reader's time limit when the loop stops early. Close it
-            # here, with the signal held back, rather than leave it to be collected when the deadline chooses.
+            # A match cut off by the file's time limit must not leave the regex budget's meter running into the next
+            # file's reading: the timer stops it before it raises, and this is the second line. The generator is
+            # left suspended inside the reader's time limit when the loop stops early. Close it here, with the
+            # signal held back, rather than leave it to be collected when the deadline chooses.
             with shielded(), suppress(readers.ReadTimeout):
+                self.matcher.stop()
                 pieces.close()
             readers.set_deadline(None)
         if blank:
