@@ -154,6 +154,8 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/tools/read_document",
         "/tools/search_files",
         "/tools/run_python",
+        "/tools/inspect_template",
+        "/tools/fill_template",
         DISPLAY_TOOL,
         "/tools/echo",
     }

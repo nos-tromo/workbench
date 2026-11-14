@@ -238,7 +238,7 @@ def test_the_runner_gets_its_context_from_the_spec_and_the_cwd(tmp_path: Path, m
 
 def test_the_registered_runners() -> None:
     """Each tool task registers its own runners: ``echo`` proves the sandbox, the document tools read files."""
-    assert set(RUNNERS) == {"echo", "read_document", "search_files", "run_python"}
+    assert set(RUNNERS) == {"echo", "read_document", "search_files", "run_python", "inspect_template", "fill_template"}
 
 
 def test_the_job_reads_no_environment() -> None:

@@ -6,6 +6,7 @@ from typing import Any
 from workbench.executor.context import JobContext
 from workbench.executor.runners.documents import read_document, search_files
 from workbench.executor.runners.python import run_python
+from workbench.executor.runners.templates import fill_template, inspect_template
 
 __all__ = ["RUNNERS", "JobContext", "echo"]
 
@@ -28,4 +29,6 @@ RUNNERS: dict[str, Callable[[dict[str, Any], JobContext], dict[str, Any]]] = {
     "read_document": read_document,
     "search_files": search_files,
     "run_python": run_python,
+    "inspect_template": inspect_template,
+    "fill_template": fill_template,
 }

@@ -1115,6 +1115,8 @@ def test_list_files_tool_is_in_the_schema(app: FastAPI, client: TestClient) -> N
         "read_document",
         "search_files",
         "run_python",
+        "inspect_template",
+        "fill_template",
     }
     tools = [r for r in iter_route_contexts(app.routes) if TOOL_TAG in (r.tags or [])]
     assert {r.operation_id for r in tools} == {
@@ -1123,6 +1125,8 @@ def test_list_files_tool_is_in_the_schema(app: FastAPI, client: TestClient) -> N
         "read_document",
         "search_files",
         "run_python",
+        "inspect_template",
+        "fill_template",
     }
     assert doc["paths"]["/tools/list_files"]["post"]["operationId"] == "list_files"
     display = doc["paths"]["/files/display"]["get"]

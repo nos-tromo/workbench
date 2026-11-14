@@ -8,6 +8,10 @@ Every reader turns one file into text with a reference for each piece of it (``p
 - :func:`units` walks the document in the finest pieces it has (a page, a cell, a paragraph, a
   table row, a line), which is what a search matches against.
 
+:func:`count_pages` and :func:`sheet_extents` tell, under the same guards, what a template's source may
+cite: the pages of a PDF or the slides of a deck, the sheets of a workbook and the cells of each that
+hold something.
+
 The files are untrusted. Nothing here runs macros, follows links, loads external entities or
 fetches anything, and a file that cannot be read is :class:`UnreadableFile`, never a hang: Office
 and OpenDocument files are zip files, whose unpacked size is checked against a limit before any
@@ -24,12 +28,13 @@ from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from workbench.executor.timer import TimeLimit, limit_until
 
 __all__ = [
     "DocumentText",
+    "Extent",
     "NoSuchPart",
     "Part",
     "ReadTimeout",
@@ -37,8 +42,10 @@ __all__ = [
     "UnsupportedFormat",
     "check",
     "check_zip",
+    "count_pages",
     "read",
     "set_deadline",
+    "sheet_extents",
     "tick",
     "units",
 ]
@@ -379,6 +386,92 @@ def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> 
         try:
             return _reader(family).read(path, part=part, max_chars=max_chars)
         except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+            raise
+        except MemoryError:
+            raise UnreadableFile(TOO_BIG) from None
+        except Exception:
+            raise UnreadableFile(DAMAGED) from None
+
+
+def count_pages(path: Path, *, file_mb: int = 50) -> int:
+    """Count the pages of a PDF or the slides of a presentation, under the same guards as :func:`read`.
+
+    Args:
+        path: A ``.pdf`` or ``.pptx`` file.
+        file_mb: The largest file a job may write, in megabytes.
+
+    Returns:
+        How many pages or slides it has.
+
+    Raises:
+        UnsupportedFormat: It is neither.
+        UnreadableFile: It is encrypted, damaged, truncated, a decompression bomb, or too big to read.
+        ReadTimeout: The deadline (:func:`set_deadline`) passed while counting.
+    """
+    if path.suffix.lower() not in {".pdf", ".pptx"}:
+        raise UnsupportedFormat("only a PDF has pages and only a presentation has slides")
+    with _backstop():
+        family = _prepare(path, file_mb)
+        try:
+            if family == "pdf":
+                from workbench.executor.readers import pdf
+
+                return len(pdf._open(path).pages)
+            from pptx import Presentation
+
+            return len(Presentation(str(path)).slides)
+        except (UnsupportedFormat, UnreadableFile):
+            raise
+        except MemoryError:
+            raise UnreadableFile(TOO_BIG) from None
+        except Exception:
+            raise UnreadableFile(DAMAGED) from None
+
+
+#: The rows and columns a sheet's cells with content span: first row, last row, first column, last column.
+Extent = tuple[int, int, int, int]
+
+
+def sheet_extents(path: Path, *, file_mb: int = 50) -> dict[str, Extent | None]:
+    """List the sheets of a workbook and the cells of each that hold something, under the same guards as :func:`read`.
+
+    Args:
+        path: An ``.xlsx``, ``.xlsm`` or ``.ods`` file.
+        file_mb: The largest file a job may write, in megabytes.
+
+    Returns:
+        Each sheet's name, in order, with the extent of its cells that hold something; ``None`` for an empty sheet.
+
+    Raises:
+        UnsupportedFormat: It is not a workbook.
+        UnreadableFile: It is encrypted, damaged, truncated, a decompression bomb, or too big to read.
+        ReadTimeout: The deadline (:func:`set_deadline`) passed while reading.
+    """
+    if path.suffix.lower() not in {".xlsx", ".xlsm", ".ods"}:
+        raise UnsupportedFormat("only a workbook has sheets and cells")
+    with _backstop():
+        family = _prepare(path, file_mb)
+        try:
+            from workbench.executor.readers import odf, sheet
+
+            source: Any = sheet.Workbook(path) if family == "xlsx" else odf.Sheets(path)
+            try:
+                extents: dict[str, Extent | None] = dict.fromkeys(source.names)
+                for name, number, row in source.walk(None, 1, cap=1):
+                    tick()
+                    columns = [column for column, text in enumerate(row, 1) if text]
+                    if not columns:
+                        continue
+                    seen = extents[name]
+                    if seen is None:
+                        extents[name] = (number, number, columns[0], columns[-1])
+                    else:
+                        extents[name] = (seen[0], number, min(seen[2], columns[0]), max(seen[3], columns[-1]))
+                return extents
+            finally:
+                if family == "xlsx":
+                    source.close()
+        except (UnsupportedFormat, UnreadableFile):
             raise
         except MemoryError:
             raise UnreadableFile(TOO_BIG) from None

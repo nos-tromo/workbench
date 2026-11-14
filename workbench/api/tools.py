@@ -6,7 +6,8 @@ own, and the description is written for the model rather than taken from the doc
 that module's audit rule; ``read_document``, ``search_files`` and ``run_python`` hand the chat's files
 to a job in the executor (:mod:`workbench.executor.runners.documents`,
 :mod:`workbench.executor.runners.python`) and are built here from what the store knows and what the job
-answers. The rest of the tools arrive with their runners.
+answers. Each later tool has a module of its own on this module's router, sharing its helpers:
+``inspect_template`` and ``fill_template`` are in :mod:`workbench.api.tools_templates`.
 
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
@@ -178,6 +179,10 @@ _RUNNER_ERRORS: Final = {
     "file_not_found": 404,
     "bad_regex": 422,
     "regex_timeout": 422,
+    "unsupported_template": 422,
+    "invalid_template": 422,
+    "invalid_value": 422,
+    "invalid_source": 422,
 }
 _ERROR_CAP: Final = 300
 _CUT_MARK: Final = " [cut]"
@@ -437,23 +442,24 @@ def _cut_part(shell: DocumentRead, part: DocumentPart, limit: int, limit_kb: int
     return best
 
 
-def _within[M: DocumentRead | SearchResult | PythonRun](answer: M, limit: int) -> M:
+def _within[M: BaseModel](answer: M, limit: int) -> M:
     """Shorten the hint, as a last resort, so that an answer whose parts or hits are cut as far as they go fits.
 
     Args:
-        answer: The answer, already cut.
+        answer: The answer, already cut; a model with a ``hint``.
         limit: The limit in bytes.
 
     Returns:
         The answer, with its hint cut to what fits if it was over the limit; as it is otherwise.
     """
-    if _json_size(answer) <= limit or not answer.hint:
+    hint: str | None = getattr(answer, "hint", None)
+    if _json_size(answer) <= limit or not hint:
         return answer
-    low, high = 0, len(answer.hint)
+    low, high = 0, len(hint)
     best = answer.model_copy(update={"hint": None})
     while low <= high:
         middle = (low + high) // 2
-        candidate = answer.model_copy(update={"hint": answer.hint[:middle]})
+        candidate = answer.model_copy(update={"hint": hint[:middle]})
         if _json_size(candidate) <= limit:
             best, low = candidate, middle + 1
         else:
