@@ -538,10 +538,10 @@ def test_slot_cleanup_gives_up_after_bounded_retries_and_names_only_the_slot(mon
 
 
 def test_slot_cleanup_ends_within_its_documented_bound() -> None:
-    """Six helper runs, each killed after 30 s, and 3.1 s of pauses: 183 s at the very worst, before the looks."""
+    """Six kill runs and one IPC run, each killed after 30 s, and 3.1 s of pauses: 213 s at worst, before the looks."""
     pauses = sum(sandbox._SLOT_KILL_PAUSE_S * 2**attempt for attempt in range(sandbox._SLOT_KILL_ATTEMPTS - 1))
     assert sandbox._HELPER_TIMEOUT_S == 30
-    assert sandbox._SLOT_KILL_ATTEMPTS * sandbox._HELPER_TIMEOUT_S + pauses == pytest.approx(183.1)
+    assert (sandbox._SLOT_KILL_ATTEMPTS + 1) * sandbox._HELPER_TIMEOUT_S + pauses == pytest.approx(213.1)
 
 
 def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -551,6 +551,7 @@ def test_slot_cleanup_stops_as_soon_as_nothing_is_left(monkeypatch: pytest.Monke
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: next(looks))
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: kills.append(slot.uid))
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: False)
     monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
     assert kills == [20001, 20001, 20001]
@@ -562,6 +563,7 @@ def test_slot_cleanup_signals_before_it_looks(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: events.append("look") or False)
     monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: events.append("kill"))
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: False)
     kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
     assert events == ["kill", "look"]
 
@@ -937,3 +939,214 @@ async def test_a_failed_drop_is_cleared_on_the_given_pool_too(tmp_path: Path, mo
 
     assert status == ("error", sandbox.SPAWN_FAILED)
     assert [name.startswith("slot-cleanup-test") for name in threads] == [True]
+
+
+# --- what a slot leaves besides processes: SysV IPC, /dev/shm, /dev/mqueue ---------------------
+
+
+def _linux_cleanup(monkeypatch: pytest.MonkeyPatch, events: list[str], *, ipc: list[bool]) -> None:
+    """Stand in for every step of the slot cleanup, noting the order; ``ipc`` answers the IPC looks."""
+    answers = iter(ipc)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: events.append("kill"))
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: events.append("look") or False)
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: events.append("ipc?") or next(answers))
+    monkeypatch.setattr(sandbox, "_clear_ipc_as_slot", lambda slot: events.append("clear"))
+
+
+def test_slot_cleanup_clears_ipc_once_no_process_is_left_and_looks_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """IPC is cleared after the last process is gone, so nothing can make more; a second look verifies it."""
+    events: list[str] = []
+    _linux_cleanup(monkeypatch, events, ipc=[True, False])
+    kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+    assert events == ["kill", "look", "ipc?", "clear", "ipc?"]
+
+
+def test_slot_cleanup_runs_no_ipc_helper_when_the_slot_left_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The common case costs one look and no second helper."""
+    events: list[str] = []
+    _linux_cleanup(monkeypatch, events, ipc=[False])
+    kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+    assert events == ["kill", "look", "ipc?"]
+
+
+def test_ipc_that_survives_the_clear_fails_the_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever stays behind could reach the slot's next job, another user's perhaps: the slot is retired."""
+    events: list[str] = []
+    _linux_cleanup(monkeypatch, events, ipc=[True, True])
+    with pytest.raises(RuntimeError) as raised:
+        kill_slot_processes(Slot(index=2, uid=20003, gid=20003))
+    assert str(raised.value) == "IPC objects of slot 2 survived the cleanup"
+
+
+def test_ipc_is_not_touched_while_processes_survive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live process could make new objects, so the slot fails before any IPC step."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sandbox, "_kill_as_slot", lambda slot: None)
+    monkeypatch.setattr(sandbox, "_slot_has_live_processes", lambda uid: True)
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", lambda uid: pytest.fail("looked at IPC"))
+    monkeypatch.setattr(sandbox.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError, match="processes of slot 0 survived the cleanup"):
+        kill_slot_processes(Slot(index=0, uid=20001, gid=20001))
+
+
+@pytest.mark.parametrize("error", [OSError("no /proc/sysvipc"), ValueError("x"), IndexError("y")])
+def test_ipc_that_cannot_be_checked_fails_the_cleanup(error: Exception, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A look that fails is not a clean look."""
+
+    def look(uid: int) -> bool:
+        """Fail as an unreadable table does."""
+        raise error
+
+    events: list[str] = []
+    _linux_cleanup(monkeypatch, events, ipc=[])
+    monkeypatch.setattr(sandbox, "_slot_has_ipc", look)
+    with pytest.raises(RuntimeError) as raised:
+        kill_slot_processes(Slot(index=1, uid=20002, gid=20002))
+    assert str(raised.value) == "processes of slot 1 could not be checked"
+
+
+@pytest.mark.parametrize("outcome", ["exit 1", "timeout"])
+def test_an_ipc_helper_that_fails_or_hangs_fails_the_cleanup(outcome: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The IPC helper is exec'd before it drops, as the kill helper is, and runs under the same timeout."""
+    seen: dict[str, Any] = {}
+
+    def run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        """End as told, after noting how it was called."""
+        seen.update(kwargs, argv=args[0])
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+        return subprocess.CompletedProcess(args[0], 1)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    with pytest.raises(RuntimeError) as raised:
+        sandbox._clear_ipc_as_slot(Slot(index=3, uid=20004, gid=20005))
+    assert str(raised.value) == "could not clear the IPC objects of slot 3"
+    assert seen["timeout"] == 30
+    assert "preexec_fn" not in seen
+    assert seen["argv"][4] == sandbox._DROP_AND_CLEAR
+    assert seen["argv"][5:7] == ["20004", "20005"]
+    assert seen["env"] == dict(sandbox.CLEAN_ENV)
+
+
+@pytest.mark.parametrize(("uid", "gid"), [("0", "20001"), ("20001", "0"), ("-1", "20001"), ("20001", "-5")])
+def test_the_ipc_helper_refuses_root_and_negative_ids(uid: str, gid: str) -> None:
+    """As root it would remove root's objects; ``setgroups`` is replaced to exit 9 so a missing check shows."""
+    disarmed = "import os\nos.setgroups = lambda groups: os._exit(9)\n" + sandbox._DROP_AND_CLEAR
+    done = subprocess.run([sys.executable, "-I", "-S", "-c", disarmed, uid, gid], check=False, capture_output=True)
+    assert done.returncode == 3, done.stderr
+
+
+def test_the_ipc_helper_imports_ctypes_only_when_there_is_sysv_ipc_to_remove() -> None:
+    """Its start-up stays as cheap as the kill helper's; ``ctypes`` loads only for ``IPC_RMID`` calls."""
+    tree = ast.parse(sandbox._DROP_AND_CLEAR)
+    top = {alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names}
+    nested = {
+        alias.name
+        for branch in tree.body
+        if isinstance(branch, ast.If)
+        for node in ast.walk(branch)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    everywhere = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    assert top == {"os", "sys"}
+    assert nested == {"ctypes"}
+    assert everywhere == {"os", "sys", "ctypes"}
+
+
+SYSV_SHM = (
+    b"       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime\n"
+    b"     22337          5   600                  4096     8     0      0 20009 20009 20001 20001          0\n"
+    b"         0          6   600                  4096     8     0      0     0     0     0     0          0\n"
+)
+SYSV_SEM = (
+    b"       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n"
+    b"     22339          0   600          1 20002 20002 20002 20002          0 1794616376\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("table", "uid", "held"),
+    [
+        (SYSV_SHM, 20001, True),  # the creator, though it handed the owner away
+        (SYSV_SHM, 20009, True),  # the owner
+        (SYSV_SHM, 20002, False),
+        (SYSV_SEM, 20002, True),  # another column layout, read from its header
+        (SYSV_SEM, 20001, False),
+        (SYSV_SEM.splitlines(keepends=True)[0], 20002, False),
+    ],
+)
+def test_sysv_objects_of_a_slot_are_found_by_owner_or_creator(table: bytes, uid: int, held: bool) -> None:
+    """``IPC_SET`` can hand an object's owner to another uid; the creator stays, so both columns count."""
+    assert sandbox._sysv_table_holds(table, uid) is held
+
+
+def test_a_slot_file_is_found_anywhere_below_an_ipc_folder(tmp_path: Path) -> None:
+    """A folder is walked through, without following links; ownership is what counts."""
+    me = os.getuid()
+    assert sandbox._folder_holds(str(tmp_path), me) is False
+    assert sandbox._folder_holds(str(tmp_path / "missing"), me) is False
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    assert sandbox._folder_holds(str(tmp_path), me) is True  # the folders are the uid's too
+    assert sandbox._folder_holds(str(tmp_path), me + 12345) is False
+
+
+MAKE_IPC = """\
+import ctypes, os, pathlib, sys
+libc = ctypes.CDLL(None, use_errno=True)
+tag, key = sys.argv[1], int(sys.argv[2])
+pathlib.Path(f"/dev/shm/wb-{tag}").write_text("synthetic note")
+pathlib.Path(f"/dev/shm/wb-{tag}-d/inner").mkdir(parents=True)
+pathlib.Path(f"/dev/shm/wb-{tag}-d/inner/note").write_text("synthetic note")
+assert libc.shmget(key, 4096, 0o1000 | 0o600) >= 0
+assert libc.shmget(0, 4096, 0o1000 | 0o600) >= 0
+assert libc.msgget(key + 1, 0o1000 | 0o600) >= 0
+assert libc.semget(key + 2, 1, 0o1000 | 0o600) >= 0
+assert libc.mq_open(f"/wb-{tag}".encode(), os.O_CREAT | os.O_RDWR, 0o600, None) >= 0
+"""
+
+
+def _ipc_of(uid: int) -> list[str]:
+    """Everything of ``uid`` in the SysV tables, ``/dev/shm`` and ``/dev/mqueue``, read independently."""
+    found = []
+    for table in ("shm", "msg", "sem"):
+        rows = Path(f"/proc/sysvipc/{table}").read_text().splitlines()
+        head = rows[0].split()
+        for row in rows[1:]:
+            cells = row.split()
+            if uid in (int(cells[head.index("uid")]), int(cells[head.index("cuid")])):
+                found.append(f"{table}:{cells[1]}")
+    for top in ("/dev/shm", "/dev/mqueue"):
+        for folder, names, files in os.walk(top):
+            found += [f"{folder}/{n}" for n in names + files if os.lstat(f"{folder}/{n}").st_uid == uid]
+    return found
+
+
+def _make_ipc_as(slot: Slot, tag: str, key: int) -> None:
+    """Leave SysV objects, POSIX shared memory files and a message queue of the slot's uid, then exit."""
+
+    def drop() -> None:
+        """Become the slot."""
+        os.setgroups([])
+        os.setgid(slot.gid)
+        os.setuid(slot.uid)
+
+    subprocess.run([sys.executable, "-I", "-c", MAKE_IPC, tag, str(key)], preexec_fn=drop, check=True, timeout=60)
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_slot_cleanup_removes_its_ipc_and_nothing_of_others() -> None:
+    """Shared memory, queues and semaphores outlive their processes; the cleanup removes the slot's own only."""
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    _make_ipc_as(slot, "slot", 0x57A0)
+    _make_ipc_as(other, "other", 0x57B0)
+    assert len(_ipc_of(slot.uid)) == 9  # 4 SysV objects, 4 entries in /dev/shm, 1 queue
+    try:
+        kill_slot_processes(slot)
+        assert _ipc_of(slot.uid) == []
+        assert len(_ipc_of(other.uid)) == 9
+        assert sandbox._slot_has_ipc(slot.uid) is False
+    finally:
+        kill_slot_processes(other)
+    assert _ipc_of(other.uid) == []

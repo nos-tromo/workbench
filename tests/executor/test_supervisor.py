@@ -45,11 +45,16 @@ spec_path.with_name("result.json").write_text(json.dumps(result))
 """
 
 
+def _sock(data: Path) -> Path:
+    """Where the socket of a volume at ``data`` lies: in a ``run`` folder beside it, as ``/run/workbench``."""
+    return data.parent / "run" / "executor.sock"
+
+
 def _settings(data: Path, **env: str) -> Settings:
     """Executor settings for a volume at ``data``, with ``env`` on top."""
     values = {
         "WORKBENCH_DATA_DIR": str(data),
-        "WORKBENCH_EXECUTOR_SOCKET": str(data / "executor.sock"),
+        "WORKBENCH_EXECUTOR_SOCKET": str(_sock(data)),
         "WORKBENCH_EXECUTOR_SLOTS": "2",
         **env,
     }
@@ -110,6 +115,12 @@ def _runner(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
 def _entries(folder: Path) -> list[str]:
     """Names in ``folder``."""
     return sorted(p.name for p in folder.iterdir())
+
+
+def _only(folder: Path) -> str:
+    """The one name in ``folder``."""
+    (name,) = _entries(folder)
+    return name
 
 
 def _mode(path: Path) -> int:
@@ -274,6 +285,28 @@ async def test_outputs_with_names_the_workspace_refuses_are_dropped(
     answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
 
     assert [o.name for o in answer.outputs] == ["Übersicht März.csv"]
+
+
+async def test_outputs_with_more_than_one_name_are_dropped_and_counted(
+    volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hard link can give ``out/`` a name for a file the job does not own; an output must be the job's alone."""
+    _chat(volume, {"q.csv": b"q"})
+    _runner(
+        monkeypatch,
+        """
+        pathlib.Path("out/a.csv").write_text("a")
+        os.link("out/a.csv", "out/b.csv")
+        os.link("q.csv", "out/q-again.csv")
+        pathlib.Path("out/r.csv").write_text("r")
+        """,
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(input_files=["q.csv"]))
+
+    assert (answer.status, [o.name for o in answer.outputs]) == ("ok", ["r.csv"])
+    assert answer.message == "dropped 3 outputs: not the job's own file"
+    assert _entries(volume / "staging" / _only(volume / "staging")) == ["r.csv"]
 
 
 async def test_only_requested_inputs_are_copied(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -501,22 +534,24 @@ async def test_removing_the_job_folder_follows_no_symlink(
     assert _entries(volume / "jobs") == []
 
 
-async def test_a_job_folder_that_cannot_be_removed_is_closed_to_the_slot(
+async def test_a_job_folder_that_cannot_be_removed_closes_and_retires_its_slot(
     volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """If removal fails, the folder is handed back to root, mode 0700, so the slot's next job cannot enter it."""
+    """A folder left behind holds a user's inputs: it goes back to root, and its slot is never reused."""
     _chat(volume)
     _runner(monkeypatch, "pass")
     monkeypatch.setattr(supervisor.shutil, "rmtree", lambda path, **kwargs: kwargs["onexc"](os.rmdir, path, OSError()))
+    sup = Supervisor(_settings(volume, WORKBENCH_EXECUTOR_SLOTS="1"), use_slots=False)
     request = _request()
 
     with caplog.at_level(logging.WARNING, logger="workbench.executor"):
-        answer = await Supervisor(_settings(volume), use_slots=False).run_job(request)
+        answer = await sup.run_job(request)
 
     left = volume / "jobs" / request.job_id
     assert answer.status == "ok"
     assert (_ids(left), _mode(left)) == (ME, 0o700)
-    assert [r.getMessage() for r in caplog.records] == ["a job folder could not be removed"]
+    assert [r.getMessage() for r in caplog.records] == ["a job folder could not be removed", "slot 0 retired"]
+    assert (await sup.run_job(_request())).message == "no usable slot"
 
 
 async def test_a_job_id_already_in_use_is_refused_and_its_folder_kept(
@@ -781,13 +816,29 @@ def _memory_max(tmp_path: Path, value: str) -> Path:
     return path
 
 
+def _sysctls(tmp_path: Path, hardlinks: str | None = "1", symlinks: str | None = "1") -> Path:
+    """A ``/proc/sys/fs`` with the two link protections set as given; ``None`` leaves one out."""
+    folder = tmp_path / "fs"
+    folder.mkdir(exist_ok=True)
+    for name, value in (("protected_hardlinks", hardlinks), ("protected_symlinks", symlinks)):
+        if value is not None:
+            (folder / name).write_text(value + "\n")
+    return folder
+
+
 @pytest.mark.parametrize("memory", [None, "max", str(4 * 1536 * MB), str(8 * 1536 * MB)])
 def test_a_well_set_up_host_passes_the_start_up_checks(memory: str | None, tmp_path: Path) -> None:
     """Root, every slot user present, and a memory limit of at least slots times job memory (or none)."""
     settings = _settings(tmp_path, WORKBENCH_EXECUTOR_SLOTS="4")
     memory_max = tmp_path / "absent" if memory is None else _memory_max(tmp_path, memory)
 
-    problem = startup_problem(settings, passwd=_passwd(tmp_path, range(20001, 20017)), memory_max=memory_max, euid=0)
+    problem = startup_problem(
+        settings,
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=memory_max,
+        sysctls=_sysctls(tmp_path),
+        euid=0,
+    )
 
     assert problem is None
 
@@ -800,6 +851,7 @@ def test_too_little_container_memory_refuses_to_start(tmp_path: Path) -> None:
         settings,
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=_memory_max(tmp_path, str(4 * 1536 * MB - 1)),
+        sysctls=_sysctls(tmp_path),
         euid=0,
     )
 
@@ -811,7 +863,11 @@ def test_missing_slot_users_refuse_to_start(tmp_path: Path) -> None:
     settings = _settings(tmp_path, WORKBENCH_EXECUTOR_SLOTS="4")
 
     problem = startup_problem(
-        settings, passwd=_passwd(tmp_path, range(20001, 20004)), memory_max=tmp_path / "absent", euid=0
+        settings,
+        passwd=_passwd(tmp_path, range(20001, 20004)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        euid=0,
     )
 
     assert problem == "1 of the 4 slot users is missing from the image"
@@ -822,7 +878,11 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
     settings = dataclasses.replace(_settings(tmp_path), executor_slots=17)
 
     problem = startup_problem(
-        settings, passwd=_passwd(tmp_path, range(20001, 20018)), memory_max=tmp_path / "absent", euid=0
+        settings,
+        passwd=_passwd(tmp_path, range(20001, 20018)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        euid=0,
     )
 
     assert problem is not None
@@ -832,10 +892,38 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
 def test_a_supervisor_that_is_not_root_refuses_to_start(tmp_path: Path) -> None:
     """Without root it cannot switch to the slot uids."""
     problem = startup_problem(
-        _settings(tmp_path), passwd=_passwd(tmp_path, range(20001, 20017)), memory_max=tmp_path / "x", euid=1000
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "x",
+        sysctls=_sysctls(tmp_path),
+        euid=1000,
     )
 
     assert problem == "the supervisor must run as root"
+
+
+@pytest.mark.parametrize(
+    ("hardlinks", "symlinks", "problem"),
+    [
+        ("0", "1", "fs.protected_hardlinks must be 1, so a job cannot link files it does not own"),
+        (None, "1", "fs.protected_hardlinks must be 1, so a job cannot link files it does not own"),
+        ("1", "0", "fs.protected_symlinks must be 1, so no one follows a job's links in shared folders"),
+        ("1", "2", "fs.protected_symlinks must be 1, so no one follows a job's links in shared folders"),
+    ],
+)
+def test_a_host_without_link_protection_refuses_to_start(
+    hardlinks: str | None, symlinks: str | None, problem: str, tmp_path: Path
+) -> None:
+    """Root stages a job's outputs: a hard link to a file the job does not own must be impossible to make."""
+    found = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path, hardlinks, symlinks),
+        euid=0,
+    )
+
+    assert found == problem
 
 
 def test_main_refuses_to_start_with_one_short_line(
@@ -848,6 +936,27 @@ def test_main_refuses_to_start_with_one_short_line(
     assert supervisor.main() == 1
 
     assert capsys.readouterr().err == "workbench executor: refusing to start: the supervisor must run as root\n"
+
+
+def test_main_reports_a_socket_it_may_not_bind_in_one_short_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal found as ``serve()`` starts, such as an unsafe socket folder, ends the process the same way."""
+
+    async def refuse(self: Supervisor) -> None:
+        """Refuse as an unsafe socket folder does."""
+        raise RuntimeError("the socket's folder must be root's alone")
+
+    monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
+    monkeypatch.setattr(Supervisor, "serve", refuse)
+
+    assert supervisor.main() == 1
+
+    assert (
+        capsys.readouterr().err == "workbench executor: refusing to start: the socket's folder must be root's alone\n"
+    )
 
 
 def test_main_refuses_a_bad_setting(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -898,10 +1007,13 @@ async def _ask(path: Path, line: bytes) -> bytes:
 
 @pytest.fixture
 def served(public_tmp: Path) -> Iterator[Path]:
-    """A prepared volume, owned by the test runner, with a short path for the socket."""
-    prepare_volume(public_tmp, Owners(root=ME, api=ME))
-    _chat(public_tmp)
-    yield public_tmp
+    """A prepared volume, owned by the test runner, and a private ``run`` folder with a short path for the socket."""
+    data = public_tmp / "data"
+    data.mkdir()
+    prepare_volume(data, Owners(root=ME, api=ME))
+    _sock(data).parent.mkdir(mode=0o755)
+    _chat(data)
+    yield data
 
 
 async def test_serve_answers_one_request_per_connection(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -911,13 +1023,13 @@ async def test_serve_answers_one_request_per_connection(served: Path, monkeypatc
     request = _request()
 
     async with _serving(sup):
-        answer = decode_result(await _ask(served / "executor.sock", encode(request)))
-        again = decode_result(await _ask(served / "executor.sock", encode(_request())))
+        answer = decode_result(await _ask(_sock(served), encode(request)))
+        again = decode_result(await _ask(_sock(served), encode(_request())))
 
     assert (answer.job_id, answer.status, answer.result) == (request.job_id, "ok", {"tool": "script"})
     assert again.status == "ok"
-    assert _mode(served / "executor.sock") == 0o660
-    assert stat.S_ISSOCK(os.lstat(served / "executor.sock").st_mode)
+    assert _mode(_sock(served)) == 0o660
+    assert stat.S_ISSOCK(os.lstat(_sock(served)).st_mode)
 
 
 @pytest.mark.parametrize(
@@ -938,7 +1050,7 @@ async def test_a_malformed_request_gets_an_error_line_and_nothing_is_logged(
 
     with caplog.at_level(logging.DEBUG):
         async with _serving(sup):
-            answer = decode_result(await _ask(served / "executor.sock", line))
+            answer = decode_result(await _ask(_sock(served), line))
 
     assert (answer.status, answer.message, answer.result, answer.outputs) == ("error", "malformed request", {}, [])
     assert "quarterly" not in caplog.text
@@ -950,23 +1062,59 @@ async def test_a_stale_socket_is_replaced(served: Path, monkeypatch: pytest.Monk
     """A socket left by an earlier run is removed before the new one is bound."""
     _runner(monkeypatch, "pass")
     stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    stale.bind(str(served / "executor.sock"))
+    stale.bind(str(_sock(served)))
     stale.close()
 
     async with _serving(Supervisor(_settings(served), use_slots=False)):
-        answer = decode_result(await _ask(served / "executor.sock", encode(_request())))
+        answer = decode_result(await _ask(_sock(served), encode(_request())))
 
     assert answer.status == "ok"
 
 
+async def test_the_socket_gets_its_mode_as_it_is_made_not_through_its_path(served: Path) -> None:
+    """``0660`` comes from the umask in force at ``bind``; no mode is set later through a path."""
+    real_chmod = os.chmod
+    os.chmod = lambda *args, **kwargs: pytest.fail("chmod by path")
+    previous = os.umask(0o002)
+    try:
+        async with _serving(Supervisor(_settings(served), use_slots=False)):
+            answer = decode_result(await _ask(_sock(served), b"not json\n"))
+    finally:
+        restored = os.umask(previous)
+        os.chmod = real_chmod
+
+    assert answer.status == "error"
+    assert _mode(_sock(served)) == 0o660
+    assert restored == 0o002
+
+
+@pytest.mark.parametrize("trap", ["group-writable", "others-writable", "symlink"])
+async def test_a_socket_folder_others_could_change_stops_serve(trap: str, served: Path) -> None:
+    """The socket's folder must be root's alone, so no one can swap the socket under the supervisor."""
+    run = _sock(served).parent
+    real = served.parent / "real-run"
+    if trap == "symlink":
+        run.rmdir()
+        real.mkdir(mode=0o755)
+        run.symlink_to(real)
+    else:
+        run.chmod(0o775 if trap == "group-writable" else 0o757)
+
+    with pytest.raises(RuntimeError, match="the socket's folder must be root's alone"):
+        await asyncio.wait_for(Supervisor(_settings(served), use_slots=False).serve(), 10)
+
+    assert not _sock(served).exists()
+    assert not real.exists() or _entries(real) == []
+
+
 async def test_something_else_in_the_sockets_place_stops_serve(served: Path) -> None:
     """A file or symlink where the socket belongs is not removed; the supervisor does not start."""
-    (served / "executor.sock").write_text("not a socket")
+    (_sock(served)).write_text("not a socket")
 
     with pytest.raises(RuntimeError, match="not a socket"):
-        await Supervisor(_settings(served), use_slots=False).serve()
+        await asyncio.wait_for(Supervisor(_settings(served), use_slots=False).serve(), 10)
 
-    assert (served / "executor.sock").read_text() == "not a socket"
+    assert (_sock(served)).read_text() == "not a socket"
 
 
 async def test_job_folders_left_by_an_earlier_run_are_removed_at_start(
@@ -981,7 +1129,7 @@ async def test_job_folders_left_by_an_earlier_run_are_removed_at_start(
 
     with caplog.at_level(logging.INFO, logger="workbench.executor"):
         async with _serving(Supervisor(_settings(served), use_slots=False)):
-            await _ask(served / "executor.sock", encode(_request()))
+            await _ask(_sock(served), encode(_request()))
 
     assert _entries(served / "jobs") == ["not-a-job"]
     assert [r.getMessage() for r in caplog.records] == ["removed 1 job folder left from an earlier run"]
@@ -997,7 +1145,7 @@ async def test_a_loosened_jobs_folder_is_reported_at_start_and_left_alone(
 
     with caplog.at_level(logging.INFO, logger="workbench.executor"):
         async with _serving(Supervisor(_settings(served), use_slots=False)):
-            answer = decode_result(await _ask(served / "executor.sock", encode(_request())))
+            answer = decode_result(await _ask(_sock(served), encode(_request())))
 
     assert answer.message == "the job could not be set up"
     assert stale.is_dir()
@@ -1111,13 +1259,14 @@ async def test_as_root_the_real_entry_point_runs_in_a_slot(root_volume: Path) ->
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="setting the socket's group needs root on Linux")
 async def test_as_root_the_socket_belongs_to_the_api_group(root_volume: Path) -> None:
     """Mode 0660, owner root, group 10001: the api may connect, the slot uids may not."""
+    _sock(root_volume).parent.mkdir(mode=0o755)
     sup = Supervisor(_settings(root_volume))
 
     async with _serving(sup):
-        answer = decode_result(await _ask(root_volume / "executor.sock", b"not json\n"))
+        answer = decode_result(await _ask(_sock(root_volume), b"not json\n"))
 
     assert answer.status == "error"
-    assert (_ids(root_volume / "executor.sock"), _mode(root_volume / "executor.sock")) == ((0, 10001), 0o660)
+    assert (_ids(_sock(root_volume)), _mode(_sock(root_volume))) == ((0, 10001), 0o660)
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
@@ -1134,3 +1283,105 @@ async def test_as_root_a_job_folder_that_cannot_be_removed_belongs_to_root(
 
     left = root_volume / "jobs" / request.job_id
     assert (_ids(left), _mode(left)) == ((0, 0), 0o700)
+
+
+LEAVE_IPC = """
+import ctypes, struct
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+pathlib.Path("/dev/shm/wb-drop").write_text("user-a: synthetic figures")
+pathlib.Path("/dev/shm/wb-dir").mkdir()
+pathlib.Path("/dev/shm/wb-dir/note").write_text("user-a: synthetic note")
+shm = libc.shmget(0x5742, 4096, 0o1000 | 0o600)
+at = libc.shmat(shm, None, 0)
+ctypes.memmove(at, b"user-a: sysv note\\0", 18)
+libc.shmdt(ctypes.c_void_p(at))
+msq = libc.msgget(0x5743, 0o1000 | 0o600)
+sent = libc.msgsnd(msq, ctypes.create_string_buffer(struct.pack("q6s", 1, b"user-a")), 6, 0)
+sem = libc.semget(0x5744, 1, 0o1000 | 0o600)
+mq = libc.mq_open(b"/wb-q", os.O_CREAT | os.O_RDWR, 0o600, None)
+queued = libc.mq_send(mq, b"user-a", 6, 0)
+result = {"uid": os.getuid(), "made": [shm >= 0, msq >= 0, sent == 0, sem >= 0, mq >= 0, queued == 0]}
+"""
+LOOK_FOR_IPC = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+tops = ("/dev/shm", "/dev/mqueue")
+mine = [n for top in tops for n in os.listdir(top) if os.lstat(f"{top}/{n}").st_uid == os.getuid()]
+result = {
+    "uid": os.getuid(),
+    "files": [os.path.exists("/dev/shm/wb-drop"), os.path.exists("/dev/shm/wb-dir")],
+    "sysv": [libc.shmget(0x5742, 0, 0), libc.msgget(0x5743, 0), libc.semget(0x5744, 0, 0)],
+    "mq": libc.mq_open(b"/wb-q", os.O_RDONLY),
+    "mine": mine,
+}
+"""
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_the_next_job_in_a_slot_finds_nothing_of_the_last(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IPC outlives processes: what user a's job leaves in shared memory and queues is gone before user b's runs."""
+    _chat(root_volume)
+    (root_volume / "workspaces" / CALLER / "user-b" / CHAT).mkdir(parents=True)
+    sup = Supervisor(_settings(root_volume, WORKBENCH_EXECUTOR_SLOTS="1"))
+
+    _runner(monkeypatch, LEAVE_IPC)
+    first = await sup.run_job(_request())
+    _runner(monkeypatch, LOOK_FOR_IPC)
+    second = await sup.run_job(_request(user_id="user-b"))
+
+    assert first.status == "ok", first
+    assert first.result == {"uid": 20001, "made": [True] * 6}
+    assert second.status == "ok", second
+    assert second.result == {"uid": 20001, "files": [False, False], "sysv": [-1, -1, -1], "mq": -1, "mine": []}
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_outputs_the_job_does_not_own_or_that_have_other_names_are_dropped(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Files in ``out/`` that are not the slot's, or that name a file linked elsewhere, never reach staging."""
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import time
+        pathlib.Path("out/r.csv").write_text("r")
+        pathlib.Path("out/ready").write_text("")
+        for _ in range(200):
+            if pathlib.Path("out/placed").exists():
+                break
+            time.sleep(0.05)
+        os.unlink("out/ready")
+        os.unlink("out/placed")
+        """,
+    )
+    request = _request()
+    out = root_volume / "jobs" / request.job_id / "workspace" / CHAT / "out"
+    database = root_volume / "workbench.db"
+    job = asyncio.create_task(Supervisor(_settings(root_volume)).run_job(request))
+    for _ in range(200):
+        if (out / "ready").exists():
+            break
+        await asyncio.sleep(0.05)
+    (out / "foreign.csv").write_text("root's, not the job's")
+    os.link(database, out / "linked.bin")
+    (out / "placed").write_text("")
+
+    answer = await job
+
+    assert (answer.status, [o.name for o in answer.outputs]) == ("ok", ["r.csv"])
+    assert answer.message == "dropped 2 outputs: not the job's own file"
+    assert os.stat(database).st_nlink == 1
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="owning a folder by another uid needs root on Linux")
+async def test_as_root_a_socket_folder_the_api_owns_stops_serve(root_volume: Path) -> None:
+    """The api must not own the socket's folder, or it could replace the socket the supervisor binds."""
+    _sock(root_volume).parent.mkdir(mode=0o755)
+    os.chown(_sock(root_volume).parent, 10001, 10001)
+
+    with pytest.raises(RuntimeError, match="the socket's folder must be root's alone"):
+        await asyncio.wait_for(Supervisor(_settings(root_volume)).serve(), 10)

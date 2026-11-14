@@ -72,6 +72,14 @@ _FIRST_SLOT_UID = 1000
 _LAST_SLOT_UID = 65533
 _PASSWD = Path("/etc/passwd")
 _MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
+_SYSCTLS = Path("/proc/sys/fs")
+# Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
+# the api's database, which root would then stage. Symlinks: a link a job leaves in a sticky,
+# world-writable folder (/dev/shm, /dev/mqueue) is not followed by anyone else.
+_LINK_PROTECTIONS = (
+    ("protected_hardlinks", "so a job cannot link files it does not own"),
+    ("protected_symlinks", "so no one follows a job's links in shared folders"),
+)
 
 _log = logging.getLogger("workbench.executor")
 
@@ -166,6 +174,7 @@ def startup_problem(
     *,
     passwd: Path = _PASSWD,
     memory_max: Path = _MEMORY_MAX,
+    sysctls: Path = _SYSCTLS,
     euid: int | None = None,
 ) -> str | None:
     """Find a reason the supervisor must not start.
@@ -174,11 +183,14 @@ def startup_problem(
         settings: The executor's settings.
         passwd: The image's user list.
         memory_max: The container's cgroup memory limit, if it has one.
+        sysctls: The kernel's ``fs`` settings, ``/proc/sys/fs``.
         euid: The effective uid to judge; the process's own by default.
 
     Returns:
         A short reason, or ``None`` when root runs it, the slot pool is sound (``make_slots``),
-        every slot uid is a user of the image, and the memory limit holds every slot's job memory.
+        every slot uid is a user of the image, the memory limit holds every slot's job memory,
+        and ``fs.protected_hardlinks`` and ``fs.protected_symlinks`` both read 1 (the host's
+        kernel settings, which a container cannot change).
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return "the supervisor must run as root"
@@ -196,6 +208,13 @@ def startup_problem(
     limit = _memory_limit(memory_max)
     if limit is not None and limit < len(slots) * settings.job_memory_mb * MB:
         return f"the container's memory limit is below {len(slots)} slots of {settings.job_memory_mb} MB"
+    for name, why in _LINK_PROTECTIONS:
+        try:
+            value = (sysctls / name).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            value = ""
+        if value != "1":
+            return f"fs.{name} must be 1, {why}"
     return None
 
 
@@ -236,23 +255,42 @@ def _read_result(job: int, limit: int) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _find_outputs(out: int, max_mb: int) -> list[tuple[str, os.stat_result]]:
+def _own_file(st: os.stat_result, owner: int) -> bool:
+    """Tell whether a file is the job's alone: its uid's, with no other name anywhere.
+
+    A second name means a hard link, which could name a file the job may not read, such as the
+    api's database, and root would copy it.
+
+    Args:
+        st: The file's status.
+        owner: The uid the job ran as.
+
+    Returns:
+        Whether it is a regular file of ``owner`` with one link.
+    """
+    return stat.S_ISREG(st.st_mode) and st.st_uid == owner and st.st_nlink == 1
+
+
+def _find_outputs(out: int, max_mb: int, owner: int) -> tuple[list[tuple[str, os.stat_result]], int]:
     """List the job's outputs: regular files directly in ``out/`` whose names a workspace accepts.
 
     Symlinks, folders and anything else are left out, and so are names ``check_filename`` refuses.
+    Regular files that are not the job's alone (``_own_file``) are left out and counted.
 
     Args:
         out: The job's ``out/``, opened.
         max_mb: Most megabytes the outputs may hold in all.
+        owner: The uid the job ran as.
 
     Returns:
-        Name and ``lstat`` of each output, by name.
+        Name and ``lstat`` of each output, by name, and how many files were not the job's alone.
 
     Raises:
         _OutputsRefused: There are more than ``MAX_OUTPUTS``, or together they hold more than ``max_mb``.
         OSError: ``out/`` cannot be listed.
     """
     found: list[tuple[str, os.stat_result]] = []
+    dropped = 0
     with os.scandir(out) as entries:
         for entry in entries:
             try:
@@ -262,12 +300,29 @@ def _find_outputs(out: int, max_mb: int) -> list[tuple[str, os.stat_result]]:
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
+            if not _own_file(st, owner):
+                dropped += 1
+                continue
             found.append((entry.name, st))
             if len(found) > MAX_OUTPUTS:
                 raise _OutputsRefused(f"too many outputs: at most {MAX_OUTPUTS}")
     if sum(st.st_size for _, st in found) > max_mb * MB:
         raise _OutputsRefused(f"the outputs are larger than {max_mb} MB in all")
-    return sorted(found, key=lambda item: item[0])
+    return sorted(found, key=lambda item: item[0]), dropped
+
+
+def _dropped(count: int) -> str:
+    """Say how many outputs were dropped as not the job's own.
+
+    Args:
+        count: How many.
+
+    Returns:
+        The note for the answer's message; empty for none.
+    """
+    if not count:
+        return ""
+    return f"dropped {count} output{'' if count == 1 else 's'}: not the job's own file"
 
 
 def _answer(job_id: str, status: Status, message: str = "", result: dict[str, Any] | None = None) -> JobResult:
@@ -314,6 +369,7 @@ class _Job:
         out: Its ``out/``, opened.
         path: The job folder's path, for the job's command line.
         cwd: The job's working folder.
+        runner: The uid the job runs as, which must own its outputs.
     """
 
     name: str
@@ -322,6 +378,7 @@ class _Job:
     out: int
     path: Path
     cwd: Path
+    runner: int
 
 
 class Supervisor:
@@ -355,7 +412,8 @@ class Supervisor:
         and the api's group, and is bound before it listens, so nobody else ever connects.
 
         Raises:
-            RuntimeError: Something other than a socket is where the socket belongs.
+            RuntimeError: The socket's folder is not root's alone, or something other than a
+                socket is where the socket belongs.
             OSError: The socket cannot be bound.
         """
         await asyncio.to_thread(self._sweep_stale_jobs)
@@ -377,7 +435,9 @@ class Supervisor:
             retired); ``timeout`` or ``killed`` when the job was stopped; ``error`` when it could
             not be set up, its slot could not be cleared, it failed, its runner raised (the
             result keeps the runner's ``{"error": ...}``), it left no readable result, or its
-            outputs broke a limit; else ``ok`` with the staged outputs.
+            outputs broke a limit; else ``ok`` with the staged outputs, its message counting
+            outputs dropped as not the job's own file (``_own_file``). A slot whose job folder
+            could not be removed is retired.
 
         Raises:
             asyncio.CancelledError: The job was cancelled; its slot is retired.
@@ -412,11 +472,14 @@ class Supervisor:
                 raise
             return _answer(req.job_id, "error", "the job's processes could not be stopped")
         try:
-            answer = await asyncio.to_thread(self._finish, req, job, outcome, limits)
+            answer, removed = await asyncio.to_thread(self._finish, req, job, outcome, limits)
         except BaseException:
             self._retire(index)  # the folder may still be being read
             raise
-        self._free.append(index)
+        if removed:
+            self._free.append(index)
+        else:
+            self._retire(index)  # what is left holds a user's files, under a folder the slot owned
         return answer
 
     def _slots_left(self) -> int:
@@ -540,7 +603,7 @@ class Supervisor:
         except BaseException as exc:
             for fd in opened:
                 os.close(fd)
-            shutil.rmtree(req.job_id, dir_fd=jobs, onexc=self._not_removed)
+            self._rmtree(req.job_id, jobs)
             os.close(jobs)
             if isinstance(exc, OSError):
                 raise _SetupError("the job folder cannot be filled") from exc
@@ -548,7 +611,8 @@ class Supervisor:
         os.close(workspace)
         os.close(chat)
         path = self._jobs / req.job_id
-        return _Job(name=req.job_id, jobs=jobs, folder=folder, out=out, path=path, cwd=path / _WORKSPACE / req.chat_id)
+        cwd = path / _WORKSPACE / req.chat_id
+        return _Job(name=req.job_id, jobs=jobs, folder=folder, out=out, path=path, cwd=cwd, runner=runner[0])
 
     def _open_chat(self, req: JobRequest) -> int | None:
         """Open the chat folder the inputs come from, through real folders only.
@@ -626,8 +690,26 @@ class Supervisor:
             for folder in folders:
                 os.close(folder)
 
-    def _finish(self, req: JobRequest, job: _Job, outcome: str, limits: Limits) -> JobResult:
-        """Read the result and stage the outputs of a job whose slot is clear, then remove its folder.
+    def _finish(self, req: JobRequest, job: _Job, outcome: str, limits: Limits) -> tuple[JobResult, bool]:
+        """Answer a job whose slot is clear, then remove its folder.
+
+        Args:
+            req: The job.
+            job: Its folder.
+            outcome: How the process ended (``run_in_slot``).
+            limits: The limits it ran with.
+
+        Returns:
+            The answer, and whether the job folder is gone.
+        """
+        try:
+            answer = self._answer_job(req, job, outcome, limits)
+        finally:
+            removed = self._remove(job)
+        return answer, removed
+
+    def _answer_job(self, req: JobRequest, job: _Job, outcome: str, limits: Limits) -> JobResult:
+        """Read the result and stage the outputs of a job whose slot is clear.
 
         Args:
             req: The job.
@@ -638,42 +720,44 @@ class Supervisor:
         Returns:
             The answer.
         """
+        if outcome == "timeout":
+            return _answer(req.job_id, "timeout", f"the job ran past its wall time of {limits.wall_s} s")
+        if outcome == "killed":
+            return _answer(req.job_id, "killed", "the job was stopped on a resource limit")
+        if outcome != "ok":
+            return _answer(req.job_id, "error", "the job failed")
+        result = _read_result(job.folder, min(req.max_chars * 4 + _RESULT_SLACK, MAX_LINE))
+        if result is None:
+            return _answer(req.job_id, "error", "the job left no readable result")
+        if set(result) == {"error"}:
+            return _answer(req.job_id, "error", "the tool failed", result)
         try:
-            if outcome == "timeout":
-                return _answer(req.job_id, "timeout", f"the job ran past its wall time of {limits.wall_s} s")
-            if outcome == "killed":
-                return _answer(req.job_id, "killed", "the job was stopped on a resource limit")
-            if outcome != "ok":
-                return _answer(req.job_id, "error", "the job failed")
-            result = _read_result(job.folder, min(req.max_chars * 4 + _RESULT_SLACK, MAX_LINE))
-            if result is None:
-                return _answer(req.job_id, "error", "the job left no readable result")
-            if set(result) == {"error"}:
-                return _answer(req.job_id, "error", "the tool failed", result)
-            try:
-                found = _find_outputs(job.out, self._settings.upload_max_mb)
-            except _OutputsRefused as exc:
-                return _answer(req.job_id, "error", str(exc), result)
-            except OSError:
-                return _answer(req.job_id, "error", "the job's outputs could not be read", result)
-            try:
-                outputs = self._stage(req.job_id, job.out, found)
-            except OSError:
-                return _answer(req.job_id, "error", "the outputs could not be staged", result)
-            return JobResult(job_id=req.job_id, status="ok", result=result, outputs=outputs)
-        finally:
-            self._remove(job)
+            found, dropped = _find_outputs(job.out, self._settings.upload_max_mb, job.runner)
+        except _OutputsRefused as exc:
+            return _answer(req.job_id, "error", str(exc), result)
+        except OSError:
+            return _answer(req.job_id, "error", "the job's outputs could not be read", result)
+        try:
+            outputs = self._stage(req.job_id, job.out, found, job.runner)
+        except OSError:
+            return _answer(req.job_id, "error", "the outputs could not be staged", result)
+        dropped += len(found) - len(outputs)
+        return JobResult(job_id=req.job_id, status="ok", result=result, outputs=outputs, message=_dropped(dropped))
 
-    def _stage(self, job_id: str, out: int, found: Iterable[tuple[str, os.stat_result]]) -> list[OutputFile]:
+    def _stage(
+        self, job_id: str, out: int, found: Iterable[tuple[str, os.stat_result]], owner: int
+    ) -> list[OutputFile]:
         """Copy the outputs to ``staging/<job-id>/``, for the api, which owns them afterwards.
 
         Args:
             job_id: The job's id, the staging folder's name.
             out: The job's ``out/``, opened.
             found: Name and ``lstat`` of each output (``_find_outputs``).
+            owner: The uid the job ran as.
 
         Returns:
-            The staged outputs; none, and no folder, when there are none.
+            The staged outputs, without those that, opened, are not the job's alone; none, and no
+            folder, when there are none.
 
         Raises:
             OSError: ``staging`` is missing, a symlink or not the api's; the job's folder in it
@@ -692,14 +776,19 @@ class Supervisor:
             folder = make_dir(job_id, staging, self._owners.root, 0o700)
             try:
                 with closing(folder):
-                    outputs = [self._stage_one(out, folder, name, st, job_id) for name, st in found]
+                    staged = [self._stage_one(out, folder, name, st, job_id, owner) for name, st in found]
+                    outputs = [output for output in staged if output is not None]
                     settle(folder, api, 0o700)
             except BaseException:
-                shutil.rmtree(job_id, dir_fd=staging, onexc=self._not_removed)
+                self._rmtree(job_id, staging)
                 raise
+            if not outputs:
+                self._rmtree(job_id, staging)
         return outputs
 
-    def _stage_one(self, out: int, folder: int, name: str, st: os.stat_result, job_id: str) -> OutputFile:
+    def _stage_one(
+        self, out: int, folder: int, name: str, st: os.stat_result, job_id: str, owner: int
+    ) -> OutputFile | None:
         """Copy one output into the job's staging folder.
 
         Args:
@@ -708,51 +797,74 @@ class Supervisor:
             name: The output's name.
             st: Its ``lstat`` when it was found.
             job_id: The job's id.
+            owner: The uid the job ran as.
 
         Returns:
-            The staged output.
+            The staged output, or ``None`` if the opened file is not the job's alone (``_own_file``).
 
         Raises:
-            OSError: It is no longer the regular file that was found, or the copy failed.
+            OSError: It is no longer the file that was found, or the copy failed.
         """
         with closing(os.open(name, READ_FLAGS, dir_fd=out)) as source:
             now = os.fstat(source)
             if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
                 raise FileNotFoundError("the output changed")
+            if not _own_file(now, owner):
+                return None
             with closing(os.open(name, CREATE_FLAGS, 0o600, dir_fd=folder)) as target:
                 if copy_bytes(source, target, st.st_size) != st.st_size:
                     raise FileNotFoundError("the output shrank")
                 settle(target, self._owners.api, 0o600)
         return OutputFile(name=name, staged_path=str(self._staging / job_id / name), size=st.st_size)
 
-    def _remove(self, job: _Job) -> None:
+    def _remove(self, job: _Job) -> bool:
         """Remove a job folder, without following any symlink in it.
 
         The folder is first handed back to root, ``0700``, so if removal fails, no later job of
-        the slot can enter what is left.
+        the slot can enter what is left; the caller retires the slot all the same.
 
         Args:
             job: The folder.
+
+        Returns:
+            Whether it is gone.
         """
         try:
             with contextlib.suppress(OSError):
                 settle(job.folder, self._owners.root, 0o700)
             os.close(job.out)
             os.close(job.folder)
-            if JOB_ID.fullmatch(job.name) is not None:  # only ever a folder this supervisor made
-                shutil.rmtree(job.name, dir_fd=job.jobs, onexc=self._not_removed)
+            # only ever a folder this supervisor made
+            return JOB_ID.fullmatch(job.name) is not None and self._rmtree(job.name, job.jobs)
         finally:
             os.close(job.jobs)
 
-    def _not_removed(self, function: Callable[..., Any], path: Any, error: BaseException) -> None:
-        """Note, without its path, that part of a folder could not be removed.
+    def _rmtree(self, name: str, parent: int) -> bool:
+        """Remove a folder below ``parent`` with the walk that never follows a symlink.
 
         Args:
-            function: The call that failed.
-            path: What it was called on; never logged.
-            error: What it raised.
+            name: Its name.
+            parent: The folder it is in, opened.
+
+        Returns:
+            Whether every part of it was removed. A failure is logged once, without a path.
         """
-        _log.warning("a job folder could not be removed")
+        failures: list[BaseException] = []
+
+        def note(function: Callable[..., Any], path: Any, error: BaseException) -> None:
+            """Keep what failed; its path is never logged.
+
+            Args:
+                function: The call that failed.
+                path: What it was called on.
+                error: What it raised.
+            """
+            failures.append(error)
+
+        shutil.rmtree(name, dir_fd=parent, onexc=note)
+        if failures:
+            _log.warning("a job folder could not be removed")
+        return not failures
 
     def _sweep_stale_jobs(self) -> None:
         """Remove job folders an earlier run left, before any job of this run starts."""
@@ -764,21 +876,38 @@ class Supervisor:
         with closing(jobs):
             stale = [name for name in os.listdir(jobs) if JOB_ID.fullmatch(name)]
             for name in stale:
-                shutil.rmtree(name, dir_fd=jobs, onexc=self._not_removed)
+                self._rmtree(name, jobs)
         if stale:
             _log.info("removed %d job folder%s left from an earlier run", len(stale), "" if len(stale) == 1 else "s")
 
     def _bind(self) -> socket.socket:
         """Bind the socket, replacing one an earlier run left, and give it its owner and mode.
 
+        The socket's folder must be root's alone, so nobody can swap the socket or its name once
+        it is checked. The mode comes from the umask in force while the socket is made, ``0660``,
+        never from a later change through its path; only the group is set afterwards, without
+        following a link.
+
         Returns:
             The bound socket, not yet listening.
 
         Raises:
-            RuntimeError: Something other than a socket is in its place.
+            RuntimeError: The socket's folder is a symlink, not a folder, not root's, or open to
+                others' writes; or something other than a socket is in the socket's place.
             OSError: It cannot be bound.
         """
         path = self._settings.executor_socket
+        try:
+            folder = os.lstat(path.parent)
+        except FileNotFoundError:
+            folder = None
+        if (
+            folder is None
+            or not stat.S_ISDIR(folder.st_mode)
+            or folder.st_uid != self._owners.root[0]
+            or folder.st_mode & 0o022
+        ):
+            raise RuntimeError("the socket's folder must be root's alone")
         try:
             found = os.lstat(path).st_mode
         except FileNotFoundError:
@@ -789,8 +918,11 @@ class Supervisor:
             os.unlink(path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.bind(str(path))
-            os.chmod(path, 0o660)
+            previous = os.umask(0o117)
+            try:
+                sock.bind(str(path))
+            finally:
+                os.umask(previous)
             os.chown(path, self._owners.root[0], self._owners.api[1], follow_symlinks=False)
         except BaseException:
             sock.close()
@@ -842,7 +974,8 @@ def main() -> int:
     """Check the host, then serve until stopped.
 
     Returns:
-        ``1`` after a one-line reason on stderr when it must not start; ``0`` when serving ends.
+        ``1`` after a one-line reason on stderr when it must not start, including a socket it may
+        not bind; ``0`` when serving ends.
     """
     try:
         settings = load_settings(os.environ, role="executor")
@@ -854,7 +987,11 @@ def main() -> int:
         print(f"workbench executor: refusing to start: {problem}", file=sys.stderr)
         return 1
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
-    asyncio.run(Supervisor(settings).serve())
+    try:
+        asyncio.run(Supervisor(settings).serve())
+    except RuntimeError as exc:  # serve's own refusals: the socket's folder or place
+        print(f"workbench executor: refusing to start: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

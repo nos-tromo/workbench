@@ -169,7 +169,8 @@ class JobResult(_Message):
             ``killed`` (the kernel stopped it on a resource limit) or ``busy`` (no free slot).
         result: The runner's answer; ``{"error": ...}`` when it raised.
         outputs: Files the job wrote.
-        message: Short human-readable reason for any status other than ``ok``.
+        message: Short human-readable reason for any status other than ``ok``; with ``ok``, a note
+            such as how many outputs were dropped, or empty.
     """
 
     job_id: str

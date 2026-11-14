@@ -42,10 +42,9 @@ _SLOT_KILL_PAUSE_S = 0.1  # before the second pass, doubled before each later on
 # Finite, since a slot process can SIGSTOP the helper once it is the slot's uid. Generous, since
 # busy jobs in other slots slow its start-up down (to 26 s measured, on one CPU next to 192 busy tasks).
 _HELPER_TIMEOUT_S = 30.0
-# Imports only os (frozen) and sys (built in). signal would pull in enum, functools and collections,
-# which an image without .pyc files compiles from source at every start. 9 is SIGKILL, and
-# ProcessLookupError is ESRCH: nothing of the uid is left to signal.
-_DROP_AND_KILL = """\
+# The helpers import only os (frozen) and sys (built in). signal would pull in enum, functools and
+# collections, which an image without .pyc files compiles from source at every start.
+_DROP = """\
 import os, sys
 uid, gid = int(sys.argv[1]), int(sys.argv[2])
 if uid <= 0 or gid <= 0:
@@ -55,11 +54,82 @@ os.setgid(gid)
 os.setuid(uid)
 if os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid):
     sys.exit(2)
+"""
+# 9 is SIGKILL, and ProcessLookupError is ESRCH: nothing of the uid is left to signal.
+_DROP_AND_KILL = (
+    _DROP
+    + """\
 try:
     os.kill(-1, 9)
 except ProcessLookupError:
     pass
 """
+)
+# Removes, as the slot, what outlives its processes. SysV objects whose owner or creator is the uid
+# get IPC_RMID (0), which only their owner or creator may send without CAP_IPC_OWNER; ctypes is
+# loaded only when there are any. Files, folders, POSIX semaphores and shared memory below the
+# folders named after the ids (/dev/shm, and /dev/mqueue for message queues) are unlinked when
+# the uid owns them, deepest first; links are removed, never followed. Errors are left for the
+# supervisor's second look to find.
+_DROP_AND_CLEAR = (
+    _DROP
+    + """\
+doomed = []
+for table, column in (("shm", "shmid"), ("msg", "msqid"), ("sem", "semid")):
+    try:
+        with open("/proc/sysvipc/" + table) as rows:
+            head = rows.readline().split()
+            at, owner, creator = head.index(column), head.index("uid"), head.index("cuid")
+            for row in rows:
+                cells = row.split()
+                if uid in (int(cells[owner]), int(cells[creator])):
+                    doomed.append((table, int(cells[at])))
+    except FileNotFoundError:
+        pass
+if doomed:
+    import ctypes
+    libc = ctypes.CDLL(None)
+    for table, ident in doomed:
+        if table == "shm":
+            libc.shmctl(ident, 0, None)
+        elif table == "msg":
+            libc.msgctl(ident, 0, None)
+        else:
+            libc.semctl(ident, 0, 0)
+for top in sys.argv[3:]:
+    folders, mine = [top], []
+    while folders:
+        folder = folders.pop()
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = folder + "/" + name
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if st.st_mode & 0o170000 == 0o040000:
+                folders.append(path)
+                if st.st_uid == uid:
+                    mine.append(path)
+            elif st.st_uid == uid:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    for path in reversed(mine):
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+"""
+)
+# Where the kernel keeps IPC that outlives processes, as files: POSIX shared memory and semaphores,
+# and POSIX message queues where their file system is mounted.
+_IPC_FOLDERS = ("/dev/shm", "/dev/mqueue")
+_SYSVIPC = Path("/proc/sysvipc")
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
 
@@ -237,26 +307,27 @@ def _slot_has_live_processes(uid: int) -> bool:
     return False
 
 
-def _kill_as_slot(slot: Slot) -> None:
-    """Send ``SIGKILL`` to every process the slot's uid can signal, from a helper that is the slot.
+def _run_as_slot(program: str, slot: Slot, extra: list[str], failure: str) -> None:
+    """Run a helper program that makes itself the slot's ids, under a timeout.
 
     The helper is started as root and drops to the slot's ids only inside the program it has
     already exec'd, so everything it does as the slot's uid falls under the timeout, and on
     expiry it is killed and reaped as root. Dropping inside ``preexec_fn`` instead would hold
     ``Popen`` in its start-up read, beyond any timeout, if a slot process stopped the helper.
-    ``kill(-1)`` as the slot reaches that uid's processes and nobody else's; from the
-    supervisor itself it would reach everything.
 
     Args:
-        slot: The slot whose processes to kill.
+        program: The helper's source; it reads uid and gid from ``argv[1:3]``.
+        slot: The slot to act as.
+        extra: Further arguments, after the ids.
+        failure: The ``RuntimeError`` message, naming only the slot.
 
     Raises:
-        RuntimeError: The helper could not run, did not become the slot's ids, or did not finish
-            within ``_HELPER_TIMEOUT_S`` (a surviving slot process can stop it).
+        RuntimeError: The helper could not run, did not become the slot's ids, failed, or did not
+            finish within ``_HELPER_TIMEOUT_S`` (a surviving slot process can stop it).
     """
     try:
         done = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", _DROP_AND_KILL, str(slot.uid), str(slot.gid)],
+            [sys.executable, "-I", "-S", "-c", program, str(slot.uid), str(slot.gid), *extra],
             env=dict(CLEAN_ENV),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -265,13 +336,124 @@ def _kill_as_slot(slot: Slot) -> None:
             timeout=_HELPER_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not clear the processes of slot {slot.index}") from exc
+        raise RuntimeError(failure) from exc
     if done.returncode != 0:
-        raise RuntimeError(f"could not clear the processes of slot {slot.index}")
+        raise RuntimeError(failure)
+
+
+def _kill_as_slot(slot: Slot) -> None:
+    """Send ``SIGKILL`` to every process the slot's uid can signal, from a helper that is the slot.
+
+    ``kill(-1)`` as the slot reaches that uid's processes and nobody else's; from the supervisor
+    itself it would reach everything.
+
+    Args:
+        slot: The slot whose processes to kill.
+
+    Raises:
+        RuntimeError: The helper failed or timed out (``_run_as_slot``).
+    """
+    _run_as_slot(_DROP_AND_KILL, slot, [], f"could not clear the processes of slot {slot.index}")
+
+
+def _clear_ipc_as_slot(slot: Slot) -> None:
+    """Remove, from a helper that is the slot, every IPC object and IPC file the slot's uid owns.
+
+    The supervisor has neither ``CAP_IPC_OWNER`` nor ``CAP_SYS_ADMIN``, so only the owner or creator
+    itself may remove a SysV object; the files are removed as the slot too.
+
+    Args:
+        slot: The slot whose IPC to remove.
+
+    Raises:
+        RuntimeError: The helper failed or timed out (``_run_as_slot``).
+    """
+    folders = [folder for folder in _IPC_FOLDERS if os.path.isdir(folder)]
+    _run_as_slot(_DROP_AND_CLEAR, slot, folders, f"could not clear the IPC objects of slot {slot.index}")
+
+
+def _sysv_table_holds(table: bytes, uid: int) -> bool:
+    """Tell from a ``/proc/sysvipc`` table whether ``uid`` owns or created one of its objects.
+
+    Args:
+        table: The table's contents: a header naming the columns, then one object per line.
+        uid: The user id to look for.
+
+    Returns:
+        Whether a row's ``uid`` or ``cuid`` is ``uid``.
+
+    Raises:
+        ValueError: The header has no ``uid`` or ``cuid`` column, or a cell is not a number.
+        IndexError: A row is shorter than the header.
+    """
+    lines = table.split(b"\n")
+    head = lines[0].split()
+    owner, creator = head.index(b"uid"), head.index(b"cuid")
+    for line in lines[1:]:
+        cells = line.split()
+        if cells and uid in (int(cells[owner]), int(cells[creator])):
+            return True
+    return False
+
+
+def _folder_holds(top: str, uid: int) -> bool:
+    """Look below ``top`` for anything ``uid`` owns, without following links.
+
+    Args:
+        top: A folder, such as ``/dev/shm``.
+        uid: The user id to look for.
+
+    Returns:
+        Whether a file, folder or link below ``top`` belongs to ``uid``. A folder that vanishes
+        while it is looked at counts as empty.
+
+    Raises:
+        OSError: A folder could not be read for another reason.
+    """
+    folders = [top]
+    while folders:
+        try:
+            entries = list(os.scandir(folders.pop()))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if st.st_uid == uid:
+                return True
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(entry.path)
+    return False
+
+
+def _slot_has_ipc(uid: int) -> bool:
+    """Look for IPC the uid left: SysV objects it owns or made, and files below ``_IPC_FOLDERS``.
+
+    Args:
+        uid: The slot's user id.
+
+    Returns:
+        Whether there is any.
+
+    Raises:
+        OSError: A table or folder could not be read.
+        ValueError: A table has an unexpected shape.
+        IndexError: A row of a table is short.
+    """
+    for table in ("shm", "msg", "sem"):
+        try:
+            content = (_SYSVIPC / table).read_bytes()
+        except FileNotFoundError:
+            continue
+        if _sysv_table_holds(content, uid):
+            return True
+    return any(_folder_holds(folder, uid) for folder in _IPC_FOLDERS)
 
 
 def kill_slot_processes(slot: Slot | None) -> None:
-    """Kill every process the slot's uid still has, however it left the job's process group.
+    """Kill every process the slot's uid still has, then remove the IPC it left, so the slot is clear.
 
     A job's descendants can leave the group with ``setsid`` or ``setpgid``, so the group kill
     does not reach them; they keep the slot's uid, and the slot's next job would share a uid
@@ -287,16 +469,24 @@ def kill_slot_processes(slot: Slot | None) -> None:
     2-26 s next to 192. A look at ``/proc`` takes milliseconds on an idle host and under a second
     on such a CPU, given an init that reaps orphans. The helper is killed after 30 s, and the
     cleanup then fails. So the call always ends: at the very worst after six helper runs of 30 s,
-    3.1 s of pauses and six looks, a little over three minutes. It blocks, so call it from a
-    thread. Does nothing without a slot or off Linux.
+    3.1 s of pauses and six looks, a little over three minutes.
+
+    Then the IPC: a SysV shared memory segment, message queue or semaphore set, or a file in
+    ``/dev/shm`` or ``/dev/mqueue``, outlives the job, and the slot's next job, perhaps another
+    user's, would run as its owner. Once no process of the uid is left, so none can make more,
+    the tables in ``/proc/sysvipc`` and those folders are searched for anything of the uid. If
+    there is, a second helper, run like the first, removes it as the slot (``_DROP_AND_CLEAR``),
+    and a second look must find nothing. That adds at most one more helper run of 30 s.
+
+    It blocks, so call it from a thread. Does nothing without a slot or off Linux.
 
     Args:
         slot: The slot to clear, or ``None``.
 
     Raises:
-        RuntimeError: The only failure. Processes of the slot remain after the retries, the helper
-            failed or timed out, ``/proc`` could not be checked, or the slot runs as root. The
-            message names only the slot's index. The slot must not be reused.
+        RuntimeError: The only failure. Processes or IPC of the slot remain after the cleanup, a
+            helper failed or timed out, ``/proc`` could not be checked, or the slot runs as root.
+            The message names only the slot's index. The slot must not be reused.
     """
     if slot is None:
         return
@@ -310,10 +500,15 @@ def kill_slot_processes(slot: Slot | None) -> None:
                 time.sleep(_SLOT_KILL_PAUSE_S * 2 ** (attempt - 1))
             _kill_as_slot(slot)
             if not _slot_has_live_processes(slot.uid):
-                return
+                break
+        else:
+            raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
+        if _slot_has_ipc(slot.uid):
+            _clear_ipc_as_slot(slot)
+            if _slot_has_ipc(slot.uid):
+                raise RuntimeError(f"IPC objects of slot {slot.index} survived the cleanup")
     except (OSError, KeyError, ValueError, IndexError) as exc:
         raise RuntimeError(f"processes of slot {slot.index} could not be checked") from exc
-    raise RuntimeError(f"processes of slot {slot.index} survived the cleanup")
 
 
 def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:
