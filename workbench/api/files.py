@@ -30,16 +30,17 @@ from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.errors import NOT_FOUND
 from workbench.api.openapi import TOOL_TAG
+from workbench.api.routing import EncodableRoute
 from workbench.api.store import NotFound, Store
 from workbench.config import Settings
 from workbench.models import VIRTUAL_ROOT, FileRecord, Principal
 from workbench.utils.audit_event import AuditWriteError
 
 #: The browser's routes; none of them is a tool.
-router = APIRouter(include_in_schema=False)
+router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
 
 #: Routes that are tools, and so the only ones in the tool document.
-tool_router = APIRouter(tags=[TOOL_TAG])
+tool_router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
 _MIB: Final = 1024 * 1024
 _CHUNK: Final = _MIB

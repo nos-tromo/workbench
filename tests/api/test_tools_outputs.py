@@ -10,6 +10,7 @@ import csv
 import dataclasses
 import io
 import json
+import logging
 from typing import Any
 
 import openpyxl
@@ -351,11 +352,16 @@ def test_a_request_too_large_for_the_executor_is_a_422(client: TestClient) -> No
 
 def test_a_lone_surrogate_in_a_value_is_written_as_a_replacement_character(client: TestClient, store: Store) -> None:
     """The escape of half a pair reaches the file as U+FFFD, in a cell and in a document."""
+    json_body = {**H, "Content-Type": "application/json"}
     body = b'{"name": "s", "format": "csv", "columns": ["a"], "rows": [["x\\ud800y"]]}'
-    r = client.post("/tools/write_table", content=body, headers={**H, "Content-Type": "application/json"})
+    r = client.post("/tools/write_table", content=body, headers=json_body)
     assert r.status_code == 200, r.text
-    (made,) = outputs(store)
-    assert "x\ufffdy" in content(store, made).decode("utf-8-sig")
+    body = b'{"name": "s", "format": "docx", "markdown": "x\\ud800y"}'
+    r = client.post("/tools/write_document", content=body, headers=json_body)
+    assert r.status_code == 200, r.text
+    cell, word = sorted(outputs(store), key=lambda rec: rec.name)
+    assert "x\ufffdy" in content(store, cell).decode("utf-8-sig")
+    assert Document(io.BytesIO(content(store, word))).paragraphs[0].text == "x\ufffdy"
 
 
 # --- the job's answer ---------------------------------------------------------------------------------------------
@@ -383,6 +389,35 @@ def test_an_answer_whose_file_was_not_kept_says_so(
     assert r.status_code == 500
     assert "dropped 1 output" in r.json()["detail"]
     assert events(audit_lines, "write_document") == []
+
+
+@pytest.mark.parametrize("tool", ["write_table", "write_document"])
+def test_an_output_of_an_unreadable_answer_that_cannot_be_removed_is_named_by_an_event(
+    client: TestClient,
+    store: Store,
+    fake_executor: Local,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tool: str,
+) -> None:
+    """A file that stays although it should go is never unknown: the log names the error, an error event the file."""
+    fake_executor.files = {"quarterly-figures.xlsx": b"PK"}
+    fake_executor.payload = {"hint": 1}
+
+    def refuse(_record: Any) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    with caplog.at_level(logging.WARNING):
+        r = table(client) if tool == "write_table" else document(client)
+    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
+    (left,) = outputs(store)
+    (event,) = events(audit_lines, tool)
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("collect", "error", [left.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 1}
+    assert "OSError" in caplog.text
+    assert "quarterly-figures" not in caplog.text
 
 
 def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake_executor: Local) -> None:

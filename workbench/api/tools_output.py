@@ -32,6 +32,8 @@ from workbench.api.tools import (
     _payload,
     _readable,
     _remove_outputs,
+    _remove_unsent,
+    _to_the_end,
     _within,
     router,
 )
@@ -224,16 +226,20 @@ async def _write(
             read, or its file was not kept (500).
     """
     _, result, made = await jobs.submit(p, tool, args, [])
-    if result.status == "ok" and (not _readable(_Written, result.result) or len(made) != 1):
-        # Nothing the model is not told of may stay.
-        await run_in_threadpool(_remove_outputs, store, made)
-        if _readable(_Written, result.result):
-            note = _clean(result.message) or "the job made no file"
-            raise HTTPException(status_code=500, detail=f"the file could not be kept: {note}")
-    done = _parse(_Written, _payload(result, "file"))
-    (new,) = made
-    await run_in_threadpool(_record_output, audit, store, p, tool, new, criteria)
-    return new, done
+
+    def record() -> tuple[FileRecord, _Written]:
+        if result.status == "ok" and (not _readable(_Written, result.result) or len(made) != 1):
+            # Nothing the model is not told of may stay.
+            _remove_unsent(audit, store, p, tool, made)
+            if _readable(_Written, result.result):
+                note = _clean(result.message) or "the job made no file"
+                raise HTTPException(status_code=500, detail=f"the file could not be kept: {note}")
+        done = _parse(_Written, _payload(result, "file"))
+        (new,) = made
+        _record_output(audit, store, p, tool, new, criteria)
+        return new, done
+
+    return await _to_the_end(record)
 
 
 @router.post(

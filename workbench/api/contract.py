@@ -30,11 +30,12 @@ from workbench.api.auth import require_caller, require_principal
 from workbench.api.deps import get_settings, get_store
 from workbench.api.errors import NOT_FOUND
 from workbench.api.openapi import tool_openapi
+from workbench.api.routing import EncodableRoute
 from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.models import VIRTUAL_ROOT, Principal
 
-router = APIRouter(include_in_schema=False)
+router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
 
 _PROMPT_FILE = "system_prompt.md"
 

@@ -211,6 +211,38 @@ def test_mkdir_over_a_file_is_a_conflict(client: TestClient) -> None:
     assert r.status_code == 409
 
 
+@pytest.mark.parametrize(
+    ("route", "body"),
+    [
+        ("/files/mkdir", b'{"folder": "a\\ud800"}'),
+        ("/files/move", b'{"source": "/workspace/chat-1/a\\udc00"}'),
+        ("/files/cwd", b'{"cwd": "\\ud800"}'),
+    ],
+    ids=["mkdir", "move", "cwd"],
+)
+def test_a_lone_surrogate_in_a_files_body_is_never_a_500(client: TestClient, route: str, body: bytes) -> None:
+    """JSON may carry the escape of half a pair; FastAPI's 422 quotes the body back, which UTF-8 could not hold."""
+    r = client.post(route, content=body, headers={**H, "Content-Type": "application/json"})
+    assert r.status_code == 422, r.text
+    assert "�" in r.text
+
+
+def test_a_lone_surrogate_in_a_folders_name_is_read_as_a_replacement_character(client: TestClient) -> None:
+    """The browser's routes read a body as the tools do: the folder is made, its name with U+FFFD."""
+    body = b'{"path": "/workspace/chat-1/a\\ud800b"}'
+    r = client.post("/files/mkdir", content=body, headers={**H, "Content-Type": "application/json"})
+    assert (r.status_code, r.json()) == (200, {"path": f"{CHAT}/a�b"})
+
+
+def test_every_route_of_the_app_reads_its_body_as_the_tools_do(app: FastAPI) -> None:
+    """One route class for the whole app, so no route that takes JSON can answer a lone surrogate with a 500."""
+    from workbench.api.routing import EncodableRoute
+
+    routes = [context.original_route for context in iter_route_contexts(app.routes)]
+    assert len(routes) > 10
+    assert [route for route in routes if not isinstance(route, EncodableRoute)] == []
+
+
 # --- view -----------------------------------------------------------------------------------------------------------
 
 

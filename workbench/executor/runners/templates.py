@@ -50,8 +50,11 @@ LOCATION_MAX: Final = 300
 
 _DEFAULT_BUDGET_S: Final = 60.0
 
-#: What openpyxl warns of when it loads a workbook and will not write back something of it.
-_LOST: Final = re.compile(r"will be (?:removed|lost|discarded|treated as an error)|is being dropped")
+#: What openpyxl warns of when it loads a workbook and will not write back something of it: a part it does not support,
+#: a header or footer it cannot parse, a print area or defined names it cannot place.
+_LOST: Final = re.compile(
+    r"will be (?:removed|lost|discarded|treated as an error|ignored)|is being dropped|cannot be (?:set|located)"
+)
 _TYPES: Final = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 _TEMPLATE_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
 _DOCUMENT_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"

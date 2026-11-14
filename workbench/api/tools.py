@@ -16,65 +16,32 @@ fixed codes (anything else is "the tool failed"), and the whole answer is cut to
 measured as the bytes that are sent.
 """
 
+import asyncio
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Any, Final, Literal, override
+from typing import Any, Final, Literal
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
+from workbench.api.jobs import _outlast
 from workbench.api.openapi import TOOL_TAG
+from workbench.api.routing import EncodableRoute
 from workbench.api.store import Store
 from workbench.models import FileRecord, Principal
-from workbench.protocol import MAX_INPUT_FILES, JobResult, encodable
+from workbench.protocol import MAX_INPUT_FILES, JobResult
 from workbench.utils.audit_event import AuditWriteError
 
 _log = logging.getLogger(__name__)
 
-
-class _ToolRequest(Request):
-    """A request whose JSON body is read with every lone surrogate replaced by U+FFFD.
-
-    JSON may carry the escape of a surrogate half alone, as code a model writes with one backslash too few does;
-    pydantic takes no such string, and FastAPI's answer that quotes it back cannot be encoded either.
-    """
-
-    @override
-    async def json(self) -> Any:
-        """Read the body as JSON, every string of it encodable as UTF-8.
-
-        Returns:
-            The body's value.
-        """
-        return encodable(await super().json())
-
-
-class _ToolRoute(APIRoute):
-    """A tool's route: it reads its body as :class:`_ToolRequest` does."""
-
-    @override
-    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
-        """Wrap the route's handler so that it is given a :class:`_ToolRequest`.
-
-        Returns:
-            The handler.
-        """
-        handler = super().get_route_handler()
-
-        async def read_encodable(request: Request) -> Response:
-            return await handler(_ToolRequest(request.scope, request.receive))
-
-        return read_encodable
-
-
-router = APIRouter(tags=[TOOL_TAG], route_class=_ToolRoute)
+router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
 
 class FileInfo(BaseModel):
@@ -880,6 +847,58 @@ def _remove_outputs(store: Store, outputs: Sequence[FileRecord]) -> list[FileRec
     return left
 
 
+def _remove_unsent(
+    audit: AuditLog, store: Store, p: Principal, tool: str, outputs: Sequence[FileRecord], used: Sequence[str] = ()
+) -> None:
+    """Remove the files of a job the model is not told of; an event names any that could not be removed.
+
+    The model is told the tool failed and never learns of these files, so none of them may stay. One that stays all the
+    same is named, by an ``error`` event of the tool, with the files the job was given, so that no file stays that the
+    audit does not know of.
+
+    Args:
+        audit: The audit log.
+        store: The file store.
+        p: The caller, user and the chat the files are in.
+        tool: The tool, a key of the audit's operations.
+        outputs: The files the job made.
+        used: Ids of the files the job was given.
+
+    Raises:
+        AuditWriteError: The event for a file that stays could not be written.
+    """
+    left = _remove_outputs(store, outputs)
+    if left:
+        ids = [*used, *(rec.id for rec in left)]
+        audit.record(tool, p, file_ids=ids, outcome="error", criteria={"outputs": len(left)})
+
+
+async def _to_the_end[T](step: Callable[[], T]) -> T:
+    """Run the step from a job's answer to its audit record to its end, whatever cancellation comes meanwhile.
+
+    Once ``submit`` returns, what the job made is in the workspace. A cancellation (the client went away) that stopped
+    the route before the record would leave a file no event names. So the step, the removal of what must not stay
+    included, is one call in a thread, a plain future of the loop's executor as in
+    :meth:`~workbench.api.jobs.JobQueue._keep`: a cancellation waits for it to end, then goes on.
+
+    Args:
+        step: The step; it records, or removes, every file the job made.
+
+    Returns:
+        What the step returned.
+
+    Raises:
+        Exception: What the step raised, such as the ``HTTPException`` the model is to be told.
+    """
+    work = asyncio.get_running_loop().run_in_executor(None, step)
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):  # the caller is gone; its cancellation is the answer
+            await _outlast(work)
+        raise
+
+
 def _readable(model: type[BaseModel], payload: object) -> bool:
     """Tell whether a runner's answer has the shape the api sends on.
 
@@ -997,13 +1016,17 @@ async def run_python(
     chosen = readable[:MAX_INPUT_FILES]
     args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
     job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen])
-    outcome = "ok" if result.status == "ok" else "error"
-    if result.status == "ok" and not _readable(_CodeRun, result.result):
-        # The model is told the tool failed and never learns of the files: none of them may stay, and the event names
-        # any that could not be removed.
-        made = await run_in_threadpool(_remove_outputs, store, made)
-        outcome = "error"
-    await run_in_threadpool(_record_run, audit, store, p, chosen, made, outcome)
+
+    def record() -> list[FileRecord]:
+        kept, outcome = made, "ok" if result.status == "ok" else "error"
+        if result.status == "ok" and not _readable(_CodeRun, result.result):
+            # The model is told the tool failed and never learns of the files: none of them may stay, and the event
+            # names any that could not be removed.
+            kept, outcome = _remove_outputs(store, made), "error"
+        _record_run(audit, store, p, chosen, kept, outcome)
+        return kept
+
+    made = await _to_the_end(record)
     payload, note = _python_payload(result)
     run = _parse(_CodeRun, payload)
     notes: list[str | None] = [run.hint, note]

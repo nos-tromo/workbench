@@ -9,6 +9,7 @@ checks of the sources the api can make, the output's name and record, the audit 
 import dataclasses
 import io
 import json
+import logging
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -434,6 +435,36 @@ def test_a_fill_whose_output_was_not_kept_says_so(
     assert r.status_code == 500
     assert "dropped 1 output" in r.json()["detail"]
     assert events(audit_lines, "fill_template") == []
+
+
+def test_an_output_of_an_unreadable_answer_that_cannot_be_removed_is_named_by_an_event(
+    client: TestClient,
+    store: Store,
+    fake_executor: Local,
+    tmp_path: Path,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A file that stays although it should go is never unknown: the log names the error, an error event the file."""
+    form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    fake_executor.files = {"form-filled.docx": b"PK"}
+    fake_executor.payload = {"filled": "all"}
+
+    def refuse(_record: Any) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    with caplog.at_level(logging.WARNING):
+        r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
+    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
+    (left,) = outputs(store)
+    (event,) = events(audit_lines, "fill_template")
+    assert (event["action"], event["outcome"]) == ("modify", "error")
+    assert event["target"]["ids"] == [form.id, left.id]
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 1}
+    assert "OSError" in caplog.text
+    assert "form-filled" not in caplog.text
 
 
 def test_unknown_names_the_model_sends_never_cost_the_filled_file(

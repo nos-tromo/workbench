@@ -37,6 +37,8 @@ from workbench.api.tools import (
     _payload,
     _readable,
     _remove_outputs,
+    _remove_unsent,
+    _to_the_end,
     _within,
     router,
 )
@@ -642,19 +644,24 @@ async def fill_template(
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
     _, result, made = await jobs.submit(in_chat, "fill_template", args, inputs)
-    if result.status == "ok" and (not _readable(_Filled, result.result) or len(made) != 1):
-        # Nothing the model can be told of may stay.
-        await run_in_threadpool(_remove_outputs, store, made)
-        if _readable(_Filled, result.result):
-            note = _clean(result.message) or "the job made no file"
-            raise HTTPException(status_code=500, detail=f"the filled file could not be kept: {note}")
-    done = _parse(_Filled, _payload(result, "file"))
-    (new,) = made
-    filled = [name for name in dict.fromkeys(done.filled) if name in body.values]
-    counts = dict.fromkeys(SOURCE_KINDS, 0)
-    for name in filled:
-        counts[body.values[name].source.kind] += 1
-    file_ids = list(dict.fromkeys([rec.id, *source_ids, new.id]))
-    await run_in_threadpool(_record_fill, audit, store, in_chat, file_ids, counts, new)
-    answer = FilledTemplate(path=new.virtual_path, filled=len(filled), unfilled=done.unfilled, warnings=done.warnings)
+    used = list(dict.fromkeys([rec.id, *source_ids]))
+
+    def record() -> tuple[FileRecord, _Filled, int]:
+        if result.status == "ok" and (not _readable(_Filled, result.result) or len(made) != 1):
+            # Nothing the model is not told of may stay.
+            _remove_unsent(audit, store, in_chat, "fill_template", made, used)
+            if _readable(_Filled, result.result):
+                note = _clean(result.message) or "the job made no file"
+                raise HTTPException(status_code=500, detail=f"the filled file could not be kept: {note}")
+        done = _parse(_Filled, _payload(result, "file"))
+        (new,) = made
+        filled = [name for name in dict.fromkeys(done.filled) if name in body.values]
+        counts = dict.fromkeys(SOURCE_KINDS, 0)
+        for name in filled:
+            counts[body.values[name].source.kind] += 1
+        _record_fill(audit, store, in_chat, [*used, new.id], counts, new)
+        return new, done, len(filled)
+
+    new, done, filled = await _to_the_end(record)
+    answer = FilledTemplate(path=new.virtual_path, filled=filled, unfilled=done.unfilled, warnings=done.warnings)
     return _fit_fill(answer, settings.result_max_kb)

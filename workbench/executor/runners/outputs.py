@@ -25,6 +25,7 @@ from workbench.executor.runners.documents import error
 from workbench.executor.templates import xml_safe
 from workbench.executor.timer import TimeLimit, limit_until
 from workbench.paths import PathError, check_filename
+from workbench.protocol import encodable
 from workbench.tables import DELIMITERS, table_problem, word_table_problem
 
 #: The api's bounds (:mod:`workbench.api.tools_output`), mirrored: characters of a document's Markdown and of a hint
@@ -40,6 +41,9 @@ CODE_FONT: Final = "Consolas"
 
 #: List levels a Word document shows; a list nested deeper takes the deepest.
 LIST_LEVELS: Final = 3
+
+#: What a thematic break (``---``) is written as: a paragraph of its own, as plain text.
+THEMATIC_BREAK: Final = "—" * 3
 
 _DEFAULT_BUDGET_S: Final = 60.0
 _REPLACED: Final = "\ufffd"
@@ -289,14 +293,19 @@ class _List:
     num_id: int | None = None
 
 
+# python-docx internals this writer relies on, below the library's public api, to stay fast (a test names each, so an
+# upgrade that drops one fails clearly): ``Paragraph._p``, ``Document._body``, ``CT_Num.new``,
+# ``CT_Numbering._insert_num`` and ``num_having_numId``, ``CT_Tbl.new_tbl``, ``CT_Tbl.tblGrid``, ``CT_Tbl.add_tr``,
+# ``CT_Row.add_tc`` and ``docx.table._Cell``.
 class _Word:
     """Writes Markdown's tokens into a Word document.
 
     python-docx's own ``add_paragraph`` and ``add_table`` look for the body's last element, its style setters look
-    through every style, and ``add_num`` through every numbering, each time: a document of tens of thousands of short
-    paragraphs or lists would take minutes. So every block is put before an empty paragraph at the end (the anchor,
-    removed once the document is written), each style is looked up once, the text's width is measured once, and each
-    numbered list's numbering gets the next free id without a search.
+    through every style, ``add_num`` through every numbering, and ``add_row`` through every row for the table's grid,
+    each time: a document of tens of thousands of short paragraphs, lists or rows would take minutes. So every block is
+    put before an empty paragraph at the end (the anchor, removed once the document is written), each style is looked up
+    once, the text's width and a table's grid are measured once, each table row is added directly, and each numbered
+    list's numbering gets the next free id without a search.
 
     Attributes:
         document: The python-docx document.
@@ -502,15 +511,21 @@ class _Word:
         if not width:
             return
         from docx.oxml.table import CT_Tbl
-        from docx.table import Table
+        from docx.table import Table, _Cell
 
         element = CT_Tbl.new_tbl(0, width, self._width)
         element.tblPr.style = self._style("Table Grid")
         self._anchor._p.addprevious(element)
         table = Table(element, self.document._body)
+        widths = [column.w for column in element.tblGrid.gridCol_lst]
         for row in rows:
-            for cell, (bold, children) in zip(table.add_row().cells, row, strict=False):
-                self.inline(cell.paragraphs[0], children, bold=bold)
+            tr = element.add_tr()  # as add_row does, with the grid read once above
+            cells = [tr.add_tc() for _ in widths]
+            for tc, column_width in zip(cells, widths, strict=True):
+                if column_width is not None:
+                    tc.width = column_width
+            for tc, (bold, children) in zip(cells, row, strict=False):
+                self.inline(_Cell(tc, table).paragraphs[0], children, bold=bold)
 
     def write(self, tokens: Sequence[Any]) -> None:
         """Write the document's tokens.
@@ -539,6 +554,12 @@ class _Word:
                 self.lists.pop()
             elif kind == "list_item_open" and self.lists:
                 self.lists[-1].fresh = True
+            elif kind == "list_item_close" and self.lists and self.lists[-1].fresh:
+                # An item without a paragraph of its own (empty, or a heading or code first) keeps its bullet or
+                # number, so the numbers after it hold.
+                self.paragraph()
+            elif kind == "hr":
+                self.run(self.paragraph(), THEMATIC_BREAK)
             elif kind in {"fence", "code_block"}:
                 self.code(token.content)
             elif kind == "table_open":
@@ -593,9 +614,16 @@ def write_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         if not isinstance(markdown, str) or len(markdown) > MAX_MARKDOWN:
             raise _Refused(f"markdown: a text of at most {MAX_MARKDOWN} characters")
         if args.get("format") == "md":
+            text: str = encodable(markdown)
+            replaced = text.count(_REPLACED) - markdown.count(_REPLACED)
             with path.open("w", encoding="utf-8", newline="") as stream:
-                stream.write(markdown)
-            return {}
+                stream.write(text)
+            return _hint(
+                f"{_plural(replaced, 'character')} UTF-8 cannot hold (half of a surrogate pair) "
+                f"{'was' if replaced == 1 else 'were'} replaced with {_REPLACED}."
+                if replaced
+                else None
+            )
         from docx import Document
         from markdown_it import MarkdownIt
 

@@ -15,6 +15,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
+from workbench.api.routing import EncodableRoute
+
 _log = logging.getLogger(__name__)
 
 #: Seconds a job waited for a slot; most wait none, the longest may wait ``WORKBENCH_QUEUE_WAIT_S``.
@@ -101,7 +103,7 @@ class Metrics:
         return generate_latest(self.registry)
 
 
-router = APIRouter(include_in_schema=False)
+router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
 
 
 @router.get("/metrics")

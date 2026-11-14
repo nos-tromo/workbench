@@ -731,6 +731,30 @@ def test_what_openpyxl_removes_from_a_sheet_is_warned(job: Job) -> None:
     assert len(warning) <= 2000
 
 
+def test_what_openpyxl_ignores_or_cannot_set_is_warned(job: Job) -> None:
+    """A header it cannot parse is dropped, a print area or defined names it cannot place are not kept: each is said."""
+    path = _workbook(job.path("printed.xlsx"), {"A1": "{{ total }}"})
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    sheet = "xl/worksheets/sheet1.xml"
+    header = b"<headerFooter><oddHeader>plain words</oddHeader></headerFooter></worksheet>"
+    parts[sheet] = parts[sheet].replace(b"</worksheet>", header)
+    names = (
+        b'<definedNames><definedName name="_xlnm.Print_Area" localSheetId="0"/>'
+        b'<definedName name="area" localSheetId="5">S!$A$1</definedName></definedNames><calcPr'
+    )
+    parts["xl/workbook.xml"] = parts["xl/workbook.xml"].replace(b"<calcPr", names)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+    answer = job.fill("printed.xlsx", {"total": 1})
+    assert "error" not in answer, answer
+    said = " ".join(answer["warnings"])
+    assert "header or footer so it will be ignored" in said
+    assert "Print area cannot be set" in said
+    assert "Defined names for sheet index 5 cannot be located" in said
+
+
 def test_rich_text_in_a_cell_is_flattened_with_a_warning(job: Job) -> None:
     """Bold or coloured words inside one cell are kept as their text alone, and the answer says so."""
     from openpyxl.cell.rich_text import CellRichText, TextBlock

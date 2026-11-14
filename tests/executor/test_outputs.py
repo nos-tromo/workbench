@@ -6,6 +6,7 @@ for a CSV file, python-docx and lxml on its parts for a Word document.
 
 import csv
 import socket
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -321,6 +322,109 @@ def test_a_paragraph_that_goes_on_in_a_list_item_continues_it(job: Job) -> None:
     ]
 
 
+def _numbered(path: Path) -> list[tuple[str, str, str | None]]:
+    """Each paragraph's style, text and numbering id."""
+    document = Document(str(path))
+    found: list[tuple[str, str, str | None]] = []
+    for paragraph in document.paragraphs:
+        number = paragraph._p.find(f"{W}pPr/{W}numPr/{W}numId")
+        style = (paragraph.style.name or "") if paragraph.style is not None else ""
+        found.append((style, paragraph.text, None if number is None else str(number.get(f"{W}val"))))
+    return found
+
+
+def test_an_item_without_a_paragraph_keeps_its_number(job: Job) -> None:
+    """An empty item, or one that starts with a code block, still has its number, and the numbers after it hold."""
+    assert job.document("items.docx", "1. a\n2.\n3. c\n") == {}
+    found = _numbered(job.output("items.docx"))
+    assert [(style, text) for style, text, _ in found] == [
+        ("List Number", "a"),
+        ("List Number", ""),
+        ("List Number", "c"),
+    ]
+    assert len({number for _, _, number in found}) == 1
+    assert found[0][2] is not None
+    assert job.document("code.docx", "- a\n-     code\n- c\n") == {}
+    bullets = [(style, text) for style, text, _ in _numbered(job.output("code.docx"))]
+    assert bullets == [("List Bullet", "a"), ("Normal", "code"), ("List Bullet", ""), ("List Bullet", "c")]
+
+
+def test_nested_numbered_lists_take_the_levels_numbering(job: Job) -> None:
+    """Three levels: List Number, List Number 2 and List Number 3, each list numbered on its own from its first item."""
+    assert job.document("nested.docx", "1. a\n   1. b\n      1. c\n   2. d\n2. e\n") == {}
+    found = _numbered(job.output("nested.docx"))
+    assert [(style, text) for style, text, _ in found] == [
+        ("List Number", "a"),
+        ("List Number 2", "b"),
+        ("List Number 3", "c"),
+        ("List Number 2", "d"),
+        ("List Number", "e"),
+    ]
+    ids = [number for _, _, number in found]
+    assert None not in ids
+    assert ids[0] == ids[4] and ids[1] == ids[3]
+    assert len({ids[0], ids[1], ids[2]}) == 3
+
+
+def test_a_thematic_break_is_written_as_text(job: Job) -> None:
+    """Other syntax is plain text: a line of --- is a paragraph of its own, never dropped."""
+    assert job.document("break.docx", "Before.\n\n---\n\nAfter.\n") == {}
+    document = Document(str(job.output("break.docx")))
+    assert [p.text for p in document.paragraphs] == ["Before.", "———", "After."]
+
+
+def test_a_long_table_reads_its_grid_once(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """python-docx's ``add_row`` looks the grid up on every row, a search as long as the table: N rows cost N² time."""
+    from docx.oxml.table import CT_Tbl
+
+    looked = 0
+    grid = CT_Tbl.tblGrid
+
+    def counted(table: CT_Tbl) -> Any:
+        nonlocal looked
+        looked += 1
+        return grid.fget(table)
+
+    monkeypatch.setattr(CT_Tbl, "tblGrid", property(counted))
+    assert job.document("long.docx", "|a|b|\n|-|-|\n" + "|x|y|\n" * 500) == {}
+    assert looked == 1
+    monkeypatch.undo()
+    (table,) = Document(str(job.output("long.docx"))).tables
+    assert len(table.rows) == 501
+    assert [cell.text for cell in table.rows[500].cells] == ["x", "y"]
+
+
+def test_a_table_of_40000_rows_is_written_well_inside_the_budget(job: Job) -> None:
+    """The longest tables a document holds are written in a fraction of the 90 s a job of 120 s gives the writer."""
+    markdown = "|a|\n|-|\n" + "|x|\n" * 40_000
+    began = time.monotonic()
+    assert job.document("tall.docx", markdown, budget_s=90) == {}
+    assert time.monotonic() - began < 45
+    assert job.output("tall.docx").stat().st_size > 0
+
+
+def test_the_python_docx_internals_the_writer_uses_are_there() -> None:
+    """The writer reaches below python-docx's public api to stay fast; an upgrade that drops one fails here, by name."""
+    from docx.oxml.numbering import CT_Num, CT_Numbering
+    from docx.oxml.table import CT_Row, CT_Tbl
+    from docx.table import _Cell
+
+    document = Document()
+    used = {
+        "Paragraph._p": hasattr(document.add_paragraph(), "_p"),
+        "Document._body": hasattr(document, "_body"),
+        "CT_Num.new": callable(getattr(CT_Num, "new", None)),
+        "CT_Numbering._insert_num": callable(getattr(CT_Numbering, "_insert_num", None)),
+        "CT_Numbering.num_having_numId": callable(getattr(CT_Numbering, "num_having_numId", None)),
+        "CT_Tbl.new_tbl": callable(getattr(CT_Tbl, "new_tbl", None)),
+        "CT_Tbl.tblGrid": isinstance(getattr(CT_Tbl, "tblGrid", None), property),
+        "CT_Tbl.add_tr": callable(getattr(CT_Tbl, "add_tr", None)),
+        "CT_Row.add_tc": callable(getattr(CT_Row, "add_tc", None)),
+        "_Cell": isinstance(_Cell, type),
+    }
+    assert [name for name, there in used.items() if not there] == []
+
+
 def test_links_images_and_raw_html_are_text_and_nothing_is_fetched(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
     """A link is its text and its address, an image its alt text, raw HTML as written; no socket is ever opened."""
 
@@ -387,6 +491,13 @@ def test_markdown_is_written_as_given(job: Job) -> None:
     text = "# Bericht\r\n\nGrüße, **fett**\n<b>raw</b>\n"
     assert job.document("notes.md", text) == {}
     assert job.output("notes.md").read_bytes() == text.encode()
+
+
+def test_a_lone_surrogate_in_markdown_is_written_as_a_replacement_character(job: Job) -> None:
+    """Half of a pair cannot be UTF-8: it becomes U+FFFD, the hint says so, and a whole pair stays one character."""
+    answer = job.document("notes.md", "a\ud800b \U0001f600")
+    assert "1 character" in answer["hint"]
+    assert job.output("notes.md").read_bytes() == "a�b \U0001f600".encode()
 
 
 def test_a_document_over_the_bound_is_refused(job: Job) -> None:

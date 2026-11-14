@@ -6,20 +6,24 @@ which files go to the job, what is recorded, how outputs reach the answer, what 
 model is told when the job could not finish.
 """
 
+import asyncio
 import dataclasses
 import io
 import itertools
 import json
 import logging
-from typing import Any
+from collections.abc import Callable, Coroutine, Sequence
+from typing import Any, override
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from tests.api.conftest import KEY
 from tests.api.test_files import CHAT, ME, AuditLines, H, put, tick
 from tests.api.test_tools_documents import Scripted
+from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
@@ -27,7 +31,8 @@ from workbench.api.metrics import Metrics
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import Store
 from workbench.config import Settings
-from workbench.models import Principal
+from workbench.models import FileRecord, JobRecord, Principal
+from workbench.protocol import JobResult
 
 
 def ran(stdout: str = "", stderr: str = "", *, truncated: bool = False, **extra: Any) -> dict[str, Any]:
@@ -335,6 +340,70 @@ def test_an_output_that_cannot_be_removed_is_logged_and_named_by_the_event(
     assert "OSError" in caplog.text
     assert "r.xlsx" not in caplog.text
     assert "read-only" not in caplog.text
+
+
+class CancelledOnReturn(JobQueue):
+    """A queue whose caller is cancelled as ``submit`` returns, as when the client goes away just then."""
+
+    @override
+    async def submit(
+        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str]
+    ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
+        """Run the job, keep its files, then cancel the task that asked for it."""
+        answer = await super().submit(p, tool, args, input_files)
+        caller = asyncio.current_task()
+        assert caller is not None
+        caller.cancel()
+        return answer
+
+
+#: Each route that makes files: its function, its body and an answer of its runner that keeps the file.
+MAKERS: dict[str, tuple[Callable[..., Coroutine[Any, Any, Any]], BaseModel, dict[str, Any]]] = {
+    "run_python": (tools.run_python, tools.RunPythonRequest(code="print(1)"), ran()),
+    "fill_template": (
+        tools_templates.fill_template,
+        tools_templates.FillTemplateRequest.model_validate(
+            {"path": f"{CHAT}/form.docx", "values": {"customer": {"value": "x", "source": {"kind": "assistant"}}}}
+        ),
+        {"filled": ["customer"], "unfilled": [], "warnings": []},
+    ),
+    "write_table": (
+        tools_output.write_table,
+        tools_output.WriteTableRequest(name="t", format="csv", columns=["a"], rows=[["1"]]),
+        {},
+    ),
+    "write_document": (
+        tools_output.write_document,
+        tools_output.WriteDocumentRequest(name="r", format="md", markdown="# r"),
+        {},
+    ),
+}
+
+
+@pytest.mark.parametrize("tool", list(MAKERS))
+def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, tool: str
+) -> None:
+    """The job's file is in the workspace once ``submit`` returns; the step to its record runs to its end regardless."""
+    route, body, payload = MAKERS[tool]
+    put(store, "form.docx", b"PK")
+    executor = Scripted(settings.data_dir)
+    executor.files = {"made.docx": b"PK"}
+    executor.payload = payload
+    queue = CancelledOnReturn(settings, executor, store, Metrics(settings.data_dir))
+    audit.start({})
+
+    async def call() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await route(body=body, p=ME, settings=settings, store=store, audit=audit, jobs=queue)
+
+    asyncio.run(call())
+    made = [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
+    named = {
+        i for event in audit_lines() if event["operation"] == f"tool.{tool}" for i in event["target"].get("ids", [])
+    }
+    assert [rec.name for rec in made] == ["made.docx"]
+    assert {rec.id for rec in made} <= named
 
 
 def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake_executor: Scripted) -> None:
