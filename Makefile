@@ -93,13 +93,14 @@ retention-dry-run:
 ### Neither sets compose's kernel.shm_rmid_forced=1: under it a segment nobody
 ### is attached to dies with its creator, so the SysV cleanup tests could not
 ### make the leftovers they clear. /scratch stands in for the data volume: the
-### slot uids must reach it.
+### slot uids must reach it. docker/ is mounted too, read-only: the image leaves
+### it out, and the healthcheck's test runs the probe written in compose.yaml.
 EXECUTOR_TEST_IMAGE  := workbench-executor:test-root
 EXECUTOR_ROOT_RUN    := docker run --rm --init --read-only --network none --user 0:0 \
 	--security-opt no-new-privileges:true --cap-drop ALL \
 	$(foreach cap,SETUID SETGID CHOWN FOWNER DAC_OVERRIDE KILL,--cap-add $(cap)) \
 	--tmpfs /tmp:mode=0700 --tmpfs /scratch:mode=0755 -e WORKBENCH_TEST_PUBLIC_TMP=/scratch \
-	-v "$(CURDIR)/tests:/app/tests:ro" -w /app
+	-v "$(CURDIR)/tests:/app/tests:ro" -v "$(CURDIR)/docker:/app/docker:ro" -w /app
 EXECUTOR_ROOT_PYTEST := python -m pytest tests/executor -q -rfEs -p no:cacheprovider -W error
 
 .PHONY: test-executor-root

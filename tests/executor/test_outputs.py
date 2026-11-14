@@ -555,7 +555,8 @@ def test_a_lone_surrogate_in_markdown_is_written_as_a_replacement_character(job:
 
     The pair comes as JSON's escapes bring it, two code points, which the runner joins into the one character.
     """
-    answer = job.document("notes.md", "a\ud800b 😀")
+    pair = chr(0xD83D) + chr(0xDE00)  # built from its halves, so no tool can store it as the one character
+    answer = job.document("notes.md", "a\ud800b " + pair)
     assert "1 character" in answer["hint"]
     assert job.output("notes.md").read_bytes() == "a�b \U0001f600".encode()
 

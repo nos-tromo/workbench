@@ -5,8 +5,10 @@ import contextlib
 import dataclasses
 import logging
 import os
+import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -17,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
 from workbench.config import Settings, load_settings
@@ -1378,11 +1381,12 @@ async def test_serve_answers_one_request_per_connection(served: Path, monkeypatc
     async with _serving(sup):
         answer = decode_result(await _ask(_sock(served), encode(request)))
         again = decode_result(await _ask(_sock(served), encode(_request())))
+        mode, kind = _mode(_sock(served)), os.lstat(_sock(served)).st_mode
 
     assert (answer.job_id, answer.status, answer.result) == (request.job_id, "ok", {"tool": "script"})
     assert again.status == "ok"
-    assert _mode(_sock(served)) == 0o660
-    assert stat.S_ISSOCK(os.lstat(_sock(served)).st_mode)
+    assert mode == 0o660
+    assert stat.S_ISSOCK(kind)
 
 
 async def test_a_lone_surrogate_in_a_runners_answer_never_costs_the_run_its_outputs(
@@ -1449,6 +1453,7 @@ async def test_serve_ends_when_its_last_slot_is_retired(served: Path, monkeypatc
 
     assert answer.message == "the job's processes could not be stopped"
     assert str(ended.value) == "every slot is retired (1 of 1); exiting so the container restarts"
+    assert not _sock(served).exists()
 
 
 async def test_serve_goes_on_while_a_slot_is_usable(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1484,12 +1489,13 @@ async def test_the_socket_gets_its_mode_as_it_is_made_not_through_its_path(serve
     try:
         async with _serving(Supervisor(_settings(served), use_slots=False)):
             answer = decode_result(await _ask(_sock(served), b"not json\n"))
+            mode = _mode(_sock(served))
     finally:
         restored = os.umask(previous)
         os.chmod = real_chmod
 
     assert answer.status == "error"
-    assert _mode(_sock(served)) == 0o660
+    assert mode == 0o660
     assert restored == 0o002
 
 
@@ -1520,6 +1526,70 @@ async def test_something_else_in_the_sockets_place_stops_serve(served: Path) -> 
         await asyncio.wait_for(Supervisor(_settings(served), use_slots=False).serve(), 10)
 
     assert (_sock(served)).read_text() == "not a socket"
+
+
+async def test_serve_removes_its_socket_when_it_ends(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A socket left behind would look like a serving supervisor to whoever only looks at the file."""
+    _runner(monkeypatch, "pass")
+
+    async with _serving(Supervisor(_settings(served), use_slots=False)):
+        answer = decode_result(await _ask(_sock(served), encode(_request())))
+        assert stat.S_ISSOCK(os.lstat(_sock(served)).st_mode)
+
+    assert answer.status == "ok"
+    assert not _sock(served).exists()
+
+
+async def test_serve_leaves_what_is_not_its_socket_when_it_ends(served: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """At the end too, only a socket in the socket's place is removed, never a file put there meanwhile."""
+    _runner(monkeypatch, "pass")
+
+    async with _serving(Supervisor(_settings(served), use_slots=False)):
+        await _ask(_sock(served), encode(_request()))
+        _sock(served).unlink()
+        _sock(served).write_text("not a socket")
+
+    assert _sock(served).read_text() == "not a socket"
+
+
+def _health_probe(path: Path) -> str:
+    """The executor's healthcheck from ``docker/compose.yaml``, aimed at ``path`` instead of the real socket."""
+    compose = yaml.safe_load((Path(__file__).resolve().parents[2] / "docker" / "compose.yaml").read_text("utf-8"))
+    test = compose["services"]["executor"]["healthcheck"]["test"]
+    assert test[:3] == ["CMD", "python", "-c"]
+    assert "/run/workbench/executor.sock" in test[3]
+    return str(test[3]).replace("/run/workbench/executor.sock", str(path))
+
+
+@pytest.mark.skipif(not Path("/proc/net/unix").exists(), reason="the healthcheck reads Linux's /proc/net/unix")
+def test_the_healthcheck_passes_only_while_a_socket_listens_on_its_path() -> None:
+    """Run as compose runs it: a socket left by an earlier run, or one not listening yet, is not a healthy executor.
+
+    The probe never connects: a connection without a request line would be a malformed request to the supervisor.
+    """
+    folder = Path(tempfile.mkdtemp(prefix="wb"))  # short: a socket's path has at most 108 bytes
+    sockets = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(3)]
+    listening, bound, stale = sockets
+    try:
+        listening.bind(str(folder / "listening"))
+        listening.listen()
+        bound.bind(str(folder / "bound"))
+        stale.bind(str(folder / "stale"))
+        stale.listen()
+        stale.close()  # its file stays, as a killed supervisor's does
+        (folder / "file").write_bytes(b"")
+        answers = {
+            name: subprocess.run(
+                [sys.executable, "-c", _health_probe(folder / name)], capture_output=True, timeout=30
+            ).returncode
+            for name in ("listening", "bound", "stale", "file", "missing")
+        }
+        assert stat.S_ISSOCK(os.lstat(folder / "stale").st_mode)
+    finally:
+        for sock in sockets:
+            sock.close()
+        shutil.rmtree(folder)
+    assert answers == {"listening": 0, "bound": 1, "stale": 1, "file": 1, "missing": 1}
 
 
 async def test_job_folders_left_by_an_earlier_run_are_removed_at_start(
@@ -1669,9 +1739,10 @@ async def test_as_root_the_socket_belongs_to_the_api_group(root_volume: Path) ->
 
     async with _serving(sup):
         answer = decode_result(await _ask(_sock(root_volume), b"not json\n"))
+        owned = (_ids(_sock(root_volume)), _mode(_sock(root_volume)))
 
     assert answer.status == "error"
-    assert (_ids(_sock(root_volume)), _mode(_sock(root_volume))) == ((0, 10001), 0o660)
+    assert owned == ((0, 10001), 0o660)
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")

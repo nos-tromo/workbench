@@ -116,7 +116,7 @@ services:
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
-      # Its first jobs find the supervisor serving.
+      # Its first jobs find the supervisor listening.
       executor:
         condition: service_healthy
     healthcheck:
@@ -192,14 +192,17 @@ services:
       volume-permissions:
         condition: service_completed_successfully
     healthcheck:
-      # Healthy once the supervisor's socket is there. It only looks: a
-      # connection without a request line would be a malformed request to
-      # the supervisor. The image has no curl.
+      # Healthy once a socket listens on the supervisor's path: the kernel's
+      # /proc/net/unix lists it with the listening flag (__SO_ACCEPTCON,
+      # 00010000). The file alone is not enough, since it outlives a
+      # supervisor that was killed, in workbench-run. The probe never
+      # connects: a connection without a request line would be a malformed
+      # request to the supervisor. The image has no curl.
       test:
         - CMD
         - python
         - -c
-        - "import os, stat, sys; p = '/run/workbench/executor.sock'; sys.exit(not (os.path.exists(p) and stat.S_ISSOCK(os.stat(p).st_mode)))"
+        - "import sys; p = '/run/workbench/executor.sock'; sys.exit(not any(f[3] == '00010000' and f[7:] == [p] for f in map(str.split, open('/proc/net/unix').readlines()[1:])))"
       interval: 30s
       timeout: 5s
       retries: 3

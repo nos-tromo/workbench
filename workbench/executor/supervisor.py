@@ -532,7 +532,9 @@ class Supervisor:
         """Answer jobs on ``executor_socket`` until cancelled, or until no slot is left.
 
         Job folders an earlier run left behind are removed first. The socket gets mode ``0660``
-        and the api's group, and is bound before it listens, so nobody else ever connects.
+        and the api's group, and is bound before it listens, so nobody else ever connects. It is
+        removed again when serving ends, however it ends (a kill leaves it, and the next start
+        replaces it).
 
         Raises:
             NoUsableSlot: Every slot is retired. The request that retired the last one is still
@@ -552,6 +554,8 @@ class Supervisor:
         finally:
             server.close()
             self._cleanup_pool.shutdown(wait=False)
+            with contextlib.suppress(OSError, RuntimeError):  # what is not our socket stays; the answer goes on
+                self._remove_socket()
         count = self._settings.executor_slots
         raise NoUsableSlot(f"every slot is retired ({count} of {count}); exiting so the container restarts")
 
@@ -1013,6 +1017,34 @@ class Supervisor:
         if stale:
             _log.info("removed %d job folder%s left from an earlier run", len(stale), "" if len(stale) == 1 else "s")
 
+    def _remove_socket(self) -> None:
+        """Remove the socket from its place, if a socket is there; anything else is left as it is.
+
+        Raises:
+            RuntimeError: The socket's folder is a symlink, not a folder, not root's, or open to others' writes; or
+                something other than a socket is in the socket's place.
+            OSError: It cannot be removed.
+        """
+        path = self._settings.executor_socket
+        try:
+            folder = os.lstat(path.parent)
+        except FileNotFoundError:
+            folder = None
+        if (
+            folder is None
+            or not stat.S_ISDIR(folder.st_mode)
+            or folder.st_uid != self._owners.root[0]
+            or folder.st_mode & 0o022
+        ):
+            raise RuntimeError("the socket's folder must be root's alone")
+        try:
+            found = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(found):
+            raise RuntimeError("the socket's place holds something that is not a socket")
+        os.unlink(path)
+
     def _bind(self) -> socket.socket:
         """Bind the socket, replacing one an earlier run left, and give it its owner and mode.
 
@@ -1030,25 +1062,7 @@ class Supervisor:
             OSError: It cannot be bound.
         """
         path = self._settings.executor_socket
-        try:
-            folder = os.lstat(path.parent)
-        except FileNotFoundError:
-            folder = None
-        if (
-            folder is None
-            or not stat.S_ISDIR(folder.st_mode)
-            or folder.st_uid != self._owners.root[0]
-            or folder.st_mode & 0o022
-        ):
-            raise RuntimeError("the socket's folder must be root's alone")
-        try:
-            found = os.lstat(path).st_mode
-        except FileNotFoundError:
-            pass
-        else:
-            if not stat.S_ISSOCK(found):
-                raise RuntimeError("the socket's place holds something that is not a socket")
-            os.unlink(path)
+        self._remove_socket()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             previous = os.umask(0o117)

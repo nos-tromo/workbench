@@ -5,11 +5,7 @@ Compose's settings and shape, the images' bases, ``.env.example``, the bundle sc
 
 import os
 import re
-import socket
-import stat
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -143,38 +139,23 @@ def _health_probe() -> str:
     return str(test[3])
 
 
-def test_the_executor_is_healthy_once_its_socket_is_there() -> None:
-    """The probe looks at the socket; it never connects, which the supervisor would read as a malformed request."""
+def test_the_executor_is_healthy_once_its_socket_listens() -> None:
+    """The probe asks the kernel for a listening socket on the path; it never connects.
+
+    A connection without a request line would be a malformed request to the supervisor. The probe is run against
+    listening, stale and unbound sockets in ``tests/executor/test_supervisor.py``, on Linux, ``make
+    test-executor-root`` included.
+    """
     probe = _health_probe()
     assert "/run/workbench/executor.sock" in probe
     assert str(load_settings({}, role="executor").executor_socket) == "/run/workbench/executor.sock"
-    assert "S_ISSOCK" in probe and "connect" not in probe and "socket." not in probe
+    assert "/proc/net/unix" in probe and "'00010000'" in probe
+    assert "connect" not in probe and "socket" not in probe.replace("executor.sock", "")
     depends = compose()["services"]["api"]["depends_on"]
     assert depends == {
         "volume-permissions": {"condition": "service_completed_successfully"},
         "executor": {"condition": "service_healthy"},
     }
-
-
-def test_the_health_probe_tells_a_socket_from_anything_else() -> None:
-    """Run as written, against a socket, a regular file and nothing: only the socket passes."""
-    folder = Path(tempfile.mkdtemp(prefix="wb"))  # short: a socket's path has at most 104 bytes on macOS
-    try:
-        sock = folder / "s"
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(sock))
-        (folder / "f").write_bytes(b"")
-        answers = {}
-        for name in ("s", "f", "missing"):
-            probe = _health_probe().replace("/run/workbench/executor.sock", str(folder / name))
-            answers[name] = subprocess.run([sys.executable, "-c", probe], capture_output=True, timeout=30).returncode
-        server.close()
-        assert stat.S_ISSOCK(os.stat(sock).st_mode)
-        assert answers["s"] == 0 and answers["f"] != 0 and answers["missing"] != 0
-    finally:
-        for path in folder.iterdir():
-            path.unlink()
-        folder.rmdir()
 
 
 # --- networks, volumes, ports, restarts -----------------------------------------------------------------------
@@ -370,6 +351,12 @@ def test_health_shows_the_containers_and_asks_the_api() -> None:
     planned = _make("-n", "health").stdout
     assert " ps " in planned
     assert "exec -T api" in planned and "/healthz" in planned
+
+
+def test_the_root_executor_tests_can_read_the_healthcheck() -> None:
+    """The image leaves ``docker/`` out: the root run mounts it, read-only, so the probe's test runs there too."""
+    planned = _make("-n", "test-executor-root").stdout
+    assert planned.count('/docker:/app/docker:ro"') == 2
 
 
 def test_the_isolation_stack_is_torn_down_on_every_way_out() -> None:
