@@ -7,7 +7,8 @@ that module's audit rule; ``read_document``, ``search_files`` and ``run_python``
 to a job in the executor (:mod:`workbench.executor.runners.documents`,
 :mod:`workbench.executor.runners.python`) and are built here from what the store knows and what the job
 answers. Each later tool has a module of its own on this module's router, sharing its helpers:
-``inspect_template`` and ``fill_template`` are in :mod:`workbench.api.tools_templates`.
+``inspect_template`` and ``fill_template`` are in :mod:`workbench.api.tools_templates`, ``write_table`` and
+``write_document`` in :mod:`workbench.api.tools_output`.
 
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
@@ -221,6 +222,7 @@ _RUNNER_ERRORS: Final = {
     "invalid_template": 422,
     "invalid_value": 422,
     "invalid_source": 422,
+    "write_timeout": 422,
 }
 _ERROR_CAP: Final = 300
 _CUT_MARK: Final = " [cut]"

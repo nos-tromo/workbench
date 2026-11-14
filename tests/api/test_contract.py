@@ -117,6 +117,13 @@ def test_system_prompt_tells_python_where_results_go_and_to_use_threads(settings
         assert phrase in prompt, phrase
 
 
+def test_system_prompt_says_how_new_tables_and_documents_are_made(settings: Settings) -> None:
+    """With the two output tools, and with run_python for a large table."""
+    prompt = system_prompt(settings)
+    for phrase in ("`write_table`", "`write_document`", "large table"):
+        assert phrase in prompt, phrase
+
+
 def test_openapi_needs_only_the_key(client: TestClient) -> None:
     """Open WebUI fetches the spec with ``Authorization`` alone."""
     assert client.get("/openapi.json", headers=KEY_ONLY).status_code == 200
@@ -156,6 +163,8 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/tools/run_python",
         "/tools/inspect_template",
         "/tools/fill_template",
+        "/tools/write_table",
+        "/tools/write_document",
         DISPLAY_TOOL,
         "/tools/echo",
     }

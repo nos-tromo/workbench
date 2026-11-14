@@ -420,3 +420,79 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
     assert (sheet["B2"].value, sheet["A6"].value, sheet["B7"].value) == (469.5, "Dredging", "=1+1")
     assert sheet["B7"].data_type == "s"
     assert [cell.value for cell in book["Sources"][1]] == ["field", "value", "source kind", "reference"]
+
+
+# --- the output tools, end to end --------------------------------------------------------------------------------
+
+OUTPUTS_CHAT = "chat-outputs"
+OUTPUT_HEADERS = {"X-User-Id": "user-a", "X-Session-Id": OUTPUTS_CHAT}
+
+
+def _output_tool(api: httpx.Client, tool: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call an output tool in the outputs' chat, and take its answer."""
+    answer = api.post(f"/tools/{tool}", json=body, headers=OUTPUT_HEADERS)
+    assert answer.status_code == 200, answer.text
+    return answer.json()
+
+
+def _fetched(api: httpx.Client, path: str) -> bytes:
+    """Fetch a file's bytes from the outputs' chat through the file browser."""
+    answer = api.get("/files/view", params={"path": path}, headers=OUTPUT_HEADERS)
+    assert answer.status_code == 200, answer.text
+    return answer.content
+
+
+def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> None:
+    """A workbook, a CSV file and a Word document, each written by a real job and read back from the workspace (R45).
+
+    The jobs run as slot uids with a read-only root and no network, in the shipped image, so this also proves that
+    xlsxwriter, markdown-it-py and python-docx are there and work as the job runs them.
+    """
+    columns = ["item", "total", "note"]
+    rows = [["Dredging", 118, "=1+1"], ["Piers", 351.5, "Grüße"], ["Total", None]]
+    workbook = _output_tool(
+        api, "write_table", {"name": "quarterly-figures", "format": "xlsx", "columns": columns, "rows": rows}
+    )
+    assert workbook == {"path": f"/workspace/{OUTPUTS_CHAT}/quarterly-figures.xlsx", "rows": 3}
+    sheet = openpyxl.load_workbook(io.BytesIO(_fetched(api, workbook["path"])))["Sheet1"]
+    assert [[cell.value for cell in row] for row in sheet.iter_rows()] == [
+        columns,
+        ["Dredging", 118, "=1+1"],
+        ["Piers", 351.5, "Grüße"],
+        ["Total", None, None],
+    ]
+    assert sheet["C2"].data_type == "s"
+    assert sheet["A1"].font.b
+    assert sheet.freeze_panes == "A2"
+
+    table = _output_tool(
+        api, "write_table", {"name": "quarterly-figures", "format": "csv", "columns": columns, "rows": rows}
+    )
+    assert table["path"] == f"/workspace/{OUTPUTS_CHAT}/quarterly-figures.csv"
+    assert "1 cell" in table["hint"]
+    raw = _fetched(api, table["path"])
+    assert raw.startswith(b"\xef\xbb\xbf")
+    assert raw.decode("utf-8-sig").splitlines() == [
+        "item,total,note",
+        "Dredging,118,'=1+1",
+        "Piers,351.5,Grüße",
+        "Total,,",
+    ]
+
+    markdown = (
+        "# Quarterly report\n\nDredging **118**.\n\n- north pier\n- south pier\n\n"
+        "| Item | Total |\n|---|---|\n| Piers | 351 |\n"
+    )
+    written = _output_tool(api, "write_document", {"name": "report", "format": "docx", "markdown": markdown})
+    assert written == {"path": f"/workspace/{OUTPUTS_CHAT}/report.docx"}
+    document = Document(io.BytesIO(_fetched(api, written["path"])))
+    assert [(p.style.name if p.style is not None else "", p.text) for p in document.paragraphs] == [
+        ("Heading 1", "Quarterly report"),
+        ("Normal", "Dredging 118."),
+        ("List Bullet", "north pier"),
+        ("List Bullet", "south pier"),
+    ]
+    assert [[cell.text for cell in row.cells] for row in document.tables[0].rows] == [
+        ["Item", "Total"],
+        ["Piers", "351"],
+    ]

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, metrics, tools, tools_templates  # noqa: F401 (adds routes)
+from workbench.api import contract, errors, files, metrics, tools, tools_output, tools_templates  # noqa: F401 (routes)
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
 from workbench.api.hardening import ViewHardening
@@ -103,7 +103,7 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: JobQu
     app.include_router(contract.router)
     app.include_router(files.router)
     app.include_router(files.tool_router)
-    app.include_router(tools.router)  # the template tools' routes are on it too (tools_templates)
+    app.include_router(tools.router)  # the template and output tools' routes are on it too
     app.include_router(metrics.router)
     return app
 
