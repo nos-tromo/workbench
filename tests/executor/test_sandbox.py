@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -712,19 +713,43 @@ def test_clean_env_holds_the_documented_variables() -> None:
     assert (env["OPENBLAS_NUM_THREADS"], env["OMP_NUM_THREADS"]) == ("1", "1")
 
 
+def _pretend_ids(monkeypatch: pytest.MonkeyPatch, uid: int, gid: int) -> None:
+    """Make the process report ``uid`` and ``gid`` as its real, effective and saved ids."""
+    for name in ("getresuid", "getresgid"):
+        if hasattr(os, name):
+            ids = uid if name == "getresuid" else gid
+            monkeypatch.setattr(os, name, lambda ids=ids: (ids, ids, ids))
+    for name, value in (("getuid", uid), ("geteuid", uid), ("getgid", gid), ("getegid", gid)):
+        monkeypatch.setattr(os, name, lambda value=value: value)
+
+
+def _record_priority(monkeypatch: pytest.MonkeyPatch, calls: list[Any], current: int = 0) -> None:
+    """Record ``setpriority`` instead of renicing the test runner, which could never undo it."""
+    monkeypatch.setattr(os, "getpriority", lambda which, who: current)
+    monkeypatch.setattr(os, "setpriority", lambda which, who, prio: calls.append(("setpriority", which, who, prio)))
+
+
 def test_preexec_drops_to_the_slot_before_it_limits(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The child leaves its session, drops groups and ids, then lowers every limit; ids come last of the four."""
+    """The child leaves its session, lowers its priority, drops groups and ids, then lowers every limit."""
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(os, "setsid", lambda: calls.append(("setsid",)))
+    _record_priority(monkeypatch, calls)
     monkeypatch.setattr(os, "setgroups", lambda groups: calls.append(("setgroups", list(groups))))
     monkeypatch.setattr(os, "setgid", lambda gid: calls.append(("setgid", gid)))
     monkeypatch.setattr(os, "setuid", lambda uid: calls.append(("setuid", uid)))
+    _pretend_ids(monkeypatch, 20003, 20003)
     monkeypatch.setattr(resource, "setrlimit", lambda which, pair: calls.append(("rlimit", which, pair)))
     limits = Limits(wall_s=9, cpu_s=7, memory_mb=512, file_mb=9, nproc=100, nofile=128)
 
     preexec(Slot(index=2, uid=20003, gid=20003), limits)()
 
-    assert calls[:4] == [("setsid",), ("setgroups", []), ("setgid", 20003), ("setuid", 20003)]
+    assert calls[:5] == [
+        ("setsid",),
+        ("setpriority", os.PRIO_PROCESS, 0, 10),
+        ("setgroups", []),
+        ("setgid", 20003),
+        ("setuid", 20003),
+    ]
     expected = {
         resource.RLIMIT_CPU: 7,
         resource.RLIMIT_FSIZE: 9 * MB,
@@ -734,14 +759,15 @@ def test_preexec_drops_to_the_slot_before_it_limits(monkeypatch: pytest.MonkeyPa
     }
     if LINUX:
         expected[resource.RLIMIT_AS] = 512 * MB
-    assert {c[1]: c[2] for c in calls[4:]} == {which: (value, value) for which, value in expected.items()}
-    assert len(calls) == 4 + len(expected)
+    assert {c[1]: c[2] for c in calls[5:]} == {which: (value, value) for which, value in expected.items()}
+    assert len(calls) == 5 + len(expected)
 
 
 def test_preexec_without_a_slot_keeps_the_uid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no slot the child still gets its own session and limits, but no id is changed."""
-    calls: list[str] = []
+    """With no slot the child still gets its own session, its lower priority and limits, but no id is changed."""
+    calls: list[Any] = []
     monkeypatch.setattr(os, "setsid", lambda: calls.append("setsid"))
+    _record_priority(monkeypatch, calls)
     monkeypatch.setattr(os, "setgroups", lambda groups: calls.append("setgroups"))
     monkeypatch.setattr(os, "setgid", lambda gid: calls.append("setgid"))
     monkeypatch.setattr(os, "setuid", lambda uid: calls.append("setuid"))
@@ -749,8 +775,64 @@ def test_preexec_without_a_slot_keeps_the_uid(monkeypatch: pytest.MonkeyPatch) -
 
     preexec(None, _limits())()
 
-    assert calls[0] == "setsid"
-    assert set(calls[1:]) == {"rlimit"}
+    assert calls[:2] == ["setsid", ("setpriority", os.PRIO_PROCESS, 0, 10)]
+    assert set(calls[2:]) == {"rlimit"}
+
+
+def test_preexec_never_raises_the_priority_of_a_child_that_is_already_lower(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A supervisor already at niceness 15 starts its jobs at 15, not 10: raising it back needs privilege."""
+    calls: list[Any] = []
+    monkeypatch.setattr(os, "setsid", lambda: None)
+    _record_priority(monkeypatch, calls, current=15)
+    monkeypatch.setattr(resource, "setrlimit", lambda which, pair: None)
+
+    preexec(None, _limits())()
+
+    assert calls == [("setpriority", os.PRIO_PROCESS, 0, 15)]
+
+
+@pytest.mark.parametrize(("uid", "gid"), [(0, 0), (0, 20001), (20001, 0), (-1, 20001), (20001, -1)])
+def test_preexec_refuses_a_slot_of_root_before_it_drops(uid: int, gid: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slot with uid or gid 0 would run user code as root; the child refuses before it changes any id."""
+    calls: list[Any] = []
+    monkeypatch.setattr(os, "setsid", lambda: None)
+    _record_priority(monkeypatch, calls)
+    monkeypatch.setattr(os, "setgroups", lambda groups: calls.append("setgroups"))
+    monkeypatch.setattr(os, "setgid", lambda gid: calls.append("setgid"))
+    monkeypatch.setattr(os, "setuid", lambda uid: calls.append("setuid"))
+    _pretend_ids(monkeypatch, uid, gid)  # what a drop to root would report: the check must not rely on it
+
+    with pytest.raises(RuntimeError, match="must not run as root"):
+        preexec(Slot(index=0, uid=uid, gid=gid), _limits())()
+
+    assert not {"setgroups", "setgid", "setuid"} & set(calls)
+
+
+@pytest.mark.parametrize(
+    ("uids", "gids"),
+    [
+        ((20003, 20003, 0), (20003, 20003, 20003)),
+        ((20003, 0, 20003), (20003, 20003, 20003)),
+        ((20003, 20003, 20003), (20003, 20003, 0)),
+        ((0, 0, 0), (0, 0, 0)),
+    ],
+    ids=["saved-uid", "effective-uid", "saved-gid", "nothing-changed"],
+)
+@pytest.mark.skipif(not hasattr(os, "getresuid"), reason="getresuid exists only on Linux")
+def test_preexec_refuses_a_drop_that_kept_any_other_id(
+    uids: tuple[int, int, int], gids: tuple[int, int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the drop, real, effective and saved ids must all be the slot's, or the job does not start."""
+    monkeypatch.setattr(os, "setsid", lambda: None)
+    _record_priority(monkeypatch, [])
+    for name in ("setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(os, name, lambda value: None)
+    monkeypatch.setattr(os, "getresuid", lambda: uids)
+    monkeypatch.setattr(os, "getresgid", lambda: gids)
+    monkeypatch.setattr(resource, "setrlimit", lambda which, pair: pytest.fail("limits set after a failed drop"))
+
+    with pytest.raises(RuntimeError, match="did not become slot 2"):
+        preexec(Slot(index=2, uid=20003, gid=20003), _limits())()
 
 
 async def test_a_full_job_runs_through_the_sandbox(tmp_path: Path) -> None:
@@ -760,3 +842,98 @@ async def test_a_full_job_runs_through_the_sandbox(tmp_path: Path) -> None:
     argv = [sys.executable, "-I", "-m", "workbench.executor.job", str(spec)]
     assert await run_in_slot(argv, tmp_path, None, _limits()) == ("ok", 0)
     assert json.loads((tmp_path / "result.json").read_text()) == {"x": 1}
+
+
+async def test_a_job_runs_at_a_lower_priority(tmp_path: Path) -> None:
+    """Jobs run at niceness 10 or more, so the supervisor and slot cleanups stay responsive under load."""
+    code = "import os; open('nice.txt', 'w').write(str(os.getpriority(os.PRIO_PROCESS, 0)))"
+    assert await _run(code, tmp_path) == ("ok", 0)
+    assert int((tmp_path / "nice.txt").read_text()) >= 10
+
+
+def _refuse_setgroups(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the drop fail in the child, as it does for a supervisor that lacks the privilege."""
+
+    def refuse(groups: list[int]) -> None:
+        """Fail like ``setgroups`` without ``CAP_SETGID``."""
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "setgroups", refuse)
+
+
+async def test_a_failed_drop_is_an_error_and_the_slot_is_still_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drop that fails in the child is reported as ``error`` with ``SPAWN_FAILED``, not raised, and runs nothing."""
+    cleared: list[int] = []
+    _refuse_setgroups(monkeypatch)
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: cleared.append(slot.index))
+    code = "open('ran.txt', 'w').write('ran')"
+    argv = [sys.executable, "-I", "-c", code]
+
+    assert await run_in_slot(argv, tmp_path, Slot(3, 20004, 20004), _limits()) == ("error", sandbox.SPAWN_FAILED)
+
+    assert sandbox.SPAWN_FAILED == 126
+    assert not (tmp_path / "ran.txt").exists()
+    assert cleared == [3]
+
+
+async def test_a_drop_that_leaves_the_supervisor_ids_runs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the id calls do nothing, the child still has the supervisor's ids; the check refuses to exec."""
+    for name in ("setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(os, name, lambda value: None)
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: None)
+    code = "open('ran.txt', 'w').write('ran')"
+    argv = [sys.executable, "-I", "-c", code]
+
+    assert await run_in_slot(argv, tmp_path, Slot(0, 20001, 20001), _limits()) == ("error", sandbox.SPAWN_FAILED)
+
+    assert not (tmp_path / "ran.txt").exists()
+
+
+async def test_a_slot_of_root_runs_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slot with uid 0 is refused in the child even where the drop calls would succeed."""
+    for name in ("setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(os, name, lambda value: None)
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: None)
+    _pretend_ids(monkeypatch, 0, 0)
+    code = "open('ran.txt', 'w').write('ran')"
+    argv = [sys.executable, "-I", "-c", code]
+
+    assert await run_in_slot(argv, tmp_path, Slot(0, 0, 0), _limits()) == ("error", sandbox.SPAWN_FAILED)
+
+    assert not (tmp_path / "ran.txt").exists()
+
+
+@pytest.mark.parametrize("code", ["pass", "import time; time.sleep(10)"])
+async def test_the_slot_cleanup_runs_on_the_pool_it_is_given(
+    code: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supervisor hands over a pool of its own, so stopped cleanups never take the default pool's threads."""
+    threads: list[str] = []
+    real_preexec = sandbox.preexec
+    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: threads.append(threading.current_thread().name))
+    argv = [sys.executable, "-I", "-c", code]
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="slot-cleanup-test") as pool:
+        await run_in_slot(argv, tmp_path, Slot(1, 20002, 20002), _limits(wall_s=1), cleanup_pool=pool)
+
+    assert len(threads) == 1
+    assert threads[0].startswith("slot-cleanup-test")
+
+
+async def test_a_failed_drop_is_cleared_on_the_given_pool_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cleanup after a failed drop runs where every other cleanup runs."""
+    threads: list[str] = []
+    _refuse_setgroups(monkeypatch)
+    monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: threads.append(threading.current_thread().name))
+    argv = [sys.executable, "-I", "-c", "pass"]
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="slot-cleanup-test") as pool:
+        status = await run_in_slot(argv, tmp_path, Slot(1, 20002, 20002), _limits(), cleanup_pool=pool)
+
+    assert status == ("error", sandbox.SPAWN_FAILED)
+    assert [name.startswith("slot-cleanup-test") for name in threads] == [True]

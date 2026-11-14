@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +18,12 @@ from typing import Literal
 from workbench.protocol import Limits
 
 MB = 1024 * 1024
+# The exit code ``run_in_slot`` reports for a job that never started because the child could not
+# become its slot. 126 is the shell's "found but could not be executed".
+SPAWN_FAILED = 126
+# Jobs run at least this nice, so the supervisor and slot cleanups stay responsive when every slot
+# is busy. A job cannot lower it again without CAP_SYS_NICE.
+JOB_NICENESS = 10
 
 CLEAN_ENV: Mapping[str, str] = MappingProxyType(
     {
@@ -88,19 +95,56 @@ def clean_env(cwd: Path, tmp_dir: Path | None = None) -> dict[str, str]:
     return env
 
 
+def _holds_only(uid: int, gid: int) -> bool:
+    """Tell whether the process's ids are all ``uid`` and ``gid``, saved ids included where the kernel has them.
+
+    Args:
+        uid: The user id every one of the process's user ids must be.
+        gid: The group id every one of the process's group ids must be.
+
+    Returns:
+        ``True`` when they are.
+    """
+    if sys.platform == "linux":
+        return os.getresuid() == (uid, uid, uid) and os.getresgid() == (gid, gid, gid)
+    return (os.getuid(), os.geteuid(), os.getgid(), os.getegid()) == (uid, uid, gid, gid)
+
+
+def _drop_to(slot: Slot) -> None:
+    """Switch the calling process to the slot's ids, for good, and prove it did.
+
+    Args:
+        slot: The slot to become.
+
+    Raises:
+        RuntimeError: The slot's uid or gid is 0 or below, which would leave the job root, or
+            after the switch any real, effective or saved id is not the slot's.
+        OSError: A switch call failed.
+    """
+    if slot.uid <= 0 or slot.gid <= 0:
+        raise RuntimeError(f"slot {slot.index} must not run as root")
+    os.setgroups([])
+    os.setgid(slot.gid)
+    os.setuid(slot.uid)
+    if not _holds_only(slot.uid, slot.gid):
+        raise RuntimeError(f"the job did not become slot {slot.index}")
+
+
 def preexec(slot: Slot | None, limits: Limits) -> Callable[[], None]:
     """Build the function that runs in the child between ``fork`` and ``exec``.
 
-    The child leaves the supervisor's session, drops its groups and switches to the slot's
-    ids, then lowers its limits. Failing at any step aborts the spawn, so a job never runs
-    with more rights than intended.
+    The child leaves the supervisor's session, lowers its priority to at least ``JOB_NICENESS``,
+    drops its groups and switches to the slot's ids, checks that it holds no other id, then
+    lowers its limits. Failing at any step aborts the spawn, so a job never runs with more
+    rights than intended; ``run_in_slot`` reports that as ``SPAWN_FAILED``.
 
     Args:
         slot: The slot whose ids the job runs as, or ``None`` to keep the current ids (tests, dev).
         limits: The limits to set in the child.
 
     Returns:
-        The function to pass as ``preexec_fn``.
+        The function to pass as ``preexec_fn``. In the child it raises ``RuntimeError`` for a
+        slot with uid or gid 0 (before any id changes) or a drop that left another id.
     """
     ceilings = {
         resource.RLIMIT_CPU: limits.cpu_s,
@@ -115,10 +159,10 @@ def preexec(slot: Slot | None, limits: Limits) -> Callable[[], None]:
     def child() -> None:
         """Isolate the freshly forked child."""
         os.setsid()
+        niceness = max(JOB_NICENESS, os.getpriority(os.PRIO_PROCESS, 0))
+        os.setpriority(os.PRIO_PROCESS, 0, niceness)
         if slot is not None:
-            os.setgroups([])
-            os.setgid(slot.gid)
-            os.setuid(slot.uid)
+            _drop_to(slot)
         for which, ceiling in ceilings.items():
             resource.setrlimit(which, (ceiling, ceiling))
 
@@ -289,15 +333,36 @@ def _outcome(returncode: int) -> Literal["ok", "error", "killed"]:
     return "error"
 
 
+async def _clear(slot: Slot | None, cleanup_pool: Executor | None) -> None:
+    """Run ``kill_slot_processes`` for the slot in a thread of ``cleanup_pool``.
+
+    Args:
+        slot: The slot to clear, or ``None`` for nothing to do.
+        cleanup_pool: Where the blocking cleanup runs; ``None`` is the loop's default pool.
+
+    Raises:
+        RuntimeError: The cleanup failed; the slot must be retired.
+    """
+    if slot is not None:
+        await asyncio.get_running_loop().run_in_executor(cleanup_pool, kill_slot_processes, slot)
+
+
 async def run_in_slot(
-    argv: list[str], cwd: Path, slot: Slot | None, limits: Limits, *, tmp_dir: Path | None = None
+    argv: list[str],
+    cwd: Path,
+    slot: Slot | None,
+    limits: Limits,
+    *,
+    tmp_dir: Path | None = None,
+    cleanup_pool: Executor | None = None,
 ) -> tuple[Literal["ok", "error", "timeout", "killed"], int]:
     """Run ``argv`` as a fresh process in ``cwd`` under the slot's ids and the limits.
 
-    The process leads its own session and runs with umask ``077``, so what it creates is
-    private to its uid. When it ends, by itself, on the wall clock or because this task is
-    cancelled, everything left in its process group is killed with it. With a slot, every
-    other process of the slot's uid is killed too, including those that left the group.
+    The process leads its own session, runs at niceness ``JOB_NICENESS`` or more and with umask
+    ``077``, so what it creates is private to its uid. When it ends, by itself, on the wall
+    clock or because this task is cancelled, everything left in its process group is killed
+    with it. With a slot, every other process of the slot's uid is killed too, including those
+    that left the group; that also happens when the child could not become the slot.
 
     Args:
         argv: The command line; ``argv[0]`` should be an absolute path since ``PATH`` is fixed.
@@ -305,25 +370,36 @@ async def run_in_slot(
         slot: The slot to run as, or ``None`` to keep the current uid (tests and dev).
         limits: Wall time and the kernel limits.
         tmp_dir: The job's private temporary directory, handed over as ``TMPDIR``, ``TEMP`` and ``TMP``.
+        cleanup_pool: The pool the slot cleanup runs on. A slot process can hold a cleanup for
+            30 s, so the supervisor gives one of its own, a thread per slot; ``None`` is the
+            loop's default pool.
 
     Returns:
         The outcome and the exit code (negative for death by a signal). ``timeout`` means the
-        wall time ran out and the group was killed.
+        wall time ran out and the group was killed. ``("error", SPAWN_FAILED)`` means the job
+        never started: the child failed to lower its priority, become the slot or set a limit
+        (``preexec`` raised, which ``subprocess`` reports as ``SubprocessError``). Nothing of
+        ``argv`` ran then.
 
     Raises:
         RuntimeError: Processes of the slot survived the cleanup; the slot must be retired.
+        OSError: ``argv[0]`` could not be executed.
     """
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        env=clean_env(cwd, tmp_dir),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        preexec_fn=preexec(slot, limits),
-        start_new_session=False,
-        umask=0o077,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=clean_env(cwd, tmp_dir),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=preexec(slot, limits),
+            start_new_session=False,
+            umask=0o077,
+        )
+    except subprocess.SubprocessError:
+        await _clear(slot, cleanup_pool)
+        return "error", SPAWN_FAILED
     returncode: int | None
     try:
         returncode = await asyncio.wait_for(process.wait(), timeout=limits.wall_s)
@@ -332,8 +408,7 @@ async def run_in_slot(
     finally:
         _kill_group(process.pid)
         reaped = await process.wait()
-        if slot is not None:
-            await asyncio.to_thread(kill_slot_processes, slot)
+        await _clear(slot, cleanup_pool)
     if returncode is None:
         return "timeout", reaped
     return _outcome(returncode), returncode

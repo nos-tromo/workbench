@@ -1,13 +1,50 @@
-"""The job protocol between the api and the executor: pydantic models, one JSON line per message."""
+"""The job protocol between the api and the executor: pydantic models, one JSON line per message.
 
+The executor runs as root and builds paths from a request, so every request is checked here,
+before anything reads it: no field it does not declare, ids that are safe folder names, and
+input paths that stay below the chat folder.
+"""
+
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+
+from workbench.paths import check_filename, check_id
 
 MAX_LINE = 1_048_576
+MAX_INPUT_FILES = 1000
+
+JOB_ID = re.compile(r"[0-9a-f]{32}")
 
 
-class Limits(BaseModel):
+class _Message(BaseModel):
+    """A protocol message: a field it does not declare is refused, not ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def check_input_path(path: str) -> str:
+    """Accept a path below the chat folder: relative, each segment one plain file name.
+
+    Args:
+        path: An entry of ``JobRequest.input_files``, such as ``reports/summary.docx``.
+
+    Returns:
+        ``path``, unchanged.
+
+    Raises:
+        ValueError: The path is absolute, or a segment is empty, ``.``, ``..`` or not a valid
+            file name (``workbench.paths.check_filename``).
+    """
+    if path.startswith("/"):
+        raise ValueError("an input file is a path relative to the chat folder")
+    for segment in path.split("/"):
+        check_filename(segment)
+    return path
+
+
+class Limits(_Message):
     """What one job may use before the sandbox stops it.
 
     Attributes:
@@ -27,15 +64,20 @@ class Limits(BaseModel):
     nofile: int = Field(default=256, gt=0)
 
 
-class JobRequest(BaseModel):
+class JobRequest(_Message):
     """One job the api hands to the executor.
 
+    The chat folder is ``<data_dir>/workspaces/<caller>/<user_id>/<chat_id>``.
+
     Attributes:
-        job_id: Opaque id the result is matched by.
+        job_id: Opaque id the result is matched by: 32 lowercase hex digits (``uuid4().hex``).
         tool: Name of the runner to run.
         args: Arguments for the runner.
-        chat_id: Chat folder the job works on.
-        input_files: Paths relative to the chat folder; the executor copies only these.
+        caller: Calling service whose user root holds the chat folder; a safe id.
+        user_id: The caller's id for the user whose root holds the chat folder; a safe id.
+        chat_id: Chat folder the job works on; a safe id.
+        input_files: Paths relative to the chat folder, at most ``MAX_INPUT_FILES``; the
+            executor copies only these.
         limits: Resource limits for this job.
         max_chars: Largest result the runner may return, in characters (``result_max_kb * 1024``).
     """
@@ -43,13 +85,68 @@ class JobRequest(BaseModel):
     job_id: str
     tool: str
     args: dict[str, Any]
+    caller: str
+    user_id: str
     chat_id: str
-    input_files: list[str]
+    input_files: list[str] = Field(max_length=MAX_INPUT_FILES)
     limits: Limits
-    max_chars: int
+    max_chars: int = Field(gt=0)
+
+    @field_validator("job_id")
+    @classmethod
+    def _check_job_id(cls, value: str) -> str:
+        """Accept exactly 32 lowercase hex digits.
+
+        Args:
+            value: The job id.
+
+        Returns:
+            ``value``, unchanged.
+
+        Raises:
+            ValueError: It is anything else.
+        """
+        if JOB_ID.fullmatch(value) is None:
+            raise ValueError("a job id is 32 lowercase hex digits")
+        return value
+
+    @field_validator("caller", "user_id", "chat_id")
+    @classmethod
+    def _check_ids(cls, value: str, info: ValidationInfo) -> str:
+        """Accept an id that is safe as one folder name.
+
+        Args:
+            value: The caller, user or chat id.
+            info: Which field is checked.
+
+        Returns:
+            ``value``, unchanged.
+
+        Raises:
+            ValueError: It is not a safe folder name (``workbench.paths.check_id``).
+        """
+        return check_id(value, what=(info.field_name or "id").replace("_", " "))
+
+    @field_validator("input_files")
+    @classmethod
+    def _check_input_files(cls, value: list[str]) -> list[str]:
+        """Accept only paths below the chat folder.
+
+        Args:
+            value: The input paths.
+
+        Returns:
+            ``value``, unchanged.
+
+        Raises:
+            ValueError: A path is not a plain relative path (``check_input_path``).
+        """
+        for path in value:
+            check_input_path(path)
+        return value
 
 
-class OutputFile(BaseModel):
+class OutputFile(_Message):
     """A file a job wrote, staged for the api to move into the workspace.
 
     Attributes:
@@ -60,10 +157,10 @@ class OutputFile(BaseModel):
 
     name: str
     staged_path: str
-    size: int
+    size: int = Field(ge=0)
 
 
-class JobResult(BaseModel):
+class JobResult(_Message):
     """What the executor answers for one job.
 
     Attributes:

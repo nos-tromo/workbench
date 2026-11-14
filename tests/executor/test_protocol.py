@@ -1,9 +1,13 @@
 """The job protocol: one JSON line per message, refused above a size cap."""
 
+import json
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
 from workbench.protocol import (
+    MAX_INPUT_FILES,
     MAX_LINE,
     JobRequest,
     JobResult,
@@ -15,19 +19,28 @@ from workbench.protocol import (
 )
 
 LIMITS = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
+JOB_ID = "0123456789abcdef0123456789abcdef"
+
+
+def _fields(**overrides: Any) -> dict[str, Any]:
+    """The fields of a request with synthetic content, with ``overrides`` applied."""
+    return {
+        "job_id": JOB_ID,
+        "tool": "echo",
+        "args": {"x": 1, "text": "line one\nline two"},
+        "caller": "open-webui",
+        "user_id": "user-a",
+        "chat_id": "chat-1",
+        "input_files": ["quarterly-figures.xlsx", "reports/summary.docx"],
+        "limits": LIMITS,
+        "max_chars": 16384,
+        **overrides,
+    }
 
 
 def _request() -> JobRequest:
     """A request with synthetic content."""
-    return JobRequest(
-        job_id="job-1",
-        tool="echo",
-        args={"x": 1, "text": "line one\nline two"},
-        chat_id="chat-1",
-        input_files=["quarterly-figures.xlsx", "reports/summary.docx"],
-        limits=LIMITS,
-        max_chars=16384,
-    )
+    return JobRequest(**_fields())
 
 
 def _result() -> JobResult:
@@ -99,3 +112,111 @@ def test_malformed_lines_are_value_errors() -> None:
         decode_request(b'{"job_id": "job-1"}\n')
     with pytest.raises(ValueError):
         decode_result(b'{"job_id": "job-1", "status": "weird", "result": {}, "outputs": []}\n')
+
+
+def test_a_request_names_the_user_root_its_chat_folder_lies_in() -> None:
+    """The executor finds the chat folder below ``<caller>/<user-id>``, so the request carries both."""
+    request = _request()
+    assert (request.caller, request.user_id, request.chat_id) == ("open-webui", "user-a", "chat-1")
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        lambda: Limits.model_validate({**LIMITS.model_dump(), "rlimit_stack": 1}),
+        lambda: JobRequest.model_validate({**_fields(limits=LIMITS.model_dump()), "uid": 0}),
+        lambda: OutputFile.model_validate({"name": "r.csv", "staged_path": "/data/staging/r.csv", "size": 1, "x": 1}),
+        lambda: JobResult.model_validate({"job_id": JOB_ID, "status": "ok", "result": {}, "outputs": [], "x": 1}),
+    ],
+    ids=["limits", "request", "output", "result"],
+)
+def test_unknown_fields_are_refused(model: Any) -> None:
+    """Every message refuses a field it does not declare, so nothing unvetted reaches the executor."""
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        model()
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    ["", "job-1", JOB_ID.upper(), JOB_ID[:-1], JOB_ID + "0", JOB_ID + "\n", "../" + JOB_ID[3:], "g" * 32],
+)
+def test_a_job_id_is_32_lowercase_hex_digits(job_id: str) -> None:
+    """The job id becomes a folder name on the root side, so it is exactly a ``uuid4().hex``."""
+    with pytest.raises(ValidationError):
+        JobRequest(**_fields(job_id=job_id))
+
+
+@pytest.mark.parametrize("field", ["caller", "user_id", "chat_id"])
+@pytest.mark.parametrize("value", ["", "..", "a/b", "-x", ".hidden", "a\x00b", "x" * 129, "chat..1"])
+def test_the_ids_of_the_folder_are_safe_folder_names(field: str, value: str) -> None:
+    """Caller, user and chat ids each become one folder name, checked as the api checks them."""
+    with pytest.raises(ValidationError):
+        JobRequest(**_fields(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "../other-chat/q.csv",
+        "reports/../../q.csv",
+        "./q.csv",
+        "reports//q.csv",
+        "reports/",
+        "",
+        "q\x00.csv",
+        "x" * 201,
+        "reports/" + "ü" * 128,
+    ],
+    ids=[
+        "absolute",
+        "dotdot",
+        "inner-dotdot",
+        "dot",
+        "empty-segment",
+        "trailing-slash",
+        "empty",
+        "nul",
+        "long",
+        "utf8",
+    ],
+)
+def test_input_files_are_plain_relative_paths(path: str) -> None:
+    """An input is a path below the chat folder: no ``..``, no absolute path, every segment a plain name."""
+    with pytest.raises(ValidationError):
+        JobRequest(**_fields(input_files=["q.csv", path]))
+
+
+def test_nested_input_files_are_accepted() -> None:
+    """A file inside a folder of the chat is named by its path below the chat folder."""
+    request = JobRequest(**_fields(input_files=["reports/2025/summary.docx", "Übersicht März.xlsx"]))
+    assert request.input_files == ["reports/2025/summary.docx", "Übersicht März.xlsx"]
+
+
+def test_at_most_a_thousand_input_files() -> None:
+    """A request lists at most ``MAX_INPUT_FILES`` inputs."""
+    names = [f"f{n}.csv" for n in range(MAX_INPUT_FILES)]
+    assert len(JobRequest(**_fields(input_files=names)).input_files) == MAX_INPUT_FILES == 1000
+    with pytest.raises(ValidationError):
+        JobRequest(**_fields(input_files=[*names, "one-more.csv"]))
+
+
+@pytest.mark.parametrize("max_chars", [0, -1])
+def test_max_chars_must_be_positive(max_chars: int) -> None:
+    """A result of no characters is no result."""
+    with pytest.raises(ValidationError):
+        JobRequest(**_fields(max_chars=max_chars))
+
+
+def test_an_output_size_is_never_negative() -> None:
+    """Sizes count bytes."""
+    assert OutputFile(name="r.csv", staged_path="/data/staging/r.csv", size=0).size == 0
+    with pytest.raises(ValidationError):
+        OutputFile.model_validate({"name": "r.csv", "staged_path": "/data/staging/r.csv", "size": -1})
+
+
+def test_a_refused_request_line_is_a_value_error() -> None:
+    """``decode_request`` refuses an unsafe request as it refuses a malformed one."""
+    line = json.dumps({**_fields(limits=LIMITS.model_dump()), "chat_id": "../x"}).encode()
+    with pytest.raises(ValueError):
+        decode_request(line)
