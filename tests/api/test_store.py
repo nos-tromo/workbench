@@ -849,6 +849,15 @@ def test_usage_is_the_sum_over_all_chats(store: Store, alice: Principal) -> None
     assert store.usage(alice) == 12
 
 
+def test_count_files_counts_every_users_files(store: Store, alice: Principal, bob: Principal) -> None:
+    """``count_files`` is the metrics' total: all users, all chats."""
+    assert store.count_files() == 0
+    put(store, alice, "a.bin")
+    put(store, alice, "b.bin", directory="/workspace/chat-2")
+    put(store, bob, "c.bin")
+    assert store.count_files() == 3
+
+
 def test_due_returns_files_older_than_the_cutoff(
     store: Store, alice: Principal, bob: Principal, clock: Clock, tmp_path: Path
 ) -> None:

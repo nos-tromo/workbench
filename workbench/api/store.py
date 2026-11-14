@@ -764,6 +764,16 @@ class Store:
             ).fetchall()
         return [_file(row) for row in rows]
 
+    def count_files(self) -> int:
+        """Count the stored files of every user, for the metrics.
+
+        Returns:
+            How many file records there are.
+        """
+        with self._db() as db:
+            row = db.execute("SELECT COUNT(*) FROM files").fetchone()
+        return int(row[0])
+
     def delete(self, p: Principal, path: str) -> FileRecord:
         """Delete a file of the user's: its bytes and its record.
 

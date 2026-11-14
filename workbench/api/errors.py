@@ -1,4 +1,4 @@
-"""Short JSON answers for the errors a path, the store or the audit chain raise on purpose.
+"""Short JSON answers for the errors a path, the store, the audit chain or the job queue raise on purpose.
 
 The exceptions carry real paths, user ids or file names in their ``__cause__``,
 and the model sees every error body, so the answer is a short fixed-text
@@ -7,6 +7,9 @@ message of these exceptions is a literal written in ``paths.py`` or ``store.py``
 
 A failed audit write is a 500 of the same kind: the action is not done, and the cause (the
 output stream) is not logged either.
+
+A job the queue refuses (``Busy``) is a 503 with one fixed text, whatever the reason: the model is
+told to retry later, and which limit was hit is for the metrics, not for the model.
 """
 
 from typing import Final
@@ -14,12 +17,16 @@ from typing import Final
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from workbench.api.jobs import Busy
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, StoreError, TooLarge
 from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
 
 #: The detail of every 404.
 NOT_FOUND: Final = "not found"
+
+#: The detail of every 503.
+BUSY: Final = "busy, retry later"
 
 #: Each error, its status, and the detail to send; ``None`` sends the error's own message.
 _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
@@ -30,11 +37,12 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
     (QuotaExceeded, 507, None),
     (StorageFull, 507, None),
     (AuditWriteError, 500, "audit unavailable"),
+    (Busy, 503, BUSY),
 )
 
 
 async def _answer(_request: Request, exc: Exception) -> JSONResponse:
-    """Turn a path, store or audit error into its short answer, without logging it.
+    """Turn a path, store, audit or queue error into its short answer, without logging it.
 
     Args:
         _request: The request that failed.
@@ -58,3 +66,4 @@ def install(app: FastAPI) -> None:
     app.add_exception_handler(PathError, _answer)
     app.add_exception_handler(StoreError, _answer)
     app.add_exception_handler(AuditWriteError, _answer)
+    app.add_exception_handler(Busy, _answer)

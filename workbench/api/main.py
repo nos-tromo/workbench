@@ -12,10 +12,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, tools
+from workbench.api import contract, errors, files, metrics, tools
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
 from workbench.api.hardening import ViewHardening
+from workbench.api.jobs import ExecutorClient, JobQueue
+from workbench.api.metrics import Metrics
 from workbench.api.store import Store
 from workbench.api.upload_limit import UploadLimit, body_limit
 from workbench.config import Settings, load_settings
@@ -43,14 +45,15 @@ def _audit_config(settings: Settings) -> dict[str, object]:
     }
 
 
-def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: object | None = None) -> FastAPI:
+def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: JobQueue | None = None) -> FastAPI:
     """Build the application over its collaborators.
 
     Args:
         settings: The api's settings; they must hold the caller key.
         store: Files and job records on the data volume.
         audit: The audit chain; the lifespan starts it and ends it.
-        jobs: The job queue that runs tools in the executor, once there is one.
+        jobs: The job queue that runs tools in the executor, once there is one. ``/metrics`` serves its
+            metrics; without one, the app has metrics of its own.
 
     Returns:
         The application, without FastAPI's own spec and documentation routes.
@@ -59,10 +62,11 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
         ConfigError: If the settings hold no caller key.
     """
     callers = CallerRegistry.from_settings(settings)
+    app_metrics = jobs.metrics if jobs is not None else Metrics(settings.data_dir)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """Open the audit chain on start and end it on shutdown.
+        """Open the audit chain and measure the data volume on start; end the chain on shutdown.
 
         Args:
             _app: The application.
@@ -71,6 +75,7 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
             Once the chain is open.
         """
         audit.start(_audit_config(settings))
+        app_metrics.refresh(files=store.count_files())
         try:
             yield
         finally:
@@ -88,6 +93,7 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
     app.state.store = store
     app.state.audit = audit
     app.state.jobs = jobs
+    app.state.metrics = app_metrics
     app.state.callers = callers
     errors.install(app)
     app.add_middleware(UploadLimit, max_body=body_limit(settings))
@@ -96,6 +102,7 @@ def create_app(settings: Settings, *, store: Store, audit: AuditLog, jobs: objec
     app.include_router(files.router)
     app.include_router(files.tool_router)
     app.include_router(tools.router)
+    app.include_router(metrics.router)
     return app
 
 
@@ -110,4 +117,5 @@ def app_factory() -> FastAPI:
     """
     settings = load_settings(os.environ, role="api")
     store = Store(settings.data_dir / _DB_NAME, Workspaces(settings.data_dir))
-    return create_app(settings, store=store, audit=AuditLog.open(settings, __version__))
+    jobs = JobQueue(settings, ExecutorClient(settings.executor_socket), store, Metrics(settings.data_dir))
+    return create_app(settings, store=store, audit=AuditLog.open(settings, __version__), jobs=jobs)
