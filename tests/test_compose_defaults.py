@@ -3,6 +3,7 @@
 Compose's settings and shape, the images' bases, ``.env.example``, the bundle script and the Makefile's targets.
 """
 
+import json
 import os
 import re
 import shutil
@@ -251,6 +252,75 @@ def test_the_test_stack_keeps_nothing_of_a_developers() -> None:
     )
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    """Reads compose's ``!reset`` tag as the pair ``("!reset", value)``."""
+
+
+_ComposeLoader.add_constructor("!reset", lambda loader, node: ("!reset", loader.construct_sequence(node)))  # type: ignore[arg-type]
+
+
+def contract_stack() -> dict[str, Any]:
+    """Read ``contract/compose.yaml``."""
+    return yaml.load((ROOT / "contract" / "compose.yaml").read_text(encoding="utf-8"), Loader=_ComposeLoader)
+
+
+#: The image open-webui-service deploys, by tag and digest (its docker/compose.yaml).
+OPEN_WEBUI_IMAGE = (
+    "ghcr.io/open-webui/open-webui:v0.13.3@sha256:46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14"
+)
+
+#: Open WebUI's production switches that bear on the contract (open-webui-service docker/compose.yaml), and the two
+#: the connection adds.
+CONTRACT_SWITCHES = {
+    "ENABLE_PERSISTENT_CONFIG": "false",
+    "AUDIT_LOG_LEVEL": "METADATA",
+    "ENABLE_AUDIT_STDOUT": "true",
+    "ENABLE_AUDIT_GET_REQUESTS": "true",
+    "AUDIT_EXCLUDED_PATHS": "/terminals",
+    "ENABLE_TOOLS": "false",
+    "ENABLE_FUNCTIONS": "false",
+    "ENABLE_CODE_INTERPRETER": "false",
+    "ENABLE_CODE_EXECUTION": "false",
+    "ENABLE_TOOL_SERVERS": "true",
+}
+
+
+def test_the_contract_stack_keeps_nothing_of_a_developers_or_the_test_stacks() -> None:
+    """Its own project, volume and network on top of the test stack; the api publishes nothing, Open WebUI loopback."""
+    stack = contract_stack()
+    assert stack["name"] == "workbench-contract"
+    assert stack["include"] == [{"path": ["../docker/compose.yaml", "../docker/compose.test.yaml"]}]
+    assert stack["volumes"] == {"workbench-data": {"name": "workbench-contract-data"}}
+    assert stack["networks"] == {"workbench-net": {"name": "workbench-contract-net"}}
+    assert stack["services"]["api"]["ports"] == ("!reset", [])
+    open_webui = stack["services"]["open-webui"]
+    assert open_webui["ports"] == ["127.0.0.1:18180:8080"]
+    assert "volumes" not in open_webui
+    assert open_webui["networks"] == ["workbench-net"]
+
+
+def test_the_contract_runs_open_webui_as_production_does() -> None:
+    """The image open-webui-service deploys, its switches, one bearer connection to workbench-api, Dependabot's."""
+    open_webui = contract_stack()["services"]["open-webui"]
+    assert open_webui["image"] == OPEN_WEBUI_IMAGE
+    env = open_webui["environment"]
+    assert {key: env.get(key) for key in CONTRACT_SWITCHES} == CONTRACT_SWITCHES
+    key = "${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}"
+    (connection,) = json.loads(env["TERMINAL_SERVER_CONNECTIONS"].replace(key, "synthetic-key"))
+    assert (connection["id"], connection["url"], connection["auth_type"]) == (
+        "workbench",
+        "http://workbench-api:8000",
+        "bearer",
+    )
+    assert connection["key"] == "synthetic-key"
+    assert connection["config"] == {
+        "chat_uploads": "filesystem",
+        "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}],
+    }
+    updates = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))["updates"]
+    assert [u["directory"] for u in updates if u["package-ecosystem"] == "docker-compose"] == ["/contract"]
+
+
 # --- the bundle script ----------------------------------------------------------------------------------------
 
 
@@ -403,3 +473,23 @@ def test_the_isolation_stack_is_torn_down_on_every_way_out() -> None:
     downs = re.findall(r"docker compose ([^;']*?) down -v", planned)
     assert downs and all("-p workbench-test " in down for down in downs)
     assert "--env-file" not in planned
+
+
+@pytest.mark.parametrize(
+    ("target", "project"), [("test-load", "workbench-test"), ("test-contract", "workbench-contract")]
+)
+def test_the_load_and_contract_stacks_are_torn_down_on_every_way_out(target: str, project: str) -> None:
+    """As the isolation stack: a trap takes the target's own project down, volumes included; ``.env`` stays out."""
+    planned = _make("-n", target).stdout
+    assert "trap " in planned and "EXIT" in planned and "INT" in planned
+    downs = re.findall(r"docker compose ([^;']*?) down -v", planned)
+    assert downs and all(f"-p {project} " in down for down in downs)
+    assert "--env-file" not in planned
+    assert f"pytest -m {target.removeprefix('test-')} " in planned
+
+
+def test_the_contract_makes_its_key_and_secret_for_each_run() -> None:
+    """Nothing to keep or leak: the caller key and Open WebUI's forwarding secret exist only in the run's shell."""
+    planned = _make("-n", "test-contract").stdout
+    for name in ("WORKBENCH_CONTRACT_KEY", "WORKBENCH_CONTRACT_JWT_SECRET"):
+        assert f'{name}="$(openssl rand -hex 32)"' in planned
