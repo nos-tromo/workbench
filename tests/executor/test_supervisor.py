@@ -2611,3 +2611,14 @@ def test_the_executor_image_has_no_setuid_or_setgid_program() -> None:
     )
     assert found.stdout.split() == []
     assert not Path("/app/contract").exists() and not Path("/app/docs").exists()  # R1 M-10: .dockerignore
+
+
+def test_the_supervisor_raises_its_soft_limit_of_open_files_to_the_hard_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The watchdog holds a descriptor per level of a running job's folders; a host may start containers at 1024."""
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(supervisor.resource, "getrlimit", lambda which: (1024, 524288))
+    monkeypatch.setattr(supervisor.resource, "setrlimit", lambda which, limits: calls.append((which, limits)))
+
+    supervisor._open_files_up_to_the_hard_limit()
+
+    assert calls == [(supervisor.resource.RLIMIT_NOFILE, (524288, 524288))]

@@ -31,6 +31,7 @@ import contextlib
 import json
 import logging
 import os
+import resource
 import shutil
 import socket
 import stat
@@ -701,8 +702,9 @@ class Supervisor:
         except BaseException:
             self._retire(index)  # the folder may still be being made, for the slot's uid
             raise
-        watch = _Watch(job, slot, limits, self._settings.workspace_max_mb)
+        watch: _Watch | None = None
         try:
+            watch = _Watch(job, slot, limits, self._settings.workspace_max_mb)
             outcome, _ = await run_in_slot(
                 job_argv(job.path / _SPEC, job.path / _HOME / _RESULT),
                 job.cwd,
@@ -1306,6 +1308,18 @@ class Supervisor:
             return _answer(req.job_id, "error", "the executor failed")
 
 
+def _open_files_up_to_the_hard_limit() -> None:
+    """Raise the supervisor's soft limit of open files to its hard one, which needs no capability.
+
+    The watchdog holds a descriptor per level of a job's folders while it measures them, up to ``MAX_JOB_DEPTH`` + 1 for
+    each running job, and a host may start the container with a soft limit of 1024. The jobs keep their own limit.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != hard:
+        with contextlib.suppress(ValueError, OSError):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+
+
 def main() -> int:
     """Check the host, then serve until stopped.
 
@@ -1325,6 +1339,7 @@ def main() -> int:
         print(f"workbench executor: refusing to start: {problem}", file=sys.stderr)
         return 1
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
+    _open_files_up_to_the_hard_limit()
     try:
         asyncio.run(Supervisor(settings).serve())
     except NoUsableSlot as exc:

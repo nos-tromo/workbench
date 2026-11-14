@@ -177,8 +177,10 @@ measures a running job about twice a second, in a thread: the resident memory
 of every process of the slot's uid, read from `/proc`, plus the SysV shared
 memory segments the uid made that nobody has attached; and the disk, entries and
 depth of `home/` and `out/`, walked by descriptor without following a link.
-Past a limit it kills the job's process group, the slot's cleanup kills the
-rest, and the answer names the limit ("the job was stopped: it wrote more than
+It holds one descriptor per level of a folder it walks, so the supervisor
+raises its own soft limit of open files to the hard one at start (the jobs keep
+theirs). Past a limit it kills the job's process group, the slot's cleanup
+kills the rest, and the answer names the limit ("the job was stopped: it wrote more than
 500 MB"). The memory limit thus holds per job, not only per process, and no
 job's processes together can take the container's memory from another slot.
 
