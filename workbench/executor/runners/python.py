@@ -2,11 +2,12 @@
 
 The job runs under a slot uid with its limits and no network, in a private copy of the chat's files, so the
 code runs right here: compiled and ``exec``-ed as ``__main__`` in a fresh module, in the job's working folder,
-with ``matplotlib``'s ``Agg`` backend set and a time limit below the job's wall time. Its standard output and
-error go to buffers that keep the start and the end of each, half of the result limit apiece, however much it
-prints. Whatever the code raises, ``SystemExit`` and ``KeyboardInterrupt`` included, becomes its traceback in
-``stderr``, so the answer is always ``{"stdout", "stderr", "truncated"}`` and, when it applies, ``hint``. The
-files it writes into ``out/`` are the job's outputs, which the supervisor collects; the runner does not list them.
+with ``matplotlib``'s ``Agg`` backend set and its font cache the image's, and a time limit below the job's wall
+time. Its standard output and error go to buffers that keep the start and the end of each, half of the result limit
+apiece, however much it prints. Whatever the code raises, ``SystemExit`` and ``KeyboardInterrupt`` included, becomes
+its traceback in ``stderr``, so the answer is always ``{"stdout", "stderr", "truncated"}`` and, when it applies,
+``hint``. The files it writes into ``out/`` are the job's outputs, which the supervisor collects; the runner does not
+list them.
 
 The answer never names the job's real folder. ``<data>/jobs/<id>/workspace/<chat>`` is written as
 ``/workspace/<chat>``, the path the code itself can use (the executor image links ``/workspace`` to the parent of
@@ -20,7 +21,9 @@ import json
 import linecache
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -38,6 +41,9 @@ FILENAME: Final = "<code>"
 
 #: What a virtual path starts with.
 VIRTUAL_ROOT: Final = "/workspace"
+
+#: matplotlib's font cache, which the executor image builds once (docker/Dockerfile.executor); root's and read-only.
+FONT_CACHE: Final = Path("/opt/mpl-cache")
 
 _DEFAULT_BUDGET_S: Final = 60.0
 
@@ -342,12 +348,39 @@ def _kept(capture: _Capture, rewrite: _Rewriter, limit: int) -> tuple[str, bool]
     return best, True
 
 
+def _seed_font_cache(prebuilt: Path = FONT_CACHE, under: str | None = None) -> None:
+    """Give matplotlib a config folder of the job's own that already holds the image's font cache.
+
+    matplotlib makes a temporary folder of its own whenever its config folder is not writable, and scans the fonts
+    into it, in every job: so the image's read-only cache is copied into a new folder in the job's private ``TMPDIR``
+    instead, and ``MPLCONFIGDIR`` names it. Outside the executor image there is nothing to copy, and matplotlib finds
+    its folder as it always does.
+
+    Args:
+        prebuilt: Where the image keeps the cache.
+        under: Where the folder is made; the job's ``TMPDIR`` by default.
+    """
+    caches = sorted(prebuilt.glob("fontlist-*.json"))
+    if not caches:
+        return
+    try:
+        config = Path(tempfile.mkdtemp(prefix="matplotlib-", dir=under))
+        for cache in caches:
+            shutil.copyfile(cache, config / cache.name)
+    except OSError:
+        return  # matplotlib scans the fonts itself, as it would without the cache
+    os.environ["MPLCONFIGDIR"] = str(config)
+
+
 def _use_agg() -> None:
     """Load matplotlib with its non-interactive backend, before the code and before its output is captured.
 
-    Loading it here sends what matplotlib logs while it sets up (a cache folder it had to make) to the job's own
-    stderr, which nobody reads, instead of into the answer.
+    The first load gets the image's font cache (:func:`_seed_font_cache`). Loading it here sends what matplotlib logs
+    while it sets up (a cache folder it had to make) to the job's own stderr, which nobody reads, instead of into the
+    answer.
     """
+    if "matplotlib" not in sys.modules:
+        _seed_font_cache()
     import matplotlib
 
     matplotlib.use("Agg")

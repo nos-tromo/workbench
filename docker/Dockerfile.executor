@@ -67,6 +67,14 @@ COPY --from=builder /app /app
 # and each cleanup helper is a fresh interpreter, and starts in milliseconds.
 RUN python -m compileall -q -j 0 /usr/local/lib/python3.12 /app
 
+# matplotlib's font cache, scanned once here, in this stage, so the font paths
+# it records are the image's own. Root's and read-only like the rest: each job
+# copies it into a config folder in its private tmp
+# (workbench/executor/runners/python.py), since matplotlib scans the fonts
+# again whenever its config folder is not writable.
+RUN MPLCONFIGDIR=/opt/mpl-cache python -c "import matplotlib.font_manager" \
+    && chmod -R a+rX,go-w /opt/mpl-cache
+
 # The supervisor is root with six capabilities (docs/sandbox.md); every job
 # drops to its slot's uid before it runs.
 USER 0:0

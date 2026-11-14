@@ -344,6 +344,42 @@ def test_the_job_answers_when_the_code_exits(tmp_job: Job) -> None:
     assert result["stderr"].rstrip().endswith("SystemExit: 0")
 
 
+def test_the_font_cache_is_copied_into_a_config_folder_of_the_jobs_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The image's read-only cache goes into a new folder in the job's tmp, which ``MPLCONFIGDIR`` names."""
+    from workbench.executor.runners import python as runner
+
+    monkeypatch.delenv("MPLCONFIGDIR", raising=False)
+    prebuilt, tmp = tmp_path / "mpl-cache", tmp_path / "tmp"
+    prebuilt.mkdir()
+    tmp.mkdir()
+    runner._seed_font_cache(prebuilt, str(tmp))
+    assert "MPLCONFIGDIR" not in os.environ  # nothing to copy: matplotlib finds its folder as before
+    (prebuilt / "fontlist-v390.json").write_text('{"_version": "synthetic"}')
+    runner._seed_font_cache(prebuilt, str(tmp))
+    config = Path(os.environ["MPLCONFIGDIR"])
+    assert config.parent == tmp
+    assert os.access(config, os.W_OK)
+    assert (config / "fontlist-v390.json").read_text() == '{"_version": "synthetic"}'
+
+
+@pytest.mark.skipif(not Path("/workspace").is_symlink(), reason="needs the executor image and its font cache")
+def test_a_job_never_scans_the_fonts_again(tmp_job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """In the image, matplotlib loads the font cache built with it; a job never generates one of its own."""
+    monkeypatch.delenv("MPLCONFIGDIR", raising=False)  # the job finds its cache itself, as under the supervisor
+    code = """
+import logging, os, sys
+logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(message)s")
+import matplotlib.pyplot
+print(sorted(os.listdir(os.environ["MPLCONFIGDIR"])))
+"""
+    result = _run_job(tmp_job, code)
+    assert "generated new fontManager" not in result["stdout"]
+    assert "Using fontManager instance from" in result["stdout"]
+    assert result["stdout"].rstrip().splitlines()[-1].startswith("['fontlist-v")
+
+
 def test_a_lone_surrogate_in_the_output_still_reaches_the_api(tmp_job: Job) -> None:
     """Halves of a surrogate pair printed apart are joined, a lone one is replaced: the result can be sent on."""
     result = tmp_job.run('print("\\ud800 and \\ud83d\\ude00")')
