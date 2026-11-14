@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Literal
 
 from workbench.executor.fs import DIR_FLAGS, closing
+from workbench.executor.seccomp import Filter
 from workbench.protocol import Limits
 
 MB = 1024 * 1024
@@ -26,6 +27,11 @@ SPAWN_FAILED = 126
 # Jobs run at least this nice, so the supervisor and slot cleanups stay responsive when every slot
 # is busy. A job cannot lower it again without CAP_SYS_NICE.
 JOB_NICENESS = 10
+# The kernel's OOM killer picks a job's process before the supervisor or another service. Raising it
+# needs no capability; a job may lower it again, but only as far as the container's own floor.
+JOB_OOM_SCORE_ADJ = 1000
+# How often the watchdog measures a running job: about twice a second.
+WATCH_INTERVAL_S = 0.5
 
 CLEAN_ENV: Mapping[str, str] = MappingProxyType(
     {
@@ -289,18 +295,19 @@ class Slot:
     gid: int
 
 
-def clean_env(cwd: Path, tmp_dir: Path | None = None) -> dict[str, str]:
-    """Build the environment of a job: ``CLEAN_ENV`` and ``HOME`` set to the job directory.
+def clean_env(cwd: Path, tmp_dir: Path | None = None, home: Path | None = None) -> dict[str, str]:
+    """Build the environment of a job: ``CLEAN_ENV``, ``HOME`` and its temporary directory.
 
     Args:
         cwd: The job directory.
         tmp_dir: The job's private temporary directory. When given, ``TMPDIR``, ``TEMP`` and
             ``TMP`` point to it, so the job never writes the shared ``/tmp``.
+        home: The job's ``HOME``, a folder it owns; the job directory when not given.
 
     Returns:
         The only variables the job sees; nothing of the supervisor's own environment.
     """
-    env = {**CLEAN_ENV, "HOME": str(cwd)}
+    env = {**CLEAN_ENV, "HOME": str(cwd if home is None else home)}
     if tmp_dir is not None:
         env.update(TMPDIR=str(tmp_dir), TEMP=str(tmp_dir), TMP=str(tmp_dir))
     return env
@@ -341,21 +348,25 @@ def _drop_to(slot: Slot) -> None:
         raise RuntimeError(f"the job did not become slot {slot.index}")
 
 
-def preexec(slot: Slot | None, limits: Limits) -> Callable[[], None]:
+def preexec(slot: Slot | None, limits: Limits, sockets: Filter | None = None) -> Callable[[], None]:
     """Build the function that runs in the child between ``fork`` and ``exec``.
 
     The child leaves the supervisor's session, lowers its priority to at least ``JOB_NICENESS``,
-    drops its groups and switches to the slot's ids, checks that it holds no other id, then
-    lowers its limits. Failing at any step aborts the spawn, so a job never runs with more
-    rights than intended; ``run_in_slot`` reports that as ``SPAWN_FAILED``.
+    raises its ``oom_score_adj`` to ``JOB_OOM_SCORE_ADJ`` (Linux), installs the seccomp filter that
+    keeps it from sockets (``workbench.executor.seccomp``), drops its groups and switches to the
+    slot's ids, checks that it holds no other id, then lowers its limits. The score and the filter
+    come while the child is still root, before the drop. Failing at any step aborts the spawn, so a
+    job never runs with more rights than intended; ``run_in_slot`` reports that as ``SPAWN_FAILED``.
 
     Args:
         slot: The slot whose ids the job runs as, or ``None`` to keep the current ids (tests, dev).
         limits: The limits to set in the child.
+        sockets: The filter to install, built in the parent; ``None`` installs none (off Linux).
 
     Returns:
         The function to pass as ``preexec_fn``. In the child it raises ``RuntimeError`` for a
-        slot with uid or gid 0 (before any id changes) or a drop that left another id.
+        slot with uid or gid 0 (before any id changes) or a drop that left another id, and
+        ``OSError`` when the score or the filter cannot be set.
     """
     ceilings = {
         resource.RLIMIT_CPU: limits.cpu_s,
@@ -367,11 +378,21 @@ def preexec(slot: Slot | None, limits: Limits) -> Callable[[], None]:
     if sys.platform == "linux":
         ceilings[resource.RLIMIT_AS] = limits.memory_mb * MB  # other kernels refuse or ignore it
 
+    linux = sys.platform == "linux"
+
     def child() -> None:
         """Isolate the freshly forked child."""
         os.setsid()
         niceness = max(JOB_NICENESS, os.getpriority(os.PRIO_PROCESS, 0))
         os.setpriority(os.PRIO_PROCESS, 0, niceness)
+        if linux:
+            fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)
+            try:
+                os.write(fd, str(JOB_OOM_SCORE_ADJ).encode())
+            finally:
+                os.close(fd)
+        if sockets is not None:
+            sockets.install()
         if slot is not None:
             _drop_to(slot)
         for which, ceiling in ceilings.items():
@@ -446,6 +467,64 @@ def _slot_has_live_processes(uid: int) -> bool:
         if _is_live_process_of(status, uid):
             return True
     return False
+
+
+def _status_fields(status: bytes) -> dict[bytes, list[bytes]]:
+    """Read the ``Uid`` and ``VmRSS`` lines of the bytes of ``/proc/<pid>/status``, never decoding the name.
+
+    Args:
+        status: The file's contents.
+
+    Returns:
+        Each of the two lines that is there, split into its words.
+    """
+    fields: dict[bytes, list[bytes]] = {}
+    for line in status.split(b"\n"):
+        key, _, value = line.partition(b":")
+        if key in (b"Uid", b"VmRSS"):
+            fields[key] = value.split()
+    return fields
+
+
+def slot_memory(uid: int, *, proc: Path = Path("/proc")) -> int:
+    """Add up the memory a slot's job holds: the resident memory of every process of the uid, and its SysV segments.
+
+    A process counts by its real uid, which a job cannot change. A SysV shared memory segment the uid made and nobody
+    has attached is in no process's resident set, so its resident and swapped bytes are added; an attached one is in
+    the resident set of each process that has it. ``memfd_create``, the other way to hold memory outside every
+    resident set, the jobs' seccomp filter refuses. A process that ends while it is read counts as gone.
+
+    Args:
+        uid: The slot's user id.
+        proc: The ``/proc`` to read.
+
+    Returns:
+        Bytes.
+
+    Raises:
+        OSError: ``/proc`` cannot be listed, or the SysV table cannot be read.
+    """
+    total = 0
+    with os.scandir(proc) as entries:
+        pids = [entry.name for entry in entries if entry.name.isdigit()]
+    for pid in pids:
+        try:
+            fields = _status_fields((proc / pid / "status").read_bytes())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        try:
+            if int(fields[b"Uid"][0]) == uid and b"VmRSS" in fields:
+                total += int(fields[b"VmRSS"][0]) * 1024
+        except (KeyError, IndexError, ValueError):
+            continue
+    try:
+        table = (proc / "sysvipc" / "shm").read_bytes()
+    except FileNotFoundError:
+        return total
+    for row in _sysv_rows(table):
+        if row.get(b"cuid") == uid and row.get(b"nattch") == 0:
+            total += row.get(b"rss", row.get(b"size", 0)) + row.get(b"swap", 0)
+    return total
 
 
 def _run_as_slot(program: str, slot: Slot, extra: list[str], failure: str) -> None:
@@ -829,31 +908,44 @@ async def run_in_slot(
     limits: Limits,
     *,
     tmp_dir: Path | None = None,
+    home: Path | None = None,
     cleanup_pool: Executor | None = None,
+    sockets: Filter | None = None,
+    watch: Callable[[], str | None] | None = None,
+    watch_interval_s: float = WATCH_INTERVAL_S,
 ) -> tuple[Literal["ok", "error", "timeout", "killed"], int]:
     """Run ``argv`` as a fresh process in ``cwd`` under the slot's ids and the limits.
 
     The process leads its own session, runs at niceness ``JOB_NICENESS`` or more and with umask
     ``077``, so what it creates is private to its uid. When it ends, by itself, on the wall
-    clock or because this task is cancelled, everything left in its process group is killed
-    with it. With a slot, every other process of the slot's uid is killed too, including those
-    that left the group; that also happens when the child could not become the slot.
+    clock, on the watchdog or because this task is cancelled, everything left in its process group
+    is killed with it. With a slot, every other process of the slot's uid is killed too, including
+    those that left the group; that also happens when the child could not become the slot.
+
+    The watchdog, when given, runs in a thread every ``watch_interval_s`` while the job runs; when
+    it names a limit the job broke, the job's group is killed and the job ends ``killed``.
 
     Args:
         argv: The command line; ``argv[0]`` should be an absolute path since ``PATH`` is fixed.
-        cwd: The job directory; the process starts there and has it as ``HOME``.
+        cwd: The job directory; the process starts there.
         slot: The slot to run as, or ``None`` to keep the current uid (tests and dev).
         limits: Wall time and the kernel limits.
         tmp_dir: The job's private temporary directory, handed over as ``TMPDIR``, ``TEMP`` and ``TMP``.
+        home: The job's ``HOME``; ``cwd`` when not given.
         cleanup_pool: The pool the slot cleanup runs on. A slot process can hold a cleanup for
             30 s, so the supervisor gives one of its own, a thread per slot; ``None`` is the
             loop's default pool.
+        sockets: The seccomp filter the job runs under (``preexec``).
+        watch: Measures the running job; returns what limit it broke, or ``None``. An error in it
+            counts as nothing broken.
+        watch_interval_s: Seconds between two measures.
 
     Returns:
         The outcome and the exit code (negative for death by a signal). ``timeout`` means the
-        wall time ran out and the group was killed. ``("error", SPAWN_FAILED)`` means the job
-        never started: the child failed to lower its priority, become the slot or set a limit
-        (``preexec`` raised, which ``subprocess`` reports as ``SubprocessError``). Nothing of
+        wall time ran out and the group was killed; ``killed`` that the kernel or the watchdog
+        stopped it. ``("error", SPAWN_FAILED)`` means the job never started: the child failed to
+        lower its priority, raise its OOM score, install the filter, become the slot or set a
+        limit (``preexec`` raised, which ``subprocess`` reports as ``SubprocessError``). Nothing of
         ``argv`` ran then.
 
     Raises:
@@ -864,26 +956,54 @@ async def run_in_slot(
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env=clean_env(cwd, tmp_dir),
+            env=clean_env(cwd, tmp_dir, home),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=preexec(slot, limits),
+            preexec_fn=preexec(slot, limits, sockets),
             start_new_session=False,
             umask=0o077,
         )
     except subprocess.SubprocessError:
         await _clear(slot, cleanup_pool)
         return "error", SPAWN_FAILED
-    returncode: int | None
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + limits.wall_s
+    waiting = asyncio.ensure_future(process.wait())
+    returncode: int | None = None
+    broken = False
     try:
-        returncode = await asyncio.wait_for(process.wait(), timeout=limits.wall_s)
-    except TimeoutError:
-        returncode = None
+        while (left := deadline - loop.time()) > 0:
+            done, _ = await asyncio.wait({waiting}, timeout=left if watch is None else min(left, watch_interval_s))
+            if done:
+                returncode = waiting.result()
+                break
+            if watch is not None and await _measure(watch):
+                broken = True
+                break
     finally:
         _kill_group(process.pid)
         reaped = await process.wait()
+        if not waiting.done():
+            waiting.cancel()
         await _clear(slot, cleanup_pool)
+    if broken:
+        return "killed", reaped
     if returncode is None:
         return "timeout", reaped
     return _outcome(returncode), returncode
+
+
+async def _measure(watch: Callable[[], str | None]) -> bool:
+    """Run the watchdog once, in a thread of the loop's default pool.
+
+    Args:
+        watch: The watchdog.
+
+    Returns:
+        Whether it named a limit the job broke; an error in it is not one.
+    """
+    try:
+        return await asyncio.to_thread(watch) is not None
+    except Exception:
+        return False

@@ -6,9 +6,10 @@ the api in place of a file or folder is refused instead of followed, whatever it
 """
 
 import contextlib
+import dataclasses
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC  # a FIFO does not block the open
@@ -151,3 +152,84 @@ def open_regular(parent: int, parts: list[str]) -> int:
         os.close(fd)
         raise IsADirectoryError("not a regular file")
     return fd
+
+
+@dataclasses.dataclass
+class Use:
+    """What a job's folders hold, as the watchdog measured it.
+
+    Attributes:
+        bytes: Disk the entries take, as the file system counts it (blocks), files and folders.
+        entries: Names in the folders, every kind, the folders' own included.
+        depth: The deepest folder reached, below the folders given (they are 0).
+    """
+
+    bytes: int = 0
+    entries: int = 0
+    depth: int = 0
+
+
+def measure(tops: Iterable[int], *, max_entries: int, max_depth: int) -> Use:
+    """Measure the trees below opened folders, without following a link, one descriptor per level at most.
+
+    A walk stops counting once ``max_entries`` is passed, and enters no folder below ``max_depth``: past either, the
+    caller has its answer. An entry that vanishes or changes while it is looked at is left out; the next measure finds
+    it.
+
+    Args:
+        tops: The folders, opened; they stay open.
+        max_entries: Past this many entries the walk stops.
+        max_depth: Folders below this depth are not entered; ``depth`` then reads ``max_depth + 1``.
+
+    Returns:
+        What was found.
+    """
+    use = Use()
+
+    def listed(fd: int) -> Iterator[str]:
+        folders: list[str] = []
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                use.entries += 1
+                if use.entries > max_entries:
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                use.bytes += st.st_blocks * 512
+                if stat.S_ISDIR(st.st_mode):
+                    folders.append(entry.name)
+        return iter(folders)
+
+    for top in tops:
+        frames: list[tuple[int, Iterator[str]]] = []
+        try:
+            frames.append((os.dup(top), listed(top)))
+            while frames and use.entries <= max_entries:
+                fd, names = frames[-1]
+                name = next(names, None)
+                if name is None:
+                    os.close(fd)
+                    frames.pop()
+                    continue
+                if len(frames) > max_depth:
+                    use.depth = max_depth + 1
+                    break
+                try:
+                    child = os.open(name, DIR_FLAGS, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    found = listed(child)
+                except OSError:
+                    os.close(child)
+                    continue
+                frames.append((child, found))
+                use.depth = max(use.depth, len(frames) - 1)
+        finally:
+            for fd, _ in frames:
+                os.close(fd)
+        if use.entries > max_entries or use.depth > max_depth:
+            break
+    return use

@@ -84,7 +84,7 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
 | Variable | Default | Meaning |
 |---|---|---|
 | `WORKBENCH_UPLOAD_MAX_MB` | 50 | Largest upload, per file, in MB. A larger one answers `413`. A request whose body passes this plus 1 MiB is refused while it arrives (`workbench/api/body_limit.py`). It also bounds each file a job writes and a job's outputs together. |
-| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads and the files tools made, in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. |
+| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads and the files tools made, in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. It also bounds what a running job may write (see [sandbox.md](sandbox.md#limits)). |
 
 ### Request bodies
 

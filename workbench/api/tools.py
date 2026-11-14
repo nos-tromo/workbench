@@ -37,7 +37,7 @@ from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, Sto
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
 from workbench.models import Principal
-from workbench.protocol import MAX_INPUT_FILES, JobResult
+from workbench.protocol import KILLED, MAX_INPUT_FILES, JobResult
 
 router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
@@ -896,7 +896,7 @@ def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
     if result.status == "error" and "error" in result.result:
         _payload(result, "code")  # raises, with the runner's code or the fixed text
     reason = _clean(result.message) or "the job failed"
-    if result.status == "killed":
+    if result.status == "killed" and result.message == KILLED:  # the watchdog's own message names the limit
         reason += " (memory, CPU time, file size or processes)"
     raise HTTPException(status_code=422, detail=f"the code could not be completed: {reason}")
 

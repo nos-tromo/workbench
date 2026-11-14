@@ -51,7 +51,7 @@ Everything lives on the external volume `workbench-data`, mounted at `/data`.
 | `/data/` | root, group of the api, `1771` | the parts below; the api may add the database's journal files here |
 | `workspaces/<caller>/<user-id>/<chat-id>/…` | api, `0700` | the users' files: uploads under the names users chose, tool outputs under the names the model chose, as plain bytes |
 | `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder within the same request |
-| `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder its slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `tmp/`, the request (`spec.json`) and the answer (`result.json`); removed when the job ends |
+| `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder root's, `0710`, its group the slot's; its `home/` and `out/` the slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `home/` with its `tmp/` and its answer (`result.json`), and the request (`spec.json`); removed when the job ends |
 | `workbench.db` | api, `0600` | the SQLite database, in WAL mode with `secure_delete` on |
 
 The database has two tables (`workbench/api/store.py`):
@@ -83,7 +83,7 @@ operator's.
 |---|---|---|
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using, moving or renaming a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
-| A job's folder in the executor | until the job ends | `workbench/executor/supervisor.py:Supervisor._remove` |
+| A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
 | Empty folders, empty chat folders and empty user roots | one hour after they were last changed | `workbench/api/store.py:Store.sweep_user` |
 

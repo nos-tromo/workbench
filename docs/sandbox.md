@@ -34,9 +34,9 @@ capability it has, what it checks before it starts, and the risks that remain.
 | Capability | Why |
 |---|---|
 | `SETUID`, `SETGID` | The job's process, between `fork` and `exec`, drops every group and becomes its slot's uid and gid for good, and checks that no other id is left (`workbench/executor/sandbox.py:preexec`, `_drop_to`). The cleanup helpers drop to the slot the same way. |
-| `CHOWN` | It hands the job's folder, `out/` and `tmp/` to the slot, and the staged outputs to the api (`workbench/executor/fs.py:settle`). |
+| `CHOWN` | It gives the job's folder the slot's group, hands `out/` and `home/` to the slot, and the staged outputs to the api (`workbench/executor/fs.py:settle`). |
 | `FOWNER` | It sets the modes of what it has just handed to another uid, and of folders it does not own. |
-| `DAC_OVERRIDE` | It reaches into folders other uids own: it copies the inputs out of the api's `0700` workspaces, makes the job's folder in the api's `0700` staging, and reads the result out of the slot's `0700` job folder and removes it after the job. |
+| `DAC_OVERRIDE` | It reaches into folders other uids own: it copies the inputs out of the api's `0700` workspaces, makes the job's folder in the api's `0700` staging, reads the result out of the slot's `0700` `home/`, measures the slot's folders while the job runs, and removes them after the job. |
 | `KILL` | It signals the job's process group, which runs as the slot's uid, when the job ends or runs out of time (`sandbox.py:_kill_group`). Every other process of the slot is killed by a helper that is the slot itself. |
 
 The supervisor refuses to start as anything but root
@@ -74,13 +74,16 @@ One job runs in a slot at a time:
 
 1. The supervisor makes the job's folder `jobs/<job-id>/` and copies the
    requested files of the chat folder into it (below).
-2. It runs `python -I -m workbench.executor.job <spec>` as a fresh process in
-   that folder, as the slot's uid, with the limits below
+2. It runs `python -I -m workbench.executor.job <spec> <result>` as a fresh
+   process in that folder, as the slot's uid, with the limits below
    (`sandbox.py:run_in_slot`). The process leads its own session, has a clean
    environment (`sandbox.py:CLEAN_ENV`, with `HOME` and `TMPDIR` in the job's
-   folder) and a `077` umask; its stdin, stdout and stderr are `/dev/null`.
-3. When the job ends, by itself, on the wall clock or because the request was
-   cancelled, its process group is killed. Then every process of the slot's uid
+   own `home/`) and a `077` umask; its stdin, stdout and stderr are
+   `/dev/null`. Before it drops to the slot's uid it raises its OOM score and
+   installs the seccomp filter that keeps it from sockets (below).
+3. While it runs, a watchdog measures it about twice a second (below). When
+   the job ends, by itself, on the wall clock, on the watchdog or because the
+   request was cancelled, its process group is killed. Then every process of the slot's uid
    is killed: a helper that drops to the slot calls `kill(-1, SIGKILL)`, and
    `/proc` is checked, up to six times with a growing pause
    (`sandbox.py:kill_slot_processes`).
@@ -95,23 +98,56 @@ removed, or whose job was cancelled in the middle, is retired for the life of
 the process. Its next job could otherwise share a uid with what is left. Once
 the last slot is retired the supervisor exits non-zero, and
 `restart: unless-stopped` brings it back with fresh slots, a fresh IPC
-namespace and a fresh `/dev/shm`.
+namespace and a fresh `/dev/shm`. A job folder whose removal failed is root's
+alone (`0700`) from then on, and the supervisor tries to remove it again every
+five minutes (`supervisor.py:Supervisor._retry_leftovers`); the log says how
+many of how many went. The removal runs in a thread, never on the event loop
+that times the other jobs.
 
 ### What a job sees
 
-- `jobs/<job-id>/`, the slot's, `0700`; nobody may list `jobs/` itself
-  (root's, `0711`).
+- `jobs/<job-id>/`, root's, `0710`, its group the slot's: the job may pass
+  through it and nobody else may. The job cannot list it, add a name to it or
+  change its mode, so it cannot open it to another slot. Nobody may list
+  `jobs/` itself (root's, `0711`). `spec.json` in it is root's, `0444`.
 - `workspace/<chat-id>/` below it, root's, `0755`: the job's working folder,
   with root-owned `0444` copies of its input files. The job can read them and
   change nothing.
 - `workspace/<chat-id>/out/`, the slot's, `0700`: the only place its outputs
   go.
-- `tmp/`, the slot's, `0700`: its `TMPDIR`.
+- `home/`, the slot's, `0700`: its `HOME`, where it writes `result.json`, with
+  `home/tmp/`, its `TMPDIR`.
 - `/workspace` in the image is a link to `/proc/self/cwd/..`, so
   `/workspace/<chat-id>/<name>` is the job's own copy, whichever job asks.
 
-A job cannot reach the users' files, the staging folder, the database, the
-socket or another job's folder: each is another uid's and closed to others.
+`out/` and `home/` are all a job can write. A job may open them to everyone;
+they stay out of reach all the same, behind the job folder only its slot can
+pass. A job cannot reach the users' files, the staging folder, the database,
+the socket or another job's folder: each is another uid's and closed to others.
+
+### No sockets
+
+Every job runs under a seccomp filter of workbench's own
+(`workbench/executor/seccomp.py`), on top of Docker's default profile. It is
+installed in `preexec`, while the child is still root and after
+`no_new_privs`, and every process the job starts inherits it:
+
+- `socket()` fails with `EACCES`, whatever the family: Internet (the
+  container's loopback), Unix (abstract names) and netlink among them;
+- `socketpair()` works for `AF_UNIX`, which asyncio's self-pipe uses; the pair
+  reaches only the job's own processes;
+- `bind()` fails, and so does `setsockopt` with `SO_PASSCRED`, `SO_PASSPIDFD`
+  or `SO_PASSPIDFD_THREAD`, which would make a Unix socket name itself: no
+  socket of a job ever has a name another job could reach;
+- `io_uring_setup()` fails (an io_uring can make sockets past the filter), and
+  so does `memfd_create()` (memory in such a file is in no process's resident
+  set, where the watchdog counts it).
+
+It knows x86_64 and aarch64, each with its own syscall numbers; a call of
+another architecture fails the same way, and the supervisor refuses to start on
+another machine. pandas, numpy, matplotlib, openpyxl, python-docx, threads and
+asyncio work under it. Nothing needs a socket in a job: the executor has no
+network, and multiprocessing does not work there anyway.
 The files of the user's other chats are never copied in. A file below a folder
 named `out` is never copied in either: `out/` is where a job writes.
 
@@ -125,13 +161,26 @@ supervisor caps whatever a request asks at its own settings
 |---|---|
 | Wall time | `WORKBENCH_JOB_WALL_S` (120 s); then the group is killed and the answer is a timeout |
 | The code's own time | 9/10 of the wall time for `run_python`, 3/4 for every other tool, stopped by `SIGALRM` inside the job (`workbench/executor/timer.py`); the wall time is the backstop |
-| `RLIMIT_AS` | `WORKBENCH_JOB_MEMORY_MB` (1536 MB) of address space |
+| `RLIMIT_AS` | `WORKBENCH_JOB_MEMORY_MB` (1536 MB) of address space, per process |
+| Memory of the job | `WORKBENCH_JOB_MEMORY_MB` for all its processes together, measured by the watchdog (below) |
 | `RLIMIT_CPU` | `WORKBENCH_JOB_WALL_S` seconds of CPU |
 | `RLIMIT_FSIZE` | `WORKBENCH_UPLOAD_MAX_MB` (50 MB) per file written |
+| What the job writes | `WORKBENCH_WORKSPACE_MAX_MB` (500 MB) in `home/` and `out/` together, at most 10 000 files and folders, nested at most 256 deep, measured by the watchdog |
 | `RLIMIT_NPROC` | 64 processes of the slot's uid |
 | `RLIMIT_NOFILE` | 256 open files |
 | `RLIMIT_CORE` | 0 |
 | Priority | niceness 10 or more, which a job cannot lower again (`sandbox.py:JOB_NICENESS`) |
+| OOM score | `oom_score_adj` 1000 (`sandbox.py:JOB_OOM_SCORE_ADJ`): the kernel's OOM killer picks a job's process first |
+
+The watchdog (`supervisor.py:_Watch`, run by `sandbox.py:run_in_slot`)
+measures a running job about twice a second, in a thread: the resident memory
+of every process of the slot's uid, read from `/proc`, plus the SysV shared
+memory segments the uid made that nobody has attached; and the disk, entries and
+depth of `home/` and `out/`, walked by descriptor without following a link.
+Past a limit it kills the job's process group, the slot's cleanup kills the
+rest, and the answer names the limit ("the job was stopped: it wrote more than
+500 MB"). The memory limit thus holds per job, not only per process, and no
+job's processes together can take the container's memory from another slot.
 
 For the container (`docker/compose.yaml`, see
 [configuration.md](configuration.md#the-executor-container)):
@@ -142,7 +191,9 @@ For the container (`docker/compose.yaml`, see
 - `mem_limit` and `memswap_limit`, the same value:
   `WORKBENCH_EXECUTOR_MEM_LIMIT` (6656 MiB): every slot's job memory plus
   512 MiB for the supervisor. Memory and swap together are that one limit, so
-  no job swaps past it.
+  no job swaps past it. The watchdog holds each job to its share; what a job
+  takes between two of its measures is held by this limit, and the OOM score
+  makes a job's process the one the kernel stops.
 
 Documents get guards of their own before a library parses them: an Office file
 may unpack to at most 20 times the upload limit, with at most 10 000 members
@@ -174,16 +225,27 @@ unless:
   `TMPDIR` of its own, so `/tmp` would be the last folder two slots could share;
 - `/proc/self/status` shows `Seccomp: 2`, a seccomp filter such as Docker's
   default profile. It refuses the kernel keyring calls, and a keyring a job
-  filled would outlive the job.
+  filled would outlive the job;
+- `/proc/self/status` shows `NoNewPrivs: 1`. It keeps a setuid or setgid
+  program inert for a job; the image has none either
+  (`docker/Dockerfile.executor` strips the bits);
+- the cgroup's process limit (`pids.max`), when there is one, holds every
+  slot's 64 processes and 64 more for the supervisor and its helpers;
+- the machine is x86_64 or aarch64, and a child under the jobs' socket filter
+  cannot open an Internet socket and can still make a Unix pair
+  (`seccomp.py:problem`).
 
-Compose sets the container up this way. `seccomp=unconfined` or Docker's
-default `/dev/shm` make it refuse.
+Compose sets the container up this way. `seccomp=unconfined`, a missing
+`no-new-privileges` or Docker's default `/dev/shm` make it refuse.
 
 ### Output validation
 
 After the job, before anything is staged (`supervisor.py:_find_outputs`,
 `_stage_one`):
 
+- `result.json` must be a regular file of the slot's uid with exactly one
+  link, as an output must, read without following a link or blocking on a
+  FIFO, and bounded in size.
 - Only regular files directly in `out/` count. Links, folders and anything
   else are left out, and so are names a workspace refuses.
 - Each must be the slot's own: owned by the slot's uid, with exactly one link.
@@ -221,13 +283,36 @@ Each of these is accepted. Each says what it would take.
   capabilities, no network and Docker's default seccomp profile could escape
   to the host. That takes a kernel vulnerability of that kind. The federation is
   single-host Docker; gVisor (below) narrows this where a host has it.
-- **A covert channel between two jobs that run at once.** Two slots share the
-  container's kernel objects while both run: abstract Unix sockets, SysV IPC,
-  CPU and timing. Two jobs that cooperate could pass data between them. That
-  takes code in both jobs written to do so, for example a listener of one user
-  and a sender in another user's chat, put there by a prompt hidden in a
-  document. Nothing survives the end of a job: each slot is cleared before its
-  next one.
+- **A channel between two jobs that run at once.** Two jobs of two users that
+  cooperate could pass a user's files between them while both run, for example
+  a listener of one user and a sender in another user's chat, put there by a
+  prompt hidden in a document. The full-bandwidth ways are closed: the
+  container's loopback, abstract Unix sockets and netlink (no job has a
+  socket, below), and the job folders (root's, closed to every other slot). What
+  remains: SysV IPC while both run (a segment, a queue or a semaphore one job
+  makes and hands to another uid; each is removed with its creator's job), the
+  `/proc` entries of the other slot's processes (their command lines name a job
+  id, and their status), and CPU and timing. Nothing survives the end of a job:
+  each slot is cleared before its next one.
+- **What the watchdog cannot see between two of its measures.** It measures
+  about twice a second. A job can write, between two measures, as much as the
+  disk takes in half a second, and take as much memory as it can map in half a
+  second; the container's memory limit and the job's OOM score hold the latter.
+  A file a job has removed but keeps open is in no folder the watchdog walks: up
+  to 256 such files (`RLIMIT_NOFILE`) of 50 MB each (`RLIMIT_FSIZE`), freed
+  when the job ends. A job that renames its folders while they are walked can
+  be counted short by one measure.
+- **A job's OOM score can come down.** A job runs at `oom_score_adj` 1000, but
+  the kernel lets a process lower its own score to the floor its parents had,
+  the container's own (0 under Docker's default), without a capability. A job
+  that does so is no longer picked first; the watchdog's memory limit still
+  holds it.
+- **A job can have its own slot retired.** A job that leaves its folder so it
+  cannot be removed (for example a tree deeper than the supervisor's open
+  files allow) or wins the race against its slot's cleanup gets its slot
+  retired; once every slot is, the executor restarts, and the jobs of other
+  users in it fail. It is a denial of service within the user's own rate
+  limits, bounded and self-healing.
 - **`fs.protected_regular` and `fs.protected_fifos` are not required.** They are
   the host's settings, not namespaced, and 0 on many Docker hosts, so requiring
   them would refuse most hosts. They guard opens in world-writable sticky

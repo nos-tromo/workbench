@@ -83,6 +83,16 @@ Nothing is followed: a link, anything that is neither a folder nor a regular
 file, and anything on another filesystem is left alone. An entry that cannot be
 looked at is skipped with a warning, and the sweep goes on with the next.
 
+### In the executor
+
+A job's folder, with the copies of the user's files the job was given, goes
+when the job ends. It is not the sweep's: the executor removes it
+(`workbench/executor/supervisor.py:Supervisor._remove`). One whose removal
+failed is closed to every slot, retried every five minutes until it goes
+(`Supervisor._retry_leftovers`, the log says how many of how many went), and
+removed at the latest when the executor restarts. Its files have no rows and
+are not recorded: they are copies the job's own event covers.
+
 ### After a sweep
 
 - **A checkpoint.** The database deletes with `secure_delete`, which overwrites

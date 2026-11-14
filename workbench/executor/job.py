@@ -1,8 +1,9 @@
-"""The job entry point: ``python -I -m workbench.executor.job <spec.json>``.
+"""The job entry point: ``python -I -m workbench.executor.job <spec.json> <result.json>``.
 
 The spec file is the only input; the process reads no environment. The working
-directory is the job directory. The runner's answer, or its error, is written to
-``result.json`` next to the spec.
+directory is the job's working folder. The runner's answer, or its error, is written
+to the result path, in the job's own ``home/``: the job folder that holds the spec is
+root's, and the job cannot add a name to it.
 """
 
 import json
@@ -19,7 +20,8 @@ def main(argv: Sequence[str]) -> int:
 
     Args:
         argv: The command line; ``argv[1]`` is the path of the spec, a JSON object with
-            ``tool``, ``args``, ``chat_id``, ``max_chars`` and ``file_mb``.
+            ``tool``, ``args``, ``chat_id``, ``max_chars`` and ``file_mb``; ``argv[2]`` is where the result goes,
+            next to the spec when it is not given.
 
     Returns:
         ``0`` once ``result.json`` is written, whether the runner succeeded, raised (``SystemExit`` and
@@ -28,6 +30,7 @@ def main(argv: Sequence[str]) -> int:
         result could be written at all.
     """
     spec_path = Path(argv[1])
+    result_path = Path(argv[2]) if len(argv) > 2 else spec_path.with_name("result.json")
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
         work_dir = Path.cwd()
@@ -47,7 +50,7 @@ def main(argv: Sequence[str]) -> int:
         payload = json.dumps({"error": "read_timeout: the work ran past its time limit"})
     except BaseException as exc:  # SystemExit and KeyboardInterrupt too: the job always answers
         payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-    return _write(spec_path.with_name("result.json"), payload)
+    return _write(result_path, payload)
 
 
 def _write(path: Path, payload: str) -> int:

@@ -143,6 +143,14 @@ def test_the_api_is_bounded_in_memory_and_processes() -> None:
     assert "/tmp:size=512m" in api["tmpfs"]
 
 
+def test_the_executor_image_strips_setuid_and_setgid_bits() -> None:
+    """R1 M-1: no setuid or setgid program in the runtime image, before it is the supervisor's."""
+    text = (DOCKER / "Dockerfile.executor").read_text(encoding="utf-8")
+    runtime = text.split(" AS runtime", 1)[1].split("\nFROM ", 1)[0]
+    assert "RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +" in runtime
+    assert runtime.index("chmod a-s") < runtime.index("USER 0:0")
+
+
 def _health_probe() -> str:
     """The executor healthcheck's Python."""
     test = compose()["services"]["executor"]["healthcheck"]["test"]

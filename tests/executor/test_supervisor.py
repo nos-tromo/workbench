@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -47,14 +49,22 @@ MB = 1024 * 1024
 PRELUDE = """\
 import json, os, pathlib, sys
 spec_path = pathlib.Path(sys.argv[1])
+result_path = pathlib.Path(sys.argv[2])
 spec = json.loads(spec_path.read_text())
 result = {}
 def tree(top):
     return sorted(str(p.relative_to(top)) for p in pathlib.Path(top).rglob("*"))
 """
 EPILOGUE = """
-spec_path.with_name("result.json").write_text(json.dumps(result))
+result_path.write_text(json.dumps(result))
 """
+
+
+async def until(condition: Any, *, seconds: float = 10.0) -> None:
+    """Let the loop run until ``condition()`` holds."""
+    async with asyncio.timeout(seconds):
+        while not condition():
+            await asyncio.sleep(0.01)
 
 
 def _sock(data: Path) -> Path:
@@ -121,7 +131,9 @@ def _request(**overrides: Any) -> JobRequest:
 def _runner(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
     """Run ``body`` as the job instead of the job entry point; it fills ``result`` and may write ``out/``."""
     code = PRELUDE + textwrap.dedent(body) + EPILOGUE
-    monkeypatch.setattr(supervisor, "job_argv", lambda spec: [sys.executable, "-I", "-c", code, str(spec)])
+    monkeypatch.setattr(
+        supervisor, "job_argv", lambda spec, result: [sys.executable, "-I", "-c", code, str(spec), str(result)]
+    )
 
 
 def _entries(folder: Path) -> list[str]:
@@ -393,7 +405,10 @@ async def test_inputs_under_a_folder_named_out_are_not_copied(volume: Path, monk
 
 
 async def test_the_job_folder_has_its_layout_and_modes(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Working folder and inputs are read-only to the job; ``out/``, ``tmp/`` and the job folder are private."""
+    """The job folder is root's, 0710, its group the job's; only ``home/`` (with ``tmp/``) and ``out/`` are the job's.
+
+    The working folder and the inputs are read-only to the job; ``HOME``, ``TMPDIR`` and the result are in ``home/``.
+    """
     _chat(volume, {"q.csv": b"q", "reports/s.txt": b"s"})
     _runner(
         monkeypatch,
@@ -403,10 +418,13 @@ async def test_the_job_folder_has_its_layout_and_modes(volume: Path, monkeypatch
         job = spec_path.parent
         result = {
             "cwd": os.getcwd() == str(job / "workspace" / spec["chat_id"]),
-            "home": os.environ["HOME"] == os.getcwd(),
-            "tmp": os.environ["TMPDIR"] == str(job / "tmp"),
+            "home": os.environ["HOME"] == str(job / "home"),
+            "tmp": os.environ["TMPDIR"] == str(job / "home" / "tmp"),
+            "result": result_path == job / "home" / "result.json",
             "modes": [mode(job), mode(job / "workspace"), mode("."), mode("q.csv"), mode("reports"),
-                      mode("reports/s.txt"), mode("out"), mode(job / "tmp"), mode(spec_path)],
+                      mode("reports/s.txt"), mode("out"), mode(job / "home"), mode(job / "home" / "tmp"),
+                      mode(spec_path)],
+            "group": os.stat(job).st_gid == os.getgid(),
             "spec": spec,
             "top": sorted(os.listdir(job)),
         }
@@ -416,8 +434,11 @@ async def test_the_job_folder_has_its_layout_and_modes(volume: Path, monkeypatch
 
     answer = await Supervisor(_settings(volume), use_slots=False).run_job(request)
 
-    assert answer.result["cwd"] and answer.result["home"] and answer.result["tmp"]
-    assert answer.result["modes"] == ["0o700", "0o755", "0o755", "0o444", "0o755", "0o444", "0o700", "0o700", "0o444"]
+    assert answer.result["cwd"] and answer.result["home"] and answer.result["tmp"] and answer.result["result"]
+    assert answer.result["modes"] == [
+        "0o710", "0o755", "0o755", "0o444", "0o755", "0o444", "0o700", "0o700", "0o700", "0o444",
+    ]  # fmt: skip
+    assert answer.result["group"]
     assert answer.result["spec"] == {
         "tool": "script",
         "args": {"x": 1},
@@ -425,7 +446,7 @@ async def test_the_job_folder_has_its_layout_and_modes(volume: Path, monkeypatch
         "max_chars": 100,
         "file_mb": 50,
     }
-    assert answer.result["top"] == ["spec.json", "tmp", "workspace"]
+    assert answer.result["top"] == ["home", "spec.json", "workspace"]
 
 
 async def test_limits_are_bounded_by_the_executors_own_settings(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -449,14 +470,14 @@ async def test_limits_are_bounded_by_the_executors_own_settings(volume: Path, mo
     "body",
     [
         "sys.exit(0)",
-        'spec_path.with_name("result.json").write_text("not json")\nsys.exit(0)',
-        'spec_path.with_name("result.json").write_text("[1, 2]")\nsys.exit(0)',
-        'spec_path.with_name("result.json").write_bytes(b"{\\"x\\": \\"\\xff\\"}")\nsys.exit(0)',
-        'spec_path.with_name("result.json").write_text("[" * 50000)\nsys.exit(0)',
-        'os.mkfifo(spec_path.with_name("result.json"))\nsys.exit(0)',
-        'os.mkdir(spec_path.with_name("result.json"))\nsys.exit(0)',
-        'os.symlink(spec["args"]["decoy"], spec_path.with_name("result.json"))\nsys.exit(0)',
-        'spec_path.with_name("result.json").write_text(json.dumps({"x": "y" * 70000}))\nsys.exit(0)',
+        'result_path.write_text("not json")\nsys.exit(0)',
+        'result_path.write_text("[1, 2]")\nsys.exit(0)',
+        'result_path.write_bytes(b"{\\"x\\": \\"\\xff\\"}")\nsys.exit(0)',
+        'result_path.write_text("[" * 50000)\nsys.exit(0)',
+        "os.mkfifo(result_path)\nsys.exit(0)",
+        "os.mkdir(result_path)\nsys.exit(0)",
+        'os.symlink(spec["args"]["decoy"], result_path)\nsys.exit(0)',
+        'result_path.write_text(json.dumps({"x": "y" * 70000}))\nsys.exit(0)',
     ],
     ids=["missing", "not-json", "not-a-dict", "not-utf8", "too-deep", "fifo", "folder", "symlink", "too-big"],
 )
@@ -490,7 +511,7 @@ async def test_a_result_up_to_its_bound_is_read(volume: Path, monkeypatch: pytes
 async def test_a_failing_process_is_an_error(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A job that exits with an error leaves no result to trust, even if it wrote one."""
     _chat(volume)
-    _runner(monkeypatch, 'spec_path.with_name("result.json").write_text("{}")\nsys.exit(3)')
+    _runner(monkeypatch, 'result_path.write_text("{}")\nsys.exit(3)')
 
     answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
 
@@ -686,9 +707,10 @@ def _fake_run(
         *,
         tmp_dir: Path | None = None,
         cleanup_pool: Any = None,
+        **_more: Any,
     ) -> tuple[str, int]:
         """Leave a result as a job would, then end as told."""
-        Path(argv[-1]).with_name("result.json").write_text('{"leaked": true}')
+        Path(argv[-1]).write_text('{"leaked": true}')
         if seen is not None:
             seen.append(limits)
         if pools is not None:
@@ -849,6 +871,11 @@ def _mountinfo(tmp_path: Path, content: str = MOUNTINFO) -> Path:
 STATUS = "Name:\tpython\nUmask:\t0077\nState:\tR (running)\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\n"
 
 
+def _no_problem() -> str | None:
+    """A seccomp probe that finds nothing wrong, for the checks that are not about it."""
+    return None
+
+
 def _status(tmp_path: Path, content: str = STATUS) -> Path:
     """A ``/proc/self/status`` holding ``content``."""
     path = tmp_path / "status"
@@ -888,6 +915,7 @@ def test_a_well_set_up_host_passes_the_start_up_checks(memory: str | None, tmp_p
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -907,6 +935,7 @@ def test_too_little_container_memory_refuses_to_start(tmp_path: Path) -> None:
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -926,6 +955,7 @@ def test_missing_slot_users_refuse_to_start(tmp_path: Path) -> None:
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -945,6 +975,7 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -963,6 +994,7 @@ def test_a_supervisor_that_is_not_root_refuses_to_start(tmp_path: Path) -> None:
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=1000,
     )
 
@@ -991,6 +1023,7 @@ def test_a_host_without_link_protection_refuses_to_start(
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1017,6 +1050,7 @@ def test_a_dev_mqueue_that_is_not_a_mounted_mqueue_refuses_to_start(content: str
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1034,6 +1068,7 @@ def test_unreadable_mount_information_refuses_to_start(tmp_path: Path) -> None:
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1078,6 +1113,7 @@ def test_a_dev_shm_slots_could_write_refuses_to_start(trap: str, tmp_path: Path)
         shm=_shared_folder(tmp_path, trap, "shm"),
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1096,6 +1132,7 @@ def test_a_tmp_slots_could_write_refuses_to_start(trap: str, tmp_path: Path) -> 
         shm=ROOT_ONLY,
         tmp=_shared_folder(tmp_path, trap, "tmp"),
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1132,6 +1169,7 @@ def test_a_supervisor_without_a_seccomp_filter_refuses_to_start(content: str | N
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=tmp_path / "absent-status" if content is None else _status(tmp_path, content),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1140,7 +1178,79 @@ def test_a_supervisor_without_a_seccomp_filter_refuses_to_start(content: str | N
 
 @pytest.mark.parametrize(
     "content",
-    [STATUS, "Seccomp:\t2\n", "Seccomp: 2\nSeccomp_filters:\t3\n", "NoNewPrivs:\t1\nSeccomp:\t2"],
+    [STATUS.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"), STATUS.replace("NoNewPrivs:\t1\n", "")],
+    ids=["off", "no-line"],
+)
+def test_a_supervisor_without_no_new_privileges_refuses_to_start(content: str, tmp_path: Path) -> None:
+    """R1 M-1: ``no-new-privileges`` is what keeps a setuid program inert for a job; the image has none either."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path, content),
+        sockets=_no_problem,
+        euid=0,
+    )
+
+    assert (
+        problem == "the supervisor must run with no-new-privileges, so no job can gain rights through a setuid program"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pids", "passes"), [("max", True), ("320", True), ("4096", True), ("319", False), ("64", False)]
+)
+def test_the_containers_process_limit_must_hold_every_slot(pids: str, passes: bool, tmp_path: Path) -> None:
+    """R1 M-2, as for memory: four slots of 64 processes and 64 for the supervisor and its helpers need 320."""
+    limit = tmp_path / "pids.max"
+    limit.write_text(pids + "\n")
+    problem = startup_problem(
+        _settings(tmp_path, WORKBENCH_EXECUTOR_SLOTS="4"),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
+        pids_max=limit,
+        sockets=_no_problem,
+        euid=0,
+    )
+
+    assert problem == (None if passes else "the container's process limit is below 4 slots of 64 and 64 more")
+
+
+def test_a_host_where_jobs_could_open_sockets_refuses_to_start(tmp_path: Path) -> None:
+    """The socket filter is tried at start: what it finds wrong is the reason (R76)."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
+        sockets=lambda: "the seccomp filter does not keep a process from opening an Internet socket",
+        euid=0,
+    )
+
+    assert problem == "the seccomp filter does not keep a process from opening an Internet socket"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        STATUS,
+        "Seccomp:\t2\nNoNewPrivs:\t1\n",
+        "NoNewPrivs: 1\nSeccomp: 2\nSeccomp_filters:\t3\n",
+        "NoNewPrivs:\t1\nSeccomp:\t2",
+    ],
     ids=["docker-default", "only-the-line", "spaces-and-more-filters", "no-final-newline"],
 )
 def test_a_seccomp_filter_passes_the_start_up_check(content: str, tmp_path: Path) -> None:
@@ -1154,6 +1264,7 @@ def test_a_seccomp_filter_passes_the_start_up_check(content: str, tmp_path: Path
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path, content),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1202,6 +1313,7 @@ def test_as_root_a_folder_of_roots_that_no_one_else_may_write_passes(tmp_path: P
         shm=shm,
         tmp=tmp,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1220,6 +1332,7 @@ def test_a_host_where_slots_could_make_posix_queues_refuses_to_start(queues_max:
         shm=ROOT_ONLY,
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1240,6 +1353,7 @@ def test_this_hosts_dev_shm_and_queue_limit_pass_only_in_the_production_shape(tm
         shm=Path("/dev/shm"),
         tmp=ROOT_ONLY,
         status=_status(tmp_path),
+        sockets=_no_problem,
         euid=0,
     )
 
@@ -1778,7 +1892,7 @@ async def test_as_a_slot_the_job_reaches_only_its_own_folder(
     assert answer.result["ids"] == [[20001] * 3, [20001] * 3, []]
     assert answer.result["nice"] >= 10
     assert answer.result["owners"] == [
-        [20001, 20001, "0o700"],
+        [0, 20001, "0o710"],
         [0, 0, "0o755"],
         [0, 0, "0o444"],
         [20001, 20001, "0o700"],
@@ -2210,3 +2324,290 @@ async def test_as_root_a_segment_another_slot_keeps_attached_neither_retires_the
     assert (sharer.status, sharer.result["uid"]) == ("ok", 20002)
     assert (after.status, after.result) == ("ok", {"uid": 20002, "plain": False, "restored": True, "zeros": True})
     assert (holding.status, holding.result) == ("ok", {"uid": 20001})
+
+
+# --- the job's own files, the watchdog and the leftovers (R75, R76) -----------------------------------------------
+
+
+async def test_a_result_with_a_second_name_is_refused(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``result.json`` must be the job's alone, as an output must: a hard link could name a file it may not read."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        """
+        result = {"x": 1}
+        other = result_path.with_name("other.json")
+        other.write_text(json.dumps(result))
+        os.link(other, result_path)
+        sys.exit(0)
+        """,
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
+
+    assert (answer.status, answer.message) == ("error", "the job left no readable result")
+
+
+@pytest.mark.parametrize(
+    ("body", "settings", "message"),
+    [
+        (
+            "pathlib.Path(os.environ['TMPDIR'], 'big').write_bytes(os.urandom(3 * 1024 * 1024))",
+            {"WORKBENCH_WORKSPACE_MAX_MB": "1"},
+            "the job was stopped: it wrote more than 1 MB",
+        ),
+        (
+            "[open(f'out/f{n}', 'w').close() for n in range(10001)]",
+            {},
+            "the job was stopped: it wrote more than 10 000 files and folders",
+        ),
+        (
+            "here = os.open(os.environ['HOME'], os.O_RDONLY)\nfor _ in range(260):\n"
+            "    os.mkdir('d', dir_fd=here)\n    deeper = os.open('d', os.O_RDONLY, dir_fd=here)\n"
+            "    os.close(here)\n    here = deeper",
+            {},
+            "the job was stopped: its folders nest more than 256 deep",
+        ),
+    ],
+    ids=["disk", "entries", "depth"],
+)
+async def test_a_job_past_a_limit_of_its_folders_is_stopped_and_told_which(
+    body: str, settings: dict[str, str], message: str, volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watchdog measures ``home/`` and ``out/`` about twice a second and stops the job well before its wall time."""
+    _chat(volume)
+    _runner(monkeypatch, body + "\nimport time\ntime.sleep(60)\n")
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(volume, **settings), use_slots=False).run_job(_request())
+
+    assert (answer.status, answer.message) == ("killed", message)
+    assert time.monotonic() - began < 30
+    assert _entries(volume / "jobs") == []
+
+
+async def test_a_job_within_its_limits_is_not_stopped(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job that writes a little and takes longer than a few measures ends by itself."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        """
+        import time
+        pathlib.Path("out/r.csv").write_bytes(b"x" * 100_000)
+        time.sleep(1.5)
+        result = {"done": True}
+        """,
+    )
+
+    answer = await Supervisor(_settings(volume, WORKBENCH_WORKSPACE_MAX_MB="1"), use_slots=False).run_job(_request())
+
+    assert (answer.status, answer.result) == ("ok", {"done": True})
+
+
+async def test_a_failed_run_removes_the_job_folder_off_the_event_loop(
+    volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 M-3: what the job left can be millions of entries; the removal runs in a thread, never on the loop."""
+    _chat(volume)
+    _fake_run(monkeypatch, [RuntimeError("processes of slot 0 survived the cleanup")])
+    threads: list[str] = []
+    real = Supervisor._remove
+
+    def remove(self: Supervisor, job: Any, watch: Any = None) -> bool:
+        threads.append(threading.current_thread().name)
+        return real(self, job, watch)
+
+    monkeypatch.setattr(Supervisor, "_remove", remove)
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
+
+    assert answer.message == "the job's processes could not be stopped"
+    assert threads and threading.main_thread().name not in threads
+
+
+async def test_a_job_folder_whose_removal_failed_is_tried_again(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R2 I5: the folder holds copies of a user's files; it is tried again on a timer, and the log has counts only."""
+    _chat(volume, {"q.csv": b"q"})
+    _runner(monkeypatch, "result = {}")
+    sup = Supervisor(_settings(volume), use_slots=False)
+    real = Supervisor._rmtree
+    failing = {"left": True}
+
+    def rmtree(self: Supervisor, name: str, parent: int, *, quiet: bool = False) -> bool:
+        if failing["left"]:
+            failing["left"] = False
+            return False
+        return real(self, name, parent, quiet=quiet)
+
+    monkeypatch.setattr(Supervisor, "_rmtree", rmtree)
+    request = _request(input_files=["q.csv"])
+    await sup.run_job(request)
+    assert _entries(volume / "jobs") == [request.job_id]
+    monkeypatch.setattr(supervisor, "LEFTOVER_RETRY_S", 0.01)
+
+    with caplog.at_level(logging.INFO, logger="workbench.executor"):
+        retrying = asyncio.create_task(sup._retry_leftovers())
+        await until(lambda: _entries(volume / "jobs") == [])
+        retrying.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await retrying
+
+    assert "removed 1 of 1 job folder a failed removal left" in caplog.text
+    assert request.job_id not in caplog.text
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_cannot_open_its_folder_to_another_slot(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R76: the job folder is root's, 0710; a job that opens ``home/`` and ``out/`` to all opens them to nobody."""
+    _chat(root_volume, {"q.csv": b"q"})
+    _runner(
+        monkeypatch,
+        f"""
+        import time
+        def attempt(action):
+            try:
+                action()
+                return "ok"
+            except PermissionError:
+                return "denied"
+        job = spec_path.parent
+        mine = {{
+            "chmod_job": attempt(lambda: os.chmod(job, 0o777)),
+            "list_job": attempt(lambda: os.listdir(job)),
+            "add_to_job": attempt(lambda: (job / "x").write_text("x")),
+            "chmod_home": attempt(lambda: os.chmod(job / "home", 0o777)),
+            "chmod_out": attempt(lambda: os.chmod("out", 0o777)),
+        }}
+        (job / "home" / "secret").write_text("user a's figures")
+        os.chmod(job / "home" / "secret", 0o666)
+        time.sleep(1)
+        other = pathlib.Path({str(root_volume / "jobs")!r}) / spec["args"]["other"]
+        result = {{
+            "mine": mine,
+            "their_secret": attempt(lambda: (other / "home" / "secret").read_text()),
+            "their_out": attempt(lambda: os.listdir(other / "workspace" / spec["chat_id"] / "out")),
+            "their_job": attempt(lambda: os.listdir(other)),
+        }}
+        """,
+    )
+    first, second = _request(input_files=["q.csv"]), _request(input_files=["q.csv"])
+    first = first.model_copy(update={"args": {"other": second.job_id}})
+    second = second.model_copy(update={"args": {"other": first.job_id}})
+
+    sup = Supervisor(_settings(root_volume))
+
+    answers = await asyncio.gather(sup.run_job(first), sup.run_job(second))
+
+    for answer in answers:
+        assert answer.status == "ok", answer
+        assert answer.result["mine"] == {
+            "chmod_job": "denied",
+            "list_job": "denied",
+            "add_to_job": "denied",
+            "chmod_home": "ok",
+            "chmod_out": "ok",
+        }
+        assert {key: answer.result[key] for key in ("their_secret", "their_out", "their_job")} == dict.fromkeys(
+            ("their_secret", "their_out", "their_job"), "denied"
+        )
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_jobs_processes_together_are_held_to_its_memory(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R75: each process stays under ``RLIMIT_AS``, but three of them together pass the job's memory, and it stops."""
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import time
+        for _ in range(3):
+            if os.fork() == 0:
+                held = bytearray(120 * 1024 * 1024)
+                for at in range(0, len(held), 4096):
+                    held[at] = 1
+                time.sleep(60)
+                os._exit(0)
+        time.sleep(60)
+        """,
+    )
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume, WORKBENCH_JOB_MEMORY_MB="256")).run_job(_request())
+
+    assert (answer.status, answer.message) == (
+        "killed",
+        "the job was stopped: its processes used more than 256 MB of memory together",
+    )
+    assert time.monotonic() - began < 40
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R76: no Internet, Unix or netlink socket, no abstract name; a Unix pair, asyncio, pandas and the OOM score do."""
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import asyncio, errno, socket
+        def attempt(action):
+            try:
+                action()
+                return "ok"
+            except OSError as exc:
+                return errno.errorcode.get(exc.errno, str(exc.errno))
+        def abstract():
+            one, two = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            one.bind(b"\\0workbench-test")
+        def passcred():
+            one, two = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            one.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        async def nothing():
+            return "ok"
+        import pandas
+        result = {
+            "inet": attempt(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM)),
+            "inet6": attempt(lambda: socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)),
+            "unix": attempt(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)),
+            "netlink": attempt(lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 2)),
+            "abstract": attempt(abstract),
+            "passcred": attempt(passcred),
+            "memfd": attempt(lambda: os.memfd_create("x")),
+            "pair": attempt(lambda: socket.socketpair()),
+            "asyncio": asyncio.run(nothing()),
+            "pandas": int(pandas.DataFrame({"a": [1, 2, 3]})["a"].sum()),
+            "oom_score_adj": pathlib.Path("/proc/self/oom_score_adj").read_text().strip(),
+        }
+        """,
+    )
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_request())
+
+    assert answer.status == "ok", answer
+    refused = ("inet", "inet6", "unix", "netlink", "abstract", "passcred", "memfd")
+    assert {key: answer.result[key] for key in refused} == dict.fromkeys(refused, "EACCES")
+    assert {key: answer.result[key] for key in ("pair", "asyncio", "pandas", "oom_score_adj")} == {
+        "pair": "ok",
+        "asyncio": "ok",
+        "pandas": 6,
+        "oom_score_adj": "1000",
+    }
+
+
+@pytest.mark.skipif(
+    not (ROOT_ON_LINUX and Path("/workspace").is_symlink()), reason="the executor image's own files, as root"
+)
+def test_the_executor_image_has_no_setuid_or_setgid_program() -> None:
+    """R1 M-1: the image strips them; ``no-new-privileges`` would keep them inert, and the supervisor requires it."""
+    found = subprocess.run(
+        ["find", "/", "-xdev", "-perm", "/6000", "-type", "f"], capture_output=True, text=True, check=False
+    )
+    assert found.stdout.split() == []
+    assert not Path("/app/contract").exists() and not Path("/app/docs").exists()  # R1 M-10: .dockerignore

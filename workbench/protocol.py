@@ -15,6 +15,10 @@ from workbench.paths import check_filename, check_id
 MAX_LINE = 1_048_576
 MAX_INPUT_FILES = 1000
 
+#: The message of a job the kernel stopped on one of its limits (memory, CPU time, file size, processes); a job the
+#: executor's watchdog stopped has a message that names the limit instead.
+KILLED = "the job was stopped on a resource limit"
+
 JOB_ID = re.compile(r"[0-9a-f]{32}")
 
 

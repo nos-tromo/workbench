@@ -622,7 +622,9 @@ async def test_run_in_slot_clears_the_slot_after_the_group_kill(
         events.append("group")
         real_kill_group(pgid)
 
-    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))  # no uid switch
+    monkeypatch.setattr(
+        sandbox, "preexec", lambda slot, limits, sockets=None: real_preexec(None, limits, sockets)
+    )  # no uid switch
     monkeypatch.setattr(sandbox, "_kill_group", kill_group)
     monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: events.append(f"slot {slot and slot.index}"))
     status, _ = await run_in_slot(
@@ -646,7 +648,7 @@ async def test_a_failed_slot_cleanup_reaches_the_caller(tmp_path: Path, monkeypa
         """Fail the way an uncleared slot does."""
         raise RuntimeError("processes of slot 2 survived the cleanup")
 
-    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))
+    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits, sockets=None: real_preexec(None, limits, sockets))
     monkeypatch.setattr(sandbox, "kill_slot_processes", refuse)
     with pytest.raises(RuntimeError, match="slot 2"):
         await run_in_slot([sys.executable, "-I", "-c", "pass"], tmp_path, Slot(2, 20003, 20003), _limits())
@@ -918,7 +920,7 @@ async def test_the_slot_cleanup_runs_on_the_pool_it_is_given(
     """The supervisor hands over a pool of its own, so stopped cleanups never take the default pool's threads."""
     threads: list[str] = []
     real_preexec = sandbox.preexec
-    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits: real_preexec(None, limits))
+    monkeypatch.setattr(sandbox, "preexec", lambda slot, limits, sockets=None: real_preexec(None, limits, sockets))
     monkeypatch.setattr(sandbox, "kill_slot_processes", lambda slot: threads.append(threading.current_thread().name))
     argv = [sys.executable, "-I", "-c", code]
 
