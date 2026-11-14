@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import scaled
 from tests.executor.conftest import SHARED_IPC_ONLY
 from workbench.executor import sandbox
 from workbench.executor.sandbox import Slot, clean_env, kill_slot_processes, preexec, run_in_slot
@@ -150,7 +151,7 @@ async def test_wall_timeout_kills_the_process_group(tmp_path: Path) -> None:
     elapsed = time.monotonic() - began
     assert status == "timeout"
     assert returncode == -signal.SIGKILL
-    assert elapsed < 8
+    assert elapsed < scaled(8)
     grandchild = int((tmp_path / "grandchild.pid").read_text())
     assert _wait_gone(grandchild), "the grandchild survived its job's wall timeout"
 

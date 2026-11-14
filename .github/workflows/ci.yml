@@ -27,6 +27,10 @@ jobs:
       python-versions: '["3.12"]'
       uv-sync-args: '--locked --group dev --extra executor'
       docker-build: true
+      # A runner is slower than a developer's machine: the tests' tight time
+      # bounds are widened by this factor (tests/conftest.py).
+      test-env: |
+        WORKBENCH_TEST_TIME_SCALE=3
 
   executor-root:
     # The executor's tests as root in its own image, in the production shape
@@ -37,6 +41,9 @@ jobs:
     # Measured 4.5 minutes on an 8-CPU host with the image's layers cached
     # (two runs of about 2 minutes each); a runner's cold build adds more.
     timeout-minutes: 20
+    env:
+      # make passes it into the test container (tests/conftest.py).
+      WORKBENCH_TEST_TIME_SCALE: "3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

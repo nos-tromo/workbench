@@ -97,11 +97,12 @@ retention-dry-run:
 ### make the leftovers they clear. /scratch stands in for the data volume: the
 ### slot uids must reach it. docker/ is mounted too, read-only: the image leaves
 ### it out, and the healthcheck's test runs the probe written in compose.yaml.
+### WORKBENCH_TEST_TIME_SCALE goes in as the shell has it (tests/conftest.py).
 EXECUTOR_TEST_IMAGE  := workbench-executor:test-root
 EXECUTOR_ROOT_RUN    := docker run --rm --init --read-only --network none --user 0:0 \
 	--security-opt no-new-privileges:true --cap-drop ALL \
 	$(foreach cap,SETUID SETGID CHOWN FOWNER DAC_OVERRIDE KILL,--cap-add $(cap)) \
-	--tmpfs /tmp:mode=0700 --tmpfs /scratch:mode=0755 -e WORKBENCH_TEST_PUBLIC_TMP=/scratch \
+	--tmpfs /tmp:mode=0700 --tmpfs /scratch:mode=0755 -e WORKBENCH_TEST_PUBLIC_TMP=/scratch -e WORKBENCH_TEST_TIME_SCALE \
 	-v "$(CURDIR)/tests:/app/tests:ro" -v "$(CURDIR)/docker:/app/docker:ro" -w /app
 EXECUTOR_ROOT_PYTEST := python -m pytest tests/executor -q -rfEs -p no:cacheprovider -W error
 

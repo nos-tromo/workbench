@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.conftest import _time_scale
 from workbench.config import load_settings
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,25 @@ def test_the_images_leave_out_what_neither_runs() -> None:
     """R1 M-10: the contract's stub model, the tests, the docs and the build helpers stay out of both images."""
     ignored = set((ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines())
     assert {"contract/", "docs/", "**/tests/", "docker/", "make/", "Makefile"} <= ignored
+
+
+def test_ci_widens_the_tests_time_bounds_and_the_root_run_takes_the_factor_in() -> None:
+    """R78: CI sets WORKBENCH_TEST_TIME_SCALE=3 for pytest and for the root run, which hands it to the container."""
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    assert "WORKBENCH_TEST_TIME_SCALE=3" in ci["jobs"]["ci"]["with"]["test-env"].split()
+    assert ci["jobs"]["executor-root"]["env"]["WORKBENCH_TEST_TIME_SCALE"] == "3"
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    run = makefile.split("EXECUTOR_ROOT_RUN    :=", 1)[1].split("\nEXECUTOR_ROOT_PYTEST", 1)[0]
+    assert "-e WORKBENCH_TEST_TIME_SCALE " in run
+
+
+def test_the_time_factor_is_one_unless_set_and_never_below_one() -> None:
+    """A blank or missing factor is 1; anything that is not a number of at least 1 stops the tests at once."""
+    assert _time_scale(None) == _time_scale("  ") == 1.0
+    assert (_time_scale("3"), _time_scale("4.5")) == (3.0, 4.5)
+    for bad in ("0.5", "-1", "fast", "nan"):
+        with pytest.raises(ValueError):
+            _time_scale(bad)
 
 
 def _health_probe() -> str:

@@ -154,6 +154,11 @@ def open_webui_audit_uris() -> list[str]:
     return [str(json.loads(line[line.index("{") :])["request_uri"]) for line in lines if AUDIT_WRITER in line]
 
 
+def open_webui_files(listing: Any) -> list[Any]:
+    """The files of Open WebUI's own ``GET /api/v1/files/``, a list or a page of one."""
+    return listing if isinstance(listing, list) else list(listing.get("items", listing.get("data", [])))
+
+
 def stub_requests(chat: str) -> list[dict[str, Any]]:
     """Read what Open WebUI sent the stub model for one chat: one JSON line per request, in order."""
     lines = docker("logs", container_of("stub-model")).splitlines()
@@ -320,6 +325,9 @@ def test_upload_list_view_through_the_proxy(admin: Account, chat: str) -> None:
     assert read.json() == {"content": CSV.decode()}
     (upload,) = eventually(lambda: upload_events(chat), 1)
     assert upload["actor"] == {"user": admin.id, "via": "service"}
+    stored = admin.client.get("/api/v1/files/")
+    assert stored.status_code == 200, stored.text
+    assert open_webui_files(stored.json()) == []  # R2 M9: Open WebUI keeps nothing of the upload itself
 
 
 def test_tool_call_through_the_proxy(admin: Account, chat: str) -> None:
@@ -416,18 +424,40 @@ def test_the_chat_open_webui_sends_on(admin: Account, chat: str) -> None:
 
 
 def test_each_open_webui_user_has_a_workspace_of_their_own(admin: Account, user_b: Account, chat: str) -> None:
-    """Two accounts, two ids, two workspaces: in the same chat folder user B sees nothing of the admin's."""
+    """Two accounts, two ids, two workspaces: in the same chat folder user B sees nothing of the admin's.
+
+    The browser cannot forge the user (R1 I-5): user B's browser sends the admin's id as ``X-User-Id``, once in that
+    case and once in lower case, and Open WebUI's proxy still names B. B sees nothing of the admin's, and B's upload
+    is recorded with B's account id as its actor.
+    """
     assert admin.id != user_b.id
     admin.upload(chat, "quarterly-figures.csv", CSV)
-    listed = user_b.terminal("GET", "/files/list", chat=chat, params={"directory": f"/workspace/{chat}"})
-    assert listed.json()["entries"] == []
-    assert user_b.terminal("POST", "/tools/list_files", chat=chat, json={}).json() == {"files": [], "truncated": False}
     path = f"/workspace/{chat}/quarterly-figures.csv"
-    assert user_b.terminal("GET", "/files/view", chat=chat, params={"path": path}).status_code == 404
-    user_b.upload(chat, "quarterly-figures.csv", b"item,total\nOwn,1\n")
+    honest: dict[str, str] = {}
+    for forged in (honest, {"X-User-Id": admin.id}, {"x-user-id": admin.id}):
+        listed = user_b.terminal(
+            "GET", "/files/list", chat=chat, params={"directory": f"/workspace/{chat}"}, headers=forged
+        )
+        assert listed.json()["entries"] == [], forged
+        tool = user_b.terminal("POST", "/tools/list_files", chat=chat, json={}, headers=forged)
+        assert tool.json() == {"files": [], "truncated": False}, forged
+        assert (
+            user_b.terminal("GET", "/files/view", chat=chat, params={"path": path}, headers=forged).status_code == 404
+        )
+    forged_upload = {"file": ("quarterly-figures.csv", b"item,total\nOwn,1\n")}
+    r = user_b.terminal(
+        "POST",
+        "/files/upload",
+        chat=chat,
+        params={"directory": f"/workspace/{chat}"},
+        files=forged_upload,
+        headers={"X-User-Id": admin.id},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["path"] == path  # B's own folder, where the name is still free
     eventually(lambda: upload_events(chat), 2)
-    actors = {e["actor"]["user"] for e in workbench_events() if e.get("target", {}).get("container") == f"chat:{chat}"}
-    assert actors == {admin.id, user_b.id}
+    actors = [e["actor"]["user"] for e in upload_events(chat)]
+    assert sorted(actors) == sorted([admin.id, user_b.id])
 
 
 # --- Open WebUI's own audit log -----------------------------------------------------------------------------------

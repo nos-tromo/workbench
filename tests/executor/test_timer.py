@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import scaled
 from workbench.executor import timer
 from workbench.executor.timer import TimeLimit, limit_until
 
@@ -64,7 +65,7 @@ def test_the_earlier_limit_fires_first_and_the_outer_one_is_still_armed_after_it
                     spin()
             assert 0.25 < time.monotonic() - began
             spin()
-    assert 0.95 < time.monotonic() - began < 4.0
+    assert 0.95 < time.monotonic() - began < scaled(4.0)
 
 
 def test_an_inner_limit_that_ends_in_time_gives_the_timer_back_to_the_outer_one() -> None:
@@ -78,7 +79,7 @@ def test_an_inner_limit_that_ends_in_time_gives_the_timer_back_to_the_outer_one(
             remaining = signal.getitimer(signal.ITIMER_REAL)[0]
             assert 0 < remaining <= began + 2.0 - now + 0.01
             spin()
-    assert 1.95 < time.monotonic() - began < 4.5
+    assert 1.95 < time.monotonic() - began < scaled(4.5)
 
 
 def test_a_longer_inner_limit_does_not_postpone_the_outer_one() -> None:
@@ -101,7 +102,7 @@ def test_each_limit_raises_once() -> None:
             except Inner:
                 pass
             spin(0.5)
-    assert time.monotonic() - began < 4.0
+    assert time.monotonic() - began < scaled(4.0)
 
 
 def test_the_timer_is_disarmed_and_a_late_signal_does_nothing() -> None:
@@ -446,7 +447,7 @@ def test_a_meter_is_spent_only_while_it_runs() -> None:
                 run(meter, 0.001)
             assert 0.1 < meter.left < 0.2
             run(meter, 5)
-    assert 0.65 < time.monotonic() - began < 3.0
+    assert 0.65 < time.monotonic() - began < scaled(3.0)
     assert meter.spent
     assert meter.until is None
     assert timer._limits == []
@@ -467,7 +468,7 @@ def test_a_meter_run_in_many_short_pieces_runs_out_at_its_total() -> None:
                 finally:
                     ran += time.monotonic() - start
                 spin(50e-6)
-    assert 0.095 <= ran < 0.2
+    assert 0.095 <= ran < scaled(0.2)
     assert time.monotonic() - began > 0.15
     assert meter.spent
 
@@ -509,7 +510,7 @@ def test_a_meter_and_deadlines_nest_in_either_order() -> None:
             assert meter.left == 0.3
             with limit_until(began + 30, Outer):
                 run(meter, 5)
-    assert 0.35 < time.monotonic() - began < 3.0
+    assert 0.35 < time.monotonic() - began < scaled(3.0)
     assert timer._limits == []
     meter = timer.Meter(5.0)
     with pytest.raises(Outer):

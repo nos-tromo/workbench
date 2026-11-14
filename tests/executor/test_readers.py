@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import scaled
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers
 from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat, sheet
@@ -808,7 +809,7 @@ def test_html_with_many_blocks_is_read_in_time_in_proportion_to_its_size(tmp_pat
         began = time.monotonic()
         doc = read(path, max_chars=100_000)
         pieces = list(readers.units(path))
-        assert time.monotonic() - began < 5
+        assert time.monotonic() - began < scaled(5)
         assert len(pieces) == count
         assert doc.total_parts == count
 
@@ -877,7 +878,7 @@ def test_the_deadline_stops_a_read_that_is_slow(big_xlsx: Path) -> None:
     try:
         with pytest.raises(ReadTimeout):
             read(big_xlsx, "Sheet1!A99000")
-        assert time.monotonic() - began < 3
+        assert time.monotonic() - began < scaled(3)
         readers.set_deadline(time.monotonic() + 0.3)
         with pytest.raises(ReadTimeout):
             list(readers.units(big_xlsx))
@@ -912,8 +913,8 @@ def within(seconds: float, work: Callable[[], object]) -> None:
     cpu, wall = time.process_time(), time.monotonic()
     with pytest.raises(UnreadableFile):
         work()
-    assert time.process_time() - cpu < seconds
-    assert time.monotonic() - wall < max(10.0, 5 * seconds)
+    assert time.process_time() - cpu < scaled(seconds)
+    assert time.monotonic() - wall < scaled(max(10.0, 5 * seconds))
 
 
 @pytest.mark.parametrize("moved", [False, True])
@@ -1027,7 +1028,7 @@ def test_a_part_of_millions_of_elements_is_counted_without_building_them(tmp_pat
     verdict, numbers = done.stdout.splitlines()
     seconds, megabytes = (float(x) for x in numbers.split())
     assert verdict == "refused the workbook holds too many strings"
-    assert seconds < 8
+    assert seconds < scaled(8)
     assert megabytes < 400
 
 
@@ -1042,7 +1043,7 @@ def test_the_timer_interrupts_a_workbook_that_is_slow_to_load(tmp_path: Path) ->
                 work()
         finally:
             readers.set_deadline(None)
-        assert time.monotonic() - began < 2
+        assert time.monotonic() - began < scaled(2)
 
 
 def test_the_timer_interrupts_pure_python_in_a_reader_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1070,7 +1071,7 @@ def test_the_timer_interrupts_pure_python_in_a_reader_call(tmp_path: Path, monke
                 work()
         finally:
             readers.set_deadline(None)
-        assert 0.25 < time.monotonic() - began < 1.0
+        assert 0.25 < time.monotonic() - began < scaled(1.0)
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
 

@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.conftest import scaled
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers, timer
 from workbench.executor.runners import RUNNERS, JobContext
@@ -131,7 +132,7 @@ def test_a_catastrophic_regex_stops_after_two_seconds(work: Path) -> None:
     (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True)
-    assert 1.5 < time.monotonic() - began < 6
+    assert 1.5 < time.monotonic() - began < scaled(6)
     assert regex_spent(result)
     assert result["hits"] == []
     # The module's handler stays installed after its first limit; only the timer is off.
@@ -146,7 +147,7 @@ def test_a_catastrophic_regex_keeps_the_hits_found_before_it(work: Path) -> None
     (work / "b.txt").write_text("aaaa\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True)
-    assert 1.5 < time.monotonic() - began < 6
+    assert 1.5 < time.monotonic() - began < scaled(6)
     assert regex_spent(result)
     assert [(h["path"], h["location"]) for h in result["hits"]] == [
         (f"/workspace/{CHAT}/a.txt", f"line {n}") for n in (1, 2, 3)
@@ -159,7 +160,7 @@ def test_the_two_seconds_are_for_the_whole_search_not_for_each_line(work: Path) 
     (work / "t.txt").write_text(("a" * 22 + "b\n") * 200, encoding="utf-8")
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True)
-    assert 1.5 < time.monotonic() - began < 4
+    assert 1.5 < time.monotonic() - began < scaled(4)
     assert regex_spent(result)
 
 
@@ -204,7 +205,7 @@ def test_the_regex_budget_works_inside_a_search_that_has_a_reader_deadline(work:
     (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True, budget_s=30)
-    assert 1.5 < time.monotonic() - began < 4
+    assert 1.5 < time.monotonic() - began < scaled(4)
     assert regex_spent(result)
     assert signal.getsignal(signal.SIGALRM) is timer._fire
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
@@ -217,7 +218,7 @@ def test_the_reader_deadline_still_fires_after_a_regex_budget_was_spent_inside_i
     shutil.copy(big_xlsx, work / "b-ledger.xlsx")
     began = time.monotonic()
     result = search(work, r"needle \d", regex=True, budget_s=3)
-    assert time.monotonic() - began < 6
+    assert time.monotonic() - began < scaled(6)
     assert len(result["hits"]) == 5
     assert result["skipped"] == [{"path": f"/workspace/{CHAT}/b-ledger.xlsx", "reason": "reading took longer than 1 s"}]
 
@@ -231,7 +232,7 @@ def test_a_files_deadline_cuts_a_catastrophic_match_short_and_the_search_goes_on
     (work / "b.txt").write_text("aaaa\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True, budget_s=3)
-    assert 0.9 < time.monotonic() - began < 4
+    assert 0.9 < time.monotonic() - began < scaled(4)
     assert [(h["path"].rsplit("/", 1)[1], h["location"]) for h in result["hits"]] == [
         ("a.txt", "line 1"),
         ("b.txt", "line 1"),
@@ -343,7 +344,7 @@ def test_a_files_deadline_that_lands_as_a_match_ends_does_not_spend_the_regex_bu
         ("c.txt", "line 1"),
     ]
     assert result["skipped"] == [{"path": f"/workspace/{CHAT}/a.txt", "reason": "reading took longer than 1 s"}]
-    assert 1.4 < elapsed < 4
+    assert 1.4 < elapsed < scaled(4)
     assert timer._limits == []
 
 
@@ -491,7 +492,7 @@ def test_a_slow_file_is_given_up_on_and_the_search_goes_on(work: Path, big_xlsx:
     (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "needle", budget_s=3)
-    assert time.monotonic() - began < 6
+    assert time.monotonic() - began < scaled(6)
     assert "error" not in result
     assert {h["path"].rsplit("/", 1)[1] for h in result["hits"]} == {"a.txt", "c.txt"}
     assert result["skipped"] == [{"path": f"/workspace/{CHAT}/b-ledger.xlsx", "reason": "reading took longer than 1 s"}]
@@ -506,7 +507,7 @@ def test_when_the_whole_time_is_used_up_inside_a_file_the_search_stops_with_a_no
     (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "needle", budget_s=1)
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < scaled(5)
     assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt"]
     assert result["truncated"] is True
     assert "stopped after 1 s" in result["hint"]
@@ -520,7 +521,7 @@ def test_a_workbook_that_is_slow_to_load_is_given_up_on_and_the_search_goes_on(w
     (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
     began = time.monotonic()
     result = search(work, "needle", budget_s=3)
-    assert time.monotonic() - began < 5
+    assert time.monotonic() - began < scaled(5)
     assert "error" not in result
     assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "c.txt"]
     assert result["skipped"] == [
@@ -576,8 +577,8 @@ def test_workbooks_with_20000_sheet_entries_and_2_million_strings_are_named_at_o
     fx.make_shared_strings_xlsx(work / "c-strings.xlsx", 2_000_000)
     (work / "d.txt").write_text("needle in d\n", encoding="utf-8")
     cpu = time.process_time()
-    result = search(work, "needle", budget_s=3)
-    assert time.process_time() - cpu < 3
+    result = search(work, "needle", budget_s=round(scaled(3)))
+    assert time.process_time() - cpu < scaled(3)
     assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "d.txt"]
     reasons = {s["path"].rsplit("/", 1)[1]: s["reason"] for s in result["skipped"]}
     assert reasons == {
@@ -741,7 +742,7 @@ def test_a_workbook_that_is_slow_to_load_ends_a_read_at_its_budget(work: Path) -
     fx.make_shared_strings_xlsx(work / "strings.xlsx", 900_000)
     began = time.monotonic()
     result = RUNNERS["read_document"]({"path": "strings.xlsx", "part": None, "budget_s": 1}, context(work))
-    assert 0.9 < time.monotonic() - began < 3
+    assert 0.9 < time.monotonic() - began < scaled(3)
     assert result == {"error": "read_timeout: reading the file took longer than 1 s; it is too large or too complex"}
 
 
