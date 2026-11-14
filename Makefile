@@ -57,7 +57,7 @@ help:
 	@echo "  make test-executor-root  executor tests as root in the executor image: production shape, then Docker's default /dev/shm"
 	@echo "  make test-isolation      build + start the test stack (own project, volume, network), run pytest -m isolation, remove it"
 	@echo "  make test-load           the same stack, then the 10-user load test (pytest -m load; manual, not in CI); prints its numbers"
-	@echo "  make test-contract       build + start the contract stack (test stack + Open WebUI v0.13.3, own project), run pytest -m contract, remove it"
+	@echo "  make test-contract       build + start the contract stack (test stack + the pinned Open WebUI, own project), run pytest -m contract, remove it"
 
 ### Container status, then the api's /healthz asked from inside its container:
 ### production publishes no port. Both services report (healthy) in the status

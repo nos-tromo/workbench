@@ -58,6 +58,9 @@ _UNITS: Final = {
 }
 _USAGE: Final = re.compile(r"([0-9.]+)\s*([A-Za-z]+)\s*/")
 
+#: Seconds to wait for ``docker stats`` to send its first sample before the load starts.
+FIRST_SAMPLE_S: Final = 30.0
+
 
 @dataclass
 class Call:
@@ -101,7 +104,11 @@ def _bytes(text: str) -> int | None:
 
 @contextmanager
 def sampled(container: str) -> Iterator[Samples]:
-    """Stream ``docker stats`` of a container while the block runs; it sends a sample about every half second."""
+    """Stream ``docker stats`` of a container while the block runs; it sends a sample about every half second.
+
+    The load starts only once the first sample is in. One that does not come within :data:`FIRST_SAMPLE_S`, or a
+    ``docker stats`` that ends first, fails the test with the reason instead of waiting for ever.
+    """
     samples = Samples()
     stream = subprocess.Popen(
         ["docker", "stats", "--format", "{{.MemUsage}}", container], stdout=subprocess.PIPE, text=True
@@ -119,7 +126,12 @@ def sampled(container: str) -> Iterator[Samples]:
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     try:
+        deadline = time.monotonic() + FIRST_SAMPLE_S
         while not samples.used:  # the first sample is there before the load starts
+            if not reader.is_alive():
+                pytest.fail(f"docker stats of the executor ended (status {stream.poll()}) before its first sample")
+            if time.monotonic() > deadline:
+                pytest.fail(f"docker stats sent no sample of the executor within {FIRST_SAMPLE_S:.0f} s")
             time.sleep(0.1)
         yield samples
         time.sleep(1.5)  # and one more after it ends

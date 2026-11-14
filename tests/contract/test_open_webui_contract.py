@@ -3,6 +3,8 @@
 ``make test-contract`` brings up ``contract/compose.yaml``: workbench's test stack and the Open WebUI image
 open-webui-service deploys, with the connection production uses. The tests sign up synthetic accounts, then call
 Open WebUI as its browser does, so every workbench path goes through Open WebUI's proxy, ``/api/v1/terminals/<id>/``.
+The browser is emulated, not observed: the tests send the calls the pinned image's frontend makes
+(``src/lib/apis/terminal/index.ts``), and no real browser runs here.
 What Open WebUI passes on is read back where workbench shows it: ``/files/cwd`` names the chat ``X-Session-Id``
 carried, and workbench's audit events name ``X-User-Id`` as their actor and that chat as their folder.
 
@@ -37,8 +39,11 @@ TERMINAL: Final = "workbench"
 PROXY: Final = f"/api/v1/terminals/{TERMINAL}"
 
 #: Every workbench path these tests make Open WebUI call: through its proxy, as its browser does, and the two of the
-#: admin's verify call (``/api/v1/policies``, which must not answer 2xx, then ``/api/config``). An image whose proxy,
-#: browser or verify call no longer gets to one of them fails on it, by name.
+#: admin's verify call (``/api/v1/policies``, which must not answer 2xx, then ``/api/config``). Every proxied call goes
+#: through :meth:`Account.terminal`, which refuses a path not listed here, so an image whose proxy no longer gets to one
+#: fails on it, by name. The browser's calls are the test's own, made as the pinned image's frontend makes them; a
+#: frontend that changed its paths would not fail here. The two verify paths never go through the helper: Open WebUI
+#: calls them itself, and only verify's answer is checked (:func:`test_verify_sees_a_plain_terminal`).
 TERMINAL_PATHS: Final = (
     "/api/v1/policies",
     "/api/config",
@@ -60,7 +65,8 @@ TERMINAL_PATHS: Final = (
 #: ``/openapi.json`` (the model is offered the nine tools), ``/api/config`` and ``/system`` (workbench's prompt reaches
 #: the model) and ``/tools/read_document`` (its audit event, its answer back to the model). The handshake leaves no
 #: trace it can see: the cwd only ever describes a ``run_command`` tool workbench has none of, and workbench answers
-#: 404 for ``<home>/AGENTS.md`` (files live in chat folders), so those two stay unpinned.
+#: 404 for ``<home>/AGENTS.md`` (files live in chat folders), so those two stay unpinned. Documentation only: no test
+#: reads this list, so nothing fails on it.
 CHAT_PATHS: Final = ("/openapi.json", "/api/config", "/system", "/files/cwd", "/files/read", "/tools/read_document")
 
 #: The stack's one model (contract/stub_model.py) and the text it answers with once a tool has answered.
@@ -135,6 +141,19 @@ def workbench_events() -> list[dict[str, Any]]:
     return [event for line in lines if line.startswith("{") and "operation" in (event := json.loads(line))]
 
 
+def upload_events(chat: str) -> list[dict[str, Any]]:
+    """Read workbench's upload events of one chat folder so far."""
+    return [
+        e for e in workbench_events() if e["operation"] == "file.upload" and e["target"]["container"] == f"chat:{chat}"
+    ]
+
+
+def open_webui_audit_uris() -> list[str]:
+    """Read the request URIs of Open WebUI's own audit records so far, in order."""
+    lines = docker("logs", container_of("open-webui")).splitlines()
+    return [str(json.loads(line[line.index("{") :])["request_uri"]) for line in lines if AUDIT_WRITER in line]
+
+
 def stub_requests(chat: str) -> list[dict[str, Any]]:
     """Read what Open WebUI sent the stub model for one chat: one JSON line per request, in order."""
     lines = docker("logs", container_of("stub-model")).splitlines()
@@ -142,7 +161,11 @@ def stub_requests(chat: str) -> list[dict[str, Any]]:
 
 
 def eventually(read: Callable[[], list[Any]], count: int, seconds: float = 30.0) -> list[Any]:
-    """Read again until ``read`` finds at least ``count`` items, or the time is up; then the last reading."""
+    """Read again until ``read`` finds at least ``count`` items, or the time is up; then the last reading.
+
+    A container's log is read through docker, whose copier may not have written a line yet when the HTTP answer that
+    caused it has come back; every read of an audit event goes through here.
+    """
     deadline = time.monotonic() + seconds
     while len(found := read()) < count and time.monotonic() < deadline:
         time.sleep(0.5)
@@ -295,9 +318,7 @@ def test_upload_list_view_through_the_proxy(admin: Account, chat: str) -> None:
     assert (viewed.status_code, viewed.content) == (200, CSV)
     read = admin.terminal("GET", "/files/read", chat=chat, params={"path": path})
     assert read.json() == {"content": CSV.decode()}
-    (upload,) = [
-        e for e in workbench_events() if e["operation"] == "file.upload" and e["target"]["container"] == f"chat:{chat}"
-    ]
+    (upload,) = eventually(lambda: upload_events(chat), 1)
     assert upload["actor"] == {"user": admin.id, "via": "service"}
 
 
@@ -404,6 +425,7 @@ def test_each_open_webui_user_has_a_workspace_of_their_own(admin: Account, user_
     path = f"/workspace/{chat}/quarterly-figures.csv"
     assert user_b.terminal("GET", "/files/view", chat=chat, params={"path": path}).status_code == 404
     user_b.upload(chat, "quarterly-figures.csv", b"item,total\nOwn,1\n")
+    eventually(lambda: upload_events(chat), 2)
     actors = {e["actor"]["user"] for e in workbench_events() if e.get("target", {}).get("container") == f"chat:{chat}"}
     assert actors == {admin.id, user_b.id}
 
@@ -414,19 +436,17 @@ def test_each_open_webui_user_has_a_workspace_of_their_own(admin: Account, user_
 def test_open_webui_audit_skips_the_terminal_proxy(admin: Account, chat: str) -> None:
     """With ``AUDIT_EXCLUDED_PATHS=/terminals`` no record names an uploaded file: its name is in the proxy's URLs.
 
-    Other requests are still recorded, so the log is on and the exclusion is what keeps the names out.
+    Other requests are still recorded, so the log is on and the exclusion is what keeps the names out. The last request
+    carries a marker of this run; once its record is in the log, so is every record of the requests before it.
     """
     name = f"harbour-ledger-{secrets.token_hex(4)}.csv"
+    marker = secrets.token_hex(8)
     admin.upload(chat, name, CSV)
     admin.terminal("GET", "/files/view", chat=chat, params={"path": f"/workspace/{chat}/{name}"})
-    admin.client.get("/api/v1/auths/")
-    records = [
-        json.loads(line[line.index("{") :])
-        for line in docker("logs", container_of("open-webui")).splitlines()
-        if AUDIT_WRITER in line
-    ]
-    uris = [str(record["request_uri"]) for record in records]
-    assert any(uri.endswith("/api/v1/auths/") for uri in uris), uris[-5:]
+    admin.client.get("/api/v1/auths/", params={"marker": marker})
+    marked = eventually(lambda: [uri for uri in open_webui_audit_uris() if marker in uri], 1)
+    assert [uri.split("?", 1)[0] for uri in marked] == [f"{OPEN_WEBUI}/api/v1/auths/"], marked
+    uris = open_webui_audit_uris()
     assert [uri for uri in uris if name in uri or "/terminals" in uri] == []
 
 
@@ -439,8 +459,11 @@ def test_a_chats_own_tool_call(admin: Account) -> None:
     The stub model asks for ``read_document`` on a file of the chat; Open WebUI makes that call on workbench itself.
     workbench records exactly that tool event, its actor the account's id and its folder the saved chat (``X-User-Id``
     and ``X-Session-Id`` on the server-side call). The model was offered the nine tools (``/openapi.json``) and
-    workbench's prompt (``/api/config``, ``/system``), and got the tool's answer back. :data:`CHAT_PATHS` says what
-    stays unpinned.
+    workbench's prompt (``/api/config``, ``/system``), and got the tool's answer back. Its own answer is in the message
+    Open WebUI streamed: a saved chat's turn runs as a task of Open WebUI's, whose stream goes to the browser over its
+    socket (the HTTP answer is ``null``), and the message it streamed is saved in the chat. The tool event is counted
+    again once the model has answered, so a late second call fails too.
+    :data:`CHAT_PATHS` says what stays unpinned.
     """
     new: dict[str, Any] = {
         "title": "Synthetic chat",
@@ -452,15 +475,14 @@ def test_a_chats_own_tool_call(admin: Account) -> None:
     assert made.status_code == 200, made.text
     chat = made.json()["id"]
     path = admin.upload(chat, "quarterly-figures.csv", CSV).json()["path"]
-    (upload,) = [
-        e for e in workbench_events() if e["operation"] == "file.upload" and e["target"]["container"] == f"chat:{chat}"
-    ]
+    (upload,) = eventually(lambda: upload_events(chat), 1)
     prompt = admin.terminal("GET", "/system").json()["prompt"]
+    message = str(uuid.uuid4())
     body = {
         "model": STUB_MODEL,
         "messages": [{"role": "user", "content": f"What is in {path}?"}],
         "chat_id": chat,
-        "id": str(uuid.uuid4()),
+        "id": message,
         "terminal_id": TERMINAL,
         "stream": True,
         "params": {"function_calling": "native"},
@@ -468,6 +490,10 @@ def test_a_chats_own_tool_call(admin: Account) -> None:
     with admin.client.stream("POST", "/api/chat/completions", json=body) as r:
         assert r.status_code == 200, r.read()
         r.read()
+
+    def streamed() -> list[str]:
+        saved = admin.client.get(f"/api/v1/chats/{chat}").json()["chat"]["history"]["messages"].get(message, {})
+        return [str(saved.get("content", ""))] if saved.get("done") else []
 
     def tool_events() -> list[dict[str, Any]]:
         return [
@@ -483,8 +509,12 @@ def test_a_chats_own_tool_call(admin: Account) -> None:
     assert event["target"]["ids"] == upload["target"]["ids"]
     asked, answered = eventually(lambda: stub_requests(chat), 2)[:2]
     assert set(asked["tools"]) == TOOLS
+    assert prompt.strip()
     assert prompt.strip() in asked["system"]
     assert asked["tool_answers"] == []
     (tool_answer,) = answered["tool_answers"]
     assert "Dredging" in tool_answer
     assert len(stub_requests(chat)) == 2
+    assert [e["operation"] for e in tool_events()] == ["tool.read_document"]  # still one, once the model has answered
+    (answer,) = eventually(streamed, 1)
+    assert STUB_ANSWER in answer

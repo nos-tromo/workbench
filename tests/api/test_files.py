@@ -213,20 +213,29 @@ def test_mkdir_over_a_file_is_a_conflict(client: TestClient) -> None:
 
 
 @pytest.mark.parametrize(
-    ("route", "body"),
+    ("route", "field", "value"),
     [
-        ("/files/mkdir", b'{"folder": "a\\ud800"}'),
-        ("/files/move", b'{"source": "/workspace/chat-1/a\\udc00"}'),
-        ("/files/cwd", b'{"cwd": "\\ud800"}'),
+        ("/files/mkdir", "folder", "harbour\\ud800"),
+        ("/files/move", "source", "/workspace/chat-1/harbour\\udc00"),
+        ("/files/cwd", "cwd", "\\ud800"),
     ],
     ids=["mkdir", "move", "cwd"],
 )
-def test_a_lone_surrogate_in_a_files_body_is_never_a_500(client: TestClient, route: str, body: bytes) -> None:
-    """JSON may carry the escape of half a pair, which UTF-8 cannot hold; the 422 names the field, never the body."""
+def test_a_lone_surrogate_in_a_files_body_is_never_a_500(
+    client: TestClient, route: str, field: str, value: str
+) -> None:
+    """JSON may carry the escape of half a pair, which UTF-8 cannot hold; the 422 names the field, never the body.
+
+    The value comes back neither as it was sent nor as it was read, with U+FFFD in place of the half pair.
+    """
+    body = f'{{"{field}": "{value}"}}'.encode()
     r = client.post(route, content=body, headers={**H, "Content-Type": "application/json"})
     assert r.status_code == 422, r.text
     assert [set(error) for error in r.json()["detail"]] == [{"type", "loc", "msg"}]
-    assert "a" not in [part for error in r.json()["detail"] for part in error["loc"]]
+    assert "�" not in r.text
+    assert value not in r.text
+    readable = value.split("\\u", 1)[0]
+    assert readable == "" or readable not in r.text
 
 
 def test_a_lone_surrogate_in_a_folders_name_is_read_as_a_replacement_character(client: TestClient) -> None:

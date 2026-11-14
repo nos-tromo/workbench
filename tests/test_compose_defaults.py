@@ -318,18 +318,27 @@ def test_the_contract_stacks_stub_model_is_hardened_and_publishes_nothing() -> N
     assert stub["read_only"] is True
     assert stub["security_opt"] == ["no-new-privileges:true"]
     assert stub["cap_drop"] == ["ALL"]
+    assert stub["tmpfs"] == ["/tmp:size=1m"]
     assert "cap_add" not in stub and "user" not in stub  # the image's own uid, 10001
     assert (ROOT / "contract" / "stub_model.py").is_file()
 
 
 def test_the_contract_runs_open_webui_as_production_does() -> None:
-    """Open WebUI by tag and digest, production's switches, one bearer connection to workbench-api, Dependabot's.
+    """Open WebUI by tag and digest, hardened as in production, its switches, one bearer connection, Dependabot's.
+
+    Hardened as open-webui-service runs it: uid 10001, a read-only root, every capability dropped, no privilege
+    escalation.
 
     The image's value is contract/compose.yaml's alone, so a Dependabot bump passes here and reaches the contract job.
     Its one provider is an OpenAI-compatible endpoint, as in production, here the stub model; Ollama stays off.
     """
     open_webui = contract_stack()["services"]["open-webui"]
     assert OPEN_WEBUI_IMAGE.fullmatch(open_webui["image"]), open_webui["image"]
+    assert open_webui["user"] == "10001:10001"
+    assert open_webui["read_only"] is True
+    assert open_webui["cap_drop"] == ["ALL"]
+    assert "cap_add" not in open_webui
+    assert open_webui["security_opt"] == ["no-new-privileges:true"]
     env = open_webui["environment"]
     assert {key: env.get(key) for key in CONTRACT_SWITCHES} == CONTRACT_SWITCHES
     assert (env["ENABLE_OPENAI_API"], env["OPENAI_API_BASE_URL"], env["ENABLE_OLLAMA_API"]) == (

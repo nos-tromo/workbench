@@ -19,7 +19,7 @@ most :data:`MAX_ERRORS` are listed, the rest counted in ``more_errors``.
 """
 
 from collections.abc import Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -99,7 +99,7 @@ async def _invalid(_request: Request, exc: Exception) -> JSONResponse:
         The 422: ``detail`` lists the first :data:`MAX_ERRORS` errors as ``type``, ``loc`` and ``msg``;
         ``more_errors`` counts the rest, when there are more.
     """
-    errors: Sequence[Any] = exc.errors() if isinstance(exc, RequestValidationError) else ()
+    errors: Sequence[Any] = cast(RequestValidationError, exc).errors()  # install() registers it for no other
     detail = [
         {
             "type": str(error.get("type", "")),

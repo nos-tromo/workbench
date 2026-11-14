@@ -872,13 +872,17 @@ def test_a_stop_ends_a_users_orphans_between_two_batches(
 ) -> None:
     """Within one user too, a cancel ends the walk before its next record.
 
-    The second batch of 200 waits for the next sweep, and so do the folders the first left empty.
+    The second batch of 200 waits for the next sweep, and so do the folders the first left empty: an empty chat folder
+    beside it, untouched for two hours, is still there.
     """
     clock.now = time.time()
     chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
     for n in range(201):
         orphan(chat / f"{n:032x}.part", clock.now)
     age(chat, 2 * HOUR, clock.now)
+    empty = chat.parent / "chat-2"
+    empty.mkdir()
+    age(empty, 2 * HOUR, clock.now)
     stop = threading.Event()
     record = sweeper._record_orphans
 
@@ -893,6 +897,7 @@ def test_a_stop_ends_a_users_orphans_between_two_batches(
     (event,) = sweeps(audit_lines)
     assert event["target"]["count"] == 200
     assert len(list(chat.iterdir())) == 1
+    assert empty.is_dir()
 
 
 def test_a_stop_during_the_prune_ends_it_before_the_next_staging_folder(

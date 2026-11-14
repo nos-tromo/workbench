@@ -68,10 +68,12 @@ jobs:
           make test-isolation
 
   contract:
-    # The terminal contract against the Open WebUI image open-webui-service
-    # deploys (contract/compose.yaml, the same tag and digest): an image bump
-    # that changes what Open WebUI calls, sends or passes back fails here.
-    # The job pulls that image; it never runs on the airgapped host.
+    # The terminal contract against the Open WebUI image pinned in
+    # contract/compose.yaml: a bump that changes what Open WebUI calls, sends
+    # or passes back fails here. That the pin is the tag and digest
+    # open-webui-service deploys is checked by a human before a bump merges
+    # (contract/compose.yaml and dependabot.yml say so); CI checks only its
+    # shape. The job pulls that image; it never runs on the airgapped host.
     runs-on: ubuntu-latest
     needs: ci
     # Measured 25 s on an 8-CPU host with every image cached (the tests

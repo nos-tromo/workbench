@@ -542,3 +542,15 @@ def test_a_422_lists_at_most_20_errors_and_counts_the_rest(client: TestClient, f
     assert body["more_errors"] == 5
     assert {key for error in body["detail"] for key in error} == {"type", "loc", "msg"}
     assert fake_executor.requests == []
+
+
+@pytest.mark.parametrize(("columns", "more"), [(20, None), (21, 1)])
+def test_a_422_with_20_errors_counts_none_more(
+    client: TestClient, fake_executor: Local, columns: int, more: int | None
+) -> None:
+    """Exactly 20 errors are all listed and nothing is counted; the 21st is the first ``more_errors`` counts."""
+    body = table(client, columns=list(range(columns))).json()
+    assert len(body["detail"]) == 20
+    assert body.get("more_errors", None) == more
+    assert ("more_errors" in body) is (more is not None)
+    assert fake_executor.requests == []

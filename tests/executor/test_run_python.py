@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import CodeType, FrameType
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -564,12 +564,21 @@ def after_a_drop(action: Callable[[FrameType], None], when: Callable[[], bool] =
         monitoring.free_tool_id(tool)
 
 
+#: Where the kernel lists this process's threads, native ones included. ``threading.active_count()`` sees only the
+#: threads Python started, never a BLAS pool's (OpenBLAS, Accelerate), and those are the ones that take a held signal.
+_TASKS: Final = Path("/proc/self/task")
+
+#: The tests that hold ``SIGALRM`` back need the kernel's count of this process's threads.
+needs_task_list = pytest.mark.skipif(
+    not _TASKS.is_dir(),
+    reason="alarm_held needs /proc/self/task to count native threads (a BLAS pool would take the held signal); "
+    "threading.active_count() cannot see them",
+)
+
+
 def _threads() -> int:
-    """Count this process's threads: the kernel's own count where ``/proc`` has one, else Python's."""
-    try:
-        return len(os.listdir("/proc/self/task"))
-    except OSError:
-        return threading.active_count()
+    """Count this process's threads as the kernel does, native ones included."""
+    return len(os.listdir(_TASKS))
 
 
 @contextmanager
@@ -578,7 +587,8 @@ def alarm_held() -> Iterator[None]:
 
     A blocked signal is held back only in the thread that blocks it: the kernel hands the timer's signal to any other
     thread, and Python then handles it in this one, wherever it is. So the process must have no other thread
-    (``tests/conftest.py`` keeps numpy from starting its BLAS pool).
+    (``tests/conftest.py`` keeps numpy from starting its BLAS pool). Only the kernel's list counts native threads, so a
+    test that uses this is marked :data:`needs_task_list`.
     """
     threads = _threads()
     assert threads == 1, f"alarm_held needs this process's only thread, and it has {threads}: the signal would go there"
@@ -595,6 +605,7 @@ def _counts_are_exact(capture: _Capture) -> None:
     assert capture._tail_size == sum(map(len, capture._tail))
 
 
+@needs_task_list
 def test_a_timeout_just_after_a_drop_waits_until_the_write_is_whole() -> None:
     """A deadline handled just after a piece left the tail used to leave that piece counted in the tail's size.
 
@@ -655,6 +666,7 @@ def test_a_handler_of_the_codes_own_that_raises_just_after_a_drop_leaves_the_cap
     assert capture.parts() == ("a" * 8, "d" * 8, 52 - 16)
 
 
+@needs_task_list
 def test_a_timeout_in_the_middle_of_a_write_of_the_code_still_answers_that_it_timed_out(tmp_job: Job) -> None:
     """The deadline lands just after a drop in code that writes long lines: the answer is the code's timeout."""
     began = time.monotonic()

@@ -672,3 +672,29 @@ def test_a_422_cuts_what_it_names_of_the_request(client: TestClient, store: Stor
     assert len(r.text) < 2000
     assert key[:400] not in r.text and tag[:400] not in r.text
     assert fake_executor.requests == []
+
+
+#: What pydantic says of a source kind it does not know, around the kind itself: 107 characters without it.
+UNKNOWN_KIND = (
+    "Input tag '{}' found using 'kind' does not match any of the expected tags: 'file', 'job', 'user', 'assistant'"
+)
+
+
+@pytest.mark.parametrize("size", [300, 301])
+def test_a_422_keeps_300_characters_of_a_part_and_cuts_the_301st(
+    client: TestClient, fake_executor: Local, size: int
+) -> None:
+    """A location part or a message of 300 characters is whole; one more, and it is its first 300 and `` [cut]``."""
+    key = "k" * size
+    tag = "t" * (size - len(UNKNOWN_KIND.format("")))
+    message = UNKNOWN_KIND.format(tag)
+    assert len(message) == size
+    values = {key: {"value": 1, "source": ASSISTANT}, "x": {"value": 1, "source": {"kind": tag}}}
+    r = client.post("/tools/fill_template", json={"path": f"{CHAT}/form.docx", "values": values}, headers=H)
+    assert r.status_code == 422
+    by_type = {error["type"]: error for error in r.json()["detail"]}
+    shown_key = key if size == 300 else key[:300] + " [cut]"
+    shown_message = message if size == 300 else message[:300] + " [cut]"
+    assert by_type["string_too_long"]["loc"] == ["body", "values", shown_key, "[key]"]
+    assert by_type["union_tag_invalid"]["msg"] == shown_message
+    assert fake_executor.requests == []
