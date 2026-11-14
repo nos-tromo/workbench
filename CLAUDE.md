@@ -134,7 +134,10 @@ key and allowed tools. Version 1 has `open-webui`; docint joins in version 2.
   (file browser) and retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error
   answers are short fixed texts (`workbench/api/errors.py`); no handler logs a
-  traceback or a cause of a path or store error.
+  traceback or a cause of a path or store error. An error no handler expected is
+  a 500 `internal error`, logged by method, route template and type alone
+  (`errors.QuietErrors`); the supervisor logs such errors by type too. An audit
+  event names at most 200 file ids; more go on `<operation>.ids` continuations.
 - **Fail closed.** An action whose audit event cannot be written does not
   happen; a retention record that cannot be written stops the api.
 

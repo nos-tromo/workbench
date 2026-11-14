@@ -22,7 +22,7 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | `action` / `operation` | by event key, below |
 | `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
-| `target` | `kind: file`, `ids` (the files' ids), `count`, `container: chat:<chat-id>` |
+| `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
 | `criteria` | `caller` (`open-webui`), and the keys below |
 
 The `container` is the chat folder the files live in, never the chat the
@@ -47,6 +47,11 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 | `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`) | `ok`, once the new file is kept |
 | `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size | `ok`, once the new file is kept |
 | `write_document` | `collect` / `tool.write_document` | the new file | — | `ok`, once the new file is kept |
+
+An event about more than 200 files is followed by continuation events under
+`<operation>.ids` (`tool.search_files.ids`, `tool.run_python.ids`,
+`tool.fill_template.ids`), each naming up to 200 more of its files (see
+[Long lists of files](#long-lists-of-files)).
 
 `fill_template`, `write_table` and `write_document` also write an `error`
 event in one case: the job's answer could not be used, so the new file must
@@ -80,11 +85,21 @@ returned. The api's audit methods take file ids and counts and no name
 
 ### Long lists of files
 
-An event names at most 200 file ids (`MAX_IDS` of the audit library). An event
-about more files names the first 200, sets `target.ids_truncated: true`, and
-`target.count` holds the full number. `search_files` and `run_python`, which can
-be given up to 1000 files, and `fill_template` with many file sources can reach
-it. Retention never does: its batches are of at most 200 files.
+An event names at most 200 file ids (`MAX_IDS` of the audit library). An action
+on more files is split, never cut (ADR 0003):
+
+- its event, under its own operation, names the first 200 ids, and
+  `target.count` holds the full number;
+- each further 200 ids go on a continuation event, `<operation>.ids` (for
+  example `tool.search_files.ids`), with `parent_event_id` the event's
+  `event_id`. It has the same `action`, `actor`, `outcome`, purpose and
+  `container`, `target.count` the number of its own ids, and no `criteria`.
+
+No event sets `ids_truncated`. `search_files` and `run_python`, which can be
+given up to 1000 files, and `fill_template` with many file sources can need
+continuations (`workbench/api/audit.py:AuditLog._emit`, with the shared
+`audit_runtime.id_chunks`). Retention never does: its batches are of at most
+200 files.
 
 ## Retention events
 
@@ -137,9 +152,11 @@ not use it.
 - **No `recipient` on `disclose`.** A view, read or display goes to the user's
   own session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
-- **No request id and no parent event.** Open WebUI's tool calls carry no
-  message id workbench could tie together. The events of one agent turn share
-  their `container` and follow each other in the chain.
+- **No request id, and no parent but a continuation's.** Open WebUI's tool calls
+  carry no message id workbench could tie together. The events of one agent turn
+  share their `container` and follow each other in the chain. Only a
+  continuation of a long id list names a parent (see
+  [Long lists of files](#long-lists-of-files)).
 
 ## The Open WebUI side
 
@@ -161,7 +178,8 @@ Open WebUI's access log is a separate stream and still carries those URLs (see
 - An action whose event cannot be written does not happen. The request gets
   `500` with `{"detail": "audit unavailable"}` (`workbench/api/errors.py`). An
   upload is removed again; a tool's new files are removed again; a view, read
-  or display sends nothing; a delete leaves the file.
+  or display sends nothing; a delete leaves the file. A continuation that cannot
+  be written fails the action the same way; the events written before it stay.
 - A retention record that cannot be written ends the api process
   (`os._exit(1)`) before anything more is deleted. stderr names how many files
   the record was about; `restart: unless-stopped` brings the api back. The

@@ -95,12 +95,17 @@ operator's.
   collects them into its audit store (see [audit.md](audit.md)). They name
   files by id, never by name.
 - **Operational log lines** go to standard error. workbench's own lines carry
-  counts and the types of errors, never a path, a name or a user id; the
-  expected errors are answered without a log line
-  (`workbench/api/errors.py`). The api runs without an access log
-  (`--no-access-log` in `docker/Dockerfile.api`). An unexpected error that
-  reaches the server's own handler is logged with its traceback, which can
-  hold a path on the volume.
+  counts, fixed texts and the types of errors: never a path, a file name, a user
+  id, the message of an unexpected error or a traceback. The expected errors are
+  answered without a log line
+  (`workbench/api/errors.py`). An error no handler expected is answered `500`
+  `{"detail": "internal error"}` and logged as one line with the method, the
+  route's template and the error's type, and the server never sees it
+  (`workbench/api/errors.py:QuietErrors`). The executor's supervisor and the
+  one-shot that lays out the volume do the same: one line with the type
+  (`workbench/executor/supervisor.py:main`, `Supervisor._handle`,
+  `workbench/executor/prepare_volume.py:main`). The api runs without an access
+  log (`--no-access-log` in `docker/Dockerfile.api`).
 - **Metrics.** `GET /metrics` gives queue lengths, waits, job durations,
   refusals by reason and disk use; no user id, chat id or file name
   (`workbench/api/metrics.py`).

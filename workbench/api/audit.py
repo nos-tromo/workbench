@@ -6,14 +6,19 @@ one. One emitter, and so one hash chain, per process; the lifespan opens it with
 :meth:`AuditLog.open` and ends it with :meth:`AuditLog.close`.
 
 The acting user is the caller's own id for the end user (``via="service"``), and
-the authenticated caller is always in the event's criteria. ``parent_event_id``
-is not set: Open WebUI's tool calls carry no message id, so the events of one
-agent turn are tied together only by their ``container`` and their order in the
-chain.
+the authenticated caller is always in the event's criteria. An action's event has
+no ``parent_event_id``: Open WebUI's tool calls carry no message id, so the events
+of one agent turn are tied together only by their ``container`` and their order in
+the chain. Only a continuation, below, names a parent.
 
-A failed write raises :class:`~workbench.utils.audit_event.AuditWriteError`; the
-caller turns it into a refusal and returns nothing, because an action that cannot
-be recorded must not happen.
+An event names at most 200 file ids (``MAX_IDS``). An action on more files is
+split, never cut: its event carries the first 200 ids and the full count, and each
+further 200 go on a continuation event, ``<operation>.ids``, whose
+``parent_event_id`` is that event's id (``audit_runtime.id_chunks``, ADR 0003).
+
+A failed write raises :class:`~workbench.utils.audit_event.AuditWriteError`, a
+continuation's as much as the event's; the caller turns it into a refusal and
+returns nothing, because an action that cannot be recorded must not happen.
 """
 
 from collections.abc import Mapping, Sequence
@@ -22,7 +27,7 @@ from typing import Final, Self
 from workbench.config import Settings
 from workbench.models import Principal
 from workbench.utils.audit_event import Actor, AuditEmitter, Purpose, Target
-from workbench.utils.audit_runtime import open_audit_stream
+from workbench.utils.audit_runtime import id_chunks, open_audit_stream
 
 #: The compose service name; the audit store binds each chain to it.
 SERVICE: Final = "workbench"
@@ -45,6 +50,9 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
 
 _SYSTEM_ACTOR: Final = Actor(user=None, via="system")
 _FILE: Final = "file"
+
+#: What the operation of a continuation event ends with.
+CONTINUATION: Final = ".ids"
 
 
 class AuditLog:
@@ -121,18 +129,18 @@ class AuditLog:
             purpose: The stated purpose, if any.
 
         Returns:
-            The id of the written event.
+            The id of the written event; more than 200 ids add continuations (:meth:`_emit`).
 
         Raises:
             KeyError: If ``key`` is not in :data:`OPERATIONS`.
-            AuditWriteError: If the event cannot be written.
+            AuditWriteError: If the event or a continuation cannot be written.
             RuntimeError: If the chain is not started or already closed.
         """
         action, operation = OPERATIONS[key]
         # caller goes first so it is among the criteria the emitter keeps when it caps their number.
         merged: dict[str, object] = {"caller": p.caller}
         merged.update((name, value) for name, value in (criteria or {}).items() if name != "caller")
-        event = self.emitter.emit(
+        return self._emit(
             action,
             operation,
             Actor(user=p.user_id, via="service"),
@@ -141,7 +149,6 @@ class AuditLog:
             target=Target(kind=_FILE, ids=file_ids, count=len(file_ids), container=f"chat:{p.chat_id}"),
             criteria=merged,
         )
-        return str(event["event_id"])
 
     def record_system(
         self,
@@ -168,11 +175,11 @@ class AuditLog:
             container: The chat folder of the files, as ``chat:<chat-id>``.
 
         Returns:
-            The id of the written event.
+            The id of the written event; more than 200 ids add continuations (:meth:`_emit`).
 
         Raises:
             ValueError: If ``action`` or ``outcome`` is unknown.
-            AuditWriteError: If the event cannot be written.
+            AuditWriteError: If the event or a continuation cannot be written.
             RuntimeError: If the chain is not started or already closed.
         """
         target = None
@@ -180,8 +187,61 @@ class AuditLog:
             target = Target(
                 kind=_FILE, ids=file_ids, count=len(file_ids) if count is None else count, container=container
             )
-        event = self.emitter.emit(action, operation, _SYSTEM_ACTOR, outcome=outcome, target=target, criteria=criteria)
-        return str(event["event_id"])
+        return self._emit(action, operation, _SYSTEM_ACTOR, outcome=outcome, target=target, criteria=criteria)
+
+    def _emit(
+        self,
+        action: str,
+        operation: str,
+        actor: Actor,
+        *,
+        outcome: str,
+        target: Target | None,
+        criteria: Mapping[str, object] | None,
+        purpose: Purpose | None = None,
+    ) -> str:
+        """Write an event, and a continuation for each further 200 of its ids, so that no id is cut.
+
+        The event carries the first 200 ids and the target's full count. Each continuation is ``<operation>.ids``, with
+        ``parent_event_id`` the event's id, the same action, actor, outcome, purpose and container, ``count`` the
+        number of its own ids, and no criteria.
+
+        Args:
+            action: The audit action.
+            operation: The event's operation.
+            actor: Who acted.
+            outcome: ``ok``, ``denied`` or ``error``.
+            target: What it touched, every id given; ``None`` for no target.
+            criteria: The event's criteria.
+            purpose: The stated purpose, if any.
+
+        Returns:
+            The id of the event.
+
+        Raises:
+            AuditWriteError: If the event or a continuation cannot be written; the events before it stay written.
+        """
+        if target is None:
+            event = self.emitter.emit(action, operation, actor, outcome=outcome, purpose=purpose, criteria=criteria)
+            return str(event["event_id"])
+        chunks = id_chunks([str(item) for item in target.ids])
+        count = len(target.ids) if target.count is None else target.count
+        first = Target(kind=target.kind, ids=chunks[0] if chunks else (), count=count, container=target.container)
+        event = self.emitter.emit(
+            action, operation, actor, outcome=outcome, purpose=purpose, target=first, criteria=criteria
+        )
+        event_id = str(event["event_id"])
+        for chunk in chunks[1:]:
+            self.emitter.emit(
+                action,
+                operation + CONTINUATION,
+                actor,
+                outcome=outcome,
+                parent_event_id=event_id,
+                purpose=purpose,
+                target=Target(kind=target.kind, ids=chunk, count=len(chunk), container=target.container),
+            )
+        return event_id
 
     def close(self) -> None:
         """End the chain with its ``shutdown`` event; later calls do nothing.

@@ -118,7 +118,10 @@ def create_app(
     app.state.metrics = app_metrics
     app.state.callers = callers
     errors.install(app)
+    # Each add wraps the ones before it, so a request meets ViewHardening, QuietErrors, UploadLimit, then the app. An
+    # error nothing else answers becomes QuietErrors' 500, which still gets the viewing headers.
     app.add_middleware(UploadLimit, max_body=body_limit(settings))
+    app.add_middleware(errors.QuietErrors)
     app.add_middleware(ViewHardening)
     app.include_router(contract.router)
     app.include_router(files.router)

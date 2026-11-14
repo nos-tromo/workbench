@@ -278,3 +278,89 @@ def test_open_refuses_an_unknown_output() -> None:
 
     with pytest.raises(ValueError, match="unknown AUDIT_OUTPUT"):
         AuditLog.open(settings, "0.0.1")
+
+
+# --- long lists of files --------------------------------------------------------------------------------------
+
+
+def file_ids(n: int) -> list[str]:
+    """``n`` synthetic file ids, in order."""
+    return [f"{i:032x}" for i in range(n)]
+
+
+def test_201_ids_are_one_event_and_one_continuation(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """The event names the first 200 ids and counts all 201; the 201st goes on a continuation, cut nowhere."""
+    ids = file_ids(201)
+    event_id = log.record("search_files", alice, file_ids=ids, criteria={"regex": False, "max_hits": 50})
+
+    primary, more = stream.events()[-2:]
+    assert primary["event_id"] == event_id
+    assert (primary["action"], primary["operation"]) == ("query", "tool.search_files")
+    assert primary["target"] == {"kind": "file", "ids": ids[:200], "count": 201, "container": "chat:chat-1"}
+    assert primary["criteria"] == {"caller": "open-webui", "regex": False, "max_hits": 50}
+    assert (more["action"], more["operation"], more["outcome"]) == ("query", "tool.search_files.ids", "ok")
+    assert more["parent_event_id"] == event_id
+    assert more["actor"] == primary["actor"]
+    assert more["target"] == {"kind": "file", "ids": ids[200:], "count": 1, "container": "chat:chat-1"}
+    assert "criteria" not in more
+    assert "ids_truncated" not in stream.raw
+
+
+def test_400_ids_are_exactly_two_events(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """Two full chunks of 200: the event and one continuation, and nothing after them."""
+    before = len(stream.events())
+    log.record("run_python", alice, file_ids=file_ids(400))
+
+    written = stream.events()[before:]
+    assert [(e["operation"], len(e["target"]["ids"]), e["target"]["count"]) for e in written] == [
+        ("tool.run_python", 200, 400),
+        ("tool.run_python.ids", 200, 200),
+    ]
+    assert [i for e in written for i in e["target"]["ids"]] == file_ids(400)
+
+
+def test_a_continuation_keeps_the_outcome_and_the_purpose(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """A failed run's continuation is a failure too, for the same stated purpose."""
+    purpose = Purpose(case_ref="case-0001")
+    log.record("run_python", alice, file_ids=file_ids(250), outcome="error", purpose=purpose)
+
+    primary, more = stream.events()[-2:]
+    assert (primary["outcome"], more["outcome"]) == ("error", "error")
+    assert primary["purpose"] == more["purpose"] == {"case_ref": "case-0001"}
+    assert len(more["target"]["ids"]) == more["target"]["count"] == 50
+
+
+def test_a_system_event_over_201_ids_is_split_too(log: AuditLog, stream: Stream) -> None:
+    """The service's own events follow the same rule, its container and count kept."""
+    ids = file_ids(201)
+    event_id = log.record_system(
+        "delete", "retention.sweep", file_ids=ids, criteria={"rule": "orphan"}, container="chat:chat-1"
+    )
+
+    primary, more = stream.events()[-2:]
+    assert primary["target"] == {"kind": "file", "ids": ids[:200], "count": 201, "container": "chat:chat-1"}
+    assert (more["operation"], more["parent_event_id"], more["actor"]) == (
+        "retention.sweep.ids",
+        event_id,
+        {"user": None, "via": "system"},
+    )
+    assert more["target"] == {"kind": "file", "ids": ids[200:], "count": 1, "container": "chat:chat-1"}
+    assert "criteria" not in more
+
+
+def test_a_failed_continuation_raises(
+    log: AuditLog, stream: Stream, alice: Principal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A continuation that cannot be written fails the record, as the first event's would."""
+    write = stream.write
+
+    def no_continuation(text: str, /) -> int:
+        if '.ids"' in text:
+            raise OSError("synthetic audit stream failure")
+        return write(text)
+
+    monkeypatch.setattr(stream, "write", no_continuation)
+    with pytest.raises(AuditWriteError):
+        log.record("run_python", alice, file_ids=file_ids(201))
+    with pytest.raises(AuditWriteError):
+        log.record_system("delete", "retention.sweep", file_ids=file_ids(201))

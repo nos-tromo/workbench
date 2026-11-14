@@ -26,7 +26,14 @@ from workbench.config import Settings, load_settings
 from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
 from workbench.executor.sandbox import Slot
-from workbench.executor.supervisor import MAX_OUTPUTS, NoUsableSlot, Supervisor, make_slots, startup_problem
+from workbench.executor.supervisor import (
+    MAX_OUTPUTS,
+    NoUsableSlot,
+    SocketRefused,
+    Supervisor,
+    make_slots,
+    startup_problem,
+)
 from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_result, encode
 
 pytestmark = pytest.mark.anyio
@@ -1301,7 +1308,7 @@ def test_main_reports_a_socket_it_may_not_bind_in_one_short_line(
 
     async def refuse(self: Supervisor) -> None:
         """Refuse as an unsafe socket folder does."""
-        raise RuntimeError("the socket's folder must be root's alone")
+        raise SocketRefused("the socket's folder must be root's alone")
 
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
@@ -1324,6 +1331,85 @@ def test_main_refuses_a_bad_setting(monkeypatch: pytest.MonkeyPatch, capsys: pyt
     err = capsys.readouterr().err
     assert err.startswith("workbench executor: WORKBENCH_EXECUTOR_SLOTS")
     assert err.count("\n") == 1
+
+
+#: A path an unexpected error might name: a synthetic file of a synthetic user.
+SECRET_PATH = "/data/workspaces/user-a/chat-1/quarterly-figures.xlsx"
+
+
+def _unexpected() -> PermissionError:
+    """An error whose message names :data:`SECRET_PATH`, as a permission problem on the volume would."""
+    return PermissionError(13, "Permission denied", SECRET_PATH)
+
+
+def _holds_a_secret(text: str) -> bool:
+    """Whether a log holds anything of the error's message."""
+    return any(part in text for part in (SECRET_PATH, "quarterly-figures", "Permission denied", "Traceback"))
+
+
+def test_main_reports_an_unexpected_error_by_its_type_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Whatever else ends serving is one line with the error's type: no traceback, no message, no path."""
+
+    async def fail(self: Supervisor) -> None:
+        """End serving as an unforeseen error would."""
+        raise _unexpected()
+
+    monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
+    monkeypatch.setattr(Supervisor, "serve", fail)
+
+    assert supervisor.main() == 1
+
+    err = capsys.readouterr().err
+    assert err == "workbench executor: stopped by an unexpected error (PermissionError)\n"
+    assert not _holds_a_secret(err)
+
+
+async def test_an_unexpected_error_while_answering_a_connection_is_logged_by_its_type_alone(
+    served: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An error outside the job's own handling closes the connection and is logged by its type alone.
+
+    asyncio would log it with its traceback. (An ``OSError`` there is the api going away, and is not logged at all.)
+    """
+
+    def fail(answer: JobResult) -> bytes:
+        raise ValueError(f"the answer for {SECRET_PATH} could not be encoded")
+
+    _runner(monkeypatch, 'result = {"tool": spec["tool"]}')
+    monkeypatch.setattr(supervisor, "_line", fail)
+    with caplog.at_level(logging.DEBUG):
+        async with _serving(Supervisor(_settings(served), use_slots=False)):
+            assert await _ask(_sock(served), encode(_request())) == b""
+            for _ in range(100):  # the handler logs once the connection is closed
+                if "ValueError" in caplog.text:
+                    break
+                await asyncio.sleep(0.02)
+
+    assert "a connection failed in the supervisor: ValueError" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert not _holds_a_secret(caplog.text)
+
+
+async def test_a_job_that_fails_in_the_supervisor_is_logged_by_its_type_alone(
+    served: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The job's answer says the executor failed; the log names the type, never the message."""
+
+    async def fail(self: Supervisor, req: JobRequest) -> JobResult:
+        raise _unexpected()
+
+    monkeypatch.setattr(Supervisor, "run_job", fail)
+    with caplog.at_level(logging.DEBUG):
+        async with _serving(Supervisor(_settings(served), use_slots=False)):
+            answer = decode_result(await _ask(_sock(served), encode(_request())))
+
+    assert (answer.status, answer.message) == ("error", "the executor failed")
+    assert "a job failed in the supervisor: PermissionError" in caplog.text
+    assert not _holds_a_secret(caplog.text)
 
 
 # --- the socket ------------------------------------------------------------------------------

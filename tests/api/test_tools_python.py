@@ -301,6 +301,32 @@ def test_outputs_whose_use_cannot_be_recorded_are_removed(
     assert [rec for rec in store.files_in_chat(ME) if rec.kind == "output"] == []
 
 
+def test_outputs_whose_id_continuation_cannot_be_recorded_are_removed(
+    client: TestClient,
+    store: Store,
+    fake_executor: Scripted,
+    audit_stream: io.StringIO,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run over 205 files names them in two events; when the second cannot be written, the run fails the same way."""
+    for n in range(205):
+        put(store, f"f{n:03d}.txt")
+    fake_executor.files = {"r.xlsx": b"PK"}
+    write = audit_stream.write
+
+    def no_continuation(text: str, /) -> int:
+        if '.ids"' in text:
+            raise OSError("synthetic audit stream failure")
+        return write(text)
+
+    monkeypatch.setattr(audit_stream, "write", no_continuation)
+    r = run(client)
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    assert [rec for rec in store.files_in_chat(ME) if rec.kind == "output"] == []
+    assert [e["target"]["count"] for e in events(audit_lines)] == [206]
+
+
 def test_outputs_of_an_answer_that_cannot_be_read_are_removed_and_the_run_is_an_error(
     client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
 ) -> None:

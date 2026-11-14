@@ -5,8 +5,8 @@ Open WebUI's origin, whatever the file holds. ``files.py`` turns active content 
 attachment; this adds the headers that sandbox the rest. They go on **every** answer of the
 route, refusals included, so a middleware sets them on the response start rather than the
 route on its own success: a 400, 401, 404, 422 or 500 written by an error handler carries
-them too. (An unhandled error is answered by Starlette's outermost layer, outside any
-middleware added here; that answer is plain text and holds no user content.)
+them too, and so does the 500 :class:`~workbench.api.errors.QuietErrors` writes, inside this
+layer, for an error no handler expected.
 """
 
 from typing import Final

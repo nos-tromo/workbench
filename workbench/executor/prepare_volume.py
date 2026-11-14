@@ -165,6 +165,9 @@ def main() -> int:
     except OSError as exc:
         print(f"workbench prepare-volume: {type(exc).__name__}: {exc.strerror}", file=sys.stderr)
         return 1
+    except Exception as exc:  # its type alone: a message or a traceback can name a path
+        print(f"workbench prepare-volume: stopped by an unexpected error ({type(exc).__name__})", file=sys.stderr)
+        return 1
     return 0
 
 

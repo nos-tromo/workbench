@@ -107,6 +107,10 @@ class NoUsableSlot(Exception):
     """Every slot is retired; the process ends so that its restart brings fresh slots and IPC."""
 
 
+class SocketRefused(RuntimeError):
+    """The socket's folder or place is not safe; serving does not start. The message is a fixed text."""
+
+
 class _SetupError(Exception):
     """The job folder could not be made; nothing ran."""
 
@@ -543,7 +547,7 @@ class Supervisor:
             NoUsableSlot: Every slot is retired. The request that retired the last one is still
                 answered, for up to 5 s; then the process should end, so that its restart brings
                 a fresh IPC namespace, ``/dev/shm`` and slots, and the start-up sweep runs.
-            RuntimeError: The socket's folder is not root's alone, or something other than a
+            SocketRefused: The socket's folder is not root's alone, or something other than a
                 socket is where the socket belongs.
             OSError: The socket cannot be bound.
         """
@@ -1028,7 +1032,7 @@ class Supervisor:
                 removes whichever socket is there.
 
         Raises:
-            RuntimeError: The socket's folder is a symlink, not a folder, not root's, or open to others' writes; or
+            SocketRefused: The socket's folder is a symlink, not a folder, not root's, or open to others' writes; or
                 something other than a socket is in the socket's place.
             OSError: It cannot be removed.
         """
@@ -1043,13 +1047,13 @@ class Supervisor:
             or folder.st_uid != self._owners.root[0]
             or folder.st_mode & 0o022
         ):
-            raise RuntimeError("the socket's folder must be root's alone")
+            raise SocketRefused("the socket's folder must be root's alone")
         try:
             found = os.lstat(path)
         except FileNotFoundError:
             return
         if not stat.S_ISSOCK(found.st_mode):
-            raise RuntimeError("the socket's place holds something that is not a socket")
+            raise SocketRefused("the socket's place holds something that is not a socket")
         if only is not None and (found.st_dev, found.st_ino) != only:
             return
         os.unlink(path)
@@ -1067,7 +1071,7 @@ class Supervisor:
             The bound socket, not yet listening.
 
         Raises:
-            RuntimeError: The socket's folder is a symlink, not a folder, not root's, or open to
+            SocketRefused: The socket's folder is a symlink, not a folder, not root's, or open to
                 others' writes; or something other than a socket is in the socket's place.
             OSError: It cannot be bound.
         """
@@ -1091,6 +1095,9 @@ class Supervisor:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Answer the one request of a connection.
 
+        An error the job's own handling did not answer closes the connection without an answer, and is logged by its
+        type alone: asyncio would log it with its traceback, whose message can name a path on the volume.
+
         Args:
             reader: The connection's incoming side.
             writer: The connection's outgoing side.
@@ -1108,6 +1115,8 @@ class Supervisor:
             await writer.drain()
         except OSError:
             pass  # the api went away; staged outputs are swept with the staging folder
+        except Exception as exc:
+            _log.error("a connection failed in the supervisor: %s", type(exc).__name__)
         finally:
             writer.close()
             with contextlib.suppress(OSError):
@@ -1134,7 +1143,9 @@ def main() -> int:
 
     Returns:
         ``1`` after a one-line reason on stderr when it must not start, including a socket it may
-        not bind, or once every slot is retired (counts only); ``0`` when serving ends.
+        not bind, or once every slot is retired (counts only); ``1`` after one line with its type
+        alone for any other error, never its message or a traceback, which can name a path; ``0``
+        when serving ends.
     """
     try:
         settings = load_settings(os.environ, role="executor")
@@ -1151,8 +1162,11 @@ def main() -> int:
     except NoUsableSlot as exc:
         print(f"workbench executor: {exc}", file=sys.stderr)
         return 1
-    except RuntimeError as exc:  # serve's own refusals: the socket's folder or place
+    except SocketRefused as exc:  # serve's own refusals, fixed texts: the socket's folder or place
         print(f"workbench executor: refusing to start: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"workbench executor: stopped by an unexpected error ({type(exc).__name__})", file=sys.stderr)
         return 1
     return 0
 

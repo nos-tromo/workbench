@@ -128,6 +128,23 @@ def test_main_reports_a_refusal_in_one_short_line(
     assert "Traceback" not in err
 
 
+def test_main_reports_an_unexpected_error_by_its_type_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An error the one-shot did not foresee is one line with its type: no traceback, no message, no path."""
+    path = "/data/workspaces/user-a/chat-1/quarterly-figures.xlsx"
+
+    def fail(data_dir: Path, owners: Owners | None = None) -> None:
+        raise ValueError(f"cannot settle {path}")
+
+    monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(pv, "prepare_volume", fail)
+
+    assert pv.main() == 1
+
+    assert capsys.readouterr().err == "workbench prepare-volume: stopped by an unexpected error (ValueError)\n"
+
+
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="owning parts by other ids needs root on Linux")
 def test_as_root_the_layout_belongs_to_the_api_and_to_root(tmp_path: Path) -> None:
     """The api owns workspaces, staging and the database; root owns the jobs folder and the volume root."""

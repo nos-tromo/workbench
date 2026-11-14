@@ -50,6 +50,7 @@ def test_every_tool_is_in_the_permission_matrix(tmp_path: Path) -> None:
 
 
 def test_every_audit_key_is_documented() -> None:
-    """Each operation an event key is recorded under is in ``docs/audit.md``."""
+    """Each operation an event key is recorded under is in ``docs/audit.md``, and so is the continuation of its ids."""
     text = doc("audit.md")
     assert [operation for _, operation in OPERATIONS.values() if f"`{operation}`" not in text] == []
+    assert "`<operation>.ids`" in text

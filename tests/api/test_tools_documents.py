@@ -541,6 +541,29 @@ def test_search_over_1000_files_looks_at_the_newest_1000_and_says_so(
     assert "1000 newest of 1005 files" in body["hint"]
 
 
+def test_a_search_over_450_files_names_every_one_in_three_events(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """An event holds 200 ids: the search's event names the first 200 and counts 450, two continuations the rest."""
+    stored = {put(store, f"f{n:03d}.txt").id for n in range(450)}
+    executor.payload = hits()
+    assert find(client, "x").status_code == 200
+    primary, *more = [e for e in audit_lines() if e["operation"].startswith("tool.search_files")]
+    assert (primary["operation"], primary["target"]["count"], len(primary["target"]["ids"])) == (
+        "tool.search_files",
+        450,
+        200,
+    )
+    assert [(e["operation"], e["parent_event_id"], e["target"]["count"]) for e in more] == [
+        ("tool.search_files.ids", primary["event_id"], 200),
+        ("tool.search_files.ids", primary["event_id"], 50),
+    ]
+    named = [i for e in [primary, *more] for i in e["target"]["ids"]]
+    assert sorted(named) == sorted(stored)
+    assert {e["target"]["container"] for e in [primary, *more]} == {"chat:chat-1"}
+    assert "ids_truncated" not in json.dumps(audit_lines())
+
+
 def test_search_answer_is_cut_at_the_limit_and_says_so(small: TestClient, store: Store, executor: Scripted) -> None:
     """Hits from the end are dropped until it fits, with a sentence about it."""
     put(store, "a.txt")
