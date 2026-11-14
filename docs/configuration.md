@@ -75,9 +75,9 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   [sandbox.md](sandbox.md#limits)).
 - The api waits for a job's answer up to the wall time plus 300 seconds: the
   executor's cleanup of a killed job can take that long.
-- Open WebUI sets no timeout on a tool call by default. open-webui-service sets
-  one (`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER`); keep it above
-  `WORKBENCH_JOB_WALL_S` plus `WORKBENCH_QUEUE_WAIT_S`.
+- Open WebUI sets no timeout on a tool call by default. open-webui-service must
+  set one (`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER`) when its workbench connection is
+  added; keep it above `WORKBENCH_JOB_WALL_S` plus `WORKBENCH_QUEUE_WAIT_S`.
 
 ## Files
 

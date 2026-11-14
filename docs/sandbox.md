@@ -63,9 +63,11 @@ cover.
 ### The uid pool and the slot lifecycle
 
 The executor runs `WORKBENCH_EXECUTOR_SLOTS` jobs at once (4 by default, at
-most 16). Slot `n` runs as uid and gid `20001 + n`. The image creates the users
-`slot1` to `slot16`, uids `20001` to `20016`, none of which can log in or owns a
-home (`docker/Dockerfile.executor`). The pool never holds root or the api's uid
+most 16). The slots are numbered from 0, as the supervisor's log names them
+("slot 0 retired"). Slot `i` runs as uid and gid `20001 + i`, which is the
+image's user `slot<i+1>`: slot 0 is user `slot1`, uid `20001`, and slot 15 is
+user `slot16`, uid `20016`. None of these users can log in or owns a home
+(`docker/Dockerfile.executor`). The pool never holds root or the api's uid
 `10001` (`supervisor.py:make_slots`).
 
 One job runs in a slot at a time:

@@ -4,6 +4,7 @@ The message of such an error can name a path on the volume, a file name or a use
 answers it too, but then raises it again, and uvicorn logs it with its traceback; the api answers it itself instead.
 """
 
+import asyncio
 import logging
 import subprocess
 import sys
@@ -17,11 +18,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.types import Message
 
 from tests.api.conftest import KEY
 from tests.api.raising_app import PATH, RefusingStore
 from tests.api.test_files import CHAT, H
 from workbench.api.audit import AuditLog
+from workbench.api.errors import QuietErrors
 from workbench.api.main import create_app
 from workbench.config import Settings
 from workbench.paths import Workspaces
@@ -126,3 +129,67 @@ def test_under_uvicorn_the_error_leaves_one_line_and_no_traceback(tmp_path: Path
     assert [secret for secret in SECRETS if secret in logged + chain] == []
     assert "an unexpected error ended GET /files/view (PermissionError)" in logged
     assert (r.status_code, r.json()) == (500, {"detail": "internal error"})
+
+
+# --- the errors' layer on its own -------------------------------------------------------------------------------
+
+
+class _Route:
+    """What the router leaves in the scope once a route matched: its template."""
+
+    path = "/files/view"
+
+
+def _scope() -> dict[str, Any]:
+    """The scope of a request the router matched to ``/files/view``."""
+    return {"type": "http", "method": "GET", "path": "/files/view", "route": _Route()}
+
+
+async def _nothing_more() -> dict[str, Any]:
+    """Receive: the request has no body."""
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+def test_an_error_after_the_answer_started_sends_no_second_start(caplog: pytest.LogCaptureFixture) -> None:
+    """A route that has begun its answer and then fails: the answer stops where it was, one line is logged.
+
+    No second ``http.response.start`` follows the first, which the server would refuse; nothing of the error's message
+    and no traceback reaches the log.
+    """
+
+    async def starts_then_fails(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/csv")]})
+        await send({"type": "http.response.body", "body": b"item,total\n", "more_body": True})
+        raise PermissionError(13, "Permission denied", PATH)
+
+    sent: list[Message] = []
+
+    async def keep(message: Message) -> None:
+        sent.append(message)
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(QuietErrors(starts_then_fails)(_scope(), _nothing_more, keep))
+    assert [m["type"] for m in sent] == ["http.response.start", "http.response.body"]
+    assert sent[0]["status"] == 200
+    (record,) = [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
+    assert record.getMessage() == "an unexpected error ended GET /files/view (PermissionError)"
+    assert all(rec.exc_info is None and rec.exc_text is None for rec in caplog.records)
+    assert [secret for secret in SECRETS if secret in caplog.text] == []
+
+
+def test_a_fallback_answer_that_cannot_be_sent_carries_nothing_of_the_error() -> None:
+    """The 500 is sent after the error is handled: if that send fails, its error is not chained to the first one.
+
+    A chained error would put the first error's message, and its path, into the server's traceback of the second.
+    """
+
+    async def fails(scope: Any, receive: Any, send: Any) -> None:
+        raise PermissionError(13, "Permission denied", PATH)
+
+    async def gone(message: Message) -> None:
+        raise RuntimeError("synthetic: the client went away")
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(QuietErrors(fails)(_scope(), _nothing_more, gone))
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None

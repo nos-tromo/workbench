@@ -38,6 +38,11 @@ under its own licence; two need a note:
 - **odfpy** is offered under several licences; workbench uses it under its
   Apache-2.0 option.
 
-No package under the GPL or the AGPL is shipped. That is why Outlook `.msg`
-files are not read: the parser for them, `extract-msg`, is GPL. `read_document`
-asks the user to save such a file as `.eml` or PDF.
+No Python package the images could use only under the GPL or the AGPL is
+installed: of the shipped packages, only these two name a GNU licence. That is
+why Outlook `.msg` files are not read: the Python parser for them,
+`extract-msg`, is GPL. `read_document` asks the user to save such a file as
+`.eml` or PDF.
+
+The images' Debian base, `python:3.12-slim-trixie`, carries the operating
+system's own packages under their own licences, GPL ones among them.

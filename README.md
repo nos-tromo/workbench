@@ -3,8 +3,10 @@
 The nos-tromo federation's shared tool tier. Open WebUI users drop files into a
 chat; the model reads, searches and analyses them, fills report templates and
 writes new tables and documents, all through workbench's typed tools. Every
-file is opened in a sandbox without network, every access is recorded in the
-federation's audit trail, and every file is deleted 7 days after it was made.
+file is opened in a sandbox without network. Uploads, reads, views, tool runs on
+files, new files and deletions are recorded in the federation's audit trail, by
+file id; listing files (`list_files` too), making a folder and moving a file
+are not. Every file is deleted 7 days after it was made.
 
 Open WebUI connects to workbench as a "terminal server", with a bearer key. Its
 browser uploads chat attachments straight into workbench through Open WebUI's
@@ -23,7 +25,8 @@ State lives on the external volume `workbench-data`, so `docker compose down -v`
 is safe; only `make nuke` removes it, after a typed confirmation.
 
 Bring-up order in the federation: inference, data, obs, **workbench**, apps,
-edge. workbench needs no other member to start; Open WebUI needs workbench.
+edge. workbench needs no other member to start. Open WebUI starts and chats
+work without it; only its workbench tools need it.
 
 ## Quick start
 
@@ -34,8 +37,9 @@ make build && make up         # production shape: no host port
 make health                   # both services, then the api's /healthz
 ```
 
-`make up-dev` (or `make dev`, which builds first) also publishes the api on
-`localhost:8100` for local work. Open WebUI's side of the connection is set up
+`make up-dev` (or `make dev`, which builds first) also publishes the api on port
+8100 of every interface of the host, for local work; use it only where that is
+safe ([docs/configuration.md](docs/configuration.md#the-composeoverrideyaml-gotcha)). Open WebUI's side of the connection is set up
 in open-webui-service. `make help` lists every target.
 
 ## Development

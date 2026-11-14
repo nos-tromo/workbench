@@ -133,8 +133,10 @@ class QuietErrors:
     name or a user id. This layer answers ``{"detail": "internal error"}`` itself and lets nothing out, so the server
     never sees the error. The log line names the method, the route's template (``/files/view``, never the path asked
     for) and the error's type. An error after the answer has started cannot become a 500; it is logged the same way,
-    and the answer stops where it was. Cancellation and the other ``BaseException`` kinds pass on: they are the
-    server's to handle.
+    and the answer stops where it was (uvicorn then adds its own fixed line that the answer was not completed). The 500
+    is sent once the error is handled, so an error in sending it is not chained to the first, whose message would then
+    reach the server's traceback. Cancellation and the other ``BaseException`` kinds pass on: they are the server's to
+    handle.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -164,13 +166,17 @@ class QuietErrors:
                 started = True
             await send(message)
 
+        failed: str | None = None
         try:
             await self.app(scope, receive, watched)
         except Exception as exc:
-            route = getattr(scope.get("route"), "path", None) or "an unmatched route"
-            _log.error("an unexpected error ended %s %s (%s)", scope.get("method", "?"), route, type(exc).__name__)
-            if not started:
-                await JSONResponse({"detail": INTERNAL}, status_code=500)(scope, receive, send)
+            failed = type(exc).__name__  # the type alone outlives the except block, so nothing chains to the error
+        if failed is None:
+            return
+        route = getattr(scope.get("route"), "path", None) or "an unmatched route"
+        _log.error("an unexpected error ended %s %s (%s)", scope.get("method", "?"), route, failed)
+        if not started:
+            await JSONResponse({"detail": INTERNAL}, status_code=500)(scope, receive, send)
 
 
 def install(app: FastAPI) -> None:

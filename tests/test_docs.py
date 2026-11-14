@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from workbench import __version__
-from workbench.api.audit import OPERATIONS, SERVICE, AuditLog
+from workbench.api.audit import CONTINUATION, OPERATIONS, SERVICE, AuditLog
 from workbench.api.main import create_app
 from workbench.api.openapi import tool_openapi
 from workbench.api.store import Store
@@ -19,6 +19,10 @@ from workbench.utils.audit_event import AuditEmitter
 ROOT = Path(__file__).resolve().parents[1]
 
 _SETTING = re.compile(r"(?:# )?([A-Z][A-Z0-9_]*)=")
+
+#: A literal system event in the api's code: ``record_system("<action>", "<operation>"`` or
+#: ``emit("<action>", "<operation>"``, the call's first two arguments, spread over lines or not.
+_SYSTEM_EVENT = re.compile(r"(?:record_system|emit)\(\s*\"[a-z_]+\",\s*\"([a-z_]+(?:\.[a-z_]+)+)\"")
 
 
 def doc(name: str) -> str:
@@ -49,8 +53,23 @@ def test_every_tool_is_in_the_permission_matrix(tmp_path: Path) -> None:
     assert [tool for tool in tools if f"`{tool}`" not in rows] == []
 
 
+def system_operations() -> set[str]:
+    """The operations the api records as the system, read from its code: every literal one it emits or records."""
+    found: set[str] = set()
+    for path in (ROOT / "workbench" / "api").glob("*.py"):
+        found.update(_SYSTEM_EVENT.findall(path.read_text(encoding="utf-8")))
+    return found
+
+
 def test_every_audit_key_is_documented() -> None:
-    """Each operation an event key is recorded under is in ``docs/audit.md``, and so is the continuation of its ids."""
+    """Each operation an event key or the system is recorded under is in ``docs/audit.md``, and the continuations.
+
+    The system's operations are found in the api's code, so a new one fails here until it is documented.
+    """
     text = doc("audit.md")
+    assert len(OPERATIONS) >= 12
     assert [operation for _, operation in OPERATIONS.values() if f"`{operation}`" not in text] == []
-    assert "`<operation>.ids`" in text
+    system = system_operations()
+    assert {"retention.sweep", "config.audit"} <= system
+    assert [operation for operation in sorted(system) if f"`{operation}`" not in text] == []
+    assert f"`<operation>{CONTINUATION}`" in text

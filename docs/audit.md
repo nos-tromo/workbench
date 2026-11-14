@@ -11,9 +11,10 @@ read it belong to obs-plane: see its
 
 Every read, change, disclosure and deletion of a file's content is one event.
 Each names its files by id, never by name, and the chat folder they are in as
-`container`. The event is written before the content leaves or the file goes,
-with one exception: an upload is recorded once it is stored, because its file
-id exists only then.
+`container`. The event is written before the content leaves or the file goes.
+A new file is the exception: an upload, and a file a tool made, is recorded once
+it is stored, because its file id exists only then; one whose event cannot be
+written is removed again.
 
 Every event a user's request causes has this shape (`workbench/api/audit.py:AuditLog.record`):
 
@@ -42,7 +43,7 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 | `delete` | `delete` / `file.delete` | the file deleted by the user | — | `ok`, before the file goes |
 | `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | `ok`, once the job has answered and before the text goes |
 | `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | `ok`, once the job has answered and before the hits go |
-| `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made | `outputs`: how many files it made that were kept | `ok` when the job ran to an answer (the code may have raised: its traceback is the answer); `error` when the job failed, ran out of time, was stopped on a limit, or its answer could not be used |
+| `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made | `outputs`: how many files it made that were kept | `ok` when the job ran to an answer: the code may have raised (its traceback is the answer) or run out of its own time, 9/10 of the wall time (stderr then says it timed out); `error` when the job failed, was stopped at the wall time or on a resource limit, its outputs broke the executor's limits, or its answer could not be used |
 | `inspect_template` | `query` / `tool.inspect_template` | the template | — | `ok`, once the job has answered and before the fields go |
 | `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`) | `ok`, once the new file is kept |
 | `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size | `ok`, once the new file is kept |
@@ -138,8 +139,9 @@ own per-request audit records carry the same id with the account. The caller,
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user
-(`X-OpenWebUI-User-Jwt`), but in v0.13.3 it reaches neither the proxied calls
-nor the model's tool calls (see
+(`X-OpenWebUI-User-Jwt`). In one observed run of v0.13.3 it reached only the
+per-chat handshake reads, neither the proxied calls nor the model's tool calls;
+no test pins that (see
 [permissions.md](permissions.md#what-open-webui-v0133-sends)). workbench does
 not use it.
 
@@ -163,12 +165,15 @@ not use it.
 Open WebUI's built-in audit log records every request it serves, with the full
 URL. The file browser's URLs carry file names in their query strings
 (`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`).
-open-webui-service therefore sets `AUDIT_EXCLUDED_PATHS=/terminals`, which Open
-WebUI matches as a prefix of `/api/v1/terminals`, and workbench records those
-accesses itself, by file id. Without that setting Open WebUI's audit records
-would carry the file names. The contract test runs Open WebUI with the setting
-and checks that no record names an uploaded file
-(`tests/contract/test_open_webui_contract.py:test_open_webui_audit_skips_the_terminal_proxy`).
+`AUDIT_EXCLUDED_PATHS=/terminals`, which Open WebUI matches as a prefix of
+`/api/v1/terminals`, keeps those URLs out of its audit records; workbench
+records those accesses itself, by file id. open-webui-service must set it when
+its workbench connection is added: its `main` sets the variable empty today, and
+without the setting Open WebUI's audit records would carry the file names. The
+contract test runs its own Open WebUI with the setting and checks that no record
+names an uploaded file
+(`tests/contract/test_open_webui_contract.py:test_open_webui_audit_skips_the_terminal_proxy`);
+it does not check open-webui-service's value.
 
 Open WebUI's access log is a separate stream and still carries those URLs (see
 [data-flow.md](data-flow.md#what-leaves)).
