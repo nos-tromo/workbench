@@ -3,9 +3,10 @@
 Open WebUI makes a tool of every operation with an ``operationId``, so each route sets its
 own, and the description is written for the model rather than taken from the docstring.
 ``display_file`` lives with the file browser in :mod:`workbench.api.files`, since it shares
-that module's audit rule; ``read_document`` and ``search_files`` hand the chat's files to a
-job in the executor (:mod:`workbench.executor.runners.documents`) and are built here from what the
-store knows and what the job answers. The rest of the tools arrive with their runners.
+that module's audit rule; ``read_document``, ``search_files`` and ``run_python`` hand the chat's files
+to a job in the executor (:mod:`workbench.executor.runners.documents`,
+:mod:`workbench.executor.runners.python`) and are built here from what the store knows and what the job
+answers. The rest of the tools arrive with their runners.
 
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
@@ -13,7 +14,9 @@ fixed codes (anything else is "the tool failed"), and the whole answer is cut to
 measured as the bytes that are sent.
 """
 
+import contextlib
 import dataclasses
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
@@ -22,9 +25,14 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
+from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.openapi import TOOL_TAG
+from workbench.api.store import Store
+from workbench.models import FileRecord, Principal
+from workbench.paths import PathError
 from workbench.protocol import MAX_INPUT_FILES, JobResult
+from workbench.utils.audit_event import AuditWriteError
 
 router = APIRouter(tags=[TOOL_TAG])
 
@@ -413,7 +421,7 @@ def _cut_part(shell: DocumentRead, part: DocumentPart, limit: int, limit_kb: int
     return best
 
 
-def _within[M: DocumentRead | SearchResult](answer: M, limit: int) -> M:
+def _within[M: DocumentRead | SearchResult | PythonRun](answer: M, limit: int) -> M:
     """Shorten the hint, as a last resort, so that an answer whose parts or hits are cut as far as they go fits.
 
     Args:
@@ -657,3 +665,261 @@ async def search_files(
             "were not searched."
         )
     return _fit_search(answer, settings.result_max_kb, notes)
+
+
+# --- run_python ------------------------------------------------------------------------------------------------
+
+#: The most characters of code one call runs.
+MAX_CODE: Final = 50_000
+
+#: The folder the code writes its outputs into; the executor gives the code no input below it.
+_OUT: Final = "out"
+
+
+class RunPythonRequest(BaseModel):
+    """Body of ``run_python``.
+
+    Attributes:
+        code: The Python to run, as a script.
+    """
+
+    code: str = Field(
+        min_length=1,
+        max_length=MAX_CODE,
+        description=(
+            "The Python code to run, as a script; at most 50000 characters. Print what you need to see, and "
+            "write every result file into out/."
+        ),
+    )
+
+
+class _CodeRun(BaseModel):
+    """What the runner answers; checked before anything of it is sent on.
+
+    Attributes:
+        stdout: What the code printed.
+        stderr: Its errors, its traceback, or the note that it timed out.
+        truncated: Whether the runner cut either stream.
+        hint: What the model should know, such as that only this chat's files are there.
+    """
+
+    stdout: str
+    stderr: str
+    truncated: bool
+    hint: str | None = Field(default=None, max_length=2000)
+
+
+class PythonRun(BaseModel):
+    """What ``run_python`` answers.
+
+    Attributes:
+        stdout: What the code printed.
+        stderr: Its warnings and errors; a traceback ends with the error.
+        files: The paths of the files it wrote into ``out/``, now in the workspace.
+        truncated: Whether stdout or stderr was cut in the middle.
+        job_id: The id of the run, the source of what it computed.
+        hint: What to tell the user, or how to go on.
+    """
+
+    stdout: str = Field(description="What the code printed.")
+    stderr: str = Field(description="Its warnings and errors; a traceback ends with the error.")
+    files: list[str] = Field(description="The files it wrote into out/, now in the workspace: their paths.")
+    truncated: bool = Field(description="True if stdout or stderr was cut in the middle to fit the result limit.")
+    job_id: str = Field(description="The id of this run; cite it as the source of what the code computed.")
+    hint: str | None = Field(default=None, max_length=2000, description="What to tell the user, or how to go on.")
+
+
+def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
+    """Take the runner's answer out of a job's result, or fail with what the model should be told.
+
+    The code ran to an answer when the job is ``ok``, and also when its outputs broke the executor's limits:
+    the job is then an ``error`` that still carries what the code printed, and no file is kept.
+
+    Args:
+        result: The executor's answer.
+
+    Returns:
+        The runner's answer, and the executor's note on the outputs, if it has one.
+
+    Raises:
+        HTTPException: The job ran out of time, was stopped on a resource limit or left no result, as when the
+            code ended its own process (422, with the executor's reason, a fixed text of its own); the runner
+            failed with a code the api knows (its status), or in another way (500, with a fixed text: the
+            runner's own may hold a path).
+    """
+    note = _clean(result.message) if result.message else None
+    if result.status == "ok":
+        return result.result, None if note is None else f"Not every file in out/ was kept: {note}."
+    if result.status == "error" and "stdout" in result.result:
+        return result.result, f"No file in out/ was kept: {note or 'the outputs could not be kept'}."
+    if result.status == "error" and "error" in result.result:
+        _payload(result, "code")  # raises, with the runner's code or the fixed text
+    reason = _clean(result.message) or "the job failed"
+    if result.status == "killed":
+        reason += " (memory, CPU time, file size or processes)"
+    raise HTTPException(status_code=422, detail=f"the code could not be completed: {reason}")
+
+
+def _record_run(
+    audit: AuditLog,
+    store: Store,
+    p: Principal,
+    inputs: Sequence[FileRecord],
+    outputs: Sequence[FileRecord],
+    outcome: str,
+) -> None:
+    """Record a run by the ids of every file it was given and every file it made.
+
+    As with an upload, a file whose making cannot be recorded does not stay: the outputs are removed again.
+
+    Args:
+        audit: The audit log.
+        store: The file store.
+        p: The caller, user and chat.
+        inputs: The files the job was given.
+        outputs: The files it made.
+        outcome: ``ok`` when the job answered, ``error`` when it failed or kept no file it made.
+
+    Raises:
+        AuditWriteError: The event could not be written.
+    """
+    try:
+        audit.record(
+            "run_python",
+            p,
+            file_ids=[rec.id for rec in [*inputs, *outputs]],
+            outcome=outcome,
+            criteria={"outputs": len(outputs)},
+        )
+    except AuditWriteError:
+        for rec in outputs:
+            with contextlib.suppress(PathError, OSError):  # the audit failure is the answer
+                store.remove(rec)
+        raise
+
+
+def _middle(text: str, keep: int) -> str:
+    """Keep the start and the end of a text, ``keep`` characters in all, around a mark of what is cut.
+
+    Args:
+        text: The text.
+        keep: How many of its characters to keep.
+
+    Returns:
+        The text as it is if it is no longer, else its two ends and the mark.
+    """
+    if len(text) <= keep:
+        return text
+    front = keep // 2
+    back = keep - front
+    return f"{text[:front]}\n[… {len(text) - keep} characters cut …]\n{text[len(text) - back :]}"
+
+
+def _fit_python(answer: PythonRun, limit_kb: int) -> PythonRun:
+    """Cut stdout and stderr in the middle, each to the same most characters, until the answer fits.
+
+    What one stream does not need goes to the other. The files are never cut: they are what the code made.
+
+    Args:
+        answer: The answer.
+        limit_kb: The result limit in kilobytes.
+
+    Returns:
+        The answer, within the limit as sent unless its files alone are over it.
+    """
+    limit = limit_kb * 1024
+    if _json_size(answer) <= limit:
+        return answer
+
+    def cut(keep: int) -> PythonRun:
+        return answer.model_copy(
+            update={"stdout": _middle(answer.stdout, keep), "stderr": _middle(answer.stderr, keep), "truncated": True}
+        )
+
+    best = cut(0)
+    low, high = 0, max(len(answer.stdout), len(answer.stderr))
+    while low <= high:
+        keep = (low + high) // 2
+        candidate = cut(keep)
+        if _json_size(candidate) <= limit:
+            best, low = candidate, keep + 1
+        else:
+            high = keep - 1
+    return _within(best, limit)
+
+
+@router.post(
+    "/tools/run_python",
+    operation_id="run_python",
+    summary="Run Python on the files of this conversation",
+    description=(
+        "Run Python code on this conversation's files and get back what it printed. The files are in the current "
+        "folder, under their names as list_files gives them (also at their /workspace/<chat>/<name> paths), "
+        "read-only. Write every result file directly into the out/ folder, not into a subfolder: each becomes a "
+        "new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image "
+        "files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so show a file with "
+        "display_file. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, "
+        "python-pptx, pypdf, odfpy, lxml, beautifulsoup4. There is no network and nothing can be installed. Use "
+        "threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a "
+        "script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when "
+        "long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures "
+        "the code computed."
+    ),
+    response_model_exclude_none=True,
+)
+async def run_python(
+    body: RunPythonRequest,
+    p: PrincipalDep,
+    settings: SettingsDep,
+    store: StoreDep,
+    audit: AuditDep,
+    jobs: JobsDep,
+) -> PythonRun:
+    """Run the model's code in the executor over the chat's files and answer with its output and new files.
+
+    Every file of the chat goes to the job, the newest 1000 if there are more (the protocol's limit), except
+    files below a folder named ``out``, which the executor never copies; the answer says what was left out. The
+    run is recorded by the ids of the files it was given and the files it made, whenever it ran, before the
+    answer goes out; the code is never recorded.
+
+    Args:
+        body: The code.
+        p: The caller, user and chat.
+        settings: The api's settings; ``result_max_kb`` caps the answer, ``job_wall_s`` gives the time limit.
+        store: The file store.
+        audit: The audit log.
+        jobs: The job queue.
+
+    Returns:
+        What the code printed, the files it made and the job's id.
+    """
+    files = sorted(await run_in_threadpool(store.files_in_chat, p), key=lambda rec: (-rec.created_at, rec.name))
+    readable = [rec for rec in files if rec.name.split("/")[0] != _OUT]
+    chosen = readable[:MAX_INPUT_FILES]
+    args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
+    job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen])
+    outcome = "ok" if result.status == "ok" else "error"
+    await run_in_threadpool(_record_run, audit, store, p, chosen, made, outcome)
+    payload, note = _python_payload(result)
+    run = _parse(_CodeRun, payload)
+    notes: list[str | None] = [run.hint, note]
+    if len(readable) > len(chosen):
+        notes.append(
+            f"The code was given the {len(chosen)} newest of {len(readable)} files; the "
+            f"{len(readable) - len(chosen)} oldest are not in its folder."
+        )
+    if len(files) > len(readable):
+        hidden = len(files) - len(readable)
+        notes.append(
+            f"{hidden} {'file' if hidden == 1 else 'files'} in the folder out/ "
+            f"{'is' if hidden == 1 else 'are'} not given to the code: out/ is where it writes."
+        )
+    answer = PythonRun(
+        stdout=run.stdout,
+        stderr=run.stderr,
+        files=[rec.virtual_path for rec in made],
+        truncated=run.truncated,
+        job_id=job.id,
+        hint=_join(*notes),
+    )
+    return _fit_python(answer, settings.result_max_kb)

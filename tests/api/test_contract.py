@@ -110,6 +110,13 @@ def test_system_prompt_carries_the_behaviour_the_spec_asks_for(settings: Setting
         assert phrase in prompt, phrase
 
 
+def test_system_prompt_tells_python_where_results_go_and_to_use_threads(settings: Settings) -> None:
+    """Results in ``out/``, plots as files, threads instead of processes (R28), and the job id as a source."""
+    prompt = system_prompt(settings)
+    for phrase in ("`out/`", "savefig", "display_file", "threads", "multiprocessing", "job_id"):
+        assert phrase in prompt, phrase
+
+
 def test_openapi_needs_only_the_key(client: TestClient) -> None:
     """Open WebUI fetches the spec with ``Authorization`` alone."""
     assert client.get("/openapi.json", headers=KEY_ONLY).status_code == 200
@@ -146,6 +153,7 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/tools/list_files",
         "/tools/read_document",
         "/tools/search_files",
+        "/tools/run_python",
         DISPLAY_TOOL,
         "/tools/echo",
     }

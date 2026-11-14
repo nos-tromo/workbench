@@ -22,8 +22,10 @@ def main(argv: Sequence[str]) -> int:
             ``tool``, ``args``, ``chat_id``, ``max_chars`` and ``file_mb``.
 
     Returns:
-        ``0`` once ``result.json`` is written, whether the runner succeeded, raised, or let a time limit
-        (:class:`~workbench.executor.timer.TimeLimit`, which is not an ``Exception``) escape.
+        ``0`` once ``result.json`` is written, whether the runner succeeded, raised (``SystemExit`` and
+        ``KeyboardInterrupt`` too), returned something other than a JSON object, or let a time limit
+        (:class:`~workbench.executor.timer.TimeLimit`, which is not an ``Exception``) escape; ``1`` if no
+        result could be written at all.
     """
     spec_path = Path(argv[1])
     try:
@@ -36,13 +38,38 @@ def main(argv: Sequence[str]) -> int:
             max_chars=spec["max_chars"],
             file_mb=spec["file_mb"],
         )
-        payload = json.dumps(RUNNERS[spec["tool"]](spec["args"], ctx))
+        answer = RUNNERS[spec["tool"]](spec["args"], ctx)
+        if not isinstance(answer, dict):
+            raise TypeError("the runner's answer is not an object")
+        payload = json.dumps(answer)
     except TimeLimit:
         # A runner handles its own limits; one that gets this far would otherwise end the process with no result.
         payload = json.dumps({"error": "read_timeout: the work ran past its time limit"})
-    except Exception as exc:
+    except BaseException as exc:  # SystemExit and KeyboardInterrupt too: the job always answers
         payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-    spec_path.with_name("result.json").write_text(payload, encoding="utf-8")
+    return _write(spec_path.with_name("result.json"), payload)
+
+
+def _write(path: Path, payload: str) -> int:
+    """Write the result, or a short error in its place if it cannot be written.
+
+    Code a job runs can fill the volume or lower its own file-size limit; the supervisor would then find a torn
+    result, or none.
+
+    Args:
+        path: Where the result goes.
+        payload: The result, JSON.
+
+    Returns:
+        ``0`` once a result is written, ``1`` if not even the short error could be.
+    """
+    try:
+        path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        try:
+            path.write_text(json.dumps({"error": f"result_unwritable: {type(exc).__name__}"}), encoding="utf-8")
+        except OSError:
+            return 1
     return 0
 
 

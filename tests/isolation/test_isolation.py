@@ -2,8 +2,7 @@
 
 The configuration tests read ``docker inspect`` and look from inside the running executor, so
 they prove what the kernel enforces, not only what the compose file asks for. The tests that
-run code go through the ``run_python`` tool, which Task 12 adds; until then they are expected
-to fail (``xfail(strict=True)``), and Task 12 removes the marks.
+run code go through the ``run_python`` tool, as the model would.
 """
 
 import json
@@ -25,7 +24,6 @@ CAPABILITY_MASK = f"{(1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) | (1 <
 PIDS_LIMIT = 320  # R19: 4 slots x 64 processes + 64 for the supervisor and its helpers
 SLOT_UIDS = range(20001, 20017)
 API_UID = 10001
-NEEDS_RUN_PYTHON = pytest.mark.xfail(reason="needs run_python (Task 12)", strict=True)
 
 
 def _capabilities(names: list[str] | None) -> set[str]:
@@ -53,7 +51,10 @@ def mounts():
     rows = (line.split() for line in pathlib.Path("/proc/self/mounts").read_text().splitlines())
     return {row[1]: [row[2], sorted(set(row[3].split(",")) & {"nosuid", "nodev", "noexec"})] for row in rows}
 def argv(pid):
-    return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    try:
+        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:  # the process ended after the listing
+        return []
 supervisors = [
     pid for pid in os.listdir("/proc") if pid.isdigit() and argv(pid)[1:3] == [b"-m", b"workbench.executor.supervisor"]
 ]
@@ -153,10 +154,9 @@ def test_the_api_runs_unprivileged_on_its_network_alone(api_info: dict[str, Any]
     assert api.get("/healthz").json() == {"ok": True}
 
 
-# --- jobs that try to escape (need run_python, Task 12) ---------------------------------------
+# --- jobs that try to escape -------------------------------------------------------------------
 
 
-@NEEDS_RUN_PYTHON
 def test_no_network(api: httpx.Client) -> None:
     """A job reaches no address, not even by IP."""
     code = """
@@ -171,7 +171,6 @@ else:
     assert stdout_of(run_python(api, code)) == "no network"
 
 
-@NEEDS_RUN_PYTHON
 def test_other_workspaces_are_unreadable(api: httpx.Client) -> None:
     """The users' files are the api's alone."""
     code = """
@@ -211,7 +210,6 @@ time.sleep(3)
 """
 
 
-@NEEDS_RUN_PYTHON
 def test_other_jobs_are_unreadable(api: httpx.Client) -> None:
     """Two jobs at once, each finding the other's folder from its command line: neither may list it."""
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -220,7 +218,6 @@ def test_other_jobs_are_unreadable(api: httpx.Client) -> None:
     assert [stdout_of(answer) for answer in answers] == ["refused", "refused"]
 
 
-@NEEDS_RUN_PYTHON
 def test_inputs_are_read_only(api: httpx.Client) -> None:
     """The job's copy of an upload is root's; only ``out/`` takes writes."""
     upload = api.post(
@@ -241,7 +238,6 @@ print("output written")
     assert stdout_of(run_python(api, code)).splitlines() == ["input refused", "output written"]
 
 
-@NEEDS_RUN_PYTHON
 def test_no_secrets_in_environment(api: httpx.Client) -> None:
     """The caller key is in no job's environment, by name or by value."""
     key = api.headers["Authorization"].removeprefix("Bearer ")
@@ -251,16 +247,23 @@ def test_no_secrets_in_environment(api: httpx.Client) -> None:
     assert not any(key in value for value in env.values())
 
 
-@NEEDS_RUN_PYTHON
 def test_fork_bomb_is_contained(api: httpx.Client) -> None:
-    """The job ends as killed, error or timeout; the next job runs normally."""
+    """The job ends as killed, error or timeout; the next job runs normally.
+
+    At the slot's process limit ``fork`` fails, so the code itself usually ends in that error, which the answer
+    carries as its traceback; else the executor stopped the job, on a resource limit or its wall time.
+    """
     bomb = run_python(api, "import os\nwhile True:\n    os.fork()\n")
 
-    assert bomb.status_code != 200 or "error" in bomb.json()
+    if bomb.status_code == 200:
+        assert bomb.json()["stderr"].rstrip().endswith("BlockingIOError: [Errno 11] Resource temporarily unavailable")
+    else:
+        detail = bomb.json()["detail"]
+        assert (bomb.status_code, detail.split(": ")[0]) == (422, "the code could not be completed"), bomb.text
+        assert "resource limit" in detail or "wall time" in detail, detail
     assert stdout_of(run_python(api, 'print("still here")')) == "still here"
 
 
-@NEEDS_RUN_PYTHON
 def test_memory_hog_is_killed_with_a_clear_message(api: httpx.Client) -> None:
     """More than the job's memory ends the job, and the answer says it was memory."""
     hog = run_python(api, "blob = bytearray(8 * 1024 ** 3)\nprint(len(blob))")
@@ -269,9 +272,49 @@ def test_memory_hog_is_killed_with_a_clear_message(api: httpx.Client) -> None:
     assert stdout_of(run_python(api, 'print("still here")')) == "still here"
 
 
-@NEEDS_RUN_PYTHON
 def test_wall_time_limit(api: httpx.Client) -> None:
     """A job that never ends is stopped at its wall time, and the answer says so."""
     sleeper = run_python(api, "import time\ntime.sleep(10_000)")
 
     assert "wall time" in sleeper.text.lower()
+
+
+def _upload(api: httpx.Client, name: str, data: bytes, *, user: str = "user-a", chat: str = "chat-1") -> str:
+    """Upload a synthetic file into a chat; return the name the workspace gave it."""
+    answer = api.post(
+        "/files/upload",
+        params={"directory": f"/workspace/{chat}"},
+        headers={"X-User-Id": user, "X-Session-Id": chat},
+        files={"file": (name, data)},
+    )
+    assert answer.status_code == 200, answer.text
+    return str(answer.json()["path"]).rsplit("/", 1)[1]
+
+
+def test_absolute_virtual_paths_work_in_python(api: httpx.Client) -> None:
+    """``/workspace/<chat>/x`` is the job's own copy of ``x``, through the image's ``/workspace`` link."""
+    name = _upload(api, "quarterly-figures.csv", b"quarter,figure\nq1,10\nq2,32\n")
+    code = f"import pandas as pd\nprint(pd.read_csv({f'/workspace/chat-1/{name}'!r})['figure'].sum())"
+    assert stdout_of(run_python(api, code)) == "42"
+
+
+def test_a_failing_read_shows_only_virtual_paths(api: httpx.Client) -> None:
+    """The traceback of a file that is not there names it as the code did, never the job's real folder."""
+    code = "import pandas as pd, pathlib\nprint(pathlib.Path.cwd())\npd.read_csv('/workspace/chat-1/missing.csv')"
+    answer = run_python(api, code)
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["stdout"].strip() == "/workspace/chat-1"
+    assert body["stderr"].rstrip().endswith("No such file or directory: '/workspace/chat-1/missing.csv'")
+    assert "/data" not in answer.text
+    assert "hint" not in body
+
+
+def test_another_chats_files_are_not_there_and_the_answer_says_why(api: httpx.Client) -> None:
+    """A file of the user's other chat is not in this job; the answer tells the model only this chat's are."""
+    name = _upload(api, "other-chat.csv", b"a,b\n1,2\n", chat="chat-2")
+    answer = run_python(api, f"open({f'/workspace/chat-2/{name}'!r})")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert "FileNotFoundError" in body["stderr"]
+    assert "only this chat's files are available" in body["hint"].lower()

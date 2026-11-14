@@ -149,6 +149,73 @@ def test_a_result_that_is_not_json_becomes_an_error(tmp_path: Path, monkeypatch:
     assert json.loads((tmp_path / "result.json").read_text())["error"].startswith("TypeError: ")
 
 
+@pytest.mark.parametrize("raised", [SystemExit(3), KeyboardInterrupt()])
+def test_a_runner_that_exits_still_leaves_a_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: BaseException
+) -> None:
+    """``SystemExit`` and ``KeyboardInterrupt`` are not ``Exception`` either; the job answers all the same."""
+
+    def leave(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+        """End the way code that calls ``sys.exit`` would."""
+        raise raised
+
+    monkeypatch.setitem(RUNNERS, "leave", leave)
+    monkeypatch.chdir(tmp_path)
+    spec = _write_spec(tmp_path, tool="leave")
+    assert job.main(["job", str(spec)]) == 0
+    assert json.loads((tmp_path / "result.json").read_text())["error"].startswith(f"{type(raised).__name__}")
+
+
+def test_a_runner_answer_that_is_not_an_object_becomes_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The supervisor reads only a JSON object; a list would leave the job with no readable result."""
+
+    def listing(args: dict[str, Any], ctx: JobContext) -> Any:
+        """Answer with a list, as no runner may."""
+        return ["a", "b"]
+
+    monkeypatch.setitem(RUNNERS, "listing", listing)
+    monkeypatch.chdir(tmp_path)
+    spec = _write_spec(tmp_path, tool="listing")
+    assert job.main(["job", str(spec)]) == 0
+    assert json.loads((tmp_path / "result.json").read_text())["error"].startswith("TypeError: ")
+
+
+def test_a_result_too_large_to_write_is_replaced_by_a_short_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails (a full volume, a file-size limit the code lowered) leaves a short error, not a torn file."""
+    real_write_text = Path.write_text
+
+    def write_text(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if len(data) > 100:
+            raise OSError(27, "File too large")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setitem(RUNNERS, "big", lambda args, ctx: {"text": "x" * 1000})
+    monkeypatch.chdir(tmp_path)
+    spec = _write_spec(tmp_path, tool="big")
+    monkeypatch.setattr(Path, "write_text", write_text)
+    assert job.main(["job", str(spec)]) == 0
+    monkeypatch.undo()
+    assert json.loads((tmp_path / "result.json").read_text()) == {"error": "result_unwritable: OSError"}
+
+
+def test_a_job_that_cannot_write_any_result_says_so_in_its_exit_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no result at all the supervisor answers from the exit status; the job does not claim success."""
+
+    def refuse(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.chdir(tmp_path)
+    spec = _write_spec(tmp_path)
+    monkeypatch.setattr(Path, "write_text", refuse)
+    assert job.main(["job", str(spec)]) == 1
+
+
 def test_the_runner_gets_its_context_from_the_spec_and_the_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The working directory is the cwd, the outputs go to ``out/`` below it, the rest comes from the spec."""
     seen: list[JobContext] = []
@@ -171,7 +238,7 @@ def test_the_runner_gets_its_context_from_the_spec_and_the_cwd(tmp_path: Path, m
 
 def test_the_registered_runners() -> None:
     """Each tool task registers its own runners: ``echo`` proves the sandbox, the document tools read files."""
-    assert set(RUNNERS) == {"echo", "read_document", "search_files"}
+    assert set(RUNNERS) == {"echo", "read_document", "search_files", "run_python"}
 
 
 def test_the_job_reads_no_environment() -> None:
