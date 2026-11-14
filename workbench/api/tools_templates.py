@@ -41,7 +41,7 @@ from workbench.api.tools import (
     router,
 )
 from workbench.models import FileRecord, Principal
-from workbench.paths import PathError, check_filename
+from workbench.paths import MAX_FILENAME, MAX_FILENAME_BYTES, PathError, check_filename
 from workbench.protocol import MAX_INPUT_FILES
 from workbench.utils.audit_event import AuditWriteError
 
@@ -289,13 +289,18 @@ class FilledTemplate(BaseModel):
     Attributes:
         path: The new file's path.
         filled: How many fields were filled.
-        unfilled: The fields left without a value.
+        unfilled: The fields left without a value: given none, or one that could not be written where they are.
         warnings: What the model should tell the user.
     """
 
     path: str = Field(description="The new file's path; show it with display_file.")
     filled: int = Field(description="How many fields were filled.")
-    unfilled: list[str] = Field(description="The fields given no value; they are empty, or keep their placeholder.")
+    unfilled: list[str] = Field(
+        description=(
+            "The fields left without a value: given none (they are empty, or keep their placeholder), or one that "
+            "could not be written where the field is (a warning says why)."
+        )
+    )
     warnings: list[str] = Field(description="What to tell the user about the fill.")
 
 
@@ -350,8 +355,10 @@ def _output_name(template: str, ext: str, wanted: str | None) -> str:
         HTTPException: The name asked for is not a plain file name, or does not end in ``ext`` (422).
     """
     if wanted is None:
-        stem = posixpath.splitext(posixpath.basename(template))[0][: 200 - len(f"-filled{ext}")]
-        return check_filename(f"{stem}-filled{ext}")
+        suffix = f"-filled{ext}"
+        stem = posixpath.splitext(posixpath.basename(template))[0][: MAX_FILENAME - len(suffix)]
+        stem = stem.encode()[: MAX_FILENAME_BYTES - len(suffix.encode())].decode(errors="ignore")  # whole characters
+        return check_filename(f"{stem}{suffix}")
     try:
         name = check_filename(wanted)
     except PathError:

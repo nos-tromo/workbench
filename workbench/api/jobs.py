@@ -46,6 +46,7 @@ from workbench.protocol import (
     Limits,
     OutputFile,
     decode_result,
+    encodable,
     encode,
 )
 
@@ -261,7 +262,7 @@ class JobQueue:
         Args:
             p: The caller, user and chat the job runs for.
             tool: Name of the runner to run.
-            args: The runner's arguments.
+            args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
             input_files: Paths relative to the chat folder that the job may read.
 
         Returns:
@@ -383,7 +384,7 @@ class JobQueue:
             req = JobRequest(
                 job_id=job.id,
                 tool=tool,
-                args=args,
+                args=encodable(args),  # a lone surrogate from the model would make the request unsendable
                 caller=p.caller,
                 user_id=p.user_id,
                 chat_id=p.chat_id,
@@ -484,7 +485,8 @@ class JobQueue:
 
         The registration runs as one call in a thread. A cancellation does not cut it off half way: it finishes,
         what it registered is removed again (the caller that is going away records no event for it), and then the
-        cancellation goes on.
+        cancellation goes on. Both calls are plain futures of the loop's executor, not tasks: ``asyncio.run`` cancels
+        every task as it shuts down, and a cancelled task would stop waiting while its thread goes on moving files.
 
         Args:
             p: The caller, user and chat the job ran for.
@@ -494,13 +496,14 @@ class JobQueue:
         Returns:
             The answer, its message extended by a note on outputs that could not be kept, and the new files.
         """
-        registering = asyncio.ensure_future(asyncio.to_thread(self._register, p, job_id, result.outputs))
+        loop = asyncio.get_running_loop()
+        registering = loop.run_in_executor(None, self._register, p, job_id, result.outputs)
         try:
             kept, lost = await asyncio.shield(registering)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):  # a registration that failed has removed its files itself
                 kept, _ = await _outlast(registering)
-                await _outlast(asyncio.ensure_future(asyncio.to_thread(self._discard, kept)))
+                await _outlast(loop.run_in_executor(None, self._discard, kept))
             raise
         if lost:
             count = sum(lost.values())

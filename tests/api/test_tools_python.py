@@ -10,6 +10,7 @@ import dataclasses
 import io
 import itertools
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -309,6 +310,33 @@ def test_outputs_of_an_answer_that_cannot_be_read_are_removed_and_the_run_is_an_
     assert (event["outcome"], event["target"]["ids"], event["criteria"]["outputs"]) == ("error", [a.id], 0)
 
 
+def test_an_output_that_cannot_be_removed_is_logged_and_named_by_the_event(
+    client: TestClient,
+    store: Store,
+    fake_executor: Scripted,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A file that stays although it should go is never unknown: the log says so, by error type; the event names it."""
+    fake_executor.files = {"r.xlsx": b"PK"}
+    fake_executor.payload = {"stdout": 1}
+
+    def refuse(_record: Any) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    with caplog.at_level(logging.WARNING):
+        r = run(client)
+    assert r.status_code == 500
+    (left,) = [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
+    (event,) = events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"], event["criteria"]["outputs"]) == ("error", [left.id], 1)
+    assert "OSError" in caplog.text
+    assert "r.xlsx" not in caplog.text
+    assert "read-only" not in caplog.text
+
+
 def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake_executor: Scripted) -> None:
     """The runner's hint at its cap and the executor's note together are longer than a hint may be: cut to it."""
     fake_executor.message = "dropped 1 output: not the job's own file"
@@ -321,6 +349,16 @@ def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake
 
 
 # --- the request -----------------------------------------------------------------------------------------------
+
+
+def test_a_lone_surrogate_in_an_argument_reaches_the_job_as_a_replacement_character(
+    client: TestClient, fake_executor: Scripted
+) -> None:
+    """JSON may carry the escape of a lone surrogate, which UTF-8 cannot hold: the job gets U+FFFD, never a 500."""
+    body = b'{"code": "print(\\"a\\ud800b\\")"}'
+    r = client.post("/tools/run_python", content=body, headers={**H, "Content-Type": "application/json"})
+    assert r.status_code == 200, r.text
+    assert fake_executor.requests[0].args["code"] == 'print("a\ufffdb")'
 
 
 def test_code_of_up_to_50000_characters_is_taken(client: TestClient, fake_executor: Scripted) -> None:

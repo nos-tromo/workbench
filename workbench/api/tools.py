@@ -15,14 +15,15 @@ fixed codes (anything else is "the tool failed"), and the whole answer is cut to
 measured as the bytes that are sent.
 """
 
-import contextlib
 import dataclasses
-from collections.abc import Sequence
+import logging
+from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, override
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
@@ -31,11 +32,48 @@ from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, Sto
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import Store
 from workbench.models import FileRecord, Principal
-from workbench.paths import PathError
-from workbench.protocol import MAX_INPUT_FILES, JobResult
+from workbench.protocol import MAX_INPUT_FILES, JobResult, encodable
 from workbench.utils.audit_event import AuditWriteError
 
-router = APIRouter(tags=[TOOL_TAG])
+_log = logging.getLogger(__name__)
+
+
+class _ToolRequest(Request):
+    """A request whose JSON body is read with every lone surrogate replaced by U+FFFD.
+
+    JSON may carry the escape of a surrogate half alone, as code a model writes with one backslash too few does;
+    pydantic takes no such string, and FastAPI's answer that quotes it back cannot be encoded either.
+    """
+
+    @override
+    async def json(self) -> Any:
+        """Read the body as JSON, every string of it encodable as UTF-8.
+
+        Returns:
+            The body's value.
+        """
+        return encodable(await super().json())
+
+
+class _ToolRoute(APIRoute):
+    """A tool's route: it reads its body as :class:`_ToolRequest` does."""
+
+    @override
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        """Wrap the route's handler so that it is given a :class:`_ToolRequest`.
+
+        Returns:
+            The handler.
+        """
+        handler = super().get_route_handler()
+
+        async def read_encodable(request: Request) -> Response:
+            return await handler(_ToolRequest(request.scope, request.receive))
+
+        return read_encodable
+
+
+router = APIRouter(tags=[TOOL_TAG], route_class=_ToolRoute)
 
 
 class FileInfo(BaseModel):
@@ -818,16 +856,26 @@ def _record_run(
         raise
 
 
-def _remove_outputs(store: Store, outputs: Sequence[FileRecord]) -> None:
+def _remove_outputs(store: Store, outputs: Sequence[FileRecord]) -> list[FileRecord]:
     """Remove files a job made that must not stay; one that cannot be removed does not stop the others.
+
+    A failure is logged, by its type alone, and never raised: the caller's own answer is the one that goes out.
 
     Args:
         store: The file store.
         outputs: The files.
+
+    Returns:
+        The files that could not be removed and are still in the workspace, for the event to name.
     """
+    left: list[FileRecord] = []
     for rec in outputs:
-        with contextlib.suppress(PathError, OSError):
+        try:
             store.remove(rec)
+        except Exception as exc:
+            _log.warning("could not remove an output that must not stay (%s)", type(exc).__name__)
+            left.append(rec)
+    return left
 
 
 def _readable(model: type[BaseModel], payload: object) -> bool:
@@ -949,9 +997,9 @@ async def run_python(
     job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen])
     outcome = "ok" if result.status == "ok" else "error"
     if result.status == "ok" and not _readable(_CodeRun, result.result):
-        # The model is told the tool failed and never learns of the files: none of them may stay.
-        await run_in_threadpool(_remove_outputs, store, made)
-        made.clear()
+        # The model is told the tool failed and never learns of the files: none of them may stay, and the event names
+        # any that could not be removed.
+        made = await run_in_threadpool(_remove_outputs, store, made)
         outcome = "error"
     await run_in_threadpool(_record_run, audit, store, p, chosen, made, outcome)
     payload, note = _python_payload(result)

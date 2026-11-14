@@ -180,6 +180,30 @@ class JobResult(_Message):
     message: str = ""
 
 
+def encodable(value: Any) -> Any:
+    """Replace every lone surrogate in the strings of a JSON value, its keys included, with U+FFFD.
+
+    JSON reads the escape of a surrogate half that has no partner as a lone surrogate, which UTF-8 cannot hold, so a
+    message that carries one could not be sent. A pair that is split over two code points stays one character.
+
+    Args:
+        value: A value as :func:`json.loads` returns it.
+
+    Returns:
+        The value, every string of it encodable as UTF-8.
+
+    Raises:
+        RecursionError: The value is nested too deeply to walk.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(value, list):
+        return [encodable(item) for item in value]
+    if isinstance(value, dict):
+        return {encodable(key): encodable(item) for key, item in value.items()}
+    return value
+
+
 def encode(model: BaseModel) -> bytes:
     """Serialise a message as one JSON line.
 

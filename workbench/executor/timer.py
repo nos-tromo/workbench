@@ -471,6 +471,11 @@ def shielded() -> Iterator[None]:
     consumed it): a deadline that passes while its ``finally`` clauses run would otherwise raise in the middle
     of them.
 
+    It holds only while the main thread is the process's one thread: the signal is blocked for the calling thread
+    alone, and with a second thread alive the kernel hands it to that one, after which Python runs the handler in
+    the main thread all the same, inside the block. Called from another thread, it blocks nothing. For bookkeeping
+    that must hold whatever threads there are, mark the function :func:`uninterrupted` instead.
+
     Yields:
         With the signal blocked.
     """

@@ -9,7 +9,8 @@ Values are data, never formulas: a string is stored as text even if it starts wi
 whether it is a field's value, a table's cell or an entry of the sources sheet (:func:`write_text`).
 
 openpyxl loads and saves the workbook; it does not keep everything a workbook can hold (charts, pivot tables,
-pictures and other drawings), and the answer warns when the template has any (:func:`unkept_parts`).
+pictures and other drawings), and the answer warns when the template has any (:func:`unkept_parts`). Rich text within
+a cell is kept as its text alone, with a warning too (:func:`flatten_rich_text`).
 """
 
 import re
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from openpyxl.cell.cell import MergedCell
+from openpyxl.cell.rich_text import CellRichText, TextBlock
 
 from workbench.executor.readers import paging as pg
 from workbench.executor.templates import Field, Refusal, merge, safe_text
@@ -301,6 +303,29 @@ def fill(book: Any, values: Mapping[str, object], warnings: list[str]) -> list[s
         cell = book[title].cell(row=row, column=column)
         write_text(cell, _PLACEHOLDER.sub(value_of, str(cell.value)))
     return list(filled)
+
+
+def flatten_rich_text(book: Any) -> int:
+    """Keep every cell that holds rich text (words in another font or colour within the cell) as its text alone.
+
+    The workbook is loaded with its rich text so that this can be counted: what openpyxl would flatten unseen is
+    flattened here, and the answer says how many cells lost their formatting.
+
+    Args:
+        book: The workbook, loaded with ``rich_text=True``.
+
+    Returns:
+        How many cells had formatting within their text.
+    """
+    flattened = 0
+    for sheet in book.worksheets:
+        for cell in sheet._cells.values():
+            value = cell.value
+            if isinstance(value, CellRichText):
+                if any(isinstance(piece, TextBlock) for piece in value):
+                    flattened += 1
+                write_text(cell, str(value))
+    return flattened
 
 
 def unkept_parts(path: Path) -> bool:

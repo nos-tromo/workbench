@@ -582,6 +582,28 @@ def test_a_signal_handler_that_prints_in_the_middle_of_a_write_follows_it() -> N
     assert capture.parts() == ("a" * 8, "bhandler", 47 - 16)
 
 
+def test_a_handler_of_the_codes_own_that_raises_just_after_a_drop_leaves_the_capture_whole() -> None:
+    """The code's own handler raising there (``signal.alarm(n)`` and ``raise TimeoutError``, say) tears nothing.
+
+    The handler's error comes out of that write, as the code asked; the sizes are still those of what is kept, so the
+    next write works instead of raising ``IndexError`` over pieces that are not there.
+    """
+    capture = _Capture(8)
+    capture.write("a" * 20)
+
+    def raise_(_frame: FrameType) -> None:
+        raise TimeoutError("the code's own alarm")
+
+    with after_a_drop(raise_) as ran, pytest.raises(TimeoutError):
+        capture.write("b" * 20)
+    assert ran
+    _counts_are_exact(capture)
+    capture.write("c" * 3)
+    capture.write("d" * 9)
+    _counts_are_exact(capture)
+    assert capture.parts() == ("a" * 8, "d" * 8, 52 - 16)
+
+
 def test_a_timeout_in_the_middle_of_a_write_of_the_code_still_answers_that_it_timed_out(tmp_job: Job) -> None:
     """The deadline lands just after a drop in code that writes long lines: the answer is the code's timeout."""
     began = time.monotonic()

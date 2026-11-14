@@ -63,10 +63,12 @@ class _Capture(io.TextIOBase):
 
     Writing costs at most two slices of what is written, whatever its size, so code that prints without end
     uses no more memory than the one string it prints. Code may write from many threads at once: each write is
-    whole. Nothing that arrives by a signal splits one either. The code's time limit waits for the end of the
-    bookkeeping (:func:`~workbench.executor.timer.uninterrupted`). The lock is reentrant, so a signal handler of
-    the code's that prints while the thread it interrupted is writing cannot deadlock it, and what the handler
-    prints is taken on by the interrupted write once that is whole, after its own text.
+    whole. The code's time limit waits for the end of the bookkeeping (:func:`~workbench.executor.timer.uninterrupted`).
+    The lock is reentrant, so a signal handler of the code's that prints while the thread it interrupted is writing
+    cannot deadlock it, and what the handler prints is taken on by the interrupted write once that is whole, after its
+    own text. A handler of the code's own that raises (``signal.alarm(n)`` with ``raise TimeoutError``) does end a
+    write half done, as the code asked, and some of that write's text may be lost; the sizes the stream counts never
+    exceed what it holds, so no later write fails over it.
 
     Attributes:
         encoding: The stream's encoding, for code that asks before it writes.
@@ -152,7 +154,10 @@ class _Capture(io.TextIOBase):
                 self._tail.append(piece)
                 self._tail_size += len(piece)
                 while self._tail_size - len(self._tail[0]) >= self._keep:
-                    self._tail_size -= len(self._tail.popleft())
+                    # The size goes down before the piece goes: an error that lands between the two leaves the size
+                    # short of the pieces, never over them, and the loop never runs out of pieces.
+                    self._tail_size -= len(self._tail[0])
+                    self._tail.popleft()
             if not self._later:
                 return
             s = self._later.pop(0)

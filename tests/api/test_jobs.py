@@ -412,6 +412,18 @@ def jobs_recorded(settings: Settings) -> int:
         db.close()
 
 
+async def test_a_lone_surrogate_in_the_arguments_is_sent_as_a_replacement_character(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """UTF-8 cannot hold one, so the request could not be encoded: it goes as U+FFFD, in keys and nested values too."""
+    queue = queue_for(settings, executor, store, metrics)
+    args = {"values": {"a\ud800": {"value": ["b\udc00", 1]}}}
+    await queue.submit(user("user-a"), "fill_template", args, [])
+    (req,) = executor.requests
+    assert req.args == {"values": {"a\ufffd": {"value": ["b\ufffd", 1]}}}
+    assert encode(req).endswith(b"\n")
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -945,6 +957,126 @@ async def test_a_cancel_while_outputs_are_registered_leaves_none_of_them(
     assert store.get_job(me, executor.requests[0].job_id).status == "cancelled"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert queue.tracked_users == 0
+
+
+@dataclasses.dataclass
+class HeldMoves:
+    """A registration held after its first move, until the test lets it go on.
+
+    Attributes:
+        moved: Set once the first output is in the chat folder.
+        go_on: The test sets it to let the registration go on.
+        ended: Each call of the store's registration that has returned or raised.
+    """
+
+    moved: threading.Event
+    go_on: threading.Event
+    ended: list[str]
+
+
+def hold_the_first_move(store: Store, monkeypatch: pytest.MonkeyPatch) -> HeldMoves:
+    """Make the store's registration stop after its first move, until the test sets ``go_on``."""
+    held = HeldMoves(threading.Event(), threading.Event(), [])
+    real = store.register_output
+
+    def slow(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+        try:
+            record = real(p, staged, name, job_id)
+            if not held.moved.is_set():
+                held.moved.set()
+                held.go_on.wait(10)
+            return record
+        finally:
+            held.ended.append(name)
+
+    monkeypatch.setattr(store, "register_output", slow)
+    return held
+
+
+async def test_outputs_registered_while_the_loop_shuts_down_are_removed(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``asyncio.run`` cancels every task as it ends; the registration is not one, so it ends and its files go again.
+
+    A registration that is a task of its own is cancelled with the caller: its thread goes on moving files in, and
+    nothing is left to remove them.
+    """
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    held = hold_the_first_move(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    before = asyncio.all_tasks()
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    await until(held.moved.is_set)
+    for task in asyncio.all_tasks() - before:
+        task.cancel()  # every task the call made, as asyncio.run's shutdown cancels every task there is
+    await asyncio.sleep(0.05)
+    held.go_on.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    await until(lambda: len(held.ended) == 2)
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert store.get_job(me, executor.requests[0].job_id).status == "cancelled"
+
+
+async def test_a_second_cancel_while_outputs_are_registered_still_leaves_none_of_them(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel that comes while the caller waits out the registration does not stop the wait: the files still go."""
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    held = hold_the_first_move(store, monkeypatch)
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    await until(held.moved.is_set)
+    running.cancel()
+    await asyncio.sleep(0.05)
+    running.cancel()
+    await asyncio.sleep(0.05)
+    held.go_on.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert held.ended == ["a.txt", "b.txt"]
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert store.get_job(me, executor.requests[0].job_id).status == "cancelled"
+    assert queue.tracked_users == 0
+
+
+async def test_an_unexpected_failure_of_the_registration_removes_what_it_moved_in(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first output is moved in, the second fails in a way the queue does not expect: the first goes again."""
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    real = store.register_output
+
+    def fail_the_second(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+        if name == "b.txt":
+            raise RuntimeError("synthetic: an unexpected failure")
+        return real(p, staged, name, job_id)
+
+    monkeypatch.setattr(store, "register_output", fail_the_second)
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(RuntimeError):
+        await queue.submit(me, "run_python", ARGS, [])
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert store.get_job(me, executor.requests[0].job_id).status == "error"
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
 
 async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure(

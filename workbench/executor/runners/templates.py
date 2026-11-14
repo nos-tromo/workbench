@@ -15,6 +15,7 @@ unfilled, and warnings: never a path of the job.
 
 import io
 import json
+import re
 import time
 import warnings
 import zipfile
@@ -48,6 +49,9 @@ WARNING_MAX: Final = 2000
 LOCATION_MAX: Final = 300
 
 _DEFAULT_BUDGET_S: Final = 60.0
+
+#: What openpyxl warns of when it loads a workbook and will not write back something of it.
+_LOST: Final = re.compile(r"will be (?:removed|lost|discarded|treated as an error)|is being dropped")
 _TYPES: Final = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 _TEMPLATE_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
 _DOCUMENT_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
@@ -89,6 +93,8 @@ def _family(path: Path) -> str:
 @contextmanager
 def _limited(budget: float) -> Iterator[None]:
     """Run the work under the job's time limit, the readers' deadline the same, and the libraries' warnings unshown.
+
+    What openpyxl warns of as it loads a workbook is not lost: :func:`_open_xlsx` records it for the answer.
 
     Args:
         budget: Seconds the work may take.
@@ -216,7 +222,7 @@ def _open_docx(path: Path, ctx: JobContext) -> Any:
     return _library(opened)
 
 
-def _open_xlsx(path: Path, ctx: JobContext) -> Any:
+def _open_xlsx(path: Path, ctx: JobContext) -> tuple[Any, list[str]]:
     """Open a workbook template: the zip guard and the workbook counts of ``read_document``, then openpyxl.
 
     Args:
@@ -224,7 +230,8 @@ def _open_xlsx(path: Path, ctx: JobContext) -> Any:
         ctx: The job's surroundings.
 
     Returns:
-        The openpyxl workbook, formulas kept.
+        The openpyxl workbook, formulas kept and rich text flattened, and a warning for each kind of thing the filled
+        workbook will not keep: what openpyxl says it removes, and the rich text.
 
     Raises:
         readers.UnreadableFile: A guard refused it, or it is damaged.
@@ -232,10 +239,29 @@ def _open_xlsx(path: Path, ctx: JobContext) -> Any:
     import openpyxl
 
     from workbench.executor.readers import sheet
+    from workbench.executor.templates import xlsx_placeholders
 
     readers.check_zip(path, ctx.file_mb)
     sheet.check_bounds(path)
-    return _library(lambda: openpyxl.load_workbook(path, rich_text=False))
+
+    def opened() -> tuple[Any, list[str]]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            book = openpyxl.load_workbook(path, rich_text=True)
+        said = [str(warning.message) for warning in caught]
+        return book, [
+            _cut(f"Not kept in the filled workbook: {text}.", WARNING_MAX) for text in said if _LOST.search(text)
+        ]
+
+    book, losses = _library(opened)
+    flattened = _library(lambda: xlsx_placeholders.flatten_rich_text(book))
+    if flattened:
+        cells = "1 cell holds" if flattened == 1 else f"{flattened} cells hold"
+        losses.append(
+            f"{cells} rich text (words in another font or colour within the cell); the filled workbook keeps "
+            f"{'its' if flattened == 1 else 'their'} text alone."
+        )
+    return book, list(dict.fromkeys(losses))
 
 
 def _input(args: Mapping[str, Any], ctx: JobContext) -> tuple[Path, str]:
@@ -382,7 +408,7 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         else:
             from workbench.executor.templates import xlsx_placeholders
 
-            book = _open_xlsx(path, ctx)
+            book, _ = _open_xlsx(path, ctx)
             places = _library(lambda: xlsx_placeholders.fields(book))
         merged = merge(places)
         fields, long_names = _nameable(merged)
@@ -410,7 +436,9 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     return _answered(work, budget)
 
 
-def _fill_docx(path: Path, ctx: JobContext, values: Mapping[str, object], warned: list[str]) -> tuple[Any, list[str]]:
+def _fill_docx(
+    path: Path, ctx: JobContext, values: Mapping[str, object], warned: list[str]
+) -> tuple[Any, list[str], set[str]]:
     """Fill a Word template: its ``{{ }}`` code first, then its content controls and form fields.
 
     Args:
@@ -420,7 +448,8 @@ def _fill_docx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
         warned: Where warnings go.
 
     Returns:
-        The filled python-docx document, and the template's field names in order.
+        The filled python-docx document, the template's field names in order, and the names given a value that
+        could be filled nowhere (each with a warning).
 
     Raises:
         Refusal: A value does not fit its field, the code does not compile, or there are no fields.
@@ -436,11 +465,14 @@ def _fill_docx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
     if _library(lambda: docx_jinja.has_code(template)):
         _library(lambda: docx_jinja.render(template, values, env, warned))
     document = template.docx
-    _library(lambda: docx_controls.fill(document, values, warned))
-    return document, names
+    placeholders = {field.name for field in places if field.kind == "placeholder"}
+    not_filled = set(_library(lambda: docx_controls.fill(document, values, warned))) - placeholders
+    return document, names, not_filled
 
 
-def _fill_xlsx(path: Path, ctx: JobContext, values: Mapping[str, object], warned: list[str]) -> tuple[Any, list[str]]:
+def _fill_xlsx(
+    path: Path, ctx: JobContext, values: Mapping[str, object], warned: list[str]
+) -> tuple[Any, list[str], set[str]]:
     """Fill a workbook template.
 
     Args:
@@ -450,17 +482,18 @@ def _fill_xlsx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
         warned: Where warnings go.
 
     Returns:
-        The filled openpyxl workbook, and the template's field names in order.
+        The filled openpyxl workbook, the template's field names in order, and no name: a cell is always filled.
 
     Raises:
         Refusal: A value does not fit its field, a table has no room, or there are no fields.
     """
     from workbench.executor.templates import xlsx_placeholders
 
-    book = _open_xlsx(path, ctx)
+    book, losses = _open_xlsx(path, ctx)
     names = [field.name for field in _library(lambda: xlsx_placeholders.fields(book))]
     if not names:
         raise Refusal("unsupported_template", _NO_FIELDS)
+    warned.extend(losses)
     _library(lambda: xlsx_placeholders.fill(book, values, warned))
     if xlsx_placeholders.unkept_parts(path):
         warned.append(
@@ -468,7 +501,7 @@ def _fill_xlsx(path: Path, ctx: JobContext, values: Mapping[str, object], warned
             "as they were, so check it before handing it on."
         )
     book.template = False
-    return book, names
+    return book, names, set()
 
 
 def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
@@ -482,7 +515,8 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         ctx: The job's surroundings.
 
     Returns:
-        ``filled`` and ``unfilled`` (field names, in the template's order) and ``warnings``; or an ``error`` result.
+        ``filled`` and ``unfilled`` (field names, in the template's order; a field given a value it could be filled
+        with nowhere is unfilled, with a warning) and ``warnings``; or an ``error`` result.
     """
     from workbench.executor.templates import sources
 
@@ -499,7 +533,7 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         values = {name: entry.get("value") for name, entry in entries.items()}
         sheets = sources.check(entries, ctx)
         warned: list[str] = []
-        filled_file, every = (_fill_docx if family == "docx" else _fill_xlsx)(path, ctx, values, warned)
+        filled_file, every, not_filled = (_fill_docx if family == "docx" else _fill_xlsx)(path, ctx, values, warned)
         names = [name for name in every if len(name) <= MAX_NAME]
         if len(names) < len(every):
             left = len(every) - len(names)
@@ -507,7 +541,7 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
                 f"{left} {'field has a name' if left == 1 else 'fields have names'} longer than {MAX_NAME} characters "
                 "and cannot be filled."
             )
-        filled = [name for name in names if name in values]
+        filled = [name for name in names if name in values and name not in not_filled]
         known = set(names)
         unused = [name for name in values if name not in known]
         if unused:
@@ -522,7 +556,7 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             else:
                 sources.to_workbook(filled_file, table)
         filled_file.save(str(ctx.out_dir / output))
-        unfilled = [name for name in names if name not in values]
+        unfilled = [name for name in names if name not in values or name in not_filled]
         if len(unfilled) > LISTED * 10:
             warned.append(f"{len(unfilled) - LISTED * 10} more fields are unfilled than are listed.")
             unfilled = unfilled[: LISTED * 10]

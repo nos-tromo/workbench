@@ -259,6 +259,41 @@ def test_a_name_that_is_taken_gets_a_number_and_the_answer_names_the_stored_file
     assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).json()["path"] == f"{CHAT}/form-filled (1).docx"
 
 
+def test_the_default_name_of_a_long_multibyte_template_is_cut_to_a_valid_name(
+    client: TestClient, store: Store, tmp_path: Path
+) -> None:
+    """A name may have 255 bytes: 83 euro signs and .docx are 254, so the default name is cut by bytes, not length."""
+    template = "€" * 83 + ".docx"
+    put(store, template, mt.make_controls_docx(tmp_path / "built" / "form.docx").read_bytes())
+    r = fill(client, f"{CHAT}/{template}", {"customer": "x"})
+    assert r.status_code == 200, r.text
+    name = r.json()["path"].rsplit("/", 1)[1]
+    assert name == "€" * 81 + "-filled.docx"
+    assert len(name.encode()) == 255
+
+
+def test_a_form_field_that_could_not_be_filled_is_not_counted_as_filled(
+    client: TestClient, store: Store, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """A form field that runs over a paragraph break is unfilled, and the event does not count its source."""
+    stored(store, tmp_path, "split.docx", mt.make_split_form_field_docx)
+    values = {"name": {"value": "x", "source": {"kind": "user"}}, "city": "y"}
+    body = fill(client, f"{CHAT}/split.docx", values).json()
+    assert (body["filled"], body["unfilled"]) == (1, ["name"])
+    (event,) = events(audit_lines, "fill_template")
+    assert event["criteria"]["filled_by_source"] == {"file": 0, "job": 0, "user": 0, "assistant": 1}
+
+
+def test_the_runners_mirrored_bounds_are_the_apis() -> None:
+    """The runner cuts to the api's bounds without importing the api; a change on one side must reach the other."""
+    from workbench.api import tools, tools_templates
+    from workbench.executor.runners import templates
+
+    assert templates.MAX_NAME == tools_templates.MAX_NAME
+    assert templates.WARNING_MAX == tools.MAX_HINT
+    assert templates.LOCATION_MAX == tools_templates.MAX_LOCATION
+
+
 def test_a_dotx_template_is_filled_into_a_docx(client: TestClient, store: Store, tmp_path: Path) -> None:
     """The default name and any name given end in .docx."""
     path = mt.as_dotx(mt.make_controls_docx(tmp_path / "built" / "a.docx"), tmp_path / "built" / "form.dotx")

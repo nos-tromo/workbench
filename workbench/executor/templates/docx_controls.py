@@ -689,7 +689,8 @@ def fill(document: Document, values: Mapping[str, object], warnings: list[str]) 
         warnings: Where warnings go.
 
     Returns:
-        The names of the fields filled.
+        The names of the fields that were given a value and filled in none of their places: form fields that run
+        over more than one paragraph, each with a warning. A field filled in some of its places is filled.
 
     Raises:
         Refusal: A field does not take its value.
@@ -698,14 +699,17 @@ def fill(document: Document, values: Mapping[str, object], warnings: list[str]) 
     for spot in find(document).spots:
         places.setdefault(spot.field.name, []).append(spot)
     checked = {name: [spot.check(values[name]) for spot in spots] for name, spots in places.items() if name in values}
-    filled: list[str] = []
+    not_filled: list[str] = []
     for name, spots in places.items():
         if name not in checked:
             continue
+        done = False
         for spot, value in zip(spots, checked[name], strict=True):
             if spot.field.kind == "form_field":
-                _fill_form(spot, value, warnings)
+                done = _fill_form(spot, value, warnings) or done
             else:
                 _fill_control(spot, value, warnings)
-        filled.append(name)
-    return filled
+                done = True
+        if not done:
+            not_filled.append(name)
+    return not_filled

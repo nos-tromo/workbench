@@ -526,6 +526,18 @@ def test_a_legacy_text_field_takes_no_more_than_its_maximum(job: Job) -> None:
     assert "40" in error
 
 
+def test_a_form_field_that_could_not_be_filled_is_unfilled_not_filled(job: Job) -> None:
+    """A text field that runs over a paragraph break is left as it is: unfilled with a warning, never in Sources."""
+    mt.make_split_form_field_docx(job.path("split.docx"))
+    answer = job.fill("split.docx", {"name": "Invented Person", "city": "Invented Town"})
+    assert (answer["filled"], answer["unfilled"]) == (["city"], ["name"])
+    (warning,) = answer["warnings"]
+    assert warning.startswith("name: ") and "more than one paragraph" in warning
+    out = job.output("split-filled.docx")
+    assert "Invented Person" not in " ".join(body_text(out))
+    assert [row[0] for row in sources_table(out)] == ["field", "city"]
+
+
 # --- fill_template: {{ }} placeholders in a document -------------------------------------------------------------
 
 
@@ -559,6 +571,24 @@ def test_a_value_is_written_as_text_never_as_markup(job: Job) -> None:
     value = 'a<b & c</w:t></w:r><w:r><w:t>"injected"'
     job.fill("letter.docx", {"customer": value})
     assert Document(str(job.output("letter-filled.docx"))).paragraphs[0].text == f"Customer: {value}"
+
+
+def test_a_template_cannot_turn_the_escaping_off(job: Job) -> None:
+    """Neither ``|safe`` nor ``{% autoescape false %}`` lets a value into the WordprocessingML.
+
+    The first is no filter here, so the template does not compile; with the second the value is escaped all the same.
+    """
+    value = "x</w:t></w:r><w:r><w:t>INJECTED"
+    mt.make_jinja_docx(job.path("safe.docx"), extra="raw:{{ customer|safe }}")
+    error = job.fill("safe.docx", {"customer": value})["error"]
+    assert error.startswith("invalid_template: ")
+    assert "safe" in error
+    assert not job.output("safe-filled.docx").exists()
+    mt.make_jinja_docx(job.path("off.docx"), extra="raw:{% autoescape false %}{{ customer }}{% endautoescape %}")
+    assert "error" not in job.fill("off.docx", {"customer": value})
+    out = job.output("off-filled.docx")
+    assert f"raw:{value}" in [p.text for p in Document(str(out)).paragraphs]
+    assert "INJECTED" not in [t.text for t in part(out, "word/document.xml").iter(f"{W}t")]
 
 
 def test_jinja_that_does_not_compile_names_the_line(job: Job) -> None:
@@ -677,6 +707,46 @@ def test_what_openpyxl_does_not_keep_is_warned(job: Job) -> None:
         archive.writestr("xl/drawings/drawing1.xml", "<xdr:wsDr xmlns:xdr='urn:x'/>")
     answer = job.fill("summary.xlsx", {"total": 1})
     assert any("drawings" in warning for warning in answer["warnings"])
+
+
+def test_what_openpyxl_removes_from_a_sheet_is_warned(job: Job) -> None:
+    """An extension openpyxl cannot keep (here a data validation of Excel 2010): its own words become a warning."""
+    path = _workbook(job.path("checked.xlsx"), {"A1": "{{ total }}"})
+    validation = (
+        '<extLst><ext uri="{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}" '
+        'xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">'
+        '<x14:dataValidations count="0"/></ext></extLst></worksheet>'
+    )
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    sheet = "xl/worksheets/sheet1.xml"
+    parts[sheet] = parts[sheet].replace(b"</worksheet>", validation.encode())
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+    answer = job.fill("checked.xlsx", {"total": 1})
+    assert "error" not in answer, answer
+    (warning,) = [w for w in answer["warnings"] if "Data Validation" in w]
+    assert "is not supported and will be removed" in warning
+    assert len(warning) <= 2000
+
+
+def test_rich_text_in_a_cell_is_flattened_with_a_warning(job: Job) -> None:
+    """Bold or coloured words inside one cell are kept as their text alone, and the answer says so."""
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
+
+    path = _workbook(job.path("styled.xlsx"), {"A1": "{{ total }}"})
+    book = openpyxl.load_workbook(path, rich_text=True)
+    sheet = book["S"]
+    sheet["A2"] = CellRichText(["Total for ", TextBlock(InlineFont(b=True), "Dredging")])
+    book.save(path)
+    answer = job.fill("styled.xlsx", {"total": 1})
+    assert any("rich text" in warning and "1 cell" in warning for warning in answer["warnings"]), answer
+    filled = openpyxl.load_workbook(job.output("styled-filled.xlsx"), rich_text=True)["S"]
+    assert (filled["A1"].value, filled["A2"].value) == (1, "Total for Dredging")
+    _workbook(job.path("plain.xlsx"), {"A1": "{{ total }}"})
+    assert not any("rich text" in warning for warning in job.fill("plain.xlsx", {"total": 1})["warnings"])
 
 
 def _workbook(path: Path, cells: dict[str, str]) -> Path:

@@ -52,7 +52,17 @@ from workbench.executor.fs import (
 from workbench.executor.prepare_volume import API_UID, JOBS, STAGING, WORKSPACES, Owners
 from workbench.executor.sandbox import Slot, run_in_slot
 from workbench.paths import PathError, check_filename
-from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_request, encode
+from workbench.protocol import (
+    JOB_ID,
+    MAX_LINE,
+    JobRequest,
+    JobResult,
+    Limits,
+    OutputFile,
+    decode_request,
+    encodable,
+    encode,
+)
 
 MB = 1024 * 1024
 MAX_OUTPUTS = 20
@@ -360,34 +370,10 @@ def _read_result(job: int, limit: int) -> dict[str, Any] | None:
         return None
     data = b"".join(chunks)
     try:
-        value = _encodable(json.loads(data))
+        value = encodable(json.loads(data))
     except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
-
-
-def _encodable(value: Any) -> Any:
-    """Replace every lone surrogate in the strings of a JSON value, its keys included, with U+FFFD.
-
-    JSON reads the escape of a surrogate half that has no partner as a lone surrogate, which UTF-8 cannot hold: the
-    answer could not be sent, and a run would lose its outputs over one character of its runner's text.
-
-    Args:
-        value: A value as :func:`json.loads` returns it.
-
-    Returns:
-        The value, every string of it encodable as UTF-8.
-
-    Raises:
-        RecursionError: The value is nested too deeply to walk.
-    """
-    if isinstance(value, str):
-        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
-    if isinstance(value, list):
-        return [_encodable(item) for item in value]
-    if isinstance(value, dict):
-        return {_encodable(key): _encodable(item) for key, item in value.items()}
-    return value
 
 
 def _own_file(st: os.stat_result, owner: int) -> bool:

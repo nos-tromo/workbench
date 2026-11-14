@@ -1,10 +1,10 @@
 """``{{ }}`` placeholders in a Word document, filled by docxtpl: fields, loops and conditions.
 
 The template's code runs in Jinja's sandbox, which keeps it from Python's internals, with every value escaped as XML
-text: a value that holds ``</w:t>`` is shown as written, never read as WordprocessingML. A name the template uses
-that is given no value renders empty, and stays in the answer's ``unfilled``. The fields are the names the code of
-the body, the headers and the footers uses and does not set itself, without Jinja's own (``range``, ``loop``); a
-name a ``for`` loop runs over takes a table.
+text, which the template cannot turn off: a value that holds ``</w:t>`` is shown as written, never read as
+WordprocessingML. A name the template uses that is given no value renders empty, and stays in the answer's
+``unfilled``. The fields are the names the code of the body, the headers and the footers uses and does not set
+itself, without Jinja's own (``range``, ``loop``); a name a ``for`` loop runs over takes a table.
 """
 
 import re
@@ -14,6 +14,7 @@ from typing import Any, Final
 from docxtpl import DocxTemplate
 from jinja2 import ChainableUndefined, TemplateError, TemplateSyntaxError, meta, nodes
 from jinja2.sandbox import SandboxedEnvironment
+from markupsafe import escape
 
 from workbench.executor.templates import Field, Refusal, safe_text
 from workbench.executor.templates.docx_controls import paragraph_text, stories
@@ -30,10 +31,16 @@ _LINE_SHOWN: Final = 80
 def environment() -> SandboxedEnvironment:
     """Make the environment every template is parsed and rendered in.
 
+    Every value is escaped as it is written out (``finalize``), whatever the template says, and the ``safe`` filter
+    is not there: neither ``|safe`` nor ``{% autoescape false %}`` lets a value through raw. A template that uses
+    ``|safe`` does not compile.
+
     Returns:
         A sandbox that escapes every value, where a missing name, or a name below it, is empty.
     """
-    return SandboxedEnvironment(autoescape=True, undefined=ChainableUndefined)
+    env = SandboxedEnvironment(autoescape=True, undefined=ChainableUndefined, finalize=escape)
+    del env.filters["safe"]
+    return env
 
 
 def _code(template: DocxTemplate) -> Iterator[tuple[str, str]]:
@@ -128,13 +135,18 @@ def _names(story: str, tree: nodes.Template) -> tuple[set[str], set[str]]:
         The names it does not set, and the names a loop runs over.
 
     Raises:
-        Refusal: The code is nested too deeply to walk.
+        Refusal: The code is nested too deeply to walk, or uses a filter or a test there is not (``|safe``).
     """
     try:
         loops = {loop.iter.name for loop in tree.find_all(nodes.For) if isinstance(loop.iter, nodes.Name)}
         return set(meta.find_undeclared_variables(tree)), loops
     except RecursionError:
         raise Refusal("invalid_template", f"the {{{{ }}}} code of the {story} is nested too deeply") from None
+    except TemplateSyntaxError as exc:
+        raise Refusal(
+            "invalid_template",
+            f"the {{{{ }}}} code of the {story} does not compile at line {exc.lineno}: {exc.message}",
+        ) from None
 
 
 def fields(template: DocxTemplate, env: SandboxedEnvironment) -> list[Field]:

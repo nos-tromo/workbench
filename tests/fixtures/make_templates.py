@@ -228,6 +228,32 @@ def make_form_fields_docx(path: Path) -> Path:
     return path
 
 
+def make_split_form_field_docx(path: Path) -> Path:
+    """Write a Word form whose text field ``name`` begins in one paragraph and ends in the next, and a whole ``city``.
+
+    A form field that runs over a paragraph break cannot be filled where it is; ``city`` can.
+
+    Args:
+        path: Where to write it.
+
+    Returns:
+        ``path``.
+    """
+    doc = Document()
+    runs = _form_field("name", "<w:textInput/>", "FORMTEXT")
+    begin, end = runs.rsplit("<w:r>", 1)
+    for label, xml in (
+        ("Name: ", begin),
+        ("", f"<w:r>{end}"),
+        ("City: ", _form_field("city", "<w:textInput/>", "FORMTEXT")),
+    ):
+        paragraph = doc.add_paragraph(label)
+        for run in list(parse_xml(f"<w:p {_DECLS}>{xml}</w:p>")):
+            paragraph._p.append(run)
+    doc.save(str(path))
+    return path
+
+
 def as_dotx(docx: Path, target: Path) -> Path:
     """Copy a Word document as a ``.dotx`` template: the same parts under the template content type.
 
