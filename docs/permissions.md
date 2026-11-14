@@ -55,7 +55,8 @@ The browser's routes (`workbench/api/files.py`).
 The handshake routes (`/api/config`, `/system`, `/openapi.json`, `/files/cwd`,
 `/skills`, `/skills/read`) and the service routes (`/healthz`, `/metrics`) read
 no file content and are not recorded (`workbench/api/contract.py`,
-`workbench/api/metrics.py`). Every other path answers `404`.
+`workbench/api/metrics.py`). Every other path answers `404` to a caller with the
+key, and `401` to anyone without it.
 
 [audit.md](audit.md) says what each event holds.
 

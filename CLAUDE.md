@@ -111,7 +111,8 @@ v0.13.3 calls besides the tools: `GET /api/v1/policies` must answer non-2xx (so
 no route exists for it), `/api/config` says `features.system`, `/system` serves
 the prompt (`workbench/api/system_prompt.md`), `/openapi.json` (key only),
 `/files/cwd`, `/files/read` of `<home>/AGENTS.md` (404), `/skills` (`[]`).
-Every route that is not registered answers 404: Open WebUI's proxy forwards
+Every route that is not registered answers 404 (401 without the key, which is
+checked before any body is read): Open WebUI's proxy forwards
 every method and path the browser sends, so the allow-list is workbench's.
 Handshake routes answer from memory or the database, never through the queue.
 
