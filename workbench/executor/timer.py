@@ -25,8 +25,11 @@ Limits nest and share the one real-time interval timer of the process:
   is raised even if the code that got the first swallows it. A signal that comes while a ``__del__`` is running
   is put off for a moment: an exception raised in a finalizer is printed and dropped, and the code that was to be
   stopped would run on.
-- Every meter that is running is stopped, charged up to that moment, before any limit's error is raised: the
-  error ends the work the meter times, and it can land in the very code that would stop the meter.
+- Every meter that is running is stopped, charged up to that moment, before the error of a limit that falls due
+  while it is in force is raised, by the handler or as a block is entered or left: the error ends the work the
+  meter times, and it can land in the very code that would stop the meter. A block whose own limit is due already
+  when it is entered raises that error at once, before the limit is listed, and leaves the meters alone; nothing
+  in the block has run, and a meter running around the block is stopped by the code that started it.
 - A block's bookkeeping runs with ``SIGALRM`` blocked, so that a signal never arrives between the limit
   being listed and the timer being armed (it is delivered when the signal is unblocked, inside the block's own
   ``try``). When the last limit leaves, the timer is disarmed.

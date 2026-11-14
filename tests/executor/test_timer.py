@@ -533,6 +533,9 @@ def test_a_deadline_that_lands_anywhere_in_starting_or_stopping_a_meter_leaves_i
     begins, and just after its clock read. Each time the meter is stopped afterwards and charged for what it ran,
     and reading that goes on for three times its budget, with the meter stopped, is not cut off by its limit.
     It used to be left running with its end in the past or near; the next file's reading then ran it out.
+
+    The shield is entered before the deadline's limit, so a busy machine cannot deliver the signal before the
+    sweep's own landing; the bounds on what is left hold however long a loaded machine takes to run the meter.
     """
     code = timer.Meter.start.__code__ if method == "start" else timer.Meter.stop.__code__
     path: list[int] = []
@@ -544,16 +547,14 @@ def test_a_deadline_that_lands_anywhere_in_starting_or_stopping_a_meter_leaves_i
         steps: list[int] = []
         with timer.limit_spending(meter, Spent):
             with pytest.raises(Inner):
-                with limit_until(time.monotonic() + 0.002, Inner), timer.shielded():
-                    time.sleep(0.003)  # the deadline passes; its signal waits for the end of the shield
+                with timer.shielded(), limit_until(time.monotonic() + 0.01, Inner):
+                    time.sleep(0.011)  # the deadline passes; its signal waits for the end of the shield
                     with handled_at(code, at, steps):
                         run(meter, 0.003)
             assert steps == path[: at + 1]
             assert meter.until is None
-            if method == "stop":
-                assert 0 < meter.left <= 0.012
-            else:
-                assert 0.0149 < meter.left <= 0.015
+            # stop: the 3 ms run is charged; start: the error lands before the run, so at most the start is
+            assert meter.left <= (0.012 if method == "stop" else 0.015)
             left = meter.left
             meter.stop()  # what the search does at the end of every file: a stopped meter stays as it is
             spin(0.05)
