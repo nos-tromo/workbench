@@ -62,7 +62,10 @@ x-settings: &settings
 services:
   volume-permissions:
     # The executor's image, which holds prepare_volume. Root, with the three
-    # capabilities it needs to reach and settle the api's 0700 folders.
+    # capabilities it needs to settle the layout: hand its parts over
+    # (CHOWN), set the modes of parts it does not own (FOWNER), and open the
+    # api's 0700 folders and 0600 database to do so, read-only
+    # (DAC_READ_SEARCH; it never writes through another's mode).
     <<: *hardened
     image: workbench-executor:${WORKBENCH_VERSION:-latest}
     command: ["python", "-m", "workbench.executor.prepare_volume"]
@@ -70,9 +73,11 @@ services:
     cap_add:
       - CHOWN
       - FOWNER
-      - DAC_OVERRIDE
+      - DAC_READ_SEARCH
     network_mode: none
     read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=0700
     logging: *default-logging
     volumes:
       - workbench-data:/data
@@ -111,6 +116,9 @@ services:
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
+      # Its first jobs find the supervisor serving.
+      executor:
+        condition: service_healthy
     healthcheck:
       # /healthz needs no key and is not in the tool schema. urllib without
       # proxies, so a proxy set for the container never sees the probe;
@@ -169,8 +177,11 @@ services:
     # R19: slots x 64 processes per job + 64 for the supervisor and its
     # cleanup helpers.
     pids_limit: ${WORKBENCH_EXECUTOR_PIDS_LIMIT:-320}
-    # Slots x WORKBENCH_JOB_MEMORY_MB + 512 MB: 4 x 1536 + 512.
+    # Slots x WORKBENCH_JOB_MEMORY_MB + 512 MiB: 4 x 1536 + 512. Memory and
+    # swap together are the same limit, so no job swaps past it.
     mem_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
+    memswap_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
+    # Docker refuses a limit above the host's CPUs (.env.example).
     cpus: ${WORKBENCH_EXECUTOR_CPUS:-4}
     environment:
       <<: *settings
@@ -180,6 +191,20 @@ services:
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
+    healthcheck:
+      # Healthy once the supervisor's socket is there. It only looks: a
+      # connection without a request line would be a malformed request to
+      # the supervisor. The image has no curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, stat, sys; p = '/run/workbench/executor.sock'; sys.exit(not (os.path.exists(p) and stat.S_ISSOCK(os.stat(p).st_mode)))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
     # The supervisor exits non-zero once its last slot is retired; the
     # restart brings fresh slots, a fresh IPC namespace and /dev/shm.
     restart: unless-stopped

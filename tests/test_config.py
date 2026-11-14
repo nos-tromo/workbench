@@ -190,3 +190,14 @@ def test_slots_are_capped_at_the_uid_pool() -> None:
     assert load_settings({"WORKBENCH_EXECUTOR_SLOTS": "16"}, role="executor").executor_slots == 16
     with pytest.raises(ConfigError, match="WORKBENCH_EXECUTOR_SLOTS"):
         load_settings({"WORKBENCH_EXECUTOR_SLOTS": "17"}, role="executor")
+
+
+@pytest.mark.parametrize("role", ["api", "executor"])
+def test_the_result_limit_is_at_most_256_kb(role: Literal["api", "executor"]) -> None:
+    """Cutting a result to its limit grows with the square of the limit: 256 KB is accepted, 257 is refused."""
+    env = {"OPEN_WEBUI_WORKBENCH_KEY": KEY}
+    assert load_settings({**env, "WORKBENCH_RESULT_MAX_KB": "1"}, role=role).result_max_kb == 1
+    assert load_settings({**env, "WORKBENCH_RESULT_MAX_KB": "256"}, role=role).result_max_kb == 256
+    with pytest.raises(ConfigError, match="WORKBENCH_RESULT_MAX_KB") as refused:
+        load_settings({**env, "WORKBENCH_RESULT_MAX_KB": "257"}, role=role)
+    assert "256" in str(refused.value)

@@ -8,6 +8,9 @@ from typing import Literal
 UID_POOL_SIZE = 16
 MIN_KEY_LENGTH = 32
 
+#: The largest result limit, in kilobytes: cutting an answer to its limit grows with the square of the limit.
+MAX_RESULT_KB = 256
+
 _KEY_VAR = "OPEN_WEBUI_WORKBENCH_KEY"
 
 
@@ -30,7 +33,7 @@ class Settings:
         jobs_per_user: Jobs one user may have running at once; their further calls wait.
         job_wall_s: Wall-clock seconds a job may run.
         job_memory_mb: Memory a job may use, in megabytes.
-        result_max_kb: Largest result returned inline, in kilobytes.
+        result_max_kb: Largest result returned inline, in kilobytes; at most ``MAX_RESULT_KB``.
         upload_max_mb: Largest accepted upload, in megabytes.
         workspace_max_mb: Largest total workspace per user, in megabytes.
         executor_socket: Unix socket the api reaches the executor on.
@@ -126,6 +129,9 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
     slots = _positive_int(env, "WORKBENCH_EXECUTOR_SLOTS", 4)
     if slots > UID_POOL_SIZE:
         raise ConfigError(f"WORKBENCH_EXECUTOR_SLOTS must be at most {UID_POOL_SIZE}, the size of the uid pool")
+    result_max_kb = _positive_int(env, "WORKBENCH_RESULT_MAX_KB", 16)
+    if result_max_kb > MAX_RESULT_KB:
+        raise ConfigError(f"WORKBENCH_RESULT_MAX_KB must be at most {MAX_RESULT_KB}")
     return Settings(
         data_dir=Path(_text(env, "WORKBENCH_DATA_DIR") or "/data"),
         open_webui_key=_api_key(env) if role == "api" else None,
@@ -137,7 +143,7 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
         jobs_per_user=_positive_int(env, "WORKBENCH_JOBS_PER_USER", 1),
         job_wall_s=_positive_int(env, "WORKBENCH_JOB_WALL_S", 120),
         job_memory_mb=_positive_int(env, "WORKBENCH_JOB_MEMORY_MB", 1536),
-        result_max_kb=_positive_int(env, "WORKBENCH_RESULT_MAX_KB", 16),
+        result_max_kb=result_max_kb,
         upload_max_mb=_positive_int(env, "WORKBENCH_UPLOAD_MAX_MB", 50),
         workspace_max_mb=_positive_int(env, "WORKBENCH_WORKSPACE_MAX_MB", 500),
         executor_socket=Path(_text(env, "WORKBENCH_EXECUTOR_SOCKET") or "/run/workbench/executor.sock"),

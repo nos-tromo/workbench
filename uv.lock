@@ -1095,6 +1095,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pyrefly" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "reportlab" },
     { name = "ruff" },
 ]
@@ -1132,6 +1133,7 @@ dev = [
     { name = "pre-commit", specifier = ">=4.7.0" },
     { name = "pyrefly", specifier = "==1.1.1" },
     { name = "pytest", specifier = ">=9.2.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "reportlab", specifier = ">=5.1.0" },
     { name = "ruff", specifier = "==0.15.14" },
 ]
