@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import openpyxl
+from lxml import etree
 
 from workbench.executor.readers import DocumentText, Part, UnreadableFile, check, tick
 from workbench.executor.readers import paging as pg
@@ -32,6 +33,26 @@ _BIG_ROW = re.compile(rb'<row\b[^>]*?\sr="(\d{7,})"')
 _BIG_CELL = re.compile(rb'<c\b[^>]*?\sr="(?:([A-Za-z]{3,})(\d+)|([A-Za-z]{1,2})(\d{7,}))"')
 _TOO_BIG: Final = "the workbook uses rows or columns beyond the limits of a spreadsheet"
 _TOO_MANY: Final = "the workbook has too many sheets"
+_TOO_MANY_NAMES: Final = "the workbook defines too many names"
+_TOO_MANY_STRINGS: Final = "the workbook holds too many strings"
+
+#: Most defined names and shared strings a workbook may have. openpyxl reads both whole before any row is read,
+#: in time and memory in proportion to their number, and no timer can stop it before its first row.
+MAX_DEFINED_NAMES: Final = 10_000
+MAX_SHARED_STRINGS: Final = 1_000_000
+
+_MAIN_NS: Final = "{*}"
+_WORKBOOK_TYPES: Final = frozenset(
+    {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+        "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    }
+)
+_STRINGS_TYPE: Final = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+_XML_ARGS: Final = {"resolve_entities": False, "no_network": True, "load_dtd": False, "huge_tree": False}
+_MAX_OVERRIDES: Final = 20_000
 
 
 def _column_number(letters: str) -> int:
@@ -49,8 +70,92 @@ def _column_number(letters: str) -> int:
     return number
 
 
+def _part_names(archive: zipfile.ZipFile) -> dict[str, list[str]]:
+    """Find the parts openpyxl will load as the workbook and as the shared strings.
+
+    openpyxl finds them through the content types the package declares, not through their usual names, so
+    a file cannot dodge a check by moving them.
+
+    Args:
+        archive: The workbook, open.
+
+    Returns:
+        The names of the workbook parts and of the shared strings parts, in the zip, by ``workbook`` and ``strings``.
+    """
+    found: dict[str, list[str]] = {"workbook": [], "strings": []}
+    try:
+        with archive.open("[Content_Types].xml") as stream:
+            overrides = etree.iterparse(stream, events=("end",), tag=f"{_MAIN_NS}Override", **_XML_ARGS)
+            for count, (_, element) in enumerate(overrides):
+                check()
+                if count > _MAX_OVERRIDES:
+                    raise UnreadableFile("the workbook declares too many parts")
+                kind = element.get("ContentType")
+                name = (element.get("PartName") or "").lstrip("/")
+                if kind in _WORKBOOK_TYPES:
+                    found["workbook"].append(name)
+                elif kind == _STRINGS_TYPE:
+                    found["strings"].append(name)
+                element.clear()
+    except KeyError:
+        pass
+    return found
+
+
+def _count(archive: zipfile.ZipFile, part: str, local_name: str, limit: int, refusal: str, *, event: str) -> None:
+    """Count the elements of one name in one part, and stop as soon as there are more than ``limit``.
+
+    Args:
+        archive: The workbook, open.
+        part: The part's name in the zip; a part that is not there is passed over.
+        local_name: The element's name, without its namespace.
+        limit: The most elements allowed.
+        refusal: The message to refuse with.
+        event: ``start`` or ``end``; ``end`` for elements whose content is to be released as the pass goes.
+
+    Raises:
+        UnreadableFile: There are more than ``limit``.
+    """
+    try:
+        stream = archive.open(part)
+    except KeyError:
+        return
+    with stream:
+        count = 0
+        for _, element in etree.iterparse(stream, events=(event,), tag=f"{_MAIN_NS}{local_name}", **_XML_ARGS):
+            count += 1
+            if count > limit:
+                raise UnreadableFile(refusal)
+            if count % 1024 == 0:
+                check()
+            if event == "end":
+                element.clear()
+
+
+def check_counts(archive: zipfile.ZipFile) -> None:
+    """Refuse a workbook with more sheets, defined names or shared strings than openpyxl can load in time.
+
+    openpyxl opens one worksheet for each ``sheet`` entry of the workbook, and many entries can name the same
+    part, so the number of worksheet parts says nothing. Names and shared strings are read whole when the
+    workbook is opened. The counts are made in a streaming pass that stops at the limit.
+
+    Args:
+        archive: The workbook, open.
+
+    Raises:
+        UnreadableFile: More than ``MAX_SHEETS`` sheets or ``MAX_DEFINED_NAMES`` defined names, or more than
+            ``MAX_SHARED_STRINGS`` shared strings.
+    """
+    parts = _part_names(archive)
+    for part in parts["workbook"]:
+        _count(archive, part, "sheet", pg.MAX_SHEETS, _TOO_MANY, event="start")
+        _count(archive, part, "definedName", MAX_DEFINED_NAMES, _TOO_MANY_NAMES, event="start")
+    for part in parts["strings"]:
+        _count(archive, part, "si", MAX_SHARED_STRINGS, _TOO_MANY_STRINGS, event="end")
+
+
 def check_bounds(path: Path) -> None:
-    """Refuse a workbook that names a row or a column no spreadsheet has, or holds too many sheets.
+    """Refuse a workbook that names a row or a column no spreadsheet has, or has too much to load in time.
 
     openpyxl's read-only reader gives an empty row for every row number that is missing, so a file
     that puts one cell at row 2 000 000 000 would keep it busy for hours, and a cell at column ``ZZZZZZ`` would
@@ -61,13 +166,12 @@ def check_bounds(path: Path) -> None:
         path: The ``.xlsx`` or ``.xlsm`` file, already checked as a zip.
 
     Raises:
-        UnreadableFile: A row is numbered above 1 048 576, a column is past ``XFD``, or there are more than
-            ``MAX_SHEETS`` sheets.
+        UnreadableFile: A row is numbered above 1 048 576, a column is past ``XFD``, or the counts of
+            :func:`check_counts` are over their limits.
     """
     with zipfile.ZipFile(path) as archive:
+        check_counts(archive)
         sheets = [name for name in archive.namelist() if _SHEET_PART.fullmatch(name)]
-        if len(sheets) > pg.MAX_SHEETS:
-            raise UnreadableFile(_TOO_MANY)
         for name in sheets:
             check()
             with archive.open(name) as member:

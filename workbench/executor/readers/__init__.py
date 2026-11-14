@@ -21,9 +21,12 @@ openpyxl.
 import time
 import zipfile
 from collections.abc import Iterator
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Protocol
+
+from workbench.executor.timer import TimeLimit, limit_until
 
 __all__ = [
     "DocumentText",
@@ -104,8 +107,12 @@ class NoSuchPart(Exception):
     """The ``part`` asked for is not in the document; the message names the parts there are."""
 
 
-class ReadTimeout(Exception):
-    """Reading ran past the deadline it was given (:func:`set_deadline`); what was read so far is lost."""
+class ReadTimeout(TimeLimit):
+    """Reading ran past the deadline it was given (:func:`set_deadline`); what was read so far is lost.
+
+    Like every :class:`~workbench.executor.timer.TimeLimit` it is not an ``Exception``, so code that catches
+    ``Exception`` (ours, and the libraries') does not swallow it.
+    """
 
 
 _deadline: float | None = None
@@ -117,8 +124,9 @@ def set_deadline(at: float | None) -> None:
     """Give the readers a time after which they stop, or take the limit away.
 
     The job is a single-threaded process that reads one file at a time, so the deadline is the process's.
-    The readers check it in their loops through :func:`tick`; a loop in a library they call is not
-    interrupted, so every loop of ours that a hostile file can make long ticks.
+    The readers check it in their loops through :func:`tick` and :func:`check`, and :func:`read` and
+    :func:`units` also make it binding with a timer (:mod:`workbench.executor.timer`), so that a long call
+    into a library that never looks at a clock is interrupted too.
 
     Args:
         at: A :func:`time.monotonic` time, or ``None`` for no deadline.
@@ -334,6 +342,20 @@ def _reader(family: str) -> _Reader:
     return text
 
 
+def _backstop() -> AbstractContextManager[None]:
+    """Make the deadline binding for library code that never looks at a clock, while a reader runs.
+
+    For :func:`units` the limit stays in force while the generator is suspended, so the code that consumes the
+    pieces is under the same deadline; its own, shorter limits (a search's regular expression) nest inside it.
+
+    Returns:
+        A context manager: a time limit until the deadline of :func:`set_deadline`, or nothing if there is none.
+    """
+    if _deadline is None:
+        return nullcontext()
+    return limit_until(_deadline, ReadTimeout)
+
+
 def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> DocumentText:
     """Read a document from ``part`` on, as much as fits in ``max_chars``.
 
@@ -352,15 +374,16 @@ def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> 
         NoSuchPart: ``part`` is not in the document.
         ReadTimeout: The deadline (:func:`set_deadline`) passed while reading.
     """
-    family = _prepare(path, file_mb)
-    try:
-        return _reader(family).read(path, part=part, max_chars=max_chars)
-    except (UnsupportedFormat, UnreadableFile, NoSuchPart, ReadTimeout):
-        raise
-    except MemoryError:
-        raise UnreadableFile(TOO_BIG) from None
-    except Exception:
-        raise UnreadableFile(DAMAGED) from None
+    with _backstop():
+        family = _prepare(path, file_mb)
+        try:
+            return _reader(family).read(path, part=part, max_chars=max_chars)
+        except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+            raise
+        except MemoryError:
+            raise UnreadableFile(TOO_BIG) from None
+        except Exception:
+            raise UnreadableFile(DAMAGED) from None
 
 
 def units(path: Path, *, file_mb: int = 50) -> Iterator[Part]:
@@ -382,12 +405,13 @@ def units(path: Path, *, file_mb: int = 50) -> Iterator[Part]:
             it can surface while iterating.
         ReadTimeout: The deadline (:func:`set_deadline`) passed while reading.
     """
-    family = _prepare(path, file_mb)
-    try:
-        yield from _reader(family).units(path)
-    except (UnsupportedFormat, UnreadableFile, NoSuchPart, ReadTimeout):
-        raise
-    except MemoryError:
-        raise UnreadableFile(TOO_BIG) from None
-    except Exception:
-        raise UnreadableFile(DAMAGED) from None
+    with _backstop():
+        family = _prepare(path, file_mb)
+        try:
+            yield from _reader(family).units(path)
+        except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+            raise
+        except MemoryError:
+            raise UnreadableFile(TOO_BIG) from None
+        except Exception:
+            raise UnreadableFile(DAMAGED) from None

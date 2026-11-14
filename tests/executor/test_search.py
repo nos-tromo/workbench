@@ -136,19 +136,44 @@ def test_the_two_seconds_are_for_the_whole_search_not_for_each_line(work: Path) 
 
 
 def test_a_plain_query_is_never_timed(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No alarm handler is installed for a plain query."""
-    (work / "t.txt").write_text("needle\n", encoding="utf-8")
-    before = signal.getsignal(signal.SIGALRM)
-    seen: list[Any] = []
-    original = docs.Matcher.find
+    """The regex budget is not used for a plain query; a regex query uses it for every piece it matches."""
+    (work / "t.txt").write_text("needle\nneedle two\n", encoding="utf-8")
+    spent: list[float] = []
+    original = docs.limit_until
 
-    def spy(self: docs.Matcher, text: str) -> list[re.Match[str]]:
-        seen.append(signal.getsignal(signal.SIGALRM))
-        return original(self, text)
+    def spy(deadline: float, error: type[docs.TimeLimit]) -> Any:
+        spent.append(deadline)
+        return original(deadline, error)
 
-    monkeypatch.setattr(docs.Matcher, "find", spy)
+    monkeypatch.setattr(docs, "limit_until", spy)
     search(work, "needle")
-    assert seen == [before]
+    assert spent == []
+    search(work, "needle", regex=True)
+    assert len(spent) == 3  # compiling, and each of the two lines
+
+
+def test_the_regex_budget_works_inside_a_search_that_has_a_reader_deadline(work: Path) -> None:
+    """The reader's timer is in force while the matching runs; the two limits do not clobber each other."""
+    (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
+    before = signal.getsignal(signal.SIGALRM)
+    began = time.monotonic()
+    result = search(work, "(a+)+$", regex=True, budget_s=30)
+    assert 1.5 < time.monotonic() - began < 4
+    assert result["error"].startswith("regex_timeout: ")
+    assert signal.getsignal(signal.SIGALRM) is before
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert readers_deadline_is_off()
+
+
+def test_the_reader_deadline_still_fires_after_a_regex_budget_was_spent_inside_it(work: Path, big_xlsx: Path) -> None:
+    """A slow file after a regex that was cheap: the file's limit is armed again when the regex's ends."""
+    (work / "a.txt").write_text("needle 1\n" * 5, encoding="utf-8")
+    shutil.copy(big_xlsx, work / "b-ledger.xlsx")
+    began = time.monotonic()
+    result = search(work, r"needle \d", regex=True, budget_s=3)
+    assert time.monotonic() - began < 6
+    assert len(result["hits"]) == 5
+    assert result["skipped"] == [{"path": f"/workspace/{CHAT}/b-ledger.xlsx", "reason": "reading took longer than 1 s"}]
 
 
 def test_snippets_are_at_most_200_characters_around_the_match(work: Path) -> None:
@@ -317,6 +342,39 @@ def test_when_the_whole_time_is_used_up_inside_a_file_the_search_stops_with_a_no
     assert "2 files were not searched" in result["hint"]
 
 
+def test_a_workbook_that_is_slow_to_load_is_given_up_on_and_the_search_goes_on(work: Path) -> None:
+    """900 000 shared strings pass the count and take nine seconds to load: the timer ends that at the file's share."""
+    (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
+    fx.make_shared_strings_xlsx(work / "b-strings.xlsx", 900_000)
+    (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "needle", budget_s=3)
+    assert time.monotonic() - began < 5
+    assert "error" not in result
+    assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "c.txt"]
+    assert result["skipped"] == [
+        {"path": f"/workspace/{CHAT}/b-strings.xlsx", "reason": "reading took longer than 1 s"}
+    ]
+    assert result["truncated"] is False
+
+
+def test_workbooks_with_20000_sheet_entries_and_2_million_strings_are_named_at_once(work: Path) -> None:
+    """Counted before they are loaded: refused in moments, and the rest of the chat is searched."""
+    (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
+    fx.make_many_entries_xlsx(work / "b-entries.xlsx", 20_000)
+    fx.make_shared_strings_xlsx(work / "c-strings.xlsx", 2_000_000)
+    (work / "d.txt").write_text("needle in d\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "needle", budget_s=3)
+    assert time.monotonic() - began < 3
+    assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "d.txt"]
+    reasons = {s["path"].rsplit("/", 1)[1]: s["reason"] for s in result["skipped"]}
+    assert reasons == {
+        "b-entries.xlsx": "the workbook has too many sheets",
+        "c-strings.xlsx": "the workbook holds too many strings",
+    }
+
+
 def test_hostile_files_are_named_and_the_search_goes_on(work: Path) -> None:
     """A row beyond the last, 20 000 sheets, 20 000 blocks: refused or read in moments; other files are searched."""
     (work / "a.txt").write_text("needle\n", encoding="utf-8")
@@ -465,6 +523,15 @@ def test_a_read_that_runs_out_of_time_is_an_error_with_a_code(work: Path, big_xl
     assert time.monotonic() - began < 4
     assert result == {"error": "read_timeout: reading the file took longer than 0.5 s; it is too large or too complex"}
     assert readers_deadline_is_off()
+
+
+def test_a_workbook_that_is_slow_to_load_ends_a_read_at_its_budget(work: Path) -> None:
+    """``read_document`` on it answers ``read_timeout`` at its budget, not at the executor's wall time."""
+    fx.make_shared_strings_xlsx(work / "strings.xlsx", 900_000)
+    began = time.monotonic()
+    result = RUNNERS["read_document"]({"path": "strings.xlsx", "part": None, "budget_s": 1}, context(work))
+    assert 0.9 < time.monotonic() - began < 3
+    assert result == {"error": "read_timeout: reading the file took longer than 1 s; it is too large or too complex"}
 
 
 def readers_deadline_is_off() -> bool:

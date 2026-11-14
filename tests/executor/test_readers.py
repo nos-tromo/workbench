@@ -1,9 +1,10 @@
 """The document readers: every format, paging, caps, and files that are broken, encrypted or hostile."""
 
 import re
+import signal
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import pytest
 
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers
-from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat
+from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat, sheet
 
 BUDGET = 16384
 
@@ -827,6 +828,117 @@ def test_a_deadline_that_has_passed_stops_the_next_page_or_sheet(tmp_path: Path)
             read(fx.make_xlsx(tmp_path / "s.xlsx"))
     finally:
         readers.set_deadline(None)
+
+
+def within(seconds: float, work: Callable[[], object]) -> None:
+    """Assert that ``work`` raises ``UnreadableFile`` in under ``seconds``."""
+    began = time.monotonic()
+    with pytest.raises(UnreadableFile):
+        work()
+    assert time.monotonic() - began < seconds
+
+
+@pytest.mark.parametrize("moved", [False, True])
+@pytest.mark.parametrize("entries", [1001, 20_000, 200_000])
+def test_a_workbook_with_many_sheet_entries_is_refused_whatever_parts_they_name(
+    tmp_path: Path, entries: int, moved: bool
+) -> None:
+    """A worksheet is opened per entry, and the entries can all name one part: 20 000 took 84 s to walk."""
+    path = fx.make_many_entries_xlsx(tmp_path / "entries.xlsx", entries, moved_workbook=moved)
+    within(2, lambda: read(path))
+    within(2, lambda: list(readers.units(path)))
+
+
+def test_a_thousand_sheet_entries_are_allowed_and_a_workbook_with_defined_names_is_counted(tmp_path: Path) -> None:
+    """The limits are counted, not guessed: 1 000 sheets read, 10 001 defined names do not, 10 000 do."""
+    # 999 entries and the workbook's second sheet.
+    assert read(fx.make_many_entries_xlsx(tmp_path / "limit.xlsx", 999)).total_parts == 1000
+    within(2, lambda: read(fx.make_defined_names_xlsx(tmp_path / "names.xlsx", 10_001)))
+    assert read(fx.make_defined_names_xlsx(tmp_path / "names-ok.xlsx", 10_000)).parts
+
+
+@pytest.mark.parametrize("strings", [1_000_001, 2_000_000])
+def test_a_workbook_with_a_million_shared_strings_is_refused_before_it_is_loaded(tmp_path: Path, strings: int) -> None:
+    """2 000 000 tiny strings took 18 s to load and 8 000 000 took 74 s at 890 MB, with nothing able to stop it."""
+    path = fx.make_shared_strings_xlsx(tmp_path / "strings.xlsx", strings)
+    assert path.stat().st_size < 200_000
+    within(2, lambda: read(path))
+    within(2, lambda: list(readers.units(path)))
+
+
+def test_a_million_shared_strings_are_counted_as_the_limit_not_over_it(tmp_path: Path) -> None:
+    """The count stops at the limit: exactly 1 000 000 passes the check (loading them is not tried here)."""
+    path = fx.make_shared_strings_xlsx(tmp_path / "strings.xlsx", 1_000_000)
+    with zipfile.ZipFile(path) as archive:
+        sheet.check_counts(archive)
+
+
+def test_the_timer_interrupts_a_workbook_that_is_slow_to_load(tmp_path: Path) -> None:
+    """900 000 shared strings are under the limit and take about nine seconds to load: the deadline cuts that short."""
+    path = fx.make_shared_strings_xlsx(tmp_path / "strings.xlsx", 900_000)
+    for work in (lambda: read(path), lambda: list(readers.units(path))):
+        began = time.monotonic()
+        readers.set_deadline(began + 0.5)
+        try:
+            with pytest.raises(ReadTimeout):
+                work()
+        finally:
+            readers.set_deadline(None)
+        assert time.monotonic() - began < 2
+
+
+def test_the_timer_interrupts_pure_python_in_a_reader_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reader that loops without looking at the clock is stopped at the deadline, for ``read`` and for ``units``."""
+    from workbench.executor.readers import text
+
+    def endless(*_args: object, **_kwargs: object) -> DocumentText:
+        while True:
+            sum(range(1000))
+
+    def endless_units(_path: Path) -> Iterator[readers.Part]:
+        while True:
+            sum(range(1000))
+            yield from ()
+
+    monkeypatch.setattr(text, "read", endless)
+    monkeypatch.setattr(text, "units", endless_units)
+    path = tmp_path / "a.txt"
+    path.write_text("x\n", encoding="utf-8")
+    for work in (lambda: read(path), lambda: list(readers.units(path))):
+        began = time.monotonic()
+        readers.set_deadline(began + 0.3)
+        try:
+            with pytest.raises(ReadTimeout):
+                work()
+        finally:
+            readers.set_deadline(None)
+        assert 0.25 < time.monotonic() - began < 1.0
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_timeout_is_not_swallowed_by_a_reader_that_catches_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ReadTimeout`` is not an ``Exception``: an ``except Exception`` around a library's work lets it through."""
+    from workbench.executor.readers import text
+
+    def careless(*_args: object, **_kwargs: object) -> DocumentText:
+        while True:
+            try:
+                sum(range(1000))
+            except Exception:
+                pass
+
+    monkeypatch.setattr(text, "read", careless)
+    path = tmp_path / "a.txt"
+    path.write_text("x\n", encoding="utf-8")
+    readers.set_deadline(time.monotonic() + 0.3)
+    try:
+        with pytest.raises(ReadTimeout):
+            read(path)
+    finally:
+        readers.set_deadline(None)
+    assert not issubclass(ReadTimeout, Exception)
 
 
 # --- PDFs that restrict only what a reader may do --------------------------------------------------------------

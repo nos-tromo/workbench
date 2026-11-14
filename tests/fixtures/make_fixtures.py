@@ -10,7 +10,7 @@ import re
 import struct
 import zipfile
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -570,3 +570,116 @@ def make_big_table_odt(path: Path, rows: int) -> Path:
     doc.text.addElement(P(text="After the table."))
     doc.save(str(path))
     return path
+
+
+def _rewrite_xlsx(
+    path: Path, changes: dict[str, Callable[[bytes], bytes]], extra: dict[str, bytes] | None = None
+) -> Path:
+    """Rewrite parts of a workbook in place.
+
+    Args:
+        path: A workbook made by :func:`make_xlsx`.
+        changes: For each part name, a function from its content to its new content.
+        extra: Parts to add, by name.
+
+    Returns:
+        ``path``.
+    """
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            out.writestr(info, changes[info.filename](data) if info.filename in changes else data)
+        for name, data in (extra or {}).items():
+            out.writestr(name, data)
+    return path
+
+
+def make_many_entries_xlsx(path: Path, entries: int, *, moved_workbook: bool = False) -> Path:
+    """Write a workbook whose ``workbook.xml`` lists ``entries`` sheets that all name the one worksheet part.
+
+    openpyxl opens a worksheet for each entry, however few parts there are.
+
+    Args:
+        path: Where to write it.
+        entries: How many ``sheet`` entries.
+        moved_workbook: Whether the workbook part is called ``xl/wb.xml``, found through the content types as
+            openpyxl finds it, instead of ``xl/workbook.xml``.
+
+    Returns:
+        ``path``.
+    """
+    make_xlsx(path, rows=2)
+
+    def many(data: bytes) -> bytes:
+        text = data.decode()
+        match = re.search(r"<sheet [^>]*/>", text)
+        assert match is not None
+        one = re.sub(r'name="[^"]*"', 'name="s{i}"', re.sub(r'sheetId="\d+"', 'sheetId="{i}"', match[0]))
+        return text.replace(match[0], "".join(one.format(i=i + 1) for i in range(entries))).encode()
+
+    if not moved_workbook:
+        return _rewrite_xlsx(path, {"xl/workbook.xml": many})
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            name = info.filename
+            if name == "xl/workbook.xml":
+                name, data = "xl/wb.xml", many(data)
+            elif name == "xl/_rels/workbook.xml.rels":
+                name = "xl/_rels/wb.xml.rels"
+            elif name in {"[Content_Types].xml", "_rels/.rels"}:
+                data = data.replace(b"/xl/workbook.xml", b"/xl/wb.xml").replace(b"xl/workbook.xml", b"xl/wb.xml")
+            out.writestr(name, data)
+    return path
+
+
+def make_shared_strings_xlsx(path: Path, strings: int) -> Path:
+    """Write a workbook with ``strings`` tiny shared strings, which openpyxl reads whole when it opens the file.
+
+    Args:
+        path: Where to write it.
+        strings: How many ``si`` elements.
+
+    Returns:
+        ``path``.
+    """
+    make_xlsx(path, rows=2)
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    override = (
+        b'<Override PartName="/xl/sharedStrings.xml" '
+        b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+    )
+    _rewrite_xlsx(path, {"[Content_Types].xml": lambda data: data.replace(b"</Types>", override)})
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as archive:
+        with archive.open("xl/sharedStrings.xml", "w", force_zip64=True) as member:
+            member.write(f'<?xml version="1.0"?><sst xmlns="{ns}" count="{strings}" uniqueCount="{strings}">'.encode())
+            block = b"<si><t>a</t></si>" * 10_000
+            for _ in range(strings // 10_000):
+                member.write(block)
+            member.write(b"<si><t>a</t></si>" * (strings % 10_000))
+            member.write(b"</sst>")
+    return path
+
+
+def make_defined_names_xlsx(path: Path, names: int) -> Path:
+    """Write a workbook that defines ``names`` names.
+
+    Args:
+        path: Where to write it.
+        names: How many ``definedName`` elements.
+
+    Returns:
+        ``path``.
+    """
+    make_xlsx(path, rows=2)
+    defined = "<definedNames>" + "".join(f'<definedName name="n{i}">Sheet1!$A$1</definedName>' for i in range(names))
+    return _rewrite_xlsx(
+        path,
+        {
+            "xl/workbook.xml": lambda data: data.replace(
+                b"</sheets>", b"</sheets>" + (defined + "</definedNames>").encode()
+            )
+        },
+    )

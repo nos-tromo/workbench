@@ -10,17 +10,16 @@ an answer for the model. A message never holds a parser's own text, which can ho
 import json
 import os
 import re
-import signal
 import time
 from collections.abc import Callable
 from itertools import islice
 from pathlib import Path
-from types import FrameType
 from typing import Any, Final
 
 from workbench import protocol
 from workbench.executor import readers
 from workbench.executor.context import JobContext
+from workbench.executor.timer import TimeLimit, limit_until
 
 #: Bytes of the answer kept back for what is not a part of the text: the path, the kind, the hint.
 RESERVE: Final = 2048
@@ -46,7 +45,7 @@ _READ_BUDGET_S: Final = 60.0
 FILE_SHARE: Final = 3
 
 
-class RegexTimeout(Exception):
+class RegexTimeout(TimeLimit):
     """A regular expression took longer than its budget."""
 
 
@@ -184,24 +183,11 @@ def snippet(text: str, match: re.Match[str]) -> str:
     return ("…" if first > 0 else "") + piece + ("…" if last < len(text) else "")
 
 
-def _on_alarm(_signum: int, _frame: FrameType | None) -> None:
-    """Stop a match that has run out of time.
-
-    Args:
-        _signum: The signal number.
-        _frame: The interrupted frame.
-
-    Raises:
-        RegexTimeout: Always.
-    """
-    raise RegexTimeout
-
-
 class Matcher:
     """Finds a query in text; a regular expression has ``REGEX_BUDGET_S`` seconds in all.
 
-    The job is a single-threaded process, so the budget is kept with a timer signal, which Python's
-    regular expression engine honours while it matches.
+    The budget is kept with the job's timer (:mod:`workbench.executor.timer`), which Python's regular
+    expression engine honours while it matches; it nests inside the deadline a reader may have set.
     """
 
     def __init__(self, query: str, *, regex: bool) -> None:
@@ -218,18 +204,7 @@ class Matcher:
         """
         self._guarded = regex
         self._left = REGEX_BUDGET_S
-        self._previous = signal.signal(signal.SIGALRM, _on_alarm) if regex else None
-        try:
-            self._pattern = self._timed(lambda: re.compile(query if regex else re.escape(query), re.IGNORECASE))
-        except BaseException:
-            self.close()
-            raise
-
-    def close(self) -> None:
-        """Put the process's alarm handler back."""
-        if self._previous is not None:
-            signal.signal(signal.SIGALRM, self._previous)
-            self._previous = None
+        self._pattern = self._timed(lambda: re.compile(query if regex else re.escape(query), re.IGNORECASE))
 
     def _timed[T](self, work: Callable[[], T]) -> T:
         """Run ``work``, within what is left of the budget when the query is a regular expression.
@@ -245,14 +220,11 @@ class Matcher:
         """
         if not self._guarded:
             return work()
-        if self._left <= 0:
-            raise RegexTimeout
         began = time.monotonic()
-        signal.setitimer(signal.ITIMER_REAL, self._left)
         try:
-            return work()
+            with limit_until(began + self._left, RegexTimeout):
+                return work()
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
             self._left -= time.monotonic() - began
 
     def find(self, text: str) -> list[re.Match[str]]:
@@ -405,8 +377,9 @@ def search_files(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             f"the expression took more than {REGEX_BUDGET_S:g} s to match; "
             "use a simpler expression or a plain text query",
         )
-    finally:
-        matcher.close()
+    except readers.ReadTimeout:
+        # The whole time ran out at a moment no file was being read (a file's own limit is handled in it).
+        search.timed_out = True
     result: dict[str, Any] = {
         "hits": search.hits,
         "truncated": search.full or search.crowded or search.timed_out,
