@@ -11,6 +11,7 @@ import pytest
 
 from workbench.executor import job
 from workbench.executor.runners import RUNNERS, JobContext
+from workbench.executor.timer import TimeLimit
 
 SPEC = {"tool": "echo", "args": {"x": 1}, "chat_id": "chat-1", "max_chars": 16384, "file_mb": 50}
 
@@ -66,6 +67,41 @@ def test_a_raising_runner_is_reported_by_type_and_message(tmp_path: Path, monkey
     spec = _write_spec(tmp_path, tool="boom", args={"x": 0})
     assert job.main(["job", str(spec)]) == 0
     assert json.loads((tmp_path / "result.json").read_text()) == {"error": "ZeroDivisionError: division by zero"}
+
+
+def test_a_time_limit_that_escapes_a_runner_still_leaves_a_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timer error is not an ``Exception``: without its own clause the job would end with no ``result.json``."""
+
+    class Late(TimeLimit):
+        """A limit that fires after the runner's own handling is over."""
+
+    def slip(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+        """Let a time limit out."""
+        raise Late
+
+    monkeypatch.setitem(RUNNERS, "slip", slip)
+    monkeypatch.chdir(tmp_path)
+    spec = _write_spec(tmp_path, tool="slip")
+    assert job.main(["job", str(spec)]) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert set(result) == {"error"}
+    assert result["error"].startswith("read_timeout: ")
+
+
+def test_a_read_that_is_out_of_time_is_a_read_timeout_result_in_a_job_process(tmp_path: Path) -> None:
+    """Through the real entry point: a reader deadline that has passed is a ``read_timeout`` result, not a crash."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.txt").write_text("hello\n", encoding="utf-8")
+    spec = _write_spec(
+        tmp_path / "control", tool="read_document", args={"path": "a.txt", "part": None, "budget_s": 0.0}
+    )
+    done = _run_job(spec, work)
+    assert done.returncode == 0, done.stderr
+    result = json.loads((tmp_path / "control" / "result.json").read_text())
+    assert result["error"].startswith("read_timeout: ")
 
 
 def test_a_result_that_is_not_json_becomes_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

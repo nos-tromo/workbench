@@ -20,7 +20,7 @@ openpyxl.
 
 import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -386,7 +386,7 @@ def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> 
             raise UnreadableFile(DAMAGED) from None
 
 
-def units(path: Path, *, file_mb: int = 50) -> Iterator[Part]:
+def units(path: Path, *, file_mb: int = 50) -> Generator[Part, None, None]:
     """Walk a document in the finest pieces it has, for a search.
 
     A piece is a page or slide (a page without text comes with an empty text), a cell, a paragraph,

@@ -358,15 +358,42 @@ def test_a_workbook_that_is_slow_to_load_is_given_up_on_and_the_search_goes_on(w
     assert result["truncated"] is False
 
 
+def test_a_regex_search_that_enters_a_limit_for_every_line_still_stops_at_its_time(work: Path) -> None:
+    """The regex budget is entered and left for every line; the search's deadline must still fire in that churn."""
+    (work / "t.txt").write_text("nothing to see here\n" * 400_000, encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, r"need(le)? \d", regex=True, budget_s=1)
+    assert time.monotonic() - began < 4
+    assert result["truncated"] is True
+    assert "stopped after 1 s" in result["hint"]
+    assert result["hits"] == []
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("kind", ["tag", "default", "noslash", "dslash"])
+def test_a_workbook_with_a_loophole_is_named_in_a_search_at_once(work: Path, kind: str) -> None:
+    """The sheet entries that openpyxl would open one by one are counted the way openpyxl finds them."""
+    (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
+    fx.make_bypass_xlsx(work / "b-loophole.xlsx", kind, 20_000)
+    (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
+    cpu = time.process_time()
+    result = search(work, "needle", budget_s=3)
+    assert time.process_time() - cpu < 2
+    assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "c.txt"]
+    assert result["skipped"] == [
+        {"path": f"/workspace/{CHAT}/b-loophole.xlsx", "reason": "the workbook has too many sheets"}
+    ]
+
+
 def test_workbooks_with_20000_sheet_entries_and_2_million_strings_are_named_at_once(work: Path) -> None:
     """Counted before they are loaded: refused in moments, and the rest of the chat is searched."""
     (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
     fx.make_many_entries_xlsx(work / "b-entries.xlsx", 20_000)
     fx.make_shared_strings_xlsx(work / "c-strings.xlsx", 2_000_000)
     (work / "d.txt").write_text("needle in d\n", encoding="utf-8")
-    began = time.monotonic()
+    cpu = time.process_time()
     result = search(work, "needle", budget_s=3)
-    assert time.monotonic() - began < 3
+    assert time.process_time() - cpu < 3
     assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt", "d.txt"]
     reasons = {s["path"].rsplit("/", 1)[1]: s["reason"] for s in result["skipped"]}
     assert reasons == {

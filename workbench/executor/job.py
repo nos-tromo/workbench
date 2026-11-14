@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from workbench.executor.runners import RUNNERS, JobContext
+from workbench.executor.timer import TimeLimit
 
 
 def main(argv: Sequence[str]) -> int:
@@ -21,7 +22,8 @@ def main(argv: Sequence[str]) -> int:
             ``tool``, ``args``, ``chat_id``, ``max_chars`` and ``file_mb``.
 
     Returns:
-        ``0`` once ``result.json`` is written, whether the runner succeeded or raised.
+        ``0`` once ``result.json`` is written, whether the runner succeeded, raised, or let a time limit
+        (:class:`~workbench.executor.timer.TimeLimit`, which is not an ``Exception``) escape.
     """
     spec_path = Path(argv[1])
     try:
@@ -35,6 +37,9 @@ def main(argv: Sequence[str]) -> int:
             file_mb=spec["file_mb"],
         )
         payload = json.dumps(RUNNERS[spec["tool"]](spec["args"], ctx))
+    except TimeLimit:
+        # A runner handles its own limits; one that gets this far would otherwise end the process with no result.
+        payload = json.dumps({"error": "read_timeout: the work ran past its time limit"})
     except Exception as exc:
         payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
     spec_path.with_name("result.json").write_text(payload, encoding="utf-8")

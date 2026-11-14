@@ -2,6 +2,8 @@
 
 import re
 import signal
+import subprocess
+import sys
 import time
 import zipfile
 from collections.abc import Callable, Iterator
@@ -686,18 +688,31 @@ def test_a_row_longer_than_the_budget_is_cut_and_paging_moves_on(tmp_path: Path)
 
 
 def refused_quickly(path: Path, *, file_mb: int = 50) -> None:
-    """Assert that reading and walking a file both raise ``UnreadableFile`` in under five seconds."""
+    """Assert that reading and walking a file both raise ``UnreadableFile`` in under five seconds.
+
+    The time is the CPU time of the process, which a busy machine does not stretch; the wall time is only
+    held to a generous multiple of it.
+    """
     for work in (lambda: read(path, file_mb=file_mb), lambda: list(readers.units(path, file_mb=file_mb))):
-        began = time.monotonic()
-        with pytest.raises(UnreadableFile):
-            work()
-        assert time.monotonic() - began < 5
+        within(5, work)
 
 
 def test_a_cell_in_a_row_no_spreadsheet_has_is_refused(tmp_path: Path) -> None:
     """Openpyxl would give an empty row for each of two billion numbers; the file is refused instead."""
     refused_quickly(fx.make_sparse_xlsx(tmp_path / "sparse.xlsx", row=2_000_000_000))
     refused_quickly(fx.make_sparse_xlsx(tmp_path / "just-over.xlsx", row=1_048_577))
+
+
+def test_a_worksheet_that_is_not_where_worksheets_usually_are_is_scanned_too(tmp_path: Path) -> None:
+    """Worksheets are found through the workbook's relationships; a row number past the end is found anywhere."""
+    import openpyxl
+
+    control = fx.make_sparse_xlsx(tmp_path / "control.xlsx", row=2, moved=True)
+    opened = openpyxl.load_workbook(control, read_only=True)
+    assert opened.sheetnames == ["Sheet1"]
+    opened.close()
+    assert read(control).parts
+    refused_quickly(fx.make_sparse_xlsx(tmp_path / "sparse.xlsx", row=2_000_000_000, moved=True))
 
 
 @pytest.mark.parametrize("column", ["XFE", "ZZZ", "AAAA", "ZZZZZZZZZZ"])
@@ -831,11 +846,12 @@ def test_a_deadline_that_has_passed_stops_the_next_page_or_sheet(tmp_path: Path)
 
 
 def within(seconds: float, work: Callable[[], object]) -> None:
-    """Assert that ``work`` raises ``UnreadableFile`` in under ``seconds``."""
-    began = time.monotonic()
+    """Assert that ``work`` raises ``UnreadableFile`` in under ``seconds`` of CPU time, and in no absurd wall time."""
+    cpu, wall = time.process_time(), time.monotonic()
     with pytest.raises(UnreadableFile):
         work()
-    assert time.monotonic() - began < seconds
+    assert time.process_time() - cpu < seconds
+    assert time.monotonic() - wall < max(10.0, 5 * seconds)
 
 
 @pytest.mark.parametrize("moved", [False, True])
@@ -871,6 +887,86 @@ def test_a_million_shared_strings_are_counted_as_the_limit_not_over_it(tmp_path:
     path = fx.make_shared_strings_xlsx(tmp_path / "strings.xlsx", 1_000_000)
     with zipfile.ZipFile(path) as archive:
         sheet.check_counts(archive)
+
+
+@pytest.mark.parametrize("kind", ["tag", "default", "noslash", "dslash", "views"])
+def test_a_workbook_that_opens_many_sheets_through_a_loophole_is_refused(tmp_path: Path, kind: str) -> None:
+    """Each loophole is a way openpyxl 3.1.5 finds sheets or the workbook that a count by the usual names misses."""
+    import openpyxl
+
+    # The control: a small one is real to openpyxl itself, and reads.
+    control = fx.make_bypass_xlsx(tmp_path / f"{kind}-control.xlsx", kind, 3)
+    opened = openpyxl.load_workbook(control, read_only=True)
+    assert len(opened.sheetnames) == (3 if kind != "views" else 1)
+    opened.close()
+    assert read(control).parts
+    sheets = fx.make_bypass_xlsx(tmp_path / f"{kind}.xlsx", kind, 20_000 if kind != "views" else 1001)
+    within(2, lambda: read(sheets))
+    within(2, lambda: list(readers.units(sheets)))
+
+
+def test_a_workbook_description_too_large_to_read_whole_is_refused(tmp_path: Path) -> None:
+    """200 000 entries are 20 MB of ``workbook.xml``, which openpyxl reads whole; it is refused unread."""
+    within(2, lambda: read(fx.make_bypass_xlsx(tmp_path / "huge.xlsx", "tag", 200_000)))
+
+
+def test_shared_strings_declared_with_an_extra_character_are_counted(tmp_path: Path) -> None:
+    """``Xxl/sharedStrings.xml``: openpyxl drops one character and reads ``xl/sharedStrings.xml``; so does the count."""
+    control = fx.make_bypass_xlsx(tmp_path / "control.xlsx", "strings-noslash", 30)
+    assert read(control).parts
+    path = fx.make_bypass_xlsx(tmp_path / "strings.xlsx", "strings-noslash", 2_000_000)
+    assert path.stat().st_size < 200_000
+    within(2, lambda: read(path))
+    within(2, lambda: list(readers.units(path)))
+
+
+def test_the_count_of_content_types_has_no_off_by_one(tmp_path: Path) -> None:
+    """Exactly the limit passes the count, one more is refused."""
+    from workbench.executor.readers import sheet as sheet_module
+
+    def with_overrides(path: Path, total: int) -> Path:
+        fx.make_xlsx(path, rows=2)
+        with zipfile.ZipFile(path) as archive:
+            existing = archive.read("[Content_Types].xml").decode().count("<Override") + 2  # and two Default entries
+        extra = "".join(
+            f'<Override PartName="/xl/extra{i}.xml" ContentType="application/xml"/>' for i in range(total - existing)
+        )
+        return fx._rewrite_xlsx(
+            path, {"[Content_Types].xml": lambda data: data.replace(b"</Types>", extra.encode() + b"</Types>")}
+        )
+
+    with zipfile.ZipFile(with_overrides(tmp_path / "limit.xlsx", sheet_module.MAX_CONTENT_TYPES)) as archive:
+        sheet_module.check_counts(archive)
+    with zipfile.ZipFile(with_overrides(tmp_path / "over.xlsx", sheet_module.MAX_CONTENT_TYPES + 1)) as archive:
+        with pytest.raises(UnreadableFile, match="too many parts"):
+            sheet_module.check_counts(archive)
+
+
+def test_a_part_of_millions_of_elements_is_counted_without_building_them(tmp_path: Path) -> None:
+    """20 million empty elements in the shared strings: refused in seconds, with a counting pass that keeps no tree.
+
+    The first counting pass kept the elements of a tree and peaked at 2.6 GB on this file.
+    """
+    path = fx.make_junk_strings_xlsx(tmp_path / "junk.xlsx", 20_000_000)
+    code = (
+        "import resource, sys, time, zipfile\n"
+        "from pathlib import Path\n"
+        "from workbench.executor.readers import UnreadableFile, sheet\n"
+        "began = time.process_time()\n"
+        "try:\n"
+        "    sheet.check_counts(zipfile.ZipFile(Path(sys.argv[1])))\n"
+        "    print('passed')\n"
+        "except UnreadableFile as exc:\n"
+        "    print('refused', exc)\n"
+        "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
+        "print(round(time.process_time() - began, 1), peak // (1024 * 1024 if sys.platform == 'darwin' else 1024))\n"
+    )
+    done = subprocess.run([sys.executable, "-I", "-c", code, str(path)], capture_output=True, text=True, check=True)
+    verdict, numbers = done.stdout.splitlines()
+    seconds, megabytes = (float(x) for x in numbers.split())
+    assert verdict == "refused the workbook holds too many strings"
+    assert seconds < 8
+    assert megabytes < 400
 
 
 def test_the_timer_interrupts_a_workbook_that_is_slow_to_load(tmp_path: Path) -> None:

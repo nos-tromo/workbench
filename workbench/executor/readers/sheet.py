@@ -16,13 +16,17 @@ from typing import Any, Final
 
 import openpyxl
 from lxml import etree
+from openpyxl.packaging.manifest import Manifest
+from openpyxl.reader.excel import _find_workbook_part
+from openpyxl.xml.constants import ARC_CONTENT_TYPES, SHARED_STRINGS, SHEET_MAIN_NS
+from openpyxl.xml.functions import fromstring
 
 from workbench.executor.readers import DocumentText, Part, UnreadableFile, check, tick
 from workbench.executor.readers import paging as pg
 
 _WHITESPACE = re.compile(r"[\r\n\t]+")
 
-_SHEET_PART = re.compile(r"xl/worksheets/[^/]+\.xml")
+_XML_PART = re.compile(r".*\.xml", re.IGNORECASE)
 _CHUNK: Final = 1 << 20
 _OVERLAP: Final = 64
 
@@ -41,18 +45,216 @@ _TOO_MANY_STRINGS: Final = "the workbook holds too many strings"
 MAX_DEFINED_NAMES: Final = 10_000
 MAX_SHARED_STRINGS: Final = 1_000_000
 
-_MAIN_NS: Final = "{*}"
-_WORKBOOK_TYPES: Final = frozenset(
-    {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
-        "application/vnd.ms-excel.template.macroEnabled.main+xml",
-    }
-)
-_STRINGS_TYPE: Final = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
 _XML_ARGS: Final = {"resolve_entities": False, "no_network": True, "load_dtd": False, "huge_tree": False}
-_MAX_OVERRIDES: Final = 20_000
+
+#: Most children the content types may have (``Default`` and ``Override`` entries), and the largest the part may be.
+MAX_CONTENT_TYPES: Final = 20_000
+MAX_MANIFEST_BYTES: Final = 8 * 1024 * 1024
+
+#: Largest workbook part, in bytes. openpyxl reads it whole into memory.
+MAX_WORKBOOK_BYTES: Final = 16 * 1024 * 1024
+
+#: Most elements of any kind the shared-strings part may have; a string takes a few at the most.
+MAX_STRING_ELEMENTS: Final = 10_000_000
+
+_TOO_MANY_PARTS: Final = "the workbook declares too many parts"
+_TOO_MANY_ENTRIES: Final = "the workbook lists too many views or references"
+_TOO_LARGE: Final = "the workbook's description is too large"
+_STRING: Final = f"{{{SHEET_MAIN_NS}}}si"
+_CHUNK_BYTES: Final = 1 << 20
+
+
+def _local(tag: object) -> str:
+    """Give an element's name without its namespace.
+
+    Args:
+        tag: The tag lxml reports.
+
+    Returns:
+        The name after the namespace; empty for a tag that is not a name (a comment).
+    """
+    return tag.rpartition("}")[2] if isinstance(tag, str) else ""
+
+
+class _RootChildren:
+    """An lxml parser target that counts the children of the root element and builds no tree."""
+
+    def __init__(self, limit: int, refusal: str) -> None:
+        """Start the count.
+
+        Args:
+            limit: The most children allowed.
+            refusal: The message to refuse with.
+        """
+        self._limit = limit
+        self._refusal = refusal
+        self._depth = 0
+        self._count = 0
+
+    def start(self, tag: str, attrib: object) -> None:
+        """Count a child of the root.
+
+        Args:
+            tag: The element's tag.
+            attrib: Its attributes.
+
+        Raises:
+            UnreadableFile: There are more children than the limit.
+        """
+        self._depth += 1
+        if self._depth == 2:
+            self._count += 1
+            if self._count > self._limit:
+                raise UnreadableFile(self._refusal)
+            if self._count % 1024 == 0:
+                check()
+
+    def end(self, tag: str) -> None:
+        """Leave an element.
+
+        Args:
+            tag: The element's tag.
+        """
+        self._depth -= 1
+
+    def close(self) -> None:
+        """Finish."""
+
+
+class _Containers:
+    """An lxml parser target that counts the children of each child of the root, as openpyxl will convert them.
+
+    openpyxl turns every child of ``sheets`` (and of the other sequences of the workbook element: views,
+    external references, pivot caches) into an object, whatever its tag is called, and every ``definedName``.
+    """
+
+    def __init__(self) -> None:
+        """Start the count."""
+        self._depth = 0
+        self._count = 0
+        self._limit = pg.MAX_SHEETS
+        self._refusal = _TOO_MANY
+
+    def start(self, tag: str, attrib: object) -> None:
+        """Count a grandchild of the root, against the limit of its parent.
+
+        Args:
+            tag: The element's tag.
+            attrib: Its attributes.
+
+        Raises:
+            UnreadableFile: A container has more children than the limit for its kind.
+        """
+        self._depth += 1
+        if self._depth == 2:
+            self._count = 0
+            if _local(tag) == "definedNames":
+                self._limit, self._refusal = MAX_DEFINED_NAMES, _TOO_MANY_NAMES
+            elif _local(tag) == "sheets":
+                self._limit, self._refusal = pg.MAX_SHEETS, _TOO_MANY
+            else:
+                self._limit, self._refusal = pg.MAX_SHEETS, _TOO_MANY_ENTRIES
+        elif self._depth == 3:
+            self._count += 1
+            if self._count > self._limit:
+                raise UnreadableFile(self._refusal)
+            if self._count % 1024 == 0:
+                check()
+
+    def end(self, tag: str) -> None:
+        """Leave an element.
+
+        Args:
+            tag: The element's tag.
+        """
+        self._depth -= 1
+
+    def close(self) -> None:
+        """Finish."""
+
+
+class _Strings:
+    """An lxml parser target that counts what openpyxl's string table reader keeps, without building a tree.
+
+    The reader keeps every element called ``si`` in the main namespace, wherever it is; elements of any other
+    kind are counted too, because the reader walks them all.
+    """
+
+    def __init__(self) -> None:
+        """Start the count."""
+        self._strings = 0
+        self._elements = 0
+
+    def start(self, tag: str, attrib: object) -> None:
+        """Count an element.
+
+        Args:
+            tag: The element's tag.
+            attrib: Its attributes.
+
+        Raises:
+            UnreadableFile: There are too many strings, or too many elements.
+        """
+        self._elements += 1
+        if tag == _STRING:
+            self._strings += 1
+            if self._strings > MAX_SHARED_STRINGS:
+                raise UnreadableFile(_TOO_MANY_STRINGS)
+        if self._elements > MAX_STRING_ELEMENTS:
+            raise UnreadableFile(_TOO_MANY_STRINGS)
+        if self._elements % 4096 == 0:
+            check()
+
+    def close(self) -> None:
+        """Finish."""
+
+
+def _scan(archive: zipfile.ZipFile, part: str, target: object, *, largest: int | None = None) -> None:
+    """Run a counting target over one part, in chunks.
+
+    Args:
+        archive: The workbook, open.
+        part: The part's name in the zip, exactly as openpyxl will look it up.
+        target: An lxml parser target.
+        largest: The most bytes the part may be, as the zip declares it; ``None`` for no limit.
+
+    Raises:
+        UnreadableFile: The target refused, or the part is larger than ``largest``.
+        KeyError: There is no such part.
+    """
+    if largest is not None and archive.getinfo(part).file_size > largest:
+        raise UnreadableFile(_TOO_LARGE)
+    parser = etree.XMLParser(target=target, **_XML_ARGS)
+    with archive.open(part) as stream:
+        while chunk := stream.read(_CHUNK_BYTES):
+            tick()
+            parser.feed(chunk)
+    parser.close()
+
+
+def check_counts(archive: zipfile.ZipFile) -> None:
+    """Refuse a workbook with more sheets, defined names or shared strings than openpyxl can load in time.
+
+    The parts are found as openpyxl finds them, with its own manifest reader and workbook part finder, so that no
+    file can name them in a way that this check misses and openpyxl does not (a content type given as the default
+    for ``xml``, a part name with one character too many in front, a part moved). openpyxl turns every child of
+    the workbook's ``sheets`` into a sheet, whatever it is called, and reads every shared string; the counts are
+    made in a streaming pass with no tree, which stops at the limit.
+
+    Args:
+        archive: The workbook, open.
+
+    Raises:
+        UnreadableFile: The content types, the workbook description or the shared strings are larger or more
+            numerous than the limits.
+    """
+    _scan(archive, ARC_CONTENT_TYPES, _RootChildren(MAX_CONTENT_TYPES, _TOO_MANY_PARTS), largest=MAX_MANIFEST_BYTES)
+    package: Any = Manifest.from_tree(fromstring(archive.read(ARC_CONTENT_TYPES)))
+    workbook = _find_workbook_part(package).PartName[1:]
+    _scan(archive, workbook, _Containers(), largest=MAX_WORKBOOK_BYTES)
+    strings = package.find(SHARED_STRINGS)
+    if strings is not None:
+        _scan(archive, strings.PartName[1:], _Strings())
 
 
 def _column_number(letters: str) -> int:
@@ -70,96 +272,12 @@ def _column_number(letters: str) -> int:
     return number
 
 
-def _part_names(archive: zipfile.ZipFile) -> dict[str, list[str]]:
-    """Find the parts openpyxl will load as the workbook and as the shared strings.
-
-    openpyxl finds them through the content types the package declares, not through their usual names, so
-    a file cannot dodge a check by moving them.
-
-    Args:
-        archive: The workbook, open.
-
-    Returns:
-        The names of the workbook parts and of the shared strings parts, in the zip, by ``workbook`` and ``strings``.
-    """
-    found: dict[str, list[str]] = {"workbook": [], "strings": []}
-    try:
-        with archive.open("[Content_Types].xml") as stream:
-            overrides = etree.iterparse(stream, events=("end",), tag=f"{_MAIN_NS}Override", **_XML_ARGS)
-            for count, (_, element) in enumerate(overrides):
-                check()
-                if count > _MAX_OVERRIDES:
-                    raise UnreadableFile("the workbook declares too many parts")
-                kind = element.get("ContentType")
-                name = (element.get("PartName") or "").lstrip("/")
-                if kind in _WORKBOOK_TYPES:
-                    found["workbook"].append(name)
-                elif kind == _STRINGS_TYPE:
-                    found["strings"].append(name)
-                element.clear()
-    except KeyError:
-        pass
-    return found
-
-
-def _count(archive: zipfile.ZipFile, part: str, local_name: str, limit: int, refusal: str, *, event: str) -> None:
-    """Count the elements of one name in one part, and stop as soon as there are more than ``limit``.
-
-    Args:
-        archive: The workbook, open.
-        part: The part's name in the zip; a part that is not there is passed over.
-        local_name: The element's name, without its namespace.
-        limit: The most elements allowed.
-        refusal: The message to refuse with.
-        event: ``start`` or ``end``; ``end`` for elements whose content is to be released as the pass goes.
-
-    Raises:
-        UnreadableFile: There are more than ``limit``.
-    """
-    try:
-        stream = archive.open(part)
-    except KeyError:
-        return
-    with stream:
-        count = 0
-        for _, element in etree.iterparse(stream, events=(event,), tag=f"{_MAIN_NS}{local_name}", **_XML_ARGS):
-            count += 1
-            if count > limit:
-                raise UnreadableFile(refusal)
-            if count % 1024 == 0:
-                check()
-            if event == "end":
-                element.clear()
-
-
-def check_counts(archive: zipfile.ZipFile) -> None:
-    """Refuse a workbook with more sheets, defined names or shared strings than openpyxl can load in time.
-
-    openpyxl opens one worksheet for each ``sheet`` entry of the workbook, and many entries can name the same
-    part, so the number of worksheet parts says nothing. Names and shared strings are read whole when the
-    workbook is opened. The counts are made in a streaming pass that stops at the limit.
-
-    Args:
-        archive: The workbook, open.
-
-    Raises:
-        UnreadableFile: More than ``MAX_SHEETS`` sheets or ``MAX_DEFINED_NAMES`` defined names, or more than
-            ``MAX_SHARED_STRINGS`` shared strings.
-    """
-    parts = _part_names(archive)
-    for part in parts["workbook"]:
-        _count(archive, part, "sheet", pg.MAX_SHEETS, _TOO_MANY, event="start")
-        _count(archive, part, "definedName", MAX_DEFINED_NAMES, _TOO_MANY_NAMES, event="start")
-    for part in parts["strings"]:
-        _count(archive, part, "si", MAX_SHARED_STRINGS, _TOO_MANY_STRINGS, event="end")
-
-
 def check_bounds(path: Path) -> None:
     """Refuse a workbook that names a row or a column no spreadsheet has, or has too much to load in time.
 
     openpyxl's read-only reader gives an empty row for every row number that is missing, so a file
     that puts one cell at row 2 000 000 000 would keep it busy for hours, and a cell at column ``ZZZZZZ`` would
-    make it build a row of billions. The sheet files are scanned for such numbers, in chunks, before openpyxl
+    make it build a row of billions. Every XML part is scanned for such numbers, in chunks, before openpyxl
     opens the workbook.
 
     Args:
@@ -171,7 +289,9 @@ def check_bounds(path: Path) -> None:
     """
     with zipfile.ZipFile(path) as archive:
         check_counts(archive)
-        sheets = [name for name in archive.namelist() if _SHEET_PART.fullmatch(name)]
+        # Every XML part, not only those called ``xl/worksheets/*.xml``: a workbook names its worksheets in
+        # its relationships, and they can be anywhere.
+        sheets = [name for name in archive.namelist() if _XML_PART.fullmatch(name)]
         for name in sheets:
             check()
             with archive.open(name) as member:

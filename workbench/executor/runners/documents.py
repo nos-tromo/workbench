@@ -12,6 +12,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from itertools import islice
 from pathlib import Path
 from typing import Any, Final
@@ -19,7 +20,7 @@ from typing import Any, Final
 from workbench import protocol
 from workbench.executor import readers
 from workbench.executor.context import JobContext
-from workbench.executor.timer import TimeLimit, limit_until
+from workbench.executor.timer import TimeLimit, limit_until, shielded
 
 #: Bytes of the answer kept back for what is not a part of the text: the path, the kind, the hint.
 RESERVE: Final = 2048
@@ -304,8 +305,9 @@ class _Search:
         self.searched += 1
         blank: list[str] = []
         readers.set_deadline(min(self.deadline, time.monotonic() + self.per_file))
+        pieces = readers.units(real, file_mb=self.ctx.file_mb)
         try:
-            for unit in readers.units(real, file_mb=self.ctx.file_mb):
+            for unit in pieces:
                 if time.monotonic() > self.deadline:
                     self.timed_out = True
                     return
@@ -330,6 +332,10 @@ class _Search:
                 self.skipped.append({"path": virtual, "reason": f"reading took longer than {self.per_file:g} s"})
             return
         finally:
+            # The generator is left suspended inside the reader's time limit when the loop stops early. Close it
+            # here, with the signal held back, rather than leave it to be collected when the deadline chooses.
+            with shielded(), suppress(readers.ReadTimeout):
+                pieces.close()
             readers.set_deadline(None)
         if blank:
             noun = blank[0].split(" ", 1)[0]

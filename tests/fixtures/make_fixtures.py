@@ -431,13 +431,14 @@ def make_restricted_pdf(
     return path
 
 
-def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B") -> Path:
+def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B", moved: bool = False) -> Path:
     """Write a workbook whose second row of data is numbered ``row`` and whose last cell is in ``column``.
 
     Args:
         path: Where to write it.
         row: The number of the second row; no spreadsheet has more than 1 048 576.
         column: The column of the second row's cells; none goes past ``XFD``.
+        moved: Whether the worksheet part is ``xl/ws/s1.xml``, named so in the workbook's relationships.
 
     Returns:
         ``path``.
@@ -452,12 +453,16 @@ def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B")
         items = [(info, src.read(info.filename)) for info in src.infolist()]
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
         for info, data in items:
-            if info.filename == "xl/worksheets/sheet1.xml":
+            name = info.filename
+            if name == "xl/worksheets/sheet1.xml":
                 xml = data.decode()
                 xml = xml.replace('<row r="2"', f'<row r="{row}"').replace('r="A2"', f'r="A{row}"')
                 xml = xml.replace('r="B2"', f'r="{column}{row}"')
                 data = xml.encode()
-            out.writestr(info, data)
+                name = "xl/ws/s1.xml" if moved else name
+            elif moved and name in {"[Content_Types].xml", "xl/_rels/workbook.xml.rels"}:
+                data = data.replace(b"worksheets/sheet1.xml", b"ws/s1.xml")
+            out.writestr(name, data)
     return path
 
 
@@ -683,3 +688,117 @@ def make_defined_names_xlsx(path: Path, names: int) -> Path:
             )
         },
     )
+
+
+_WORKBOOK_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+_STRINGS_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+
+
+def make_bypass_xlsx(path: Path, kind: str, count: int) -> Path:
+    """Write a workbook that opens ``count`` sheets or reads ``count`` shared strings through a loophole.
+
+    Each kind is a way the part or the entries are named that openpyxl 3.1.5 understands and a count that looks
+    for the usual names does not:
+
+    - ``tag``: the children of ``sheets`` are called ``x``, not ``sheet``; openpyxl makes a sheet of each;
+    - ``default``: there is no ``Override`` for the workbook, ``Default Extension="xml"`` has its content type,
+      and openpyxl falls back to ``xl/workbook.xml``;
+    - ``noslash``: the workbook is ``xl/wb.xml`` and its part name is ``Xxl/wb.xml``, of which openpyxl drops
+      exactly one character;
+    - ``dslash``: the part name is ``//xl/wb.xml`` and the zip member ``/xl/wb.xml``;
+    - ``views``: ``count`` ``workbookView`` entries in ``bookViews``, which openpyxl also turns into objects;
+    - ``strings-noslash``: ``count`` shared strings in ``xl/sharedStrings.xml``, declared as ``Xxl/sharedStrings.xml``.
+
+    Args:
+        path: Where to write it.
+        kind: One of the above.
+        count: How many sheet entries, or shared strings for ``strings-noslash``.
+
+    Returns:
+        ``path``.
+    """
+    base = Workbook()
+    sheet: Any = base.active
+    sheet.title = "Sheet1"
+    sheet.append(["a", "b"])
+    base.save(str(path))
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+    def many(text: str) -> str:
+        if kind == "views":
+            return text.replace("</bookViews>", "<workbookView/>" * count + "</bookViews>")
+        match = re.search(r"<sheet [^>]*/>", text)
+        assert match is not None
+        one = re.sub(r'name="[^"]*"', 'name="s{i}"', re.sub(r'sheetId="\d+"', 'sheetId="{i}"', match[0]))
+        if kind == "tag":
+            one = one.replace("<sheet ", "<x ", 1)
+        return text.replace(match[0], "".join(one.format(i=i + 1) for i in range(count)))
+
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            name = info.filename
+            if name == "xl/workbook.xml" and kind != "strings-noslash":
+                data = many(data.decode()).encode()
+                if kind in {"noslash", "dslash"}:
+                    name = "xl/wb.xml" if kind == "noslash" else "/xl/wb.xml"
+            elif name == "xl/_rels/workbook.xml.rels" and kind in {"noslash", "dslash"}:
+                name = "xl/_rels/wb.xml.rels" if kind == "noslash" else "/xl/_rels/wb.xml.rels"
+            elif name == "[Content_Types].xml":
+                text = data.decode()
+                if kind == "default":
+                    text = text.replace(f'<Override PartName="/xl/workbook.xml" ContentType="{_WORKBOOK_TYPE}"/>', "")
+                    text = text.replace(
+                        '<Default Extension="xml" ContentType="application/xml"/>',
+                        f'<Default Extension="xml" ContentType="{_WORKBOOK_TYPE}"/>',
+                    )
+                elif kind == "noslash":
+                    text = text.replace('PartName="/xl/workbook.xml"', 'PartName="Xxl/wb.xml"')
+                elif kind == "dslash":
+                    text = text.replace('PartName="/xl/workbook.xml"', 'PartName="//xl/wb.xml"')
+                elif kind == "strings-noslash":
+                    override = f'<Override PartName="Xxl/sharedStrings.xml" ContentType="{_STRINGS_TYPE}"/></Types>'
+                    text = text.replace("</Types>", override)
+                data = text.encode()
+            out.writestr(name, data)
+        if kind == "strings-noslash":
+            with out.open("xl/sharedStrings.xml", "w", force_zip64=True) as member:
+                member.write(
+                    f'<?xml version="1.0"?><sst xmlns="{namespace}" count="{count}" uniqueCount="{count}">'.encode()
+                )
+                block = b"<si><t>a</t></si>" * 10_000
+                for _ in range(count // 10_000):
+                    member.write(block)
+                member.write(b"<si><t>a</t></si>" * (count % 10_000))
+                member.write(b"</sst>")
+    return path
+
+
+def make_junk_strings_xlsx(path: Path, elements: int) -> Path:
+    """Write a workbook whose shared strings part holds ``elements`` empty elements that are not strings.
+
+    openpyxl's reader walks all of them and keeps a tree of them; a counting pass that builds a tree does too.
+
+    Args:
+        path: Where to write it.
+        elements: How many ``x`` elements.
+
+    Returns:
+        ``path``.
+    """
+    make_xlsx(path, rows=2)
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    override = (
+        b'<Override PartName="/xl/sharedStrings.xml" '
+        b'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+    )
+    _rewrite_xlsx(path, {"[Content_Types].xml": lambda data: data.replace(b"</Types>", override)})
+    with zipfile.ZipFile(path, "a", zipfile.ZIP_DEFLATED) as archive:
+        with archive.open("xl/sharedStrings.xml", "w", force_zip64=True) as member:
+            member.write(f'<?xml version="1.0"?><sst xmlns="{namespace}"><si><t>a</t></si>'.encode())
+            block = b"<x/>" * 100_000
+            for _ in range(elements // 100_000):
+                member.write(block)
+            member.write(b"</sst>")
+    return path
