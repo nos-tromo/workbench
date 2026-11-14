@@ -572,6 +572,21 @@ def test_the_runners_search_hints_and_skipped_files_pass_through(
     assert body["truncated"] is True
 
 
+def test_a_regex_that_spent_its_budget_answers_with_its_hits_and_the_note(
+    client: TestClient, store: Store, executor: Scripted
+) -> None:
+    """The runner's partial answer is a success: the hits found before the budget ran out reach the model."""
+    put(store, "a.txt")
+    note = "regex budget exhausted; use a simpler expression, or a plain text query."
+    executor.payload = {**hits((f"{CHAT}/a.txt", "line 1", "aaaa")), "truncated": True, "hint": note}
+    r = find(client, "(a+)+$", regex=True)
+    assert r.status_code == 200
+    body = r.json()
+    assert [(h["location"], h["snippet"]) for h in body["hits"]] == [("line 1", "aaaa")]
+    assert body["truncated"] is True
+    assert body["hint"] == note
+
+
 def test_search_returns_no_more_hits_than_asked_for(client: TestClient, store: Store, executor: Scripted) -> None:
     """A job that gives more is held to ``max_hits``."""
     put(store, "a.txt")

@@ -17,6 +17,7 @@ from typing import Any, Final
 import openpyxl
 from lxml import etree
 from openpyxl.packaging.manifest import Manifest
+from openpyxl.packaging.relationship import get_dependents, get_rels_path
 from openpyxl.reader.excel import _find_workbook_part
 from openpyxl.xml.constants import ARC_CONTENT_TYPES, SHARED_STRINGS, SHEET_MAIN_NS
 from openpyxl.xml.functions import fromstring
@@ -26,15 +27,17 @@ from workbench.executor.readers import paging as pg
 
 _WHITESPACE = re.compile(r"[\r\n\t]+")
 
-_XML_PART = re.compile(r".*\.xml", re.IGNORECASE)
 _CHUNK: Final = 1 << 20
-_OVERLAP: Final = 64
+_OVERLAP: Final = 1024
 
 #: A row element with a number of seven digits or more, and a cell whose column has three letters or more or
 #: whose row has seven digits or more: the only ones that can be past the end of a sheet. (``XFD`` has three
-#: letters; a cell in a column of one or two letters only needs a look when its row has seven digits.)
-_BIG_ROW = re.compile(rb'<row\b[^>]*?\sr="(\d{7,})"')
-_BIG_CELL = re.compile(rb'<c\b[^>]*?\sr="(?:([A-Za-z]{3,})(\d+)|([A-Za-z]{1,2})(\d{7,}))"')
+#: letters; a cell in a column of one or two letters only needs a look when its row has seven digits.) What lies
+#: between the name and ``r`` may not hold a ``<``, which no tag of well-formed XML has: so each try ends at the
+#: next ``<`` and the scan takes time in proportion to the part, where ``[^>]*?`` ran on to the next ``>`` from
+#: every ``<row`` of a run such as ``<row<row<row...`` and took time in proportion to its square.
+_BIG_ROW = re.compile(rb'<row\b[^<]*?\sr="(\d{7,})"')
+_BIG_CELL = re.compile(rb'<c\b[^<]*?\sr="(?:([A-Za-z]{3,})(\d+)|([A-Za-z]{1,2})(\d{7,}))"')
 _TOO_BIG: Final = "the workbook uses rows or columns beyond the limits of a spreadsheet"
 _TOO_MANY: Final = "the workbook has too many sheets"
 _TOO_MANY_NAMES: Final = "the workbook defines too many names"
@@ -50,6 +53,9 @@ _XML_ARGS: Final = {"resolve_entities": False, "no_network": True, "load_dtd": F
 #: Most children the content types may have (``Default`` and ``Override`` entries), and the largest the part may be.
 MAX_CONTENT_TYPES: Final = 20_000
 MAX_MANIFEST_BYTES: Final = 8 * 1024 * 1024
+
+#: Most relationships the workbook may have; its relationships part may be as large as the content types.
+MAX_RELATIONSHIPS: Final = 20_000
 
 #: Largest workbook part, in bytes. openpyxl reads it whole into memory.
 MAX_WORKBOOK_BYTES: Final = 16 * 1024 * 1024
@@ -232,7 +238,7 @@ def _scan(archive: zipfile.ZipFile, part: str, target: object, *, largest: int |
     parser.close()
 
 
-def check_counts(archive: zipfile.ZipFile) -> None:
+def check_counts(archive: zipfile.ZipFile) -> str:
     """Refuse a workbook with more sheets, defined names or shared strings than openpyxl can load in time.
 
     The parts are found as openpyxl finds them, with its own manifest reader and workbook part finder, so that no
@@ -244,17 +250,48 @@ def check_counts(archive: zipfile.ZipFile) -> None:
     Args:
         archive: The workbook, open.
 
+    Returns:
+        The name of the workbook part in the zip, as openpyxl will open it.
+
     Raises:
         UnreadableFile: The content types, the workbook description or the shared strings are larger or more
             numerous than the limits.
     """
     _scan(archive, ARC_CONTENT_TYPES, _RootChildren(MAX_CONTENT_TYPES, _TOO_MANY_PARTS), largest=MAX_MANIFEST_BYTES)
     package: Any = Manifest.from_tree(fromstring(archive.read(ARC_CONTENT_TYPES)))
-    workbook = _find_workbook_part(package).PartName[1:]
+    workbook: str = _find_workbook_part(package).PartName[1:]
     _scan(archive, workbook, _Containers(), largest=MAX_WORKBOOK_BYTES)
     strings = package.find(SHARED_STRINGS)
     if strings is not None:
         _scan(archive, strings.PartName[1:], _Strings())
+    return workbook
+
+
+def related_parts(archive: zipfile.ZipFile, workbook: str) -> list[str]:
+    """List the parts the workbook's relationships name, as openpyxl resolves them: where it opens its worksheets.
+
+    openpyxl's ``ExcelReader.read_worksheets`` opens each sheet from the target of its relationship, normalised
+    by ``get_dependents``, whatever the part is called and whatever its extension (``xl/ws/s1.bin`` is opened as
+    readily as ``xl/worksheets/sheet1.xml``); a target that is not in the zip is passed over. The same functions
+    resolve them here. Every target that is in the zip is listed, not only the worksheets: an external target that
+    names a member is opened too, and scanning a part that is not a sheet does no harm.
+
+    Args:
+        archive: The workbook, open.
+        workbook: The workbook part, from :func:`check_counts`.
+
+    Returns:
+        The names of those parts in the zip, sorted.
+
+    Raises:
+        UnreadableFile: The relationships part is larger or has more entries than the limits.
+    """
+    rels = get_rels_path(workbook)
+    members = set(archive.namelist())
+    if rels not in members:
+        return []  # openpyxl cannot open the workbook either
+    _scan(archive, rels, _RootChildren(MAX_RELATIONSHIPS, _TOO_MANY_PARTS), largest=MAX_MANIFEST_BYTES)
+    return sorted({str(rel.target) for rel in get_dependents(archive, rels)} & members)
 
 
 def _column_number(letters: str) -> int:
@@ -276,9 +313,10 @@ def check_bounds(path: Path) -> None:
     """Refuse a workbook that names a row or a column no spreadsheet has, or has too much to load in time.
 
     openpyxl's read-only reader gives an empty row for every row number that is missing, so a file
-    that puts one cell at row 2 000 000 000 would keep it busy for hours, and a cell at column ``ZZZZZZ`` would
-    make it build a row of billions. Every XML part is scanned for such numbers, in chunks, before openpyxl
-    opens the workbook.
+    that puts one cell at row 2 000 000 000 would keep it busy for hours, and a cell at column ``ZZZ`` would
+    make it build a row wider than a sheet. Every part the workbook's relationships name (:func:`related_parts`)
+    is scanned for such numbers, in chunks, before openpyxl opens the workbook. The scan reads bytes: a number
+    it cannot see (spelled with a character reference, say) is still stopped by the row loop's own bound.
 
     Args:
         path: The ``.xlsx`` or ``.xlsm`` file, already checked as a zip.
@@ -288,11 +326,9 @@ def check_bounds(path: Path) -> None:
             :func:`check_counts` are over their limits.
     """
     with zipfile.ZipFile(path) as archive:
-        check_counts(archive)
-        # Every XML part, not only those called ``xl/worksheets/*.xml``: a workbook names its worksheets in
-        # its relationships, and they can be anywhere.
-        sheets = [name for name in archive.namelist() if _XML_PART.fullmatch(name)]
-        for name in sheets:
+        # The parts openpyxl will open as worksheets are the targets of the workbook's relationships, under
+        # whatever name and extension they give, not the members called ``xl/worksheets/*.xml``.
+        for name in related_parts(archive, check_counts(archive)):
             check()
             with archive.open(name) as member:
                 tail = b""

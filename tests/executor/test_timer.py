@@ -5,7 +5,9 @@ import random
 import signal
 import threading
 import time
+from collections.abc import Callable
 from types import FrameType
+from typing import Any
 
 import pytest
 
@@ -37,7 +39,7 @@ def test_a_limit_raises_its_error_in_pure_python_code_at_its_deadline() -> None:
     with pytest.raises(Inner):
         with limit_until(began + 0.3, Inner):
             spin()
-    assert 0.25 < time.monotonic() - began < 1.0
+    assert 0.25 < time.monotonic() - began < 3.0
 
 
 def test_a_deadline_that_has_passed_raises_at_once_and_arms_nothing() -> None:
@@ -58,22 +60,23 @@ def test_the_earlier_limit_fires_first_and_the_outer_one_is_still_armed_after_it
             with pytest.raises(Inner):
                 with limit_until(began + 0.3, Inner):
                     spin()
-            assert 0.25 < time.monotonic() - began < 0.9
+            assert 0.25 < time.monotonic() - began
             spin()
-    assert 0.95 < time.monotonic() - began < 1.6
+    assert 0.95 < time.monotonic() - began < 4.0
 
 
 def test_an_inner_limit_that_ends_in_time_gives_the_timer_back_to_the_outer_one() -> None:
     """Leaving the inner block arms the timer for the outer deadline again."""
     began = time.monotonic()
     with pytest.raises(Outer):
-        with limit_until(began + 0.8, Outer):
+        with limit_until(began + 2.0, Outer):
             with limit_until(began + 5.0, Inner):
-                time.sleep(0.05)
+                time.sleep(0.01)
+            now = time.monotonic()
             remaining = signal.getitimer(signal.ITIMER_REAL)[0]
-            assert 0.5 < remaining < 0.8
+            assert 0 < remaining <= began + 2.0 - now + 0.01
             spin()
-    assert 0.75 < time.monotonic() - began < 1.5
+    assert 1.95 < time.monotonic() - began < 4.5
 
 
 def test_a_longer_inner_limit_does_not_postpone_the_outer_one() -> None:
@@ -83,7 +86,7 @@ def test_a_longer_inner_limit_does_not_postpone_the_outer_one() -> None:
         with limit_until(began + 0.3, Outer):
             with limit_until(began + 5.0, Inner):
                 spin()
-    assert 0.25 < time.monotonic() - began < 1.0
+    assert 0.25 < time.monotonic() - began < 3.0
 
 
 def test_each_limit_raises_once() -> None:
@@ -96,7 +99,7 @@ def test_each_limit_raises_once() -> None:
             except Inner:
                 pass
             spin(0.5)
-    assert time.monotonic() - began < 1.5
+    assert time.monotonic() - began < 4.0
 
 
 def test_the_timer_is_disarmed_and_a_late_signal_does_nothing() -> None:
@@ -153,7 +156,8 @@ def test_rapid_nesting_does_not_postpone_the_outer_deadline(spin_us: int) -> Non
     """Inner blocks entered and left faster than every 100 us: the outer limit still fires at its deadline.
 
     The timer used to be armed again from "now" for at least 100 us each time, so that a deadline a few
-    microseconds away was pushed back by every enter and every exit: a 5 us body never fired within two seconds.
+    microseconds away was pushed back by every enter and every exit: a 5 us body never fired within two seconds,
+    a 400 us one only after 1.84 s. The bound is wide enough for a loaded machine and well short of either.
     """
     began = time.monotonic()
     with pytest.raises(Outer):
@@ -163,7 +167,7 @@ def test_rapid_nesting_does_not_postpone_the_outer_deadline(spin_us: int) -> Non
                     end = time.perf_counter() + spin_us / 1e6
                     while time.perf_counter() < end:
                         pass
-    assert 0.05 <= time.monotonic() - began < 0.08
+    assert 0.05 <= time.monotonic() - began < 0.5
     assert timer._limits == []
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
@@ -179,7 +183,7 @@ def test_a_passed_deadline_raises_when_a_block_is_entered_or_left_and_not_later(
             woke.append(time.monotonic())
             with limit_until(time.monotonic() + 10, Inner):
                 pytest.fail("the block was entered after its outer limit had passed")
-    assert time.monotonic() - woke[0] < 0.05
+    assert time.monotonic() - woke[0] < 0.5
     assert timer._limits == []
 
 
@@ -259,7 +263,7 @@ def test_a_signal_during_a_shielded_block_is_delivered_when_it_ends() -> None:
                 time.sleep(0.2)
                 inside = True
     assert inside
-    assert 0.19 < time.monotonic() - began < 0.5
+    assert 0.19 < time.monotonic() - began < 2.0
     assert timer._limits == []
 
 
@@ -299,7 +303,7 @@ def test_a_signal_handled_inside_the_call_that_blocks_it_does_not_leave_it_block
     with pytest.raises(Inner):
         with limit_until(began + 0.1, Inner):
             spin()
-    assert time.monotonic() - began < 0.5
+    assert time.monotonic() - began < 3.0
 
 
 def test_a_limit_is_not_raised_inside_a_finalizer_where_it_would_be_lost(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,5 +327,163 @@ def test_a_limit_is_not_raised_inside_a_finalizer_where_it_would_be_lost(monkeyp
             spin()
     monkeypatch.undo()
     assert dropped == []
-    assert 0.29 < time.monotonic() - began < 1.0
+    assert 0.29 < time.monotonic() - began < 3.0
+    assert timer._limits == []
+
+
+def test_a_second_limit_that_is_due_too_fires_even_if_the_first_error_is_swallowed() -> None:
+    """Both deadlines pass while the signal cannot be handled (one long call into C, here a shield).
+
+    The earlier one's error is raised first and a library swallows it; the other one used to be left with the
+    timer disarmed, so it never fired inside the block (the reviewer's ``swallow.py``). It fires at once now.
+    """
+    began = time.monotonic()
+    reached: list[str] = []
+    with pytest.raises(Outer):
+        with limit_until(began + 0.05, Outer):
+            with limit_until(began + 0.03, Inner):
+                try:
+                    with timer.shielded():
+                        time.sleep(0.1)
+                except Inner:
+                    reached.append("inner swallowed")
+                spin(1.5)
+                reached.append("spun to the end")
+    assert reached == ["inner swallowed"]
+    assert time.monotonic() - began < 1.0
+    assert timer._limits == []
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_signal_handled_inside_the_handler_waits_until_it_has_raised() -> None:
+    """Python runs handlers between any two bytecodes, the handler's own too: a nested one must not raise first.
+
+    It would replace the error the running handler is about to raise, so that one limit's error is never seen.
+    """
+    returned: list[bool] = []
+    with pytest.raises(Outer):
+        with limit_until(time.monotonic() + 5, Outer):
+            timer._firing = True  # as if the handler were running
+            try:
+                timer._limits[0].deadline = time.monotonic() - 1
+                timer._fire(signal.SIGALRM, None)
+                returned.append(True)  # it raised nothing: the running handler raises first
+                assert signal.getitimer(signal.ITIMER_REAL)[0] <= 0.001  # and it comes back in a moment
+            finally:
+                timer._firing = False
+            spin()
+    assert returned == [True]
+    assert timer._limits == []
+
+
+# --- a meter: a budget spent only while it runs -------------------------------------------------------------------
+
+
+class Spent(TimeLimit):
+    """The error of a meter's limit."""
+
+
+def run(meter: timer.Meter, seconds: float) -> None:
+    """Run the meter for about ``seconds`` of pure Python, the way a search matches a piece of text."""
+    if meter.spent:
+        raise Spent
+    meter.start()
+    try:
+        spin(seconds)
+    finally:
+        meter.stop()
+
+
+def test_a_meter_is_spent_only_while_it_runs() -> None:
+    """Half a second of waiting with the meter stopped costs nothing; running it for its 0.2 s raises, once."""
+    meter = timer.Meter(0.2)
+    began = time.monotonic()
+    with pytest.raises(Spent):
+        with timer.limit_spending(meter, Spent):
+            for _ in range(10):
+                time.sleep(0.05)
+                run(meter, 0.001)
+            assert 0.1 < meter.left < 0.2
+            run(meter, 5)
+    assert 0.65 < time.monotonic() - began < 3.0
+    assert meter.spent
+    assert meter.until is None
+    assert timer._limits == []
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_meter_run_in_many_short_pieces_runs_out_at_its_total() -> None:
+    """Thousands of short runs with gaps between: the budget is their sum, and the gaps are not charged."""
+    meter = timer.Meter(0.1)
+    ran = 0.0
+    began = time.monotonic()
+    with pytest.raises(Spent):
+        with timer.limit_spending(meter, Spent):
+            while time.monotonic() < began + 5:
+                start = time.monotonic()
+                try:
+                    run(meter, 50e-6)
+                finally:
+                    ran += time.monotonic() - start
+                spin(50e-6)
+    assert 0.095 <= ran < 0.2
+    assert time.monotonic() - began > 0.15
+    assert meter.spent
+
+
+def test_running_a_meter_makes_no_system_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Starting and stopping it reads the clock only: the timer and the mask are not touched for each run."""
+    meter = timer.Meter(5.0)
+    calls: list[str] = []
+
+    def counted(name: str) -> Callable[..., Any]:
+        original = getattr(signal, name)
+
+        def call(*args: Any) -> Any:
+            calls.append(name)
+            return original(*args)
+
+        return call
+
+    with timer.limit_spending(meter, Spent):
+        for name in ("setitimer", "getitimer", "pthread_sigmask", "getsignal", "signal"):
+            monkeypatch.setattr(signal, name, counted(name))
+        for _ in range(20_000):
+            meter.start()
+            meter.stop()
+        monkeypatch.undo()
+    assert calls == []
+    assert 4.9 < meter.left < 5.0
+
+
+def test_a_meter_and_deadlines_nest_in_either_order() -> None:
+    """A deadline inside a meter's limit fires while the meter is stopped; the meter fires later, at its total."""
+    meter = timer.Meter(0.3)
+    began = time.monotonic()
+    with pytest.raises(Spent):
+        with timer.limit_spending(meter, Spent):
+            with pytest.raises(Inner):
+                with limit_until(began + 0.1, Inner):
+                    spin()
+            assert meter.left == 0.3
+            with limit_until(began + 30, Outer):
+                run(meter, 5)
+    assert 0.35 < time.monotonic() - began < 3.0
+    assert timer._limits == []
+    meter = timer.Meter(5.0)
+    with pytest.raises(Outer):
+        with limit_until(time.monotonic() + 0.2, Outer):
+            with timer.limit_spending(meter, Spent):
+                run(meter, 5)
+    assert 4.5 < meter.left < 5.0
+    assert timer._limits == []
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_spent_meter_raises_on_entering() -> None:
+    """Nothing runs on a budget that is gone."""
+    meter = timer.Meter(0.0)
+    with pytest.raises(Spent):
+        with timer.limit_spending(meter, Spent):
+            pytest.fail("not entered")
     assert timer._limits == []

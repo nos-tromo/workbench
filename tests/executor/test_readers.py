@@ -715,6 +715,68 @@ def test_a_worksheet_that_is_not_where_worksheets_usually_are_is_scanned_too(tmp
     refused_quickly(fx.make_sparse_xlsx(tmp_path / "sparse.xlsx", row=2_000_000_000, moved=True))
 
 
+def test_a_worksheet_whose_part_is_not_called_xml_is_scanned_too(tmp_path: Path) -> None:
+    """A sheet is opened from its relationship's target whatever its extension; the scan follows the same target.
+
+    Scanning only the members whose names end in ``.xml`` left ``xl/ws/s1.bin`` to the row loop's own bound.
+    """
+    import openpyxl
+
+    control = fx.make_sparse_xlsx(tmp_path / "control.xlsx", row=2, part="ws/s1.bin")
+    opened = openpyxl.load_workbook(control, read_only=True)
+    assert [list(row) for row in opened["Sheet1"].iter_rows(values_only=True)] == [["a", "b"], ["c", "d"]]
+    opened.close()
+    assert labels(read(control)) == ["Sheet1!A1:B2"]
+    far = fx.make_sparse_xlsx(tmp_path / "far.xlsx", row=2_000_000_000, part="ws/s1.bin")
+    wide = fx.make_sparse_xlsx(tmp_path / "wide.xlsx", row=2, column="ZZZ", part="ws/s1.bin")
+    for path in (far, wide):
+        with pytest.raises(UnreadableFile, match="beyond the limits"):
+            sheet.check_bounds(path)  # the scan itself, not the row loop behind it
+        refused_quickly(path)
+
+
+def test_a_part_that_no_relationship_names_is_neither_opened_nor_refused(tmp_path: Path) -> None:
+    """A stray part with a row past the end is not a worksheet of the workbook: openpyxl never opens it."""
+    path = fx.make_orphan_part_xlsx(tmp_path / "stray.xlsx")
+    sheet.check_bounds(path)
+    assert labels(read(path)) == ["Sheet1!A1:B2"]
+
+
+def test_the_relationships_of_a_workbook_are_counted_before_they_are_resolved(tmp_path: Path) -> None:
+    """20 000 relationships are resolved and read; one more is refused without building them."""
+    assert labels(read(fx.make_many_relationships_xlsx(tmp_path / "limit.xlsx", sheet.MAX_RELATIONSHIPS))) == [
+        "Sheet1!A1:B2"
+    ]
+    path = fx.make_many_relationships_xlsx(tmp_path / "over.xlsx", sheet.MAX_RELATIONSHIPS + 1)
+    with pytest.raises(UnreadableFile, match="too many parts"):
+        sheet.check_bounds(path)
+
+
+@pytest.mark.parametrize(("tag", "count"), [("row", 256 * 1024), ("c", 512 * 1024)])
+def test_a_run_of_unclosed_tags_is_scanned_in_time_in_proportion_to_its_size(
+    tmp_path: Path, tag: str, count: int
+) -> None:
+    """1 MiB of ``<row<row<row...`` in a comment: the scan used to try each to the next ``>``, past the 3 s deadline."""
+    path = fx.make_tag_storm_xlsx(tmp_path / "storm.xlsx", tag, count)
+    cpu = time.process_time()
+    sheet.check_bounds(path)
+    assert time.process_time() - cpu < 1
+    assert labels(read(path)) == ["Sheet1!A1:B2"]
+
+
+def test_openpyxl_is_the_version_the_workbook_checks_were_verified_against() -> None:
+    """The counts and the scan find the parts with openpyxl's own code: a new openpyxl needs a fresh look first."""
+    import openpyxl
+
+    assert openpyxl.__version__ == "3.1.5", (
+        f"openpyxl is {openpyxl.__version__}, not 3.1.5: re-verify readers/sheet.py against it before moving this "
+        "pin. check_counts must count what ExcelReader.read_workbook (WorkbookParser: sheets, the other sequences, "
+        "defined names) and ExcelReader.read_strings (read_string_table) load, with the parts found as "
+        "_find_workbook_part and Manifest find them; related_parts must list every part read_worksheets can "
+        "open (get_rels_path, get_dependents). Re-run tests/executor/test_readers.py on the new version."
+    )
+
+
 @pytest.mark.parametrize("column", ["XFE", "ZZZ", "AAAA", "ZZZZZZZZZZ"])
 def test_a_cell_in_a_column_no_spreadsheet_has_is_refused(tmp_path: Path, column: str) -> None:
     """Past ``XFD`` there are no columns; a row of billions of cells is never built."""

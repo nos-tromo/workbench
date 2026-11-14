@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from tests.fixtures import make_fixtures as fx
+from workbench.executor import timer
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.executor.runners import documents as docs
 
@@ -113,17 +114,43 @@ def test_an_invalid_regex_is_an_error_with_a_reason(work: Path) -> None:
     assert result["error"].startswith("bad_regex: missing ), unterminated subpattern at position 0")
 
 
+def regex_spent(result: dict[str, Any]) -> bool:
+    """Tell whether a search ended because its regular expression spent its budget, and said so as it should."""
+    hint = result.get("hint", "")
+    return (
+        "error" not in result
+        and result["truncated"] is True
+        and "regex budget exhausted; use a simpler expression" in hint
+        and "2 s matching in all" in hint
+    )
+
+
 def test_a_catastrophic_regex_stops_after_two_seconds(work: Path) -> None:
-    """Backtracking that would take minutes is cut off: the error is ``regex_timeout``, and the alarm is disarmed."""
+    """Backtracking that would take minutes is cut off: no error, the note, and the timer is disarmed."""
     (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
-    before = signal.getsignal(signal.SIGALRM)
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True)
     assert 1.5 < time.monotonic() - began < 6
-    assert result["error"].startswith("regex_timeout: ")
-    assert "2 s" in result["error"]
-    assert signal.getsignal(signal.SIGALRM) is before
+    assert regex_spent(result)
+    assert result["hits"] == []
+    # The module's handler stays installed after its first limit; only the timer is off.
+    assert signal.getsignal(signal.SIGALRM) is timer._fire
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert timer._limits == []
+
+
+def test_a_catastrophic_regex_keeps_the_hits_found_before_it(work: Path) -> None:
+    """The lines before the one that backtracks are hits; they come back with the note, not as an error."""
+    (work / "a.txt").write_text("aaaa\n" * 3 + "a" * 40 + "b\n" + "aaa\n", encoding="utf-8")
+    (work / "b.txt").write_text("aaaa\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "(a+)+$", regex=True)
+    assert 1.5 < time.monotonic() - began < 6
+    assert regex_spent(result)
+    assert [(h["path"], h["location"]) for h in result["hits"]] == [
+        (f"/workspace/{CHAT}/a.txt", f"line {n}") for n in (1, 2, 3)
+    ]
+    assert "2 files were not searched to the end" in result["hint"]
 
 
 def test_the_two_seconds_are_for_the_whole_search_not_for_each_line(work: Path) -> None:
@@ -132,35 +159,53 @@ def test_the_two_seconds_are_for_the_whole_search_not_for_each_line(work: Path) 
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True)
     assert 1.5 < time.monotonic() - began < 4
-    assert result["error"].startswith("regex_timeout: ")
+    assert regex_spent(result)
 
 
 def test_a_plain_query_is_never_timed(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The regex budget is not used for a plain query; a regex query uses it for every piece it matches."""
+    """A plain query has no budget; a regex query enters its limit once to compile and once for the whole search.
+
+    The limit used to be entered around every piece, at five microseconds of system calls each, all charged to
+    the budget: a 400 000-line file ran out of it with nothing matched.
+    """
+    spent: list[docs.Meter] = []
+    original = docs.limit_spending
+
+    def spy(meter: docs.Meter, error: type[docs.TimeLimit]) -> Any:
+        spent.append(meter)
+        return original(meter, error)
+
+    monkeypatch.setattr(docs, "limit_spending", spy)
     (work / "t.txt").write_text("needle\nneedle two\n", encoding="utf-8")
-    spent: list[float] = []
-    original = docs.limit_until
-
-    def spy(deadline: float, error: type[docs.TimeLimit]) -> Any:
-        spent.append(deadline)
-        return original(deadline, error)
-
-    monkeypatch.setattr(docs, "limit_until", spy)
     search(work, "needle")
     assert spent == []
     search(work, "needle", regex=True)
-    assert len(spent) == 3  # compiling, and each of the two lines
+    assert len(spent) == 2
+    (work / "u.txt").write_text("needle\n" * 1000, encoding="utf-8")
+    search(work, "needle", regex=True)
+    assert len(spent) == 4
+
+
+def test_the_regex_budget_counts_matching_not_reading(work: Path) -> None:
+    """A search of a 600 000-line file reads for about a second but matches for far less: it completes.
+
+    It ran out of its two seconds at 400 000 lines when every line's limit was charged to the budget.
+    """
+    (work / "t.txt").write_text("nothing to see here\n" * 600_000 + "needle 7\n", encoding="utf-8")
+    result = search(work, r"need(le)? \d", regex=True)
+    assert "hint" not in result
+    assert result["truncated"] is False
+    assert [h["location"] for h in result["hits"]] == ["line 600001"]
 
 
 def test_the_regex_budget_works_inside_a_search_that_has_a_reader_deadline(work: Path) -> None:
     """The reader's timer is in force while the matching runs; the two limits do not clobber each other."""
     (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
-    before = signal.getsignal(signal.SIGALRM)
     began = time.monotonic()
     result = search(work, "(a+)+$", regex=True, budget_s=30)
     assert 1.5 < time.monotonic() - began < 4
-    assert result["error"].startswith("regex_timeout: ")
-    assert signal.getsignal(signal.SIGALRM) is before
+    assert regex_spent(result)
+    assert signal.getsignal(signal.SIGALRM) is timer._fire
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
     assert readers_deadline_is_off()
 
@@ -358,16 +403,29 @@ def test_a_workbook_that_is_slow_to_load_is_given_up_on_and_the_search_goes_on(w
     assert result["truncated"] is False
 
 
-def test_a_regex_search_that_enters_a_limit_for_every_line_still_stops_at_its_time(work: Path) -> None:
-    """The regex budget is entered and left for every line; the search's deadline must still fire in that churn."""
-    (work / "t.txt").write_text("nothing to see here\n" * 400_000, encoding="utf-8")
+def test_a_regex_search_over_many_lines_still_stops_at_its_time(work: Path) -> None:
+    """The regex budget's meter runs for every line; the search's own deadline still fires among them."""
+    (work / "t.txt").write_text("nothing to see here\n" * 1_000_000, encoding="utf-8")
     began = time.monotonic()
-    result = search(work, r"need(le)? \d", regex=True, budget_s=1)
+    result = search(work, r"need(le)? \d", regex=True, budget_s=0.2)
     assert time.monotonic() - began < 4
     assert result["truncated"] is True
-    assert "stopped after 1 s" in result["hint"]
+    assert "stopped after 0.2 s" in result["hint"]
+    assert "regex budget" not in result["hint"]
     assert result["hits"] == []
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_a_regex_over_the_100000_row_workbook_finds_its_ten_hits(work: Path, big_xlsx: Path) -> None:
+    """The brief's large fixture: the cells of rows 99 990 to 99 999 match, all ten are found, no budget runs out.
+
+    With the limit entered around each of its 600 000 cells the budget ran out first, with no hits and an error.
+    """
+    shutil.copy(big_xlsx, work / "ledger.xlsx")
+    result = search(work, r"item 9999\d\b", regex=True)
+    assert "hint" not in result
+    assert result["truncated"] is False
+    assert [h["location"] for h in result["hits"]] == [f"Sheet1!B{n}" for n in range(99_990, 100_000)]
 
 
 @pytest.mark.parametrize("kind", ["tag", "default", "noslash", "dslash"])

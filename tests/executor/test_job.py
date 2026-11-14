@@ -104,6 +104,42 @@ def test_a_read_that_is_out_of_time_is_a_read_timeout_result_in_a_job_process(tm
     assert result["error"].startswith("read_timeout: ")
 
 
+def test_a_time_limit_that_escapes_a_runner_is_a_result_in_a_job_process(tmp_path: Path) -> None:
+    """In a fresh process, through the module's own entry point, a timer error no runner handles is a result.
+
+    It ends in ``result.json`` and exit status 0 by way of the job's ``except TimeLimit``. The real runners handle
+    their own limits, so a runner is registered that lets one out: the timer fires in its loop, in the job
+    process, and nothing in the runner catches it.
+    """
+    spec = _write_spec(tmp_path / "control", tool="slip")
+    script = (
+        "import runpy, sys, time\n"
+        "from workbench.executor.runners import RUNNERS\n"
+        "from workbench.executor.timer import TimeLimit, limit_until\n"
+        "class Late(TimeLimit):\n"
+        "    pass\n"
+        "def slip(args, ctx):\n"
+        "    with limit_until(time.monotonic() + 0.05, Late):\n"
+        "        while True:\n"
+        "            pass\n"
+        "RUNNERS['slip'] = slip\n"
+        "sys.argv = ['job', sys.argv[1]]\n"
+        "runpy.run_module('workbench.executor.job', run_name='__main__')\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(spec)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((tmp_path / "control" / "result.json").read_text()) == {
+        "error": "read_timeout: the work ran past its time limit"
+    }
+
+
 def test_a_result_that_is_not_json_becomes_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A runner that returns something JSON cannot hold still leaves a readable result."""
     monkeypatch.setitem(RUNNERS, "paths", lambda args, ctx: {"where": tmp_path})

@@ -12,20 +12,20 @@ import os
 import re
 import time
 from collections.abc import Callable
-from contextlib import suppress
-from itertools import islice
+from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
 from typing import Any, Final
 
 from workbench import protocol
 from workbench.executor import readers
 from workbench.executor.context import JobContext
-from workbench.executor.timer import TimeLimit, limit_until, shielded
+from workbench.executor.timer import Meter, TimeLimit, limit_spending, shielded
 
 #: Bytes of the answer kept back for what is not a part of the text: the path, the kind, the hint.
 RESERVE: Final = 2048
 
-#: Seconds in all that a regular expression may spend matching, in one search.
+#: Seconds in all that a regular expression may spend matching (and compiling), in one search; the reading of
+#: the files in between does not count.
 REGEX_BUDGET_S: Final = 2.0
 
 #: Most hits one page, cell, paragraph or line gives, so one piece cannot use up all the hits.
@@ -47,7 +47,7 @@ FILE_SHARE: Final = 3
 
 
 class RegexTimeout(TimeLimit):
-    """A regular expression took longer than its budget."""
+    """A regular expression has spent its budget."""
 
 
 def error(code: str, message: str) -> dict[str, Any]:
@@ -185,10 +185,13 @@ def snippet(text: str, match: re.Match[str]) -> str:
 
 
 class Matcher:
-    """Finds a query in text; a regular expression has ``REGEX_BUDGET_S`` seconds in all.
+    """Finds a query in text; a regular expression may spend ``REGEX_BUDGET_S`` seconds matching, in all.
 
-    The budget is kept with the job's timer (:mod:`workbench.executor.timer`), which Python's regular
-    expression engine honours while it matches; it nests inside the deadline a reader may have set.
+    The budget is a :class:`~workbench.executor.timer.Meter` that runs only around each match, so the time spent
+    reading the files in between does not count, and starting and stopping it costs two clock reads and no
+    system call. It is made binding by one :func:`~workbench.executor.timer.limit_spending` block around the
+    whole search (:meth:`limit`), in which the readers' own deadlines nest; Python's regular expression engine
+    honours the timer while it matches, so one expression that backtracks without end is stopped too.
     """
 
     def __init__(self, query: str, *, regex: bool) -> None:
@@ -203,12 +206,23 @@ class Matcher:
             RegexTimeout: Compiling it took more than the budget.
             RecursionError: The expression is nested too deeply.
         """
-        self._guarded = regex
-        self._left = REGEX_BUDGET_S
-        self._pattern = self._timed(lambda: re.compile(query if regex else re.escape(query), re.IGNORECASE))
+        self.budget: Meter | None = Meter(REGEX_BUDGET_S) if regex else None
+        if regex:
+            with self.limit():
+                self._pattern = self._metered(lambda: re.compile(query, re.IGNORECASE))
+        else:
+            self._pattern = re.compile(re.escape(query), re.IGNORECASE)
 
-    def _timed[T](self, work: Callable[[], T]) -> T:
-        """Run ``work``, within what is left of the budget when the query is a regular expression.
+    def limit(self) -> AbstractContextManager[None]:
+        """Make the budget binding inside a block; a plain query has none.
+
+        Returns:
+            The block; :class:`RegexTimeout` is raised in it once the budget is spent.
+        """
+        return nullcontext() if self.budget is None else limit_spending(self.budget, RegexTimeout)
+
+    def _metered[T](self, work: Callable[[], T]) -> T:
+        """Run ``work`` with the budget's meter running.
 
         Args:
             work: A function of no arguments.
@@ -217,16 +231,35 @@ class Matcher:
             What ``work`` returns.
 
         Raises:
-            RegexTimeout: The budget ran out before or during ``work``.
+            RegexTimeout: The budget is spent already, or ran out during ``work`` (inside :meth:`limit`).
         """
-        if not self._guarded:
+        budget = self.budget
+        if budget is None:
             return work()
-        began = time.monotonic()
+        if budget.spent:
+            raise RegexTimeout
+        budget.start()
         try:
-            with limit_until(began + self._left, RegexTimeout):
-                return work()
+            return work()
         finally:
-            self._left -= time.monotonic() - began
+            budget.stop()
+
+    def _first(self, text: str) -> list[re.Match[str]]:
+        """Find the first non-empty matches in a text.
+
+        Args:
+            text: The text.
+
+        Returns:
+            At most ``HITS_PER_UNIT`` matches, in order.
+        """
+        found: list[re.Match[str]] = []
+        for match in self._pattern.finditer(text):
+            if match.end() > match.start():
+                found.append(match)
+                if len(found) == HITS_PER_UNIT:
+                    break
+        return found
 
     def find(self, text: str) -> list[re.Match[str]]:
         """Find the first matches in a text, leaving out empty ones.
@@ -238,12 +271,11 @@ class Matcher:
             At most ``HITS_PER_UNIT`` matches, in order.
 
         Raises:
-            RegexTimeout: The budget ran out.
+            RegexTimeout: The budget is spent.
         """
-        pattern = self._pattern
-        return self._timed(
-            lambda: list(islice((m for m in pattern.finditer(text) if m.end() > m.start()), HITS_PER_UNIT))
-        )
+        if self.budget is None:
+            return self._first(text)
+        return self._metered(lambda: self._first(text))
 
 
 def _files(root: Path) -> list[str]:
@@ -290,6 +322,7 @@ class _Search:
         self.unsupported = 0
         self.full = False
         self.timed_out = False
+        self.regex_spent = False
 
     def file(self, name: str) -> None:
         """Search one file.
@@ -325,6 +358,9 @@ class _Search:
         except (readers.UnreadableFile, readers.UnsupportedFormat) as exc:
             self.skipped.append({"path": virtual, "reason": str(exc)})
             return
+        except RegexTimeout:
+            self.regex_spent = True
+            return
         except readers.ReadTimeout:
             if time.monotonic() > self.deadline:
                 self.timed_out = True
@@ -354,7 +390,8 @@ def search_files(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     Returns:
         ``hits`` (``path``, ``location``, ``snippet``), ``truncated``, ``files_searched``, ``unsupported_files``
         and, when they apply, ``skipped`` (files that could not be searched, and why) and ``hint``; or an
-        ``error`` result.
+        ``error`` result. A regular expression that spends its budget ends the search with the hits found until
+        then, ``truncated`` and a hint, not with an error.
     """
     query = str(args["query"])
     regex = bool(args.get("regex", False))
@@ -372,23 +409,21 @@ def search_files(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     search = _Search(ctx, matcher, max_hits, time.monotonic() + budget)
     finished = 0
     try:
-        for name in names:
-            search.file(name)
-            if search.full or search.crowded or search.timed_out:
-                break
-            finished += 1
+        with matcher.limit():
+            for name in names:
+                search.file(name)
+                if search.full or search.crowded or search.timed_out or search.regex_spent:
+                    break
+                finished += 1
     except RegexTimeout:
-        return error(
-            "regex_timeout",
-            f"the expression took more than {REGEX_BUDGET_S:g} s to match; "
-            "use a simpler expression or a plain text query",
-        )
+        # The budget ran out at a moment no file was being matched (a file's own matching is handled in it).
+        search.regex_spent = True
     except readers.ReadTimeout:
         # The whole time ran out at a moment no file was being read (a file's own limit is handled in it).
         search.timed_out = True
     result: dict[str, Any] = {
         "hits": search.hits,
-        "truncated": search.full or search.crowded or search.timed_out,
+        "truncated": search.full or search.crowded or search.timed_out or search.regex_spent,
         "files_searched": search.searched,
         "unsupported_files": search.unsupported,
     }
@@ -401,6 +436,12 @@ def search_files(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         hints.append("There are more hits than fit in an answer; narrow the query.")
     if search.timed_out:
         hints.append(f"The search stopped after {budget:g} s; {len(names) - finished} files were not searched.")
+    if search.regex_spent:
+        hints.append(
+            f"regex budget exhausted; use a simpler expression, or a plain text query. The expression may spend "
+            f"{REGEX_BUDGET_S:g} s matching in all; these are the hits found until then, and "
+            f"{len(names) - finished} files were not searched to the end."
+        )
     if len(search.skipped) > SKIPPED_LISTED:
         hints.append(f"{len(search.skipped) - SKIPPED_LISTED} more files could not be searched.")
     if hints:

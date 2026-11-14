@@ -431,7 +431,9 @@ def make_restricted_pdf(
     return path
 
 
-def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B", moved: bool = False) -> Path:
+def make_sparse_xlsx(
+    path: Path, *, row: int = 2_000_000_000, column: str = "B", moved: bool = False, part: str | None = None
+) -> Path:
     """Write a workbook whose second row of data is numbered ``row`` and whose last cell is in ``column``.
 
     Args:
@@ -439,10 +441,12 @@ def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B",
         row: The number of the second row; no spreadsheet has more than 1 048 576.
         column: The column of the second row's cells; none goes past ``XFD``.
         moved: Whether the worksheet part is ``xl/ws/s1.xml``, named so in the workbook's relationships.
+        part: Another name for the worksheet part, below ``xl/`` (``ws/s1.bin``), named so in the relationships.
 
     Returns:
         ``path``.
     """
+    target = part or ("ws/s1.xml" if moved else None)
     book = Workbook()
     sheet: Any = book.active
     sheet.title = "Sheet1"
@@ -459,11 +463,71 @@ def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B",
                 xml = xml.replace('<row r="2"', f'<row r="{row}"').replace('r="A2"', f'r="A{row}"')
                 xml = xml.replace('r="B2"', f'r="{column}{row}"')
                 data = xml.encode()
-                name = "xl/ws/s1.xml" if moved else name
-            elif moved and name in {"[Content_Types].xml", "xl/_rels/workbook.xml.rels"}:
-                data = data.replace(b"worksheets/sheet1.xml", b"ws/s1.xml")
+                name = f"xl/{target}" if target else name
+            elif target and name in {"[Content_Types].xml", "xl/_rels/workbook.xml.rels"}:
+                data = data.replace(b"worksheets/sheet1.xml", target.encode())
             out.writestr(name, data)
     return path
+
+
+def make_tag_storm_xlsx(path: Path, tag: str, count: int) -> Path:
+    """Write a small workbook whose worksheet has a comment of ``count`` unclosed tags, ``<row<row<row...``.
+
+    A pattern that runs from each ``<row`` to the next ``>`` reads the rest of the run from every one of them.
+
+    Args:
+        path: Where to write it.
+        tag: ``row`` or ``c``.
+        count: How many times ``<tag`` is repeated.
+
+    Returns:
+        ``path``.
+    """
+    make_sparse_xlsx(path, row=2)
+    storm = b"<!--" + f"<{tag}".encode() * count + b"-->"
+    return _rewrite_xlsx(
+        path, {"xl/worksheets/sheet1.xml": lambda data: data.replace(b"<sheetData>", storm + b"<sheetData>")}
+    )
+
+
+def make_orphan_part_xlsx(path: Path) -> Path:
+    """Write a small workbook with a stray worksheet part that no relationship names, with a row past the end.
+
+    openpyxl never opens a part that the workbook's relationships do not name.
+
+    Args:
+        path: Where to write it.
+
+    Returns:
+        ``path``.
+    """
+    make_sparse_xlsx(path, row=2)
+    stray = b'<worksheet><sheetData><row r="2000000000"><c r="A2000000000"/></row></sheetData></worksheet>'
+    return _rewrite_xlsx(path, {}, {"xl/worksheets/sheet9.xml": stray})
+
+
+def make_many_relationships_xlsx(path: Path, count: int) -> Path:
+    """Write a small workbook whose relationships part has ``count`` entries in all, the extra ones naming its styles.
+
+    Args:
+        path: Where to write it.
+        count: How many relationships; the workbook has three of its own.
+
+    Returns:
+        ``path``.
+    """
+    make_sparse_xlsx(path, row=2)
+    extra = "".join(
+        f'<Relationship Type="urn:synthetic:extra" Target="styles.xml" Id="rIdX{n}"/>' for n in range(count - 3)
+    )
+    return _rewrite_xlsx(
+        path,
+        {
+            "xl/_rels/workbook.xml.rels": lambda data: data.replace(
+                b"</Relationships>", f"{extra}</Relationships>".encode()
+            )
+        },
+    )
 
 
 def make_many_sheets_xlsx(path: Path, sheets: int) -> Path:
