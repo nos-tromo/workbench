@@ -51,10 +51,12 @@ updates:
           - "version-update:semver-major"
           - "version-update:semver-minor"
 
-  # The Open WebUI image the contract test runs (contract/compose.yaml). It
-  # must stay the tag and digest open-webui-service deploys, whose own
-  # Dependabot bumps that copy: merge a bump here only with the same one
-  # there. A bump that changes the terminal contract fails the contract job.
+  # The Open WebUI image the contract test runs, pinned in
+  # contract/compose.yaml only (the static tests check its shape, not its
+  # value, so a bump reaches the contract job). It must stay the tag and
+  # digest open-webui-service deploys, whose own Dependabot bumps that copy:
+  # merge a bump here only with the same one there. A bump that changes the
+  # terminal contract fails the contract job.
   # The image lives on ghcr.io, so its updates come without the wait (see
   # above).
   - package-ecosystem: "docker-compose"

@@ -610,13 +610,22 @@ def fill_body(value_json: str) -> str:
     return f'{{"path": "{CHAT}/form.docx", "values": {{"x": {value}}}}}'
 
 
-@pytest.mark.parametrize("depth", [300, 5000], ids=["past the serializer", "past the parser"])
+@pytest.mark.parametrize(
+    ("depth", "past_the_parser"), [(300, False), (20_000, True)], ids=["past the serializer", "past the parser"]
+)
 def test_a_value_nested_too_deeply_is_a_422_and_nothing_runs(
-    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, depth: int
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, depth: int, past_the_parser: bool
 ) -> None:
-    """A list of lists of lists was a 500 when the job was encoded, or past the parser a 400; it is refused as read."""
+    """A list of lists of lists was a 500 when the job was encoded; it is refused as read, with one short answer.
+
+    20 000 levels are past Python's own JSON parser, which raises ``RecursionError`` before the depth is checked: the
+    test checks that premise first, so a parser that one day takes that many fails here instead of passing unseen.
+    """
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     body = fill_body(nested_json(depth))
+    if past_the_parser:
+        with pytest.raises(RecursionError):
+            json.loads(body)
     r = client.post("/tools/fill_template", content=body, headers={**H, "Content-Type": "application/json"})
     assert (r.status_code, r.json()) == (422, {"detail": "request nested too deeply"})
     assert fake_executor.requests == []

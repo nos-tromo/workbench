@@ -259,15 +259,14 @@ class _ComposeLoader(yaml.SafeLoader):
 _ComposeLoader.add_constructor("!reset", lambda loader, node: ("!reset", loader.construct_sequence(node)))  # type: ignore[arg-type]
 
 
-def contract_stack() -> dict[str, Any]:
-    """Read ``contract/compose.yaml``."""
-    return yaml.load((ROOT / "contract" / "compose.yaml").read_text(encoding="utf-8"), Loader=_ComposeLoader)
+def contract_stack(name: str = "compose.yaml") -> dict[str, Any]:
+    """Read a file of ``contract/``: the stack, or the override it includes last."""
+    return yaml.load((ROOT / "contract" / name).read_text(encoding="utf-8"), Loader=_ComposeLoader)
 
 
-#: The image open-webui-service deploys, by tag and digest (its docker/compose.yaml).
-OPEN_WEBUI_IMAGE = (
-    "ghcr.io/open-webui/open-webui:v0.13.3@sha256:46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14"
-)
+#: The shape of the Open WebUI pin: a release tag and a digest. The pin itself lives in contract/compose.yaml only, so a
+#: Dependabot bump there passes this check and reaches the contract job, which then runs the new image.
+OPEN_WEBUI_IMAGE = re.compile(r"ghcr\.io/open-webui/open-webui:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}")
 
 #: Open WebUI's production switches that bear on the contract (open-webui-service docker/compose.yaml), and the two
 #: the connection adds.
@@ -286,13 +285,23 @@ CONTRACT_SWITCHES = {
 
 
 def test_the_contract_stack_keeps_nothing_of_a_developers_or_the_test_stacks() -> None:
-    """Its own project, volume and network on top of the test stack; the api publishes nothing, Open WebUI loopback."""
+    """Its own project, volume and network on top of the test stack; the api publishes nothing, Open WebUI loopback.
+
+    The test stack is changed by an override file that ends the ``include``'s path list, Compose's documented way;
+    the including file only adds services, since redefining an included resource there is an error.
+    """
     stack = contract_stack()
     assert stack["name"] == "workbench-contract"
-    assert stack["include"] == [{"path": ["../docker/compose.yaml", "../docker/compose.test.yaml"]}]
-    assert stack["volumes"] == {"workbench-data": {"name": "workbench-contract-data"}}
-    assert stack["networks"] == {"workbench-net": {"name": "workbench-contract-net"}}
-    assert stack["services"]["api"]["ports"] == ("!reset", [])
+    assert stack["include"] == [
+        {"path": ["../docker/compose.yaml", "../docker/compose.test.yaml", "workbench.override.yaml"]}
+    ]
+    assert set(stack) == {"name", "include", "services"}
+    assert set(stack["services"]) == {"open-webui", "stub-model"}
+    override = contract_stack("workbench.override.yaml")
+    assert override["volumes"] == {"workbench-data": {"name": "workbench-contract-data"}}
+    assert override["networks"] == {"workbench-net": {"name": "workbench-contract-net"}}
+    assert set(override["services"]) == {"api"}
+    assert override["services"]["api"]["ports"] == ("!reset", [])
     open_webui = stack["services"]["open-webui"]
     assert open_webui["ports"] == ["127.0.0.1:18180:8080"]
     assert "volumes" not in open_webui
@@ -314,12 +323,13 @@ def test_the_contract_stacks_stub_model_is_hardened_and_publishes_nothing() -> N
 
 
 def test_the_contract_runs_open_webui_as_production_does() -> None:
-    """The image open-webui-service deploys, its switches, one bearer connection to workbench-api, Dependabot's.
+    """Open WebUI by tag and digest, production's switches, one bearer connection to workbench-api, Dependabot's.
 
+    The image's value is contract/compose.yaml's alone, so a Dependabot bump passes here and reaches the contract job.
     Its one provider is an OpenAI-compatible endpoint, as in production, here the stub model; Ollama stays off.
     """
     open_webui = contract_stack()["services"]["open-webui"]
-    assert open_webui["image"] == OPEN_WEBUI_IMAGE
+    assert OPEN_WEBUI_IMAGE.fullmatch(open_webui["image"]), open_webui["image"]
     env = open_webui["environment"]
     assert {key: env.get(key) for key in CONTRACT_SWITCHES} == CONTRACT_SWITCHES
     assert (env["ENABLE_OPENAI_API"], env["OPENAI_API_BASE_URL"], env["ENABLE_OLLAMA_API"]) == (

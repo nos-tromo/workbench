@@ -2,10 +2,11 @@
 ### deploys, connected as one terminal server, for tests/contract.
 ###
 ### A project of its own (workbench-contract): workbench's services come from docker/compose.yaml with
-### docker/compose.test.yaml on top, through `include`, with a data volume and a network named for this project, so
-### neither a developer's stack nor the isolation stack is touched. Open WebUI keeps its state in a tmpfs that dies
-### with its container, and `down -v` removes the rest. The caller key and Open WebUI's forwarding secret are made
-### per run by make test-contract; the accounts the tests sign up are synthetic.
+### docker/compose.test.yaml and contract/workbench.override.yaml on top, through `include`; the override names a data
+### volume and a network for this project, so neither a developer's stack nor the isolation stack is touched. This
+### file only adds services and redefines nothing it includes (Compose refuses that). Open WebUI keeps its state in a
+### tmpfs that dies with its container, and `down -v` removes the rest. The caller key and Open WebUI's forwarding
+### secret are made per run by make test-contract; the accounts the tests sign up are synthetic.
 ###
 ### Open WebUI runs without edge-guard, straight on the test's network, with the switches of its production
 ### environment that bear on the contract (open-webui-service docker/compose.yaml). It reaches workbench by its
@@ -19,18 +20,14 @@ include:
   - path:
       - ../docker/compose.yaml
       - ../docker/compose.test.yaml
+      - workbench.override.yaml
 
 services:
-  api:
-    # Reached only through Open WebUI: no port on the host, so the isolation stack keeps 18100.
-    ports: !reset []
-    environment:
-      OPEN_WEBUI_WORKBENCH_KEY: ${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}
-
   open-webui:
-    # Two files pin this image and must stay equal: open-webui-service's docker/compose.yaml, which production runs,
-    # and this one, which Dependabot bumps on its own (.github/dependabot.yml, directory /contract). A bump that
-    # changes the terminal contract fails make test-contract.
+    # This repo pins the image here and nowhere else (its tests check only that it is a tag and a digest). It must
+    # stay what open-webui-service's docker/compose.yaml pins, which production runs. Dependabot bumps this copy on
+    # its own (.github/dependabot.yml, directory /contract): merge such a bump only with the same bump there. A bump
+    # that changes the terminal contract fails make test-contract.
     image: ghcr.io/open-webui/open-webui:v0.13.3@sha256:46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14
     user: "10001:10001"
     security_opt:
@@ -128,11 +125,3 @@ services:
       start_period: 30s
       start_interval: 2s
     restart: "no"
-
-volumes:
-  workbench-data:
-    name: workbench-contract-data
-
-networks:
-  workbench-net:
-    name: workbench-contract-net

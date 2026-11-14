@@ -8,6 +8,7 @@ import asyncio
 import dataclasses
 import io
 import itertools
+import json
 import logging
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -1298,9 +1299,17 @@ def test_list_files_tool_is_empty_for_a_new_chat_and_other_users(client: TestCli
     assert len(client.post("/tools/list_files", headers=H).json()["files"]) == 1
 
 
-@pytest.mark.parametrize("depth", [300, 5000], ids=["past the serializer", "past the parser"])
-def test_a_files_body_nested_too_deeply_is_a_422(client: TestClient, depth: int) -> None:
-    """The browser's JSON routes read a body as the tools do: past the depth limit, one short refusal."""
+@pytest.mark.parametrize(
+    ("depth", "past_the_parser"), [(300, False), (20_000, True)], ids=["past the depth limit", "past the parser"]
+)
+def test_a_files_body_nested_too_deeply_is_a_422(client: TestClient, depth: int, past_the_parser: bool) -> None:
+    """The browser's JSON routes read a body as the tools do: past the depth limit, or the parser's, one short refusal.
+
+    The premise of the second case is checked first: Python's JSON parser itself raises ``RecursionError`` on it.
+    """
     body = '{"path": ' + "[" * depth + '"x"' + "]" * depth + "}"
+    if past_the_parser:
+        with pytest.raises(RecursionError):
+            json.loads(body)
     r = client.post("/files/mkdir", content=body, headers={**H, "Content-Type": "application/json"})
     assert (r.status_code, r.json()) == (422, {"detail": "request nested too deeply"})
