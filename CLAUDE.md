@@ -185,7 +185,7 @@ make build && make up     # production shape, no host port; make dev = build + u
 make health               # container status, then the api's /healthz from inside
 make retention-dry-run    # what retention would delete now: counts and ages only
 make bundle               # airgap bundle of both images, from the latest release tag
-make nuke                 # DESTROY workbench-data (type 'workbench' to confirm)
+make nuke                 # DESTROY workbench-data (type 'workbench' to confirm); no audit event records it
 ```
 
 `make/common.mk` and `scripts/bundle-lib.sh` are vendored verbatim from

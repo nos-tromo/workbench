@@ -92,9 +92,12 @@ operator's.
 ## What leaves
 
 - **Tool results go to Open WebUI**, the caller that asked. Open WebUI puts
-  them into the chat and sends them to the model through the federation's
-  inference router. They stay in the chat history for Open WebUI's chat
-  retention, 365 days by default (see the box at the top).
+  them into the chat and sends them, in the model's context, to whatever model
+  the operator configured behind the federation's inference router. If that
+  model is run by an outside provider (a hosted API, or an Ollama `*-cloud`
+  model), the results leave the host and the federation to that provider. They
+  stay in the chat history for Open WebUI's chat retention, 365 days by default
+  (see the box at the top).
 - **Files go to the user's browser** through Open WebUI's proxy, when the user
   views or downloads them (`GET /files/view`), or when a card shows one
   (`display_file`). What a user downloads is outside workbench from then on.
@@ -136,8 +139,9 @@ operator's.
   workbench cannot change it, since those paths are Open WebUI's protocol; the
   fix belongs in open-webui-service or obs-plane.
 
-Nothing else leaves. The executor has no network, and the api calls no model
-and no other service.
+workbench itself sends nothing outside the host: the executor has no network,
+and the api calls no model and no other service. What leaves the federation
+leaves through Open WebUI's model call, above.
 
 ## Facts for the record of processing and the impact assessment
 
@@ -158,21 +162,29 @@ in the files they upload or in the values the model writes.
 
 - to the caller that asked, Open WebUI, for the same user: tool results and
   files;
-- through Open WebUI, to the federation's inference router and the model it
-  serves: tool results enter the model's context. What Open WebUI does with an
-  answer (the chat history, the model call) is its own processing, recorded
-  there;
+- through Open WebUI, to the federation's inference router and the model the
+  operator configured behind it: tool results enter the model's context. When
+  that model is run by an outside provider, they leave the host and the
+  federation to that provider. What Open WebUI does with an answer (the chat
+  history, the model call) is its own processing, recorded there;
 - to obs-plane: the audit events (account id, chat id, file ids, times, counts)
   into its audit store, and the containers' log lines into its log store.
   Metrics hold no personal data.
 
-Nothing leaves the federation. Whether any of these is a recipient in the legal
-sense is for the operator to decide.
+workbench itself sends nothing outside the host. Tool results go to whatever
+model the operator configured behind the inference router; if that is an
+outside provider, they leave the host and the federation. Whether any of these
+is a recipient in the legal sense is for the operator to decide.
 
 **Storage periods.** Files and job records: `WORKBENCH_RETENTION_DAYS`, 7 days by
 default, from creation. Leftovers of interrupted work: one hour. Audit events:
 obs-plane's audit retention (`AUDIT_RETENTION`, one year by default). Copies in
-Open WebUI's chat history: its chat retention, 365 days by default.
+Open WebUI's chat history: its chat retention, 365 days by default. Docker's
+`local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a copy of
+each container's output on the host, the api's audit lines (account ids, chat
+ids, file ids) among them: rotated by size, at most five files of 50 MB per
+container, not by time, so with little traffic it can outlive obs-plane's
+retention.
 
 **Technical and organisational measures.**
 
@@ -190,6 +202,8 @@ Open WebUI's chat history: its chat retention, 365 days by default.
 **Decisions that stay with the operator.**
 
 - the legal basis of the processing;
+- which inference provider serves the chat model: one inside the federation,
+  or an outside provider that receives the tool results;
 - whether any of the flows above goes to a recipient in the legal sense;
 - the outcome of the impact assessment;
 - the notice to users: what workbench keeps and for how long, and that Open

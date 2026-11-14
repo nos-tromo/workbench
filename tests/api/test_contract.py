@@ -127,6 +127,14 @@ def test_system_prompt_says_how_new_tables_and_documents_are_made(settings: Sett
         assert phrase in prompt, phrase
 
 
+def test_system_prompt_says_who_sees_the_files_without_promising_nobody(settings: Settings) -> None:
+    """R2 M5: only this user reaches the workspace; tool results go into the chat and to the configured model."""
+    prompt = system_prompt(settings)
+    assert "shared with nobody" not in prompt
+    for phrase in ("only this user", "part of this chat", "the operator configured"):
+        assert phrase in prompt, phrase
+
+
 def test_openapi_needs_only_the_key(client: TestClient) -> None:
     """Open WebUI fetches the spec with ``Authorization`` alone."""
     assert client.get("/openapi.json", headers=KEY_ONLY).status_code == 200

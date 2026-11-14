@@ -73,11 +73,17 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
 - A job's code gets 9/10 of `WORKBENCH_JOB_WALL_S` for `run_python` and 3/4 for
   the other tools, before the wall time stops it (see
   [sandbox.md](sandbox.md#limits)).
-- The api waits for a job's answer up to the wall time plus 300 seconds: the
-  executor's cleanup of a killed job can take that long.
+- The api waits for a job's answer up to the wall time plus 300 seconds
+  (`workbench/api/jobs.py:_READ_GRACE_S`): the executor's cleanup of a killed
+  job can take that long.
 - Open WebUI sets no timeout on a tool call by default. open-webui-service must
   set one (`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER`) when its workbench connection is
-  added; keep it above `WORKBENCH_JOB_WALL_S` plus `WORKBENCH_QUEUE_WAIT_S`.
+  added. It must be longer than a call can take in workbench:
+  `WORKBENCH_QUEUE_WAIT_S` + `WORKBENCH_JOB_WALL_S` + 300 seconds, 480 seconds
+  with the defaults (60 + 120 + 300). With a shorter one, Open WebUI gives up on
+  a call whose job is slow to be cleaned up before workbench answers it, and the
+  model never gets the answer, although workbench may still finish the job,
+  record it and keep its files.
 
 ## Files
 
@@ -155,8 +161,8 @@ The formulas, for other slot counts or job memory:
 `docker/compose.yaml` alone, the production shape with no host port. A bare
 `docker compose` run from `docker/` loads `compose.override.yaml` on its own,
 since that is compose's default override file name, and so publishes
-`127.0.0.1:8100`, without the root `.env` either. Use `make`, or `docker compose --env-file .env -f docker/compose.yaml`
-from the repo root.
+`127.0.0.1:8100`, without the root `.env` either. Use `make`, or
+`docker compose --env-file .env -f docker/compose.yaml` from the repo root.
 
 ## Not exposed
 

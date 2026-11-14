@@ -91,6 +91,8 @@ recorded and which are not.
   same file.
 - The handshake routes (`/api/config`, `/system`, `/openapi.json`,
   `/files/cwd`, `/skills`), `/healthz` and `/metrics`.
+- `make nuke`, which removes the whole data volume: the operator's act on the
+  host, outside the api and its chain ([retention.md](retention.md#make-nuke-is-outside-the-trail)).
 - A request refused before it becomes an operation: no or a wrong key (`401`),
   a body too large (`413`), a missing or invalid user (`400`), a body that does
   not validate (`422`), a full queue (`503`), a file that does not exist

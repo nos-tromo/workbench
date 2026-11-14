@@ -147,6 +147,14 @@ connection takes them over.
 The hour for leftovers and empty folders is fixed
 (`retention.py:FOLDER_GRACE_S`).
 
+## `make nuke` is outside the trail
+
+`make nuke` removes the whole volume `workbench-data`, every user's files and
+the database, after you type `workbench` to confirm (`Makefile`). No audit event
+records it: it is the operator's act on the host, with Docker, outside the api
+and its chain. The host's own audit (deploy ADR 0003, "The host covers what no
+service sees") is what can record that call.
+
 ## Copies outside workbench
 
 Retention deletes workbench's files. It does not reach the copies elsewhere:
