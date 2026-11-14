@@ -1,9 +1,10 @@
 """The runners of ``write_table`` and ``write_document``, which write one new file from the model's values in the job.
 
 Neither reads a file of the chat: everything comes in the job's arguments, which the api has checked; they are checked
-here again against the same bounds (the executor imports nothing of the api, so the bounds are mirrored, and a test
-ties the two), and a value that does not pass is an ``invalid_value`` that names its place and writes nothing. The file
-goes into ``out/`` under the name the api chose. The answer is a hint at most, never a path of the job.
+here again, and a value that does not pass is an ``invalid_value`` that names its place and writes nothing. A table is
+checked by the very rules the api checks it by (:mod:`workbench.tables`); the length of a document's Markdown and of a
+hint are the api's bounds mirrored (the executor imports nothing of the api), and a test ties them. The file goes into
+``out/`` under the name the api chose. The answer is a hint at most, never a path of the job.
 
 Every value is data. A workbook cell is written by the value's type, so a string stays a string even if it looks like
 a formula, a number or a web address. A CSV cell that a spreadsheet would run (``=``, ``+``, ``-``, ``@``, a tab or a
@@ -13,7 +14,6 @@ and in a Word document, and the hint says so. All of the work runs under the job
 """
 
 import csv
-import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -25,18 +25,12 @@ from workbench.executor.runners.documents import error
 from workbench.executor.templates import xml_safe
 from workbench.executor.timer import TimeLimit, limit_until
 from workbench.paths import PathError, check_filename
+from workbench.tables import DELIMITERS, table_problem, word_table_problem
 
-#: The api's bounds and rules (:mod:`workbench.api.tools_output`), mirrored: rows, columns, characters of a cell
-#: (Excel's limit), of a document's Markdown, of a sheet's name and of a hint (``MAX_HINT``); what a sheet's name may
-#: not hold, and the one name Excel keeps for itself.
-MAX_ROWS: Final = 100_000
-MAX_COLUMNS: Final = 16_384
-MAX_CELL: Final = 32_767
+#: The api's bounds (:mod:`workbench.api.tools_output`), mirrored: characters of a document's Markdown and of a hint
+#: (``MAX_HINT``). A table's bounds and rules are not mirrored: both sides use :mod:`workbench.tables`.
 MAX_MARKDOWN: Final = 200_000
-MAX_SHEET_NAME: Final = 31
 HINT_MAX: Final = 2000
-SHEET_FORBIDDEN: Final = frozenset("[]:*?/\\")
-SHEET_RESERVED: Final = "history"
 
 #: The first characters that make a spreadsheet run a CSV cell as a formula.
 FORMULA_START: Final = ("=", "+", "-", "@", "\t", "\r")
@@ -126,56 +120,8 @@ def _plural(count: int, noun: str) -> str:
 # --- write_table --------------------------------------------------------------------------------------------------
 
 
-def _check_cell(value: object, where: str) -> None:
-    """Refuse a cell the file cannot hold.
-
-    Args:
-        value: The cell's value.
-        where: Its place, such as ``row 3, column 2``.
-
-    Raises:
-        _Refused: It is not a string, a number, a bool or ``None``; a string is longer than :data:`MAX_CELL`; a
-            number is not finite, or larger than a spreadsheet holds.
-    """
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, str):
-        if len(value) > MAX_CELL:
-            raise _Refused(f"{where}: a cell holds at most {MAX_CELL} characters")
-        return
-    if isinstance(value, int | float):
-        try:
-            finite = math.isfinite(value)
-        except OverflowError:
-            finite = False
-        if not finite:
-            raise _Refused(f"{where}: a number must be finite and no larger than a spreadsheet holds")
-        return
-    raise _Refused(f"{where}: a cell takes a string, a number, true, false or null")
-
-
-def _check_sheet(sheet: str) -> str | None:
-    """Tell what is wrong with a sheet's name, by Excel's rules.
-
-    Args:
-        sheet: The name.
-
-    Returns:
-        Why Excel would refuse it, or ``None``.
-    """
-    if not 1 <= len(sheet) <= MAX_SHEET_NAME:
-        return f"a sheet's name has 1 to {MAX_SHEET_NAME} characters"
-    if SHEET_FORBIDDEN & set(sheet):
-        return "a sheet's name holds none of [ ] : * ? / \\"
-    if sheet.startswith("'") or sheet.endswith("'"):
-        return "a sheet's name does not begin or end with '"
-    if sheet.casefold() == SHEET_RESERVED:
-        return "History is a name Excel keeps for itself"
-    return None
-
-
 def _table(args: dict[str, Any]) -> tuple[list[str], list[list[Any]], str]:
-    """Take the table out of the arguments, every cell checked.
+    """Take the table out of the arguments, every cell checked by the rules the api checks it by.
 
     Args:
         args: ``columns``, ``rows`` and ``sheet``.
@@ -184,27 +130,14 @@ def _table(args: dict[str, Any]) -> tuple[list[str], list[list[Any]], str]:
         The columns' names, the rows, and the sheet's name.
 
     Raises:
-        _Refused: A bound is broken; the message names the field, or the row and the column, from 1.
+        _Refused: A bound or a rule is broken; the message names the field, or the row and the column, from 1.
     """
-    columns, rows, sheet = args.get("columns"), args.get("rows"), args.get("sheet", "Sheet1")
-    if not isinstance(columns, list) or not 1 <= len(columns) <= MAX_COLUMNS:
-        raise _Refused(f"columns: a table has 1 to {MAX_COLUMNS} columns")
-    for number, name in enumerate(columns, 1):
-        if not isinstance(name, str):
-            raise _Refused(f"columns, column {number}: a column's name is a string")
-        _check_cell(name, f"columns, column {number}")
-    if not isinstance(rows, list) or len(rows) > MAX_ROWS:
-        raise _Refused(f"rows: a table has at most {MAX_ROWS} rows")
-    for row_number, row in enumerate(rows, 1):
-        if not isinstance(row, list):
-            raise _Refused(f"row {row_number}: a row is a list of values")
-        if len(row) > len(columns):
-            raise _Refused(f"row {row_number} has {len(row)} cells, but the table has {len(columns)} columns")
-        for column_number, value in enumerate(row, 1):
-            _check_cell(value, f"row {row_number}, column {column_number}")
-    why = _check_sheet(sheet) if isinstance(sheet, str) else "a sheet's name is a string"
-    if why is not None:
-        raise _Refused(f"sheet: {why}")
+    columns: Any = args.get("columns")
+    rows: Any = args.get("rows")
+    sheet: Any = args.get("sheet", "Sheet1")
+    problem = table_problem(columns, rows, sheet)
+    if problem is not None:
+        raise _Refused(problem)
     return columns, rows, sheet
 
 
@@ -268,20 +201,21 @@ def _csv_text(value: object) -> tuple[str, bool]:
     return str(value), False
 
 
-def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> int:
-    """Write the table as CSV in Excel's dialect, UTF-8 with a byte order mark so that Excel reads umlauts right.
+def _write_csv(path: Path, columns: list[str], rows: list[list[Any]], delimiter: str) -> int:
+    """Write the table as CSV, quoted as RFC 4180 does, UTF-8 with a byte order mark so that Excel reads umlauts right.
 
     Args:
         path: Where.
         columns: The columns' names.
         rows: The rows, checked; a short one is filled with empty cells.
+        delimiter: What separates the cells: a comma, a semicolon or a tab.
 
     Returns:
         How many cells were escaped.
     """
     escaped = 0
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.writer(stream)
+        writer = csv.writer(stream, delimiter=delimiter)
         for values in [columns, *rows]:
             cells: list[str] = []
             for value in values:
@@ -298,7 +232,8 @@ def write_table(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     Args:
         args: ``name`` (the file's name, with its extension), ``format`` (``xlsx`` or ``csv``), ``columns`` (the
             header's names), ``rows`` (lists of strings, numbers, bools and ``None``, none longer than ``columns``),
-            ``sheet`` (the workbook's sheet) and ``budget_s`` (the seconds the work may take).
+            ``sheet`` (the workbook's sheet), ``delimiter`` (a CSV's separator, ``,`` by default; a workbook has
+            none) and ``budget_s`` (the seconds the work may take).
         ctx: The job's surroundings.
 
     Returns:
@@ -311,7 +246,10 @@ def write_table(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             raise _Refused("format: a table is written as xlsx or csv")
         columns, rows, sheet = _table(args)
         if args.get("format") == "csv":
-            escaped = _write_csv(path, columns, rows)
+            delimiter = args.get("delimiter", ",")
+            if delimiter not in DELIMITERS:
+                raise _Refused("delimiter: a CSV's cells are separated by a comma, a semicolon or a tab")
+            escaped = _write_csv(path, columns, rows, delimiter)
             one = escaped == 1
             return _hint(
                 f"{_plural(escaped, 'cell')} began with =, +, -, @, a tab or a carriage return and "
@@ -610,11 +548,33 @@ class _Word:
             index += 1
 
 
+def _table_widths(tokens: Sequence[Any]) -> list[int]:
+    """Count the columns of each table, by its header row.
+
+    Args:
+        tokens: What markdown-it made of the Markdown.
+
+    Returns:
+        Each table's columns, in the document's order.
+    """
+    widths: list[int] = []
+    header = False
+    for token in tokens:
+        if token.type == "table_open":
+            widths.append(0)
+        elif token.type in {"thead_open", "thead_close"}:
+            header = token.type == "thead_open"
+        elif token.type == "th_open" and header and widths:
+            widths[-1] += 1
+    return widths
+
+
 def write_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Write a document into a new Word or Markdown file in ``out/``, from Markdown.
 
     A Word document has headings 1 to 4 (5 and 6 become 4), paragraphs, bold and italic, bullet and numbered lists to
-    three levels, tables and code; other syntax is its text.
+    three levels, tables of up to Word's 63 columns (a wider one is refused before anything is written) and code;
+    other syntax is its text.
 
     Args:
         args: ``name`` (the file's name, with its extension), ``format`` (``docx`` or ``md``), ``markdown`` and
@@ -639,9 +599,12 @@ def write_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         from docx import Document
         from markdown_it import MarkdownIt
 
-        parser = MarkdownIt("commonmark", {"html": False}).enable("table")
+        tokens = MarkdownIt("commonmark", {"html": False}).enable("table").parse(markdown)
+        problem = word_table_problem(_table_widths(tokens))
+        if problem is not None:
+            raise _Refused(problem)
         word = _Word(Document())
-        word.write(parser.parse(markdown))
+        word.write(tokens)
         word.close()
         word.document.save(str(path))
         return _hint(

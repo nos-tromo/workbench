@@ -91,6 +91,7 @@ def test_a_table_is_written_into_a_new_file_of_the_chat(client: TestClient, stor
         "columns": COLUMNS,
         "rows": ROWS,
         "sheet": "Sheet1",
+        "delimiter": ",",
         "budget_s": 90,
     }
     (made,) = outputs(store)
@@ -222,15 +223,55 @@ def test_a_cell_out_of_bounds_is_a_422_naming_its_place(
     assert fake_executor.requests == []
 
 
-@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e400", "1" + "0" * 400])
+def test_a_csv_may_be_separated_by_a_semicolon(client: TestClient, store: Store, fake_executor: Local) -> None:
+    """A semicolon instead of a comma: the byte order mark and the escaping stay."""
+    r = table(client, "semicolons", "csv", rows=[["=1+1", 1.5]], delimiter=";")
+    assert r.status_code == 200, r.text
+    assert fake_executor.requests[0].args["delimiter"] == ";"
+    (made,) = outputs(store)
+    raw = content(store, made)
+    assert raw.startswith(b"\xef\xbb\xbf")
+    rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline=""), delimiter=";"))
+    assert rows == [COLUMNS, ["'=1+1", "1.5"]]
+
+
+def test_a_delimiter_given_with_a_workbook_is_not_used(client: TestClient, store: Store) -> None:
+    """It applies to csv alone; a workbook is written as without it."""
+    assert table(client, delimiter="\t").status_code == 200
+    (made,) = outputs(store)
+    sheet = openpyxl.load_workbook(io.BytesIO(content(store, made)))["Sheet1"]
+    assert [[cell.value for cell in row] for row in sheet.iter_rows()] == [COLUMNS, *ROWS]
+
+
+@pytest.mark.parametrize("delimiter", ["|", ",,", ""])
+def test_a_delimiter_csv_does_not_take_is_a_422(client: TestClient, fake_executor: Local, delimiter: str) -> None:
+    """A comma, a semicolon or a tab."""
+    assert table(client, fmt="csv", delimiter=delimiter).status_code == 422
+    assert fake_executor.requests == []
+
+
+def test_a_document_with_a_table_wider_than_word_holds_is_a_422(client: TestClient, store: Store) -> None:
+    """Word's 63 columns: the answer names the table and points to write_table; no file is made."""
+    wide = "|" + "c|" * 64 + "\n|" + "-|" * 64 + "\n"
+    r = document(client, markdown=f"Intro.\n\n{wide}")
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert detail.startswith("invalid_value: markdown: table 1 has 64 columns")
+    assert "write_table" in detail
+    assert outputs(store) == []
+
+
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e400", "1" + "0" * 400, "1.7e308", "-1e308"])
 def test_a_number_that_is_not_finite_is_a_422_naming_its_place(
     client: TestClient, fake_executor: Local, number: str
 ) -> None:
-    """NaN and infinities parse from the request but would reach the job as null; too large an integer has no float."""
+    """NaN and infinities parse but would reach the job as null; an integer too large for a float, or past Excel's."""
     body = f'{{"name": "t", "format": "xlsx", "columns": ["a", "b"], "rows": [[1, 2], [3, {number}]]}}'
     r = client.post("/tools/write_table", content=body.encode(), headers={**H, "Content-Type": "application/json"})
-    assert r.status_code == 422, r.text
-    assert r.json()["detail"].startswith("row 2, column 2: ")
+    assert (r.status_code, r.json()) == (
+        422,
+        {"detail": "row 2, column 2: a number must be finite and no larger in size than 9.99999999999999E+307"},
+    )
     assert fake_executor.requests == []
 
 
@@ -422,11 +463,16 @@ def test_the_runners_mirrored_bounds_are_the_apis() -> None:
     from workbench.api import tools, tools_output
     from workbench.executor.runners import outputs as runner
 
-    assert runner.MAX_ROWS == tools_output.MAX_ROWS
-    assert runner.MAX_COLUMNS == tools_output.MAX_COLUMNS
-    assert runner.MAX_CELL == tools_output.MAX_CELL
     assert runner.MAX_MARKDOWN == tools_output.MAX_MARKDOWN
-    assert runner.MAX_SHEET_NAME == tools_output.MAX_SHEET_NAME
-    assert runner.SHEET_FORBIDDEN == tools_output.SHEET_FORBIDDEN
-    assert runner.SHEET_RESERVED == tools_output.SHEET_RESERVED
     assert runner.HINT_MAX == tools.MAX_HINT
+
+
+def test_a_tables_rules_are_one_module_both_sides_call() -> None:
+    """The table's bounds and checks are not copied: the api and the runner use the shared module's."""
+    from workbench import tables
+    from workbench.api import tools_output
+    from workbench.executor.runners import outputs as runner
+
+    assert tools_output.table_problem is tables.table_problem
+    assert runner.table_problem is tables.table_problem
+    assert runner.word_table_problem is tables.word_table_problem

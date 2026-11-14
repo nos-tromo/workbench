@@ -144,6 +144,25 @@ def test_csv_cells_a_spreadsheet_would_run_are_escaped_and_counted(job: Job) -> 
     ]
 
 
+@pytest.mark.parametrize(("delimiter", "line"), [(";", "'=1+1;1.5;TRUE"), ("\t", "'=1+1\t1.5\tTRUE")])
+def test_a_csv_may_be_separated_by_a_semicolon_or_a_tab(job: Job, delimiter: str, line: str) -> None:
+    """The byte order mark and the escaping stay whatever separates the cells."""
+    assert "1 cell" in job.table("t.csv", ["a", "b", "c"], [["=1+1", 1.5, True]], delimiter=delimiter)["hint"]
+    raw = job.output("t.csv").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")
+    with job.output("t.csv").open(encoding="utf-8-sig", newline="") as stream:
+        assert list(csv.reader(stream, delimiter=delimiter)) == [["a", "b", "c"], ["'=1+1", "1.5", "TRUE"]]
+    assert raw.decode("utf-8-sig").splitlines()[1] == line
+
+
+def test_a_delimiter_is_for_csv_alone(job: Job) -> None:
+    """A workbook has no delimiter: one given is not used. One a CSV does not take is refused."""
+    assert job.table("t.xlsx", ["a"], [[1]], delimiter=";") == {}
+    assert openpyxl.load_workbook(job.output("t.xlsx"))["Sheet1"]["A2"].value == 1
+    assert job.table("u.csv", ["a"], [[1]], delimiter="|")["error"].startswith("invalid_value: delimiter: ")
+    assert not job.output("u.csv").exists()
+
+
 # --- write_table: what the runner refuses -----------------------------------------------------------------------
 
 
@@ -153,11 +172,26 @@ def test_csv_cells_a_spreadsheet_would_run_are_escaped_and_counted(job: Job) -> 
         (["a"], [[1, 2]], "row 1 has 2 cells"),
         (["a", "b"], [[1], [1, "x" * 32_768]], "row 2, column 2"),
         (["a"], [[10**400]], "row 1, column 1"),
+        (
+            ["a"],
+            [[1.7e308]],
+            "row 1, column 1: a number must be finite and no larger in size than 9.99999999999999E+307",
+        ),
+        (["a"], [[-1e308]], "row 1, column 1"),
         (["a"], [[[1]]], "row 1, column 1"),
         (["x" * 32_768], [], "column 1"),
         ([], [], "column"),
     ],
-    ids=["row too long", "cell too long", "number too large", "not a value", "name too long", "no columns"],
+    ids=[
+        "row too long",
+        "cell too long",
+        "integer too large",
+        "over excel's largest",
+        "under excel's smallest",
+        "not a value",
+        "name too long",
+        "no columns",
+    ],
 )
 def test_the_runner_refuses_what_the_api_would_have(job: Job, columns: list[str], rows: list[Any], said: str) -> None:
     """The api checks first; the runner trusts nothing of it and names the place, 1-based, and writes nothing."""
@@ -309,6 +343,30 @@ def test_links_images_and_raw_html_are_text_and_nothing_is_fetched(job: Job, mon
         rels = archive.read("word/_rels/document.xml.rels").decode()
     assert "image" not in rels
     assert "example.invalid" not in rels
+
+
+def test_excels_largest_numbers_are_written(job: Job) -> None:
+    """9.99999999999999E+307 either way is within Excel's bound."""
+    assert job.table("t.xlsx", ["a"], [[9.99999999999999e307], [-9.99999999999999e307]]) == {}
+    sheet = openpyxl.load_workbook(job.output("t.xlsx"))["Sheet1"]
+    assert (sheet["A2"].value, sheet["A3"].value) == (9.99999999999999e307, -9.99999999999999e307)
+
+
+def _markdown_table(width: int) -> str:
+    """A Markdown table of ``width`` columns and one row."""
+    return "|" + "|".join(f"c{n}" for n in range(width)) + "|\n|" + "---|" * width + "\n|" + "x|" * width + "\n"
+
+
+def test_a_table_wider_than_word_holds_is_refused_before_anything_is_written(job: Job) -> None:
+    """Word's tables have at most 63 columns: the refusal names the table, counted from 1, and points to write_table."""
+    markdown = f"# Figures\n\n{_markdown_table(2)}\nText.\n\n{_markdown_table(64)}"
+    error = job.document("wide.docx", markdown)["error"]
+    assert error.startswith("invalid_value: markdown: table 2 has 64 columns")
+    assert "63" in error and "write_table" in error
+    assert list(job.ctx.out_dir.iterdir()) == []
+    assert job.document("widest.docx", _markdown_table(63)) == {}
+    assert len(Document(str(job.output("widest.docx"))).tables[0].columns) == 63
+    assert job.document("wide.md", _markdown_table(64), format="md") == {}
 
 
 def test_characters_a_document_cannot_hold_are_replaced_and_the_hint_says_so(job: Job) -> None:

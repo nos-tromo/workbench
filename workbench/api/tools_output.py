@@ -3,15 +3,16 @@
 Each makes one new file of the chat from the model's values: a table as an Excel workbook or a CSV file, a document as
 a Word file written from Markdown or as the Markdown itself. The runners (:mod:`workbench.executor.runners.outputs`)
 write the file in the executor; the job is given no file. Here the api checks the request before a job is sent: the
-file's name, the sheet's name, and every cell of a table (its place, its length, a finite number), so a refusal is a
-422 that names the field, or the row and the column counted from 1, and costs no job. A number that is not finite
-must be refused here: the request goes to the executor as JSON, which has no NaN or infinity.
+file's name, and a table by the rules of :mod:`workbench.tables` (the sheet's name, every cell's place, its length, a
+number within Excel's range), which the runner checks again with the same functions; a refusal is a 422 that names the
+field, or the row and the column counted from 1, and costs no job. A number that is not finite must be refused here:
+the request goes to the executor as JSON, which has no NaN or infinity. A Markdown table wider than Word's 63 columns
+is refused by the runner, which parses the Markdown, before it writes anything.
 
 Each is recorded as a ``collect`` of the new file, by its id; ``write_table`` with how many rows and columns the table
 has. Never a name, a column's name or a value. A new file whose event cannot be written is removed again.
 """
 
-import math
 from collections.abc import Mapping
 from typing import Any, Final, Literal
 
@@ -36,22 +37,14 @@ from workbench.api.tools import (
 )
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, check_filename
+from workbench.tables import MAX_COLUMNS, MAX_ROWS, MAX_SHEET_NAME, MAX_WORD_COLUMNS, Delimiter, table_problem
 from workbench.utils.audit_event import AuditWriteError
 
-#: Most rows and columns of a table (Excel's columns), most characters of a cell (Excel's limit) and of a sheet's
-#: name, and most characters of a document's Markdown. The runner checks them again (a test ties the two).
-MAX_ROWS: Final = 100_000
-MAX_COLUMNS: Final = 16_384
-MAX_CELL: Final = 32_767
-MAX_SHEET_NAME: Final = 31
+#: Most characters of a document's Markdown; the runner checks it again (a test ties the two).
 MAX_MARKDOWN: Final = 200_000
 
 #: The longest name the model may give a new file, before its extension is added.
 MAX_NAME: Final = 255
-
-#: What a sheet's name may not hold, and the one name Excel keeps for itself.
-SHEET_FORBIDDEN: Final = frozenset("[]:*?/\\")
-SHEET_RESERVED: Final = "history"
 
 _NAME: Final = (
     "The new file's name. The extension is added if it is missing (report.txt becomes report.txt.docx); a name that "
@@ -70,6 +63,7 @@ class WriteTableRequest(BaseModel):
         columns: The header's names.
         rows: The rows, each a list of values in the columns' order.
         sheet: The workbook's sheet.
+        delimiter: What separates a CSV file's cells.
     """
 
     name: str = Field(min_length=1, max_length=MAX_NAME, description=_NAME)
@@ -89,6 +83,10 @@ class WriteTableRequest(BaseModel):
         min_length=1,
         max_length=MAX_SHEET_NAME,
         description="The sheet's name in a workbook: 1 to 31 characters, none of [ ] : * ? / \\, not History.",
+    )
+    delimiter: Delimiter = Field(
+        default=",",
+        description="What separates a CSV file's cells: a comma (the default), a semicolon or a tab. Not for xlsx.",
     )
 
 
@@ -173,74 +171,6 @@ def _output_name(wanted: str, extension: str) -> str:
     return name
 
 
-def _check_sheet(sheet: str) -> None:
-    """Refuse a sheet's name that Excel refuses.
-
-    Args:
-        sheet: The name, 1 to 31 characters already.
-
-    Raises:
-        HTTPException: It holds a bracket, a colon, a star, a question mark or a slash either way, begins or ends with
-            ``'``, or is ``History`` (422).
-    """
-    why = None
-    if SHEET_FORBIDDEN & set(sheet):
-        why = "a sheet's name holds none of [ ] : * ? / \\"
-    elif sheet.startswith("'") or sheet.endswith("'"):
-        why = "a sheet's name does not begin or end with '"
-    elif sheet.casefold() == SHEET_RESERVED:
-        why = "History is a name Excel keeps for itself"
-    if why is not None:
-        raise HTTPException(status_code=422, detail=f"sheet: {why}")
-
-
-def _cell_problem(value: Cell) -> str | None:
-    """Tell what is wrong with a cell.
-
-    Args:
-        value: The cell's value.
-
-    Returns:
-        Why the file cannot hold it, or ``None``.
-    """
-    if isinstance(value, str):
-        return f"a cell holds at most {MAX_CELL} characters" if len(value) > MAX_CELL else None
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        try:
-            finite = math.isfinite(value)
-        except OverflowError:
-            finite = False
-        return None if finite else "a number must be finite and no larger than a spreadsheet holds"
-    return None
-
-
-def _check_table(columns: list[str], rows: list[list[Cell]]) -> None:
-    """Refuse a table whose cells the file cannot hold, naming the first such place.
-
-    Args:
-        columns: The header's names.
-        rows: The rows.
-
-    Raises:
-        HTTPException: A column's name or a cell is longer than a cell may be, a number is not finite (NaN, an
-            infinity, or an integer too large for a float), or a row has more cells than there are columns (422).
-    """
-    for number, name in enumerate(columns, 1):
-        problem = _cell_problem(name)
-        if problem is not None:
-            raise HTTPException(status_code=422, detail=f"columns, column {number}: {problem}")
-    for row_number, row in enumerate(rows, 1):
-        if len(row) > len(columns):
-            raise HTTPException(
-                status_code=422,
-                detail=f"row {row_number} has {len(row)} cells, but the table has {len(columns)} columns",
-            )
-        for column_number, value in enumerate(row, 1):
-            problem = _cell_problem(value)
-            if problem is not None:
-                raise HTTPException(status_code=422, detail=f"row {row_number}, column {column_number}: {problem}")
-
-
 def _record_output(
     audit: AuditLog, store: Store, p: Principal, tool: str, output: FileRecord, criteria: Mapping[str, object] | None
 ) -> None:
@@ -312,14 +242,16 @@ async def _write(
     summary="Write a table into a new Excel or CSV file",
     description=(
         "Write a table into a new file of this conversation: an Excel workbook (format xlsx, a bold header row that "
-        "stays in view) or a CSV file (format csv, UTF-8 that Excel opens with umlauts intact). columns are the "
-        "header's names; rows are lists of values in the columns' order, each a string, a number, true, false or "
-        "null; a shorter row is filled with empty cells. At most 100000 rows, 16384 columns and 32767 characters a "
-        "cell. Values are data, never formulas: =SUM(A1:A3), 0042 or a web address stay text; a number keeps 15 "
-        "significant digits in Excel, so write long identifiers as strings. In a CSV a text that starts with =, +, "
-        "-, @, a tab or a carriage return gets a leading ' so that a spreadsheet does not run it, and hint says how "
-        "many. sheet names the workbook's sheet. One request is at most 1 MB: for a large table, write the file with "
-        "run_python into out/ instead. Show the result with display_file."
+        "stays in view) or a CSV file (format csv, UTF-8, comma-separated unless delimiter is ; or a tab). For "
+        "people who will open the file in Excel, use xlsx: Excel reads a CSV file by the computer's regional "
+        "settings (German Excel splits it on ; and may read 1.5 as text or a date), so CSV is for exchanging data "
+        "with other programs. columns are the header's names; rows are lists of values in the columns' order, each "
+        "a string, a number, true, false or null; a shorter row is filled with empty cells. At most 100000 rows, "
+        "16384 columns and 32767 characters a cell. Values are data, never formulas: =SUM(A1:A3), 0042 or a web "
+        "address stay text; a number keeps 15 significant digits in Excel, so write long identifiers as strings. In "
+        "a CSV a text that starts with =, +, -, @, a tab or a carriage return gets a leading ' so that a spreadsheet "
+        "does not run it, and hint says how many. sheet names the workbook's sheet. One request is at most 1 MB: for "
+        "a large table, write the file with run_python into out/ instead. Show the result with display_file."
     ),
     response_model_exclude_none=True,
 )
@@ -334,7 +266,7 @@ async def write_table(
     """Write the model's table into a new file of the chat, in the executor.
 
     Args:
-        body: The name, the format, the columns, the rows and the sheet.
+        body: The name, the format, the columns, the rows, the sheet and the CSV's delimiter.
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         store: The file store.
@@ -349,14 +281,16 @@ async def write_table(
             :func:`_write`).
     """
     name = _output_name(body.name, body.format)
-    _check_sheet(body.sheet)
-    await run_in_threadpool(_check_table, body.columns, body.rows)
+    problem = await run_in_threadpool(table_problem, body.columns, body.rows, body.sheet)
+    if problem is not None:
+        raise HTTPException(status_code=422, detail=problem)
     args: dict[str, Any] = {
         "name": name,
         "format": body.format,
         "columns": body.columns,
         "rows": body.rows,
         "sheet": body.sheet,
+        "delimiter": body.delimiter,
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
     criteria = {"rows": len(body.rows), "columns": len(body.columns)}
@@ -373,7 +307,8 @@ async def write_table(
         "Write a document into a new file of this conversation from Markdown: a Word document (format docx) or the "
         "Markdown itself (format md). A Word document takes headings # to #### (##### and ###### become level 4), "
         "paragraphs, **bold** and *italic*, bullet and numbered lists nested up to three levels (each numbered list "
-        "counts from its own first number), tables (| a | b | over a |---|---| line) and code, in blocks or "
+        f"counts from its own first number), tables of up to {MAX_WORD_COLUMNS} columns (| a | b | over a |---|---| "
+        "line; Word holds no wider one, so write that with write_table) and code, in blocks or "
         "`inline`, in a monospace font. A link is written as its text with the address in parentheses, an image as "
         "its alt text: nothing is fetched. Raw HTML and other syntax stay plain text. At most 200000 characters. "
         "Show the result with display_file."
