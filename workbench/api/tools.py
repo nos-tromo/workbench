@@ -166,6 +166,7 @@ _RUNNER_ERRORS: Final = {
     "unsupported_format": 422,
     "unreadable_file": 422,
     "no_such_part": 422,
+    "read_timeout": 422,
     "file_not_found": 404,
     "bad_regex": 422,
     "regex_timeout": 422,
@@ -192,8 +193,9 @@ class ReadDocumentRequest(BaseModel):
         default=None,
         description=(
             "Where to start reading; leave it out for the start. Use the next_part of an earlier answer to go on. "
-            "A page: 'page 3' or 'pages 3-9'. A slide: 'slide 2'. A paragraph or table: 'paragraph 40', 'table 2'. "
-            "A sheet: its name, or a range of rows: 'Sheet1!A201:F400'. Lines of a text: 'lines 100-200'."
+            "A page: 'page 3' or 'pages 3-9'. A slide: 'slide 2'. A paragraph: 'paragraph 40'. A table or some of its "
+            "rows: 'table 2', 'table 2, row 350' or 'table 2, rows 30-60'. A sheet: its name, or a range of rows: "
+            "'Sheet1!A201:F400'. Lines of a text: 'lines 100-200'."
         ),
         json_schema_extra=_STRING,
     )
@@ -529,8 +531,9 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
         "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, TXT and MD. Give the file's path "
         "from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a "
         "long file is read in several calls: when truncated is true, call again with part set to next_part. "
-        "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs and tables ('paragraph 40', "
-        "'table 2'), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's "
+        "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table "
+        "rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to "
+        "200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's "
         "name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. "
         "pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so "
         "tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: "
@@ -565,7 +568,8 @@ async def read_document(
     """
     rec = await run_in_threadpool(store.get, p, body.path)
     in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
-    _, result, _ = await jobs.submit(in_chat, "read_document", {"path": rec.name, "part": body.part}, [rec.name])
+    args = {"path": rec.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
+    _, result, _ = await jobs.submit(in_chat, "read_document", args, [rec.name])
     payload = _payload(result, "file")
     answer = _parse(DocumentRead, {**payload, "path": rec.virtual_path} if isinstance(payload, dict) else None)
     await run_in_threadpool(

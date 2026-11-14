@@ -2,7 +2,9 @@
 
 There is no OCR. A page whose text layer is empty (a scan, a picture) is never returned as an empty
 page: it is listed in ``pages_without_text``, so the model can tell the user the file needs OCR elsewhere.
-A PDF that asks for a password to open is :class:`~workbench.executor.readers.UnreadableFile`.
+A PDF that asks for a password to open is :class:`~workbench.executor.readers.UnreadableFile`; one that only has
+an owner password (it restricts printing or copying, and opens for anyone) is read, whatever its algorithm: the
+AES ones need the ``cryptography`` library, which the executor image carries.
 """
 
 import logging
@@ -12,14 +14,16 @@ from pathlib import Path
 from typing import Any, Final
 
 from pypdf import PdfReader
+from pypdf.errors import DependencyError
 
-from workbench.executor.readers import DocumentText, Part, UnreadableFile
+from workbench.executor.readers import DocumentText, Part, UnreadableFile, check
 from workbench.executor.readers import paging as pg
 
 #: Most pages one read looks at, so a long run of scanned pages cannot keep the job busy.
 MAX_PAGES_LOOKED_AT: Final = 200
 
 _ENCRYPTED: Final = "the PDF is password-protected (encrypted)"
+_CANNOT_DECRYPT: Final = "the PDF is encrypted in a way that cannot be decrypted here"
 
 # pypdf reports damage it recovers from as warnings; the job's log is not where they belong.
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -41,6 +45,8 @@ def _open(path: Path) -> PdfReader:
     if reader.is_encrypted:
         try:
             opened = reader.decrypt("")
+        except DependencyError:
+            raise UnreadableFile(_CANNOT_DECRYPT) from None
         except Exception:
             raise UnreadableFile(_ENCRYPTED) from None
         if not opened:
@@ -60,6 +66,9 @@ def _page_text(reader: PdfReader, number: int) -> str:
     """
     try:
         raw: Any = reader.pages[number - 1].extract_text()
+    except DependencyError:
+        # Not a page without text: the library that decrypts it is missing, and saying "needs OCR" would be wrong.
+        raise UnreadableFile(_CANNOT_DECRYPT) from None
     except Exception:
         return ""
     text = re.sub(r"[ \t]+\n", "\n", str(raw))
@@ -88,6 +97,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
     collector = pg.Collector(max_chars)
     without: list[int] = []
     for number in range(first, last + 1):
+        check()
         if number - first >= MAX_PAGES_LOOKED_AT:
             collector.next_part = f"page {number}"
             break
@@ -121,4 +131,5 @@ def units(path: Path) -> Iterator[Part]:
     """
     reader = _open(path)
     for number in range(1, len(reader.pages) + 1):
+        check()
         yield Part(f"page {number}", _page_text(reader, number))

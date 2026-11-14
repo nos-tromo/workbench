@@ -18,6 +18,7 @@ The readers load their libraries on first use, so a job that reads a PDF does no
 openpyxl.
 """
 
+import time
 import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -28,10 +29,14 @@ __all__ = [
     "DocumentText",
     "NoSuchPart",
     "Part",
+    "ReadTimeout",
     "UnreadableFile",
     "UnsupportedFormat",
+    "check",
     "check_zip",
     "read",
+    "set_deadline",
+    "tick",
     "units",
 ]
 
@@ -97,6 +102,51 @@ class UnreadableFile(Exception):
 
 class NoSuchPart(Exception):
     """The ``part`` asked for is not in the document; the message names the parts there are."""
+
+
+class ReadTimeout(Exception):
+    """Reading ran past the deadline it was given (:func:`set_deadline`); what was read so far is lost."""
+
+
+_deadline: float | None = None
+_ticks = 0
+_CHECK_EVERY: Final = 64
+
+
+def set_deadline(at: float | None) -> None:
+    """Give the readers a time after which they stop, or take the limit away.
+
+    The job is a single-threaded process that reads one file at a time, so the deadline is the process's.
+    The readers check it in their loops through :func:`tick`; a loop in a library they call is not
+    interrupted, so every loop of ours that a hostile file can make long ticks.
+
+    Args:
+        at: A :func:`time.monotonic` time, or ``None`` for no deadline.
+    """
+    global _deadline
+    _deadline = at
+
+
+def tick() -> None:
+    """Note one step of a loop; every few steps, look at the clock.
+
+    Raises:
+        ReadTimeout: The deadline has passed.
+    """
+    global _ticks
+    _ticks += 1
+    if _ticks % _CHECK_EVERY == 0:
+        check()
+
+
+def check() -> None:
+    """Look at the clock now: for a loop whose every step can be slow, such as one step per sheet.
+
+    Raises:
+        ReadTimeout: The deadline has passed.
+    """
+    if _deadline is not None and time.monotonic() > _deadline:
+        raise ReadTimeout
 
 
 @dataclass
@@ -300,11 +350,12 @@ def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> 
         UnsupportedFormat: The type is not readable (``.msg`` included: save it as .eml or PDF).
         UnreadableFile: The file is encrypted, damaged, truncated, a decompression bomb, or too big to read.
         NoSuchPart: ``part`` is not in the document.
+        ReadTimeout: The deadline (:func:`set_deadline`) passed while reading.
     """
     family = _prepare(path, file_mb)
     try:
         return _reader(family).read(path, part=part, max_chars=max_chars)
-    except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+    except (UnsupportedFormat, UnreadableFile, NoSuchPart, ReadTimeout):
         raise
     except MemoryError:
         raise UnreadableFile(TOO_BIG) from None
@@ -329,11 +380,12 @@ def units(path: Path, *, file_mb: int = 50) -> Iterator[Part]:
         UnsupportedFormat: The type is not readable.
         UnreadableFile: The file is encrypted, damaged, truncated, a decompression bomb, or too big to read;
             it can surface while iterating.
+        ReadTimeout: The deadline (:func:`set_deadline`) passed while reading.
     """
     family = _prepare(path, file_mb)
     try:
         yield from _reader(family).units(path)
-    except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+    except (UnsupportedFormat, UnreadableFile, NoSuchPart, ReadTimeout):
         raise
     except MemoryError:
         raise UnreadableFile(TOO_BIG) from None

@@ -4,40 +4,81 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4.element import PageElement
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Part, tick
 from workbench.executor.readers import text as txt
 
-_BLOCKS: Final = (
-    "p div li ul ol dl dt dd h1 h2 h3 h4 h5 h6 table caption section article header footer main nav aside "
-    "pre blockquote form fieldset figure figcaption address hr title"
-).split()
-_INVISIBLE: Final = ("script", "style", "noscript", "template")
+_BLOCKS: Final = frozenset(
+    (
+        "p div li ul ol dl dt dd h1 h2 h3 h4 h5 h6 table caption section article header footer main nav aside "
+        "pre blockquote form fieldset figure figcaption address hr title tbody thead tfoot"
+    ).split()
+)
+_INVISIBLE: Final = frozenset({"script", "style", "noscript", "template"})
+_CELLS: Final = frozenset({"td", "th"})
 
 
 def html_to_lines(data: bytes | str) -> list[str]:
     """Turn a page into lines of text.
 
+    The tree is walked once, with a stack of its own, so the time is in proportion to the size of the page
+    however many blocks stand side by side or how deeply they nest: a break at the start and end of each block,
+    a row of a table on one line with its cells joined by `` | `` (a break inside a cell is a space).
+
     Args:
         data: The page, as bytes (its encoding is detected) or text.
 
     Returns:
-        The visible text, one line per block, a table row on one line with its cells joined by `` | ``;
-        blank lines are dropped and runs of spaces collapsed.
+        The visible text, one line per block; blank lines are dropped and runs of spaces collapsed.
     """
     soup = BeautifulSoup(data, "lxml")
-    for tag in soup(_INVISIBLE):
-        tag.decompose()
-    for row in reversed(soup.find_all("tr")):
-        cells = [" ".join(cell.get_text(" ").split()) for cell in row.find_all(["td", "th"])]
-        row.replace_with(NavigableString("\n" + " | ".join(cells) + "\n"))
-    for tag in soup.find_all("br"):
-        tag.replace_with(NavigableString("\n"))
-    for tag in soup.find_all(_BLOCKS):
-        tag.insert_before(NavigableString("\n"))
-        tag.insert_after(NavigableString("\n"))
-    lines = (" ".join(line.split()) for line in soup.get_text().splitlines())
+    out: list[str] = []
+    cell_depth = 0
+    cells_in_row: list[int] = []
+
+    def split() -> None:
+        out.append(" " if cell_depth else "\n")
+
+    stack: list[tuple[Iterator[PageElement], str]] = [(iter(soup.contents), "")]
+    while stack:
+        tick()
+        children, closing = stack[-1]
+        node = next(children, None)
+        if node is None:
+            stack.pop()
+            if closing == "tr":
+                split()
+                if cells_in_row:
+                    cells_in_row.pop()
+            elif closing in _CELLS:
+                cell_depth -= 1
+            elif closing in _BLOCKS:
+                split()
+            continue
+        if isinstance(node, Tag):
+            name = node.name
+            if name in _INVISIBLE:
+                continue
+            if name == "br":
+                split()
+                continue
+            if name == "tr":
+                split()
+                cells_in_row.append(0)
+            elif name in _CELLS:
+                if cells_in_row:
+                    if cells_in_row[-1]:
+                        out.append(" | ")
+                    cells_in_row[-1] += 1
+                cell_depth += 1
+            elif name in _BLOCKS:
+                split()
+            stack.append((iter(node.contents), name))
+        elif type(node) is NavigableString:
+            out.append(str(node))
+    lines = (" ".join(line.split()) for line in "".join(out).splitlines())
     return [line for line in lines if line]
 
 

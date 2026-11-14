@@ -2,6 +2,7 @@
 
 import json
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -281,6 +282,55 @@ def test_results_never_hold_the_jobs_real_path(work: Path) -> None:
     assert all(h["path"].startswith(f"/workspace/{CHAT}/") for h in result["hits"])
 
 
+@pytest.fixture(scope="module")
+def big_xlsx(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A workbook of 100 000 rows: a search over it takes several seconds, built once for the module."""
+    return fx.make_xlsx(tmp_path_factory.mktemp("big") / "ledger.xlsx", rows=100_000)
+
+
+def test_a_slow_file_is_given_up_on_and_the_search_goes_on(work: Path, big_xlsx: Path) -> None:
+    """One file may use a third of the time; it is named, what was found elsewhere is returned, no timeout."""
+    (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
+    shutil.copy(big_xlsx, work / "b-ledger.xlsx")
+    (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "needle", budget_s=3)
+    assert time.monotonic() - began < 6
+    assert "error" not in result
+    assert {h["path"].rsplit("/", 1)[1] for h in result["hits"]} == {"a.txt", "c.txt"}
+    assert result["skipped"] == [{"path": f"/workspace/{CHAT}/b-ledger.xlsx", "reason": "reading took longer than 1 s"}]
+    assert result["truncated"] is False
+    assert result["files_searched"] == 3
+
+
+def test_when_the_whole_time_is_used_up_inside_a_file_the_search_stops_with_a_note(work: Path, big_xlsx: Path) -> None:
+    """The partial hits are returned, with how many files were not searched; the job is not left to be killed."""
+    (work / "a.txt").write_text("needle in a\n", encoding="utf-8")
+    shutil.copy(big_xlsx, work / "b-ledger.xlsx")
+    (work / "c.txt").write_text("needle in c\n", encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "needle", budget_s=1)
+    assert time.monotonic() - began < 5
+    assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt"]
+    assert result["truncated"] is True
+    assert "stopped after 1 s" in result["hint"]
+    assert "2 files were not searched" in result["hint"]
+
+
+def test_hostile_files_are_named_and_the_search_goes_on(work: Path) -> None:
+    """A row beyond the last, 20 000 sheets, 20 000 blocks: refused or read in moments; other files are searched."""
+    (work / "a.txt").write_text("needle\n", encoding="utf-8")
+    fx.make_sparse_xlsx(work / "sparse.xlsx", row=2_000_000_000)
+    fx.make_many_sheets_ods(work / "sheets.ods", 20_000)
+    fx.make_many_blocks_html(work / "blocks.html", 20_000)
+    began = time.monotonic()
+    result = search(work, "needle")
+    assert time.monotonic() - began < 5
+    skipped = {s["path"].rsplit("/", 1)[1]: s["reason"] for s in result["skipped"]}
+    assert set(skipped) == {"sparse.xlsx", "sheets.ods"}
+    assert [h["path"].rsplit("/", 1)[1] for h in result["hits"]] == ["a.txt"]
+
+
 # --- read_document ---------------------------------------------------------------------------------------------
 
 
@@ -294,7 +344,7 @@ def test_read_document_answers_with_the_virtual_path_and_the_parts(work: Path) -
         "paragraph 1",
         "paragraph 2",
         "paragraph 3",
-        "table 1",
+        "table 1, rows 1-3",
         "paragraph 4",
     ]
     assert (result["total_parts"], result["pages_without_text"], result["truncated"]) == (5, [], False)
@@ -407,6 +457,23 @@ def test_the_zip_bomb_guard_uses_the_jobs_file_limit(work: Path) -> None:
     assert "unpacks to more than" not in read_doc(work, "bomb.docx", file_mb=2).get("error", "")
 
 
+def test_a_read_that_runs_out_of_time_is_an_error_with_a_code(work: Path, big_xlsx: Path) -> None:
+    """The runner stops at its own budget, well before the executor would kill the job."""
+    shutil.copy(big_xlsx, work / "ledger.xlsx")
+    began = time.monotonic()
+    result = RUNNERS["read_document"]({"path": "ledger.xlsx", "part": "Sheet1!A99000", "budget_s": 0.5}, context(work))
+    assert time.monotonic() - began < 4
+    assert result == {"error": "read_timeout: reading the file took longer than 0.5 s; it is too large or too complex"}
+    assert readers_deadline_is_off()
+
+
+def readers_deadline_is_off() -> bool:
+    """Tell whether no read deadline is left set: a later read is not stopped by an earlier one."""
+    from workbench.executor import readers
+
+    return readers._deadline is None
+
+
 # --- through the job entry point -------------------------------------------------------------------------------
 
 
@@ -432,7 +499,7 @@ def test_read_document_runs_as_a_job(work: Path) -> None:
     fx.make_docx(work / "review.docx")
     result = run_job(work, "read_document", {"path": "review.docx", "part": "table 1"})
     assert result["path"] == f"/workspace/{CHAT}/review.docx"
-    assert [p["label"] for p in result["parts"]] == ["table 1", "paragraph 4"]
+    assert [p["label"] for p in result["parts"]] == ["table 1, rows 1-3", "paragraph 4"]
     assert str(work.parent.parent) not in json.dumps(result)
 
 

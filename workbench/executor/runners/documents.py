@@ -40,7 +40,10 @@ SNIPPET: Final = 200
 SKIPPED_LISTED: Final = 20
 _LISTED_NUMBERS: Final = 20
 _DEFAULT_BUDGET_S: Final = 60.0
-_CLOCK_EVERY: Final = 256
+_READ_BUDGET_S: Final = 60.0
+
+#: One file may use this share of a search's time; a file that takes longer is given up on and named.
+FILE_SHARE: Final = 3
 
 
 class RegexTimeout(Exception):
@@ -109,7 +112,8 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Read one file of the chat from ``part`` on.
 
     Args:
-        args: ``path``, relative to the chat folder, and ``part``, where to start or ``None``.
+        args: ``path``, relative to the chat folder; ``part``, where to start or ``None``; and ``budget_s``, the
+            seconds after which reading stops.
         ctx: The job's surroundings.
 
     Returns:
@@ -122,6 +126,8 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     real = ctx.work_dir / name
     if name.split("/")[0] == "out" or not real.is_file():
         return error("file_not_found", f"{virtual} is not in this conversation's workspace")
+    budget = float(args.get("budget_s", _READ_BUDGET_S))
+    readers.set_deadline(time.monotonic() + budget)
     try:
         doc = readers.read(
             real,
@@ -135,6 +141,10 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return error("unreadable_file", str(exc))
     except readers.NoSuchPart as exc:
         return error("no_such_part", str(exc))
+    except readers.ReadTimeout:
+        return error("read_timeout", f"reading the file took longer than {budget:g} s; it is too large or too complex")
+    finally:
+        readers.set_deadline(None)
     result: dict[str, Any] = {
         "path": virtual,
         "kind": doc.kind,
@@ -298,6 +308,7 @@ class _Search:
         self.matcher = matcher
         self.max_hits = max_hits
         self.deadline = deadline
+        self.per_file = max((deadline - time.monotonic()) / FILE_SHARE, 1.0)
         self.room = ctx.max_chars * HITS_ROOM
         self.crowded = False
         self.hits: list[dict[str, str]] = []
@@ -320,9 +331,10 @@ class _Search:
             return
         self.searched += 1
         blank: list[str] = []
+        readers.set_deadline(min(self.deadline, time.monotonic() + self.per_file))
         try:
-            for count, unit in enumerate(readers.units(real, file_mb=self.ctx.file_mb)):
-                if count % _CLOCK_EVERY == 0 and time.monotonic() > self.deadline:
+            for unit in readers.units(real, file_mb=self.ctx.file_mb):
+                if time.monotonic() > self.deadline:
                     self.timed_out = True
                     return
                 if not unit.text.strip():
@@ -339,6 +351,14 @@ class _Search:
         except (readers.UnreadableFile, readers.UnsupportedFormat) as exc:
             self.skipped.append({"path": virtual, "reason": str(exc)})
             return
+        except readers.ReadTimeout:
+            if time.monotonic() > self.deadline:
+                self.timed_out = True
+            else:
+                self.skipped.append({"path": virtual, "reason": f"reading took longer than {self.per_file:g} s"})
+            return
+        finally:
+            readers.set_deadline(None)
         if blank:
             noun = blank[0].split(" ", 1)[0]
             numbers = [int(label.rsplit(" ", 1)[1]) for label in blank]

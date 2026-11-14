@@ -10,7 +10,7 @@ from typing import Any, Final
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Part, check
 from workbench.executor.readers import paging as pg
 
 #: Most slides one read looks at.
@@ -79,6 +79,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
     collector = pg.Collector(max_chars)
     without: list[int] = []
     for number in range(first, last + 1):
+        check()
         if number - first >= MAX_SLIDES_LOOKED_AT:
             collector.next_part = f"slide {number}"
             break
@@ -108,4 +109,5 @@ def units(path: Path) -> Iterator[Part]:
         Each slide as ``slide N`` with all its text; a slide without text has empty text.
     """
     for number, slide in enumerate(Presentation(str(path)).slides, 1):
+        check()
         yield Part(f"slide {number}", _slide_text(slide))

@@ -16,7 +16,7 @@ from typing import Final
 
 from charset_normalizer import from_bytes
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Part, tick
 from workbench.executor.readers import paging as pg
 
 #: Longest line shown; the rest of a longer line is cut.
@@ -178,6 +178,7 @@ def line_units(lines: Sequence[str]) -> Iterator[Part]:
         Each non-blank line as ``line N``, whole.
     """
     for number, line in enumerate(lines, 1):
+        tick()
         if line.strip():
             yield Part(f"line {number}", line)
 

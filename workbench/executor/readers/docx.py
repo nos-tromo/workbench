@@ -14,7 +14,7 @@ from typing import Final
 
 from lxml import etree
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Part, tick
 from workbench.executor.readers import paging as pg
 
 _W: Final = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -88,6 +88,7 @@ def _walk(parent: etree._Element, counters: list[int]) -> Iterator[Part]:
         ``paragraph N`` for each non-empty paragraph, ``table T, row R`` for each row of each table.
     """
     for child in parent:
+        tick()
         if child.tag == _P:
             text = _paragraph_text(child)
             if text:

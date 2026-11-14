@@ -107,7 +107,7 @@ def test_read_document_sends_only_the_requested_file(client: TestClient, store: 
     (req,) = executor.requests
     assert req.tool == "read_document"
     assert req.input_files == ["review.docx"]
-    assert req.args == {"path": "review.docx", "part": "paragraph 1"}
+    assert req.args == {"path": "review.docx", "part": "paragraph 1", "budget_s": 90}
     assert (req.caller, req.user_id, req.chat_id) == ("open-webui", "user-a", "chat-1")
     assert req.max_chars == 16 * 1024
     assert r.json() == {
@@ -135,7 +135,7 @@ def test_no_part_is_sent_as_none(client: TestClient, store: Store, executor: Scr
     executor.payload = reading("x", ("lines 1-1", "a"))
     read(client, f"{CHAT}/a.txt")
     client.post("/tools/read_document", json={"path": f"{CHAT}/a.txt", "part": None}, headers=H)
-    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None}] * 2
+    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 90}] * 2
 
 
 def test_a_file_in_a_folder_and_in_another_chat_runs_in_its_own_chat_folder(
@@ -206,6 +206,7 @@ def test_a_folder_is_not_a_document(client: TestClient, store: Store, executor: 
         ("unsupported_format", 422, ".msg cannot be read here; save it as .eml or PDF"),
         ("unreadable_file", 422, "the PDF is password-protected (encrypted)"),
         ("no_such_part", 422, "this document has 2 pages"),
+        ("read_timeout", 422, "reading the file took longer than 90 s; it is too large or too complex"),
         ("file_not_found", 404, "is not in this conversation's workspace"),
     ],
 )

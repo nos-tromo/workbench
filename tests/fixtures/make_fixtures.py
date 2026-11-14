@@ -16,12 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from docx import Document
+from docx.table import _Cell
 from odf.opendocument import OpenDocumentSpreadsheet, OpenDocumentText
 from odf.table import Table, TableCell, TableRow
 from odf.text import H, P
 from openpyxl import Workbook
 from pptx import Presentation
 from pptx.util import Inches
+from pypdf import PdfWriter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
@@ -358,4 +360,213 @@ def make_zip_bomb(path: Path, *, mb: int = 25) -> Path:
             for _ in range(mb):
                 member.write(block)
             member.write(b"</w:body></w:document>")
+    return path
+
+
+_ENTITY_BOMB = "".join(f'<!ENTITY l{n} "{f"&l{n - 1};" * 10}">' for n in range(1, 8))
+_ENTITY_USES = {"none": None, "external": "before &x; after", "bomb": "before &l7; after"}
+
+
+def with_entities(path: Path, member: str, old_text: str, secret: Path, *, use: str) -> Path:
+    """Declare entities in one XML part of a zip file, and use one of them in its text.
+
+    The declared entities are ``x``, a local file (a ``SYSTEM`` entity), and ``l7``, a billion-laughs chain
+    (ten million times ``ha``). The text ``old_text`` of the part is replaced by the entity references that
+    ``use`` names; with ``none`` the declarations are there and no reference is.
+
+    Args:
+        path: An Office or OpenDocument file, rewritten in place.
+        member: The XML part to change, such as ``word/document.xml``.
+        old_text: Text that is in that part.
+        secret: A local file whose content must never appear in what is read.
+        use: ``none``, ``external`` (``before &x; after``) or ``bomb`` (``before &l7; after``).
+
+    Returns:
+        ``path``.
+    """
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            if info.filename == member:
+                xml = data.decode("utf-8")
+                assert old_text in xml, member
+                replacement = _ENTITY_USES[use]
+                if replacement is not None:
+                    xml = xml.replace(old_text, replacement, 1)
+                head = xml.index("?>") + 2 if xml.startswith("<?xml") else 0
+                root = re.search(r"<([A-Za-z_][\w:.-]*)", xml[head:])
+                assert root is not None
+                doctype = (
+                    f'<!DOCTYPE {root[1]} [<!ENTITY l0 "ha">{_ENTITY_BOMB}<!ENTITY x SYSTEM "{secret.as_uri()}">]>'
+                )
+                data = (xml[:head] + doctype + xml[head:]).encode("utf-8")
+            out.writestr(info, data)
+    return path
+
+
+def make_restricted_pdf(
+    path: Path, pages: Sequence[str | None], *, user_password: str = "", algorithm: str = "AES-128"
+) -> Path:
+    """Write a PDF that is encrypted, with an owner password and a user password that may be empty.
+
+    With an empty user password any reader opens it, as a browser does for a PDF that only restricts printing or
+    copying; with another one it asks for the password.
+
+    Args:
+        path: Where to write it.
+        pages: The text of each page, or ``None`` for a page without a text layer.
+        user_password: The password needed to open it; empty for none.
+        algorithm: ``RC4-128``, ``AES-128`` or ``AES-256``.
+
+    Returns:
+        ``path``.
+    """
+    plain = make_pdf(path.with_name(path.name + ".plain"), pages)
+    writer = PdfWriter(clone_from=str(plain))
+    writer.encrypt(user_password=user_password, owner_password="synthetic-owner-password", algorithm=algorithm)
+    with path.open("wb") as handle:
+        writer.write(handle)
+    plain.unlink()
+    return path
+
+
+def make_sparse_xlsx(path: Path, *, row: int = 2_000_000_000, column: str = "B") -> Path:
+    """Write a workbook whose second row of data is numbered ``row`` and whose last cell is in ``column``.
+
+    Args:
+        path: Where to write it.
+        row: The number of the second row; no spreadsheet has more than 1 048 576.
+        column: The column of the second row's cells; none goes past ``XFD``.
+
+    Returns:
+        ``path``.
+    """
+    book = Workbook()
+    sheet: Any = book.active
+    sheet.title = "Sheet1"
+    sheet.append(["a", "b"])
+    sheet.append(["c", "d"])
+    book.save(str(path))
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+        for info, data in items:
+            if info.filename == "xl/worksheets/sheet1.xml":
+                xml = data.decode()
+                xml = xml.replace('<row r="2"', f'<row r="{row}"').replace('r="A2"', f'r="A{row}"')
+                xml = xml.replace('r="B2"', f'r="{column}{row}"')
+                data = xml.encode()
+            out.writestr(info, data)
+    return path
+
+
+def make_many_sheets_xlsx(path: Path, sheets: int) -> Path:
+    """Write a workbook of ``sheets`` sheets, each with one cell.
+
+    Args:
+        path: Where to write it.
+        sheets: How many sheets.
+
+    Returns:
+        ``path``.
+    """
+    book = Workbook(write_only=True)
+    for n in range(sheets):
+        book.create_sheet(f"s{n}").append([n])
+    book.save(str(path))
+    return path
+
+
+def make_many_blocks_html(path: Path, count: int) -> Path:
+    """Write a page of ``count`` paragraphs side by side.
+
+    Args:
+        path: Where to write it.
+        count: How many paragraphs.
+
+    Returns:
+        ``path``.
+    """
+    path.write_text("<html><body>" + "<p>x</p>" * count + "</body></html>", encoding="utf-8")
+    return path
+
+
+def make_many_sheets_ods(path: Path, sheets: int, *, data_in_last: bool = False) -> Path:
+    """Write a spreadsheet of ``sheets`` sheets, empty but for a cell in the last one if asked.
+
+    Args:
+        path: Where to write it.
+        sheets: How many sheets.
+        data_in_last: Whether the last sheet holds one cell.
+
+    Returns:
+        ``path``.
+    """
+    ns = (
+        'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"'
+    )
+    tables = "".join(f'<table:table table:name="s{n}"/>' for n in range(sheets - 1))
+    last = (
+        '<table:table table:name="last"><table:table-row><table:table-cell office:value-type="string">'
+        "<text:p>only data</text:p></table:table-cell></table:table-row></table:table>"
+        if data_in_last
+        else f'<table:table table:name="s{sheets - 1}"/>'
+    )
+    content = (
+        f'<?xml version="1.0"?><office:document-content {ns}><office:body><office:spreadsheet>'
+        f"{tables}{last}</office:spreadsheet></office:body></office:document-content>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("content.xml", content)
+    return path
+
+
+def make_big_table_docx(path: Path, rows: int) -> Path:
+    """Write a Word document with a paragraph, a table of ``rows`` rows and a closing paragraph.
+
+    Args:
+        path: Where to write it.
+        rows: How many rows the table has.
+
+    Returns:
+        ``path``.
+    """
+    doc = Document()
+    doc.add_paragraph("Before the table.")
+    table: Any = doc.add_table(rows=rows, cols=3)
+    # table.cell(r, c) builds the whole grid on each call, which makes a long table quadratic; go by the rows.
+    for r, tr in enumerate(table._tbl.tr_lst):
+        for c, tc in enumerate(tr.tc_lst):
+            _Cell(tc, table).text = (f"item {r + 1}", f"synthetic value {r + 1}", str((r + 1) * 3))[c]
+    doc.add_paragraph("After the table.")
+    doc.save(str(path))
+    return path
+
+
+def make_big_table_odt(path: Path, rows: int) -> Path:
+    """Write an OpenDocument text with a table of ``rows`` rows between two paragraphs.
+
+    Args:
+        path: Where to write it.
+        rows: How many rows the table has.
+
+    Returns:
+        ``path``.
+    """
+    doc: Any = OpenDocumentText()
+    doc.text.addElement(P(text="Before the table."))
+    table = Table(name="Big")
+    for r in range(rows):
+        tr = TableRow()
+        for value in (f"item {r + 1}", f"synthetic value {r + 1}", str((r + 1) * 3)):
+            cell = TableCell()
+            cell.addElement(P(text=value))
+            tr.addElement(cell)
+        table.addElement(tr)
+    doc.text.addElement(table)
+    doc.text.addElement(P(text="After the table."))
+    doc.save(str(path))
     return path

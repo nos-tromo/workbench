@@ -13,7 +13,7 @@ from typing import Final
 
 from lxml import etree
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Part, UnreadableFile, check, tick
 from workbench.executor.readers import paging as pg
 
 _CONTENT: Final = "content.xml"
@@ -39,6 +39,7 @@ _NOT_TEXT: Final = frozenset({f"{_OFFICE}annotation", f"{_OFFICE}annotation-end"
 MAX_COLUMNS: Final = 1024
 MAX_ROW_COPIES: Final = 1000
 _MAX_SPACES: Final = 200
+_TOO_MANY: Final = "the workbook has too many sheets"
 
 
 def _parse_args() -> dict[str, bool]:
@@ -101,6 +102,7 @@ def _walk(parent: etree._Element, counters: list[int]) -> Iterator[Part]:
         ``paragraph N`` for each non-empty paragraph or heading, ``table T, row R`` for each row of a table.
     """
     for child in parent:
+        tick()
         tag = child.tag
         if not isinstance(tag, str) or tag in _SKIPPED:
             continue
@@ -202,6 +204,24 @@ def _row_cells(row: etree._Element, cap: int | None) -> list[str]:
     return cells
 
 
+def _sheet_name(table: etree._Element) -> str:
+    """Read a sheet's name.
+
+    Args:
+        table: A ``table:table`` element.
+
+    Returns:
+        The name.
+
+    Raises:
+        UnreadableFile: The name is longer than ``MAX_SHEET_NAME``.
+    """
+    name = table.get(f"{_TABLE}name") or ""
+    if len(name) > pg.MAX_SHEET_NAME:
+        raise UnreadableFile("a sheet's name is too long")
+    return name
+
+
 def _release(element: etree._Element) -> None:
     """Free an element read, and the siblings before it, so a long sheet does not pile up in memory.
 
@@ -215,7 +235,11 @@ def _release(element: etree._Element) -> None:
 
 
 class Sheets:
-    """An ``.ods`` file, as a :class:`~workbench.executor.readers.paging.SheetSource`."""
+    """An ``.ods`` file, as a :class:`~workbench.executor.readers.paging.SheetSource`.
+
+    The file is streamed: one pass for the sheets' names, and one for the rows, which starts at the sheet asked
+    for and goes on through the sheets after it, however many there are.
+    """
 
     def __init__(self, path: Path) -> None:
         """Remember the file; nothing is read until a sheet is asked for.
@@ -226,73 +250,90 @@ class Sheets:
         self._path = path
         self._names: list[str] | None = None
 
+    def _events(self) -> Iterator[tuple[str, etree._Element]]:
+        """Stream the start and end of every table and table row of ``content.xml``.
+
+        Yields:
+            Each event and its element.
+        """
+        with zipfile.ZipFile(self._path) as archive, archive.open(_CONTENT) as stream:
+            yield from etree.iterparse(stream, events=("start", "end"), tag=(_TABLE_EL, _ROW), **_parse_args())
+
     @property
     def names(self) -> list[str]:
-        """The sheets' names, in order, found by one pass over the file."""
+        """The sheets' names, in order, found by one pass over the file.
+
+        Raises:
+            UnreadableFile: There are more than ``MAX_SHEETS`` sheets; the pass stops when it sees one too many.
+        """
         if self._names is None:
-            self._names = [name for name, _, _ in self._walk(None, 1, None) if name is not None]
-        return self._names
-
-    def rows(self, sheet: str, start: int, *, cap: int | None) -> Iterator[tuple[int, list[str]]]:
-        """Walk the rows of a sheet from ``start`` on that hold something.
-
-        Args:
-            sheet: The sheet's name.
-            start: The first row number to give.
-            cap: The most characters of a cell to give; ``None`` for the whole cell.
-
-        Yields:
-            The row's number and its cells as text, from column A.
-        """
-        for _, number, cells in self._walk(sheet, start, cap):
-            if number is not None and cells is not None:
-                yield number, cells
-
-    def _walk(
-        self, sheet: str | None, start: int, cap: int | None
-    ) -> Iterator[tuple[str | None, int | None, list[str] | None]]:
-        """Stream ``content.xml``, giving each top-level sheet's name and the rows of the chosen sheet.
-
-        Args:
-            sheet: The sheet whose rows to give; ``None`` gives only the names.
-            start: The first row number to give.
-            cap: The most characters of a cell to keep.
-
-        Yields:
-            ``(name, None, None)`` at each sheet, and ``(None, row number, cells)`` for each row with content
-            of the chosen sheet; the walk ends after that sheet.
-        """
-        depth = 0
-        number = 0
-        chosen = False
-        with zipfile.ZipFile(self._path) as archive, archive.open(_CONTENT) as stream:
-            for event, element in etree.iterparse(
-                stream, events=("start", "end"), tag=(_TABLE_EL, _ROW), **_parse_args()
-            ):
+            names: list[str] = []
+            depth = 0
+            for event, element in self._events():
+                tick()
                 if element.tag == _TABLE_EL:
                     if event == "start":
                         depth += 1
                         if depth == 1:
-                            name = element.get(f"{_TABLE}name") or ""
-                            number, chosen = 0, name == sheet
-                            yield name, None, None
+                            names.append(_sheet_name(element))
+                            if len(names) > pg.MAX_SHEETS:
+                                raise UnreadableFile(_TOO_MANY)
                     else:
                         depth -= 1
-                        if depth == 0 and chosen:
-                            return
                         _release(element)
-                    continue
-                if event != "end" or depth != 1:
-                    continue
-                if chosen:
-                    repeat = max(1, int(element.get(f"{_TABLE}number-rows-repeated", "1")))
-                    cells = _row_cells(element, cap)
-                    if any(cells):
-                        for copy in range(min(repeat, MAX_ROW_COPIES)):
-                            if number + 1 + copy >= start:
-                                yield None, number + 1 + copy, cells
-                    number += repeat
-                _release(element)
+                elif event == "end":
+                    _release(element)
+            self._names = names
+        return self._names
+
+    def walk(self, sheet: str | None, start: int, *, cap: int | None) -> Iterator[tuple[str, int, list[str]]]:
+        """Walk the rows that hold something, from ``sheet`` on, in one pass.
+
+        Args:
+            sheet: The sheet to start at, or ``None`` for the first.
+            start: The first row number to give of that sheet; later sheets are given from their first row.
+            cap: The most characters of a cell to give; ``None`` for the whole cell.
+
+        Yields:
+            The sheet's name, the row's number and its cells as text.
+        """
+        depth = 0
+        number = 0
+        sheets = 0
+        name = ""
+        reached = sheet is None
+        begin = 1
+        for event, element in self._events():
+            tick()
+            if element.tag == _TABLE_EL:
+                if event == "start":
+                    depth += 1
+                    if depth == 1:
+                        check()
+                        sheets += 1
+                        if sheets > pg.MAX_SHEETS:
+                            raise UnreadableFile(_TOO_MANY)
+                        name = _sheet_name(element)
+                        number = 0
+                        begin = start if sheet is not None and name == sheet else 1
+                        reached = reached or name == sheet
+                else:
+                    depth -= 1
+                    _release(element)
+                continue
+            if event != "end":
+                continue
+            if depth == 1 and reached:
+                repeat = max(1, int(element.get(f"{_TABLE}number-rows-repeated", "1")))
+                cells = _row_cells(element, cap)
+                if any(cells):
+                    for copy in range(min(repeat, MAX_ROW_COPIES)):
+                        if number + 1 + copy >= begin:
+                            yield name, number + 1 + copy, cells
+                number += repeat
+            elif depth == 1:
+                number += max(1, int(element.get(f"{_TABLE}number-rows-repeated", "1")))
+            _release(element)
 
 
 def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:

@@ -10,9 +10,10 @@ characters is a budget in bytes of the answer.
 import json
 import re
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Final, Protocol
 
-from workbench.executor.readers import DocumentText, NoSuchPart, Part
+from workbench.executor.readers import DocumentText, NoSuchPart, Part, tick
 
 #: Rows in one range of a sheet.
 RANGE_ROWS: Final = 200
@@ -20,11 +21,20 @@ RANGE_ROWS: Final = 200
 #: Longest cell shown when reading; a search matches the whole cell.
 CELL_CAP: Final = 300
 
+#: The limits of a spreadsheet: rows, columns (XFD) and, for these readers, sheets.
+MAX_ROW: Final = 1_048_576
+MAX_COLUMN: Final = 16_384
+MAX_SHEETS: Final = 1000
+
+#: Longest sheet name read; Excel's own limit is 31. A reference to a sheet carries its name, and the api's answer
+#: holds a label of at most 300 characters.
+MAX_SHEET_NAME: Final = 100
+
 CUT_MARK: Final = " [cut]"
 
 _TABLE_ROW: Final = re.compile(r"table (\d+), row (\d+)")
 _PARAGRAPH_REF: Final = re.compile(r"(?:paragraphs?\s*)?(\d+)")
-_TABLE_REF: Final = re.compile(r"table\s*(\d+)(?:,\s*row\s*\d+)?")
+_TABLE_REF: Final = re.compile(r"table\s*(\d+)(?:\s*,\s*rows?\s*(\d+)(?:\s*-\s*(\d+))?)?")
 _SHEET_REF: Final = re.compile(r"[A-Za-z]{0,3}(\d*)(?::[A-Za-z]{0,3}(\d*))?")
 _LAST_ROW: Final = 1_048_576
 
@@ -115,6 +125,28 @@ class Collector:
         self.cut = label
         return True
 
+    def grow(self, label: str, text: str, following: str) -> bool:
+        """Replace the last part with a longer version of it, if the longer one fits.
+
+        Args:
+            label: The part's new label.
+            text: The part's new text.
+            following: The label to continue at if it does not fit.
+
+        Returns:
+            ``True`` if the part grew. ``False`` if it did not: the part is as it was, nothing more is taken,
+            and ``following`` is ``next_part``.
+        """
+        last = self.parts[-1]
+        extra = part_size(label, text) - part_size(last.label, last.text)
+        if not self._closed and extra <= self._left:
+            self.parts[-1] = Part(label, text)
+            self._left -= extra
+            return True
+        self._closed = True
+        self.next_part = following
+        return False
+
     def _fit(self, label: str, text: str) -> str | None:
         """Find the longest start of ``text``, with the cut mark, that fits what is left.
 
@@ -137,43 +169,32 @@ class Collector:
         return best
 
 
-def blocks(pieces: Iterable[Part]) -> Iterator[Part]:
-    """Group the rows of each table into one block, leaving paragraphs as they are.
+@dataclass
+class _Start:
+    """Where a block read begins.
 
-    Args:
-        pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``) in document order.
-
-    Yields:
-        The paragraphs, and each table as one part labelled ``table T`` with a ``row R: a | b`` line per row.
+    Attributes:
+        paragraph: The paragraph to start at, or ``None`` if it starts at a table.
+        table: The table to start at.
+        row: The row of that table to start at.
+        last: The last row of that table to read, if the caller named one.
     """
-    label = ""
-    rows: list[str] = []
-    for piece in pieces:
-        match = _TABLE_ROW.fullmatch(piece.label)
-        if match is None:
-            if rows:
-                yield Part(label, "\n".join(rows))
-                rows = []
-            yield piece
-            continue
-        name = f"table {match[1]}"
-        if rows and name != label:
-            yield Part(label, "\n".join(rows))
-            rows = []
-        label = name
-        rows.append(f"row {match[2]}: {piece.text}")
-    if rows:
-        yield Part(label, "\n".join(rows))
+
+    paragraph: int | None = None
+    table: int = 0
+    row: int = 1
+    last: int | None = None
 
 
-def _block_label(part: str | None) -> str | None:
-    """Turn what the caller asked for into a block's label.
+def _start(part: str | None) -> _Start | None:
+    """Turn what the caller asked for into where a block read begins.
 
     Args:
-        part: ``paragraph 12``, ``12``, ``table 2`` or ``table 2, row 3``, in any case; or ``None``.
+        part: ``paragraph 12``, ``12``, ``table 2``, ``table 2, row 30`` or ``table 2, rows 30-60``, in any
+            case; or ``None``.
 
     Returns:
-        The label of the block to start at, or ``None`` for the start of the document.
+        The start, or ``None`` for the start of the document.
 
     Raises:
         NoSuchPart: It is none of those forms.
@@ -183,48 +204,92 @@ def _block_label(part: str | None) -> str | None:
     wanted = " ".join(part.lower().split())
     paragraph = _PARAGRAPH_REF.fullmatch(wanted)
     if paragraph:
-        return f"paragraph {int(paragraph[1])}"
+        return _Start(paragraph=int(paragraph[1]))
     table = _TABLE_REF.fullmatch(wanted)
     if table:
-        return f"table {int(table[1])}"
-    raise NoSuchPart("a part of this document is 'paragraph N' or 'table N'")
+        return _Start(table=int(table[1]), row=int(table[2] or 1), last=int(table[3]) if table[3] else None)
+    raise NoSuchPart("a part of this document is 'paragraph N', 'table N' or 'table N, rows A-B'")
+
+
+def _run_label(table: int, first: int, last: int) -> str:
+    """Label a run of rows of a table.
+
+    Args:
+        table: The table's number.
+        first: The first row of the run.
+        last: The last row of the run.
+
+    Returns:
+        ``table T, row R`` for one row, ``table T, rows A-B`` for more.
+    """
+    return f"table {table}, row {first}" if first == last else f"table {table}, rows {first}-{last}"
 
 
 def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_chars: int) -> DocumentText:
     """Read a document of paragraphs and tables from ``part`` on.
 
+    A paragraph is a part. A table is paged by rows: consecutive rows that fit are one part, labelled
+    ``table T, rows A-B``, and the first row that does not fit is where to go on (``table T, row R``), so a
+    table of any length can be read to its end.
+
     Args:
         kind: The reader family to report.
-        pieces: Paragraphs and table rows in document order (see :func:`blocks`).
+        pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``, text ``a | b``) in document order.
         part: The label to start at, or ``None``.
         max_chars: The budget in bytes of JSON.
 
     Returns:
-        The blocks that fit, whole, and where to continue.
+        The parts that fit, whole, and where to continue.
 
     Raises:
         NoSuchPart: ``part`` is not a paragraph or table of the document.
     """
-    wanted = _block_label(part)
+    start = _start(part)
     collector = Collector(max_chars)
-    total = 0
-    started = wanted is None
+    paragraphs = 0
+    tables: set[int] = set()
+    started = start is None
     offering = True
-    for block in blocks(pieces):
-        total += 1
+    open_table = 0
+    first_row = 0
+    for piece in pieces:
+        tick()
+        match = _TABLE_ROW.fullmatch(piece.label)
+        if match is None:
+            paragraphs += 1
+            open_table = 0
+            if not started:
+                if start is None or start.paragraph is None or piece.label != f"paragraph {start.paragraph}":
+                    continue
+                started = True
+            if offering:
+                offering = collector.add(piece.label, piece.text)
+            continue
+        table, row = int(match[1]), int(match[2])
+        tables.add(table)
         if not started:
-            if block.label != wanted:
+            if start is None or start.paragraph is not None or table != start.table or row < start.row:
                 continue
             started = True
-        if offering:
-            offering = collector.add(block.label, block.text)
+        if not offering:
+            continue
+        if start is not None and start.last is not None and table == start.table and row > start.last:
+            offering = False
+            continue
+        line = f"row {row}: {piece.text}"
+        if open_table == table and collector.parts:
+            last = collector.parts[-1]
+            offering = collector.grow(_run_label(table, first_row, row), f"{last.text}\n{line}", piece.label)
+        else:
+            open_table, first_row = table, row
+            offering = collector.add(piece.label, line)
     if not started:
-        raise NoSuchPart(f"this document has no {wanted}; it has {total} paragraphs and tables")
+        raise NoSuchPart(f"this document has no such part; it has {paragraphs} paragraphs and {len(tables)} tables")
     return DocumentText(
         kind=kind,
         parts=collector.parts,
         pages_without_text=[],
-        total_parts=total,
+        total_parts=paragraphs + len(tables),
         truncated=collector.truncated,
         next_part=collector.next_part,
         cut=collector.cut,
@@ -292,19 +357,19 @@ class SheetSource(Protocol):
 
     @property
     def names(self) -> list[str]:
-        """The sheets' names, in order."""
+        """The sheets' names, in order; at most ``MAX_SHEETS``."""
         ...
 
-    def rows(self, sheet: str, start: int, *, cap: int | None) -> Iterator[tuple[int, list[str]]]:
-        """Walk the rows of a sheet from ``start`` on that hold something.
+    def walk(self, sheet: str | None, start: int, *, cap: int | None) -> Iterator[tuple[str, int, list[str]]]:
+        """Walk the rows that hold something, in one pass over the workbook.
 
         Args:
-            sheet: The sheet's name.
-            start: The first row number to give.
+            sheet: The sheet to start at, or ``None`` for the first.
+            start: The first row number to give of that sheet; later sheets are given from their first row.
             cap: The most characters of a cell to give; ``None`` for the whole cell.
 
         Yields:
-            The row's number and its cells as text, from column A, with empty cells as empty text.
+            The sheet's name, the row's number and its cells as text, from column A, empty cells as empty text.
         """
         ...
 
@@ -350,7 +415,9 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
 
     The range starts at the first row with content at or after the one asked for, spans at most
     ``RANGE_ROWS`` rows, and ends sooner if the budget does. Each row is a line ``<row>: a | b | c``
-    with the cells from column A; the label gives the range, such as ``Sheet1!A1:F200``.
+    with the cells from column A; the label gives the range, such as ``Sheet1!A1:F200``. With no part, a
+    first sheet that is empty is passed over. The workbook is walked once, from the start of the range to its
+    end, however many sheets it has.
 
     Args:
         kind: The reader family to report.
@@ -359,57 +426,35 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
         max_chars: The budget in bytes of JSON.
 
     Returns:
-        The range, and where to continue: the next range of the sheet, or the next sheet.
+        The range, and where to continue: the next range of the sheet, or the next sheet with content.
 
     Raises:
         NoSuchPart: The sheet is not in the workbook.
     """
     names = source.names
     sheet, start, last = parse_sheet_ref(part, names)
-    order = names.index(sheet)
-    while True:
-        result = _read_range(kind, source, sheet, start, last, max_chars, total=len(names))
-        if result.parts or part is not None or order + 1 >= len(names):
-            break
-        order += 1
-        sheet, start = names[order], 1
-    if result.next_part is None and order + 1 < len(names):
-        result.next_part = quote_sheet(names[order + 1])
-        result.truncated = True
-    return result
-
-
-def _read_range(
-    kind: str, source: SheetSource, sheet: str, start: int, last: int | None, max_chars: int, *, total: int
-) -> DocumentText:
-    """Read one range of one sheet.
-
-    Args:
-        kind: The reader family to report.
-        source: The workbook.
-        sheet: The sheet's name.
-        start: The first row to look at.
-        last: The last row the caller asked for, if any.
-        max_chars: The budget in bytes of JSON.
-        total: The number of sheets.
-
-    Returns:
-        The range; its ``next_part`` is the next range of this sheet if there is one.
-    """
-    quoted = quote_sheet(sheet)
-    left = max_chars - part_size(f"{quoted}!A{_LAST_ROW}:ZZZ{_LAST_ROW}", "")
+    explicit = part is not None and bool(part.strip())
     lines: list[str] = []
+    current = ""
     first = end = 0
     window = RANGE_ROWS
     width = 1
-    next_row: int | None = None
+    left = max_chars - part_size(f"{quote_sheet(sheet)}!A{MAX_ROW}:ZZZ{MAX_ROW}", "")
+    next_part: str | None = None
     cut = False
-    for number, row in source.rows(sheet, start, cap=CELL_CAP):
+    for name, number, row in source.walk(sheet if explicit else None, start, cap=CELL_CAP):
+        tick()
         if not lines:
-            first = number
+            if explicit and name != sheet:
+                next_part = quote_sheet(name)
+                break
+            current, first = name, number
             window = RANGE_ROWS if last is None else max(1, min(RANGE_ROWS, last - first + 1))
+        elif name != current:
+            next_part = quote_sheet(name)
+            break
         elif number >= first + window:
-            next_row = number
+            next_part = f"{quote_sheet(current)}!A{number}:{column_letters(width)}{number + RANGE_ROWS - 1}"
             break
         shown = list(row)
         while shown and not shown[-1]:
@@ -418,7 +463,7 @@ def _read_range(
         cost = len(json.dumps(line, ensure_ascii=False).encode()) + 1
         if cost > left:
             if lines:
-                next_row = number
+                next_part = f"{quote_sheet(current)}!A{number}:{column_letters(width)}{number + RANGE_ROWS - 1}"
                 break
             line = clip(line, max(1, left - len(CUT_MARK.encode()) - 8)) + CUT_MARK
             cut = True
@@ -430,16 +475,20 @@ def _read_range(
         lines.append(line)
         end, width = number, max(width, len(shown))
     if not lines:
-        return DocumentText(kind=kind, parts=[], pages_without_text=[], total_parts=total)
-    label = f"{quoted}!A{first}:{column_letters(width)}{end}"
-    next_part = None
-    if next_row is not None:
-        next_part = f"{quoted}!A{next_row}:{column_letters(width)}{next_row + RANGE_ROWS - 1}"
+        return DocumentText(
+            kind=kind,
+            parts=[],
+            pages_without_text=[],
+            total_parts=len(names),
+            truncated=next_part is not None,
+            next_part=next_part,
+        )
+    label = f"{quote_sheet(current)}!A{first}:{column_letters(width)}{end}"
     return DocumentText(
         kind=kind,
         parts=[Part(label, "\n".join(lines))],
         pages_without_text=[],
-        total_parts=total,
+        total_parts=len(names),
         truncated=next_part is not None or cut,
         next_part=next_part,
         cut=label if cut else None,
@@ -455,9 +504,9 @@ def cells(source: SheetSource) -> Iterator[Part]:
     Yields:
         Each cell, labelled with its address (``Sheet1!C5``), with its whole text.
     """
-    for sheet in source.names:
+    for sheet, number, row in source.walk(None, 1, cap=None):
+        tick()
         quoted = quote_sheet(sheet)
-        for number, row in source.rows(sheet, 1, cap=None):
-            for column, text in enumerate(row, 1):
-                if text:
-                    yield Part(f"{quoted}!{column_letters(column)}{number}", text)
+        for column, text in enumerate(row, 1):
+            if text:
+                yield Part(f"{quoted}!{column_letters(column)}{number}", text)

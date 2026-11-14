@@ -1,14 +1,17 @@
 """The document readers: every format, paging, caps, and files that are broken, encrypted or hostile."""
 
+import re
 import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers
-from workbench.executor.readers import DocumentText, NoSuchPart, UnreadableFile, UnsupportedFormat
+from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat
 
 BUDGET = 16384
 
@@ -105,10 +108,10 @@ def test_pdf_units_give_every_page_and_an_empty_text_for_a_page_without_text(tmp
 
 
 def test_docx_reads_paragraphs_and_tables(tmp_path: Path) -> None:
-    """Paragraphs are numbered, empty ones skipped; a table is one part with a line per row."""
+    """Paragraphs are numbered, empty ones skipped; a table is a run of rows, a line per row."""
     doc = read(fx.make_docx(tmp_path / "review.docx"))
     assert doc.kind == "docx"
-    assert labels(doc) == ["paragraph 1", "paragraph 2", "paragraph 3", "table 1", "paragraph 4"]
+    assert labels(doc) == ["paragraph 1", "paragraph 2", "paragraph 3", "table 1, rows 1-3", "paragraph 4"]
     assert doc.parts[0].text == "Quarterly figures review"
     assert doc.parts[3].text == "row 1: Item | Planned | Actual\nrow 2: Dredging | 120 | 118\nrow 3: Piers | 340 | 351"
     assert doc.total_parts == 5
@@ -140,10 +143,11 @@ def test_a_shape_that_word_wrote_twice_is_read_once(tmp_path: Path) -> None:
 def test_docx_pages_by_paragraph_and_table(tmp_path: Path) -> None:
     """Paging starts at a paragraph or a table; a bare number is a paragraph."""
     docx = fx.make_docx(tmp_path / "review.docx")
-    assert labels(read(docx, "paragraph 3")) == ["paragraph 3", "table 1", "paragraph 4"]
-    assert labels(read(docx, "3")) == ["paragraph 3", "table 1", "paragraph 4"]
-    assert labels(read(docx, "Table 1")) == ["table 1", "paragraph 4"]
-    assert labels(read(docx, "table 1, row 2")) == ["table 1", "paragraph 4"]
+    assert labels(read(docx, "paragraph 3")) == ["paragraph 3", "table 1, rows 1-3", "paragraph 4"]
+    assert labels(read(docx, "3")) == ["paragraph 3", "table 1, rows 1-3", "paragraph 4"]
+    assert labels(read(docx, "Table 1")) == ["table 1, rows 1-3", "paragraph 4"]
+    assert labels(read(docx, "table 1, row 2")) == ["table 1, rows 2-3", "paragraph 4"]
+    assert labels(read(docx, "table 1, rows 2-2")) == ["table 1, row 2"]
     with pytest.raises(NoSuchPart):
         read(docx, "paragraph 40")
     with pytest.raises(NoSuchPart):
@@ -348,7 +352,7 @@ def test_odt_reads_paragraphs_and_tables(tmp_path: Path) -> None:
     """Headings and paragraphs are numbered together; a table is one part."""
     doc = read(fx.make_odt(tmp_path / "survey.odt"))
     assert doc.kind == "odt"
-    assert labels(doc) == ["paragraph 1", "paragraph 2", "table 1", "paragraph 3"]
+    assert labels(doc) == ["paragraph 1", "paragraph 2", "table 1, rows 1-2", "paragraph 3"]
     assert doc.parts[2].text == "row 1: Harbour | Depth\nrow 2: North | 12"
     assert [p.label for p in readers.units(tmp_path / "survey.odt")][2:4] == ["table 1, row 1", "table 1, row 2"]
 
@@ -589,29 +593,6 @@ def test_a_zip_with_too_many_parts_is_refused(tmp_path: Path) -> None:
         read(path)
 
 
-def test_an_xml_bomb_and_an_external_entity_are_not_expanded(tmp_path: Path) -> None:
-    """Nothing external is loaded and entities are not resolved: the secret stays out, and it takes no time."""
-    secret = tmp_path / "secret.txt"
-    secret.write_text("SYNTHETIC-SECRET-CONTENT", encoding="utf-8")
-    lol = "".join(f'<!ENTITY l{n} "{f"&l{n - 1};" * 10}">' for n in range(1, 8))
-    body = (
-        f'<?xml version="1.0"?><!DOCTYPE d [<!ENTITY l0 "ha">{lol}<!ENTITY x SYSTEM "{secret.as_uri()}">]>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
-        "<w:p><w:r><w:t>before &x; &l7; after</w:t></w:r></w:p></w:body></w:document>"
-    )
-    path = tmp_path / "xxe.docx"
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("word/document.xml", body)
-    began = time.monotonic()
-    try:
-        doc = read(path)
-    except UnreadableFile:
-        doc = None
-    assert time.monotonic() - began < 5
-    assert "SYNTHETIC-SECRET-CONTENT" not in (texts(doc) if doc else "")
-    assert "hahahaha" not in (texts(doc) if doc else "")
-
-
 def test_a_failing_parser_never_shows_its_own_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Whatever a library raises, the model sees the fixed text: parser messages can hold paths."""
     from workbench.executor.readers import pdf
@@ -625,3 +606,316 @@ def test_a_failing_parser_never_shows_its_own_message(tmp_path: Path, monkeypatc
         read(path)
     assert "synthetic" not in str(raised.value)
     assert str(tmp_path) not in str(raised.value)
+
+
+# --- tables are paged by rows ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("make", [fx.make_big_table_docx, fx.make_big_table_odt])
+def test_a_long_table_is_read_to_its_end_by_following_next_part(tmp_path: Path, make: Callable[..., Path]) -> None:
+    """A table of 1 000 rows is more than one answer: its rows are paged, each once, to the text after it."""
+    path = make(tmp_path / "long.docx" if make is fx.make_big_table_docx else tmp_path / "long.odt", 1000)
+    rows: list[int] = []
+    seen: list[str] = []
+    doc = read(path, max_chars=3000)
+    pages = 1
+    while True:
+        for part in doc.parts:
+            assert readers.paging.part_size(part.label, part.text) <= 3000
+            seen.append(part.label)
+            if part.label.startswith("table 1"):
+                rows += [int(m[1]) for m in re.finditer(r"^row (\d+):", part.text, re.M)]
+        if doc.next_part is None:
+            break
+        assert doc.truncated is True
+        doc = read(path, doc.next_part, max_chars=3000)
+        pages += 1
+    assert pages > 5
+    assert rows == list(range(1, 1001))
+    assert seen[0] == "paragraph 1"
+    assert seen[-1] == "paragraph 2"
+    assert doc.total_parts == 3
+
+
+@pytest.mark.parametrize("make", [fx.make_big_table_docx, fx.make_big_table_odt])
+def test_the_label_of_a_table_run_is_a_range_and_can_be_asked_for(tmp_path: Path, make: Callable[..., Path]) -> None:
+    """``table 1, rows 1-N`` says what is in the part; ``table 1, row N+1`` is where the next one starts."""
+    path = make(tmp_path / ("long.docx" if make is fx.make_big_table_docx else "long.odt"), 1000)
+    first = read(path, "table 1", max_chars=3000)
+    (part,) = first.parts
+    last = int(re.findall(r"^row (\d+):", part.text, re.M)[-1])
+    assert part.label == f"table 1, rows 1-{last}"
+    assert first.next_part == f"table 1, row {last + 1}"
+    follow = read(path, first.next_part, max_chars=3000)
+    assert follow.parts[0].text.startswith(f"row {last + 1}: item {last + 1}")
+    assert labels(read(path, "table 1, rows 10-12")) == ["table 1, rows 10-12"]
+    with pytest.raises(NoSuchPart):
+        read(path, "table 1, row 5000")
+    with pytest.raises(NoSuchPart):
+        read(path, "table 2")
+
+
+def test_a_search_hit_in_a_table_can_be_opened_with_its_location(tmp_path: Path) -> None:
+    """``units`` names ``table 1, row 350``; that is a ``part`` that starts there."""
+    path = fx.make_big_table_docx(tmp_path / "long.docx", 1000)
+    (hit,) = [p for p in readers.units(path) if "item 350" in p.text]
+    assert hit.label == "table 1, row 350"
+    opened = read(path, hit.label)
+    assert opened.parts[0].label.startswith("table 1, rows 350-")
+    assert opened.parts[0].text.startswith("row 350: item 350 | synthetic value 350 | 1050")
+
+
+def test_a_row_longer_than_the_budget_is_cut_and_paging_moves_on(tmp_path: Path) -> None:
+    """One cell of 5 000 characters in a table: the row is cut and marked, the next row is next."""
+    from docx import Document
+
+    doc = Document()
+    table = doc.add_table(rows=3, cols=1)
+    for r, value in enumerate(["short", "long " * 1000, "after"]):
+        table.cell(r, 0).text = value
+    path = tmp_path / "wide.docx"
+    doc.save(str(path))
+    first = read(path, "table 1, row 2", max_chars=800)
+    assert first.parts[0].text.endswith(" [cut]")
+    assert first.cut == "table 1, row 2"
+    assert first.next_part == "table 1, row 3"
+
+
+# --- files that would keep a reader busy -----------------------------------------------------------------------
+
+
+def refused_quickly(path: Path, *, file_mb: int = 50) -> None:
+    """Assert that reading and walking a file both raise ``UnreadableFile`` in under five seconds."""
+    for work in (lambda: read(path, file_mb=file_mb), lambda: list(readers.units(path, file_mb=file_mb))):
+        began = time.monotonic()
+        with pytest.raises(UnreadableFile):
+            work()
+        assert time.monotonic() - began < 5
+
+
+def test_a_cell_in_a_row_no_spreadsheet_has_is_refused(tmp_path: Path) -> None:
+    """Openpyxl would give an empty row for each of two billion numbers; the file is refused instead."""
+    refused_quickly(fx.make_sparse_xlsx(tmp_path / "sparse.xlsx", row=2_000_000_000))
+    refused_quickly(fx.make_sparse_xlsx(tmp_path / "just-over.xlsx", row=1_048_577))
+
+
+@pytest.mark.parametrize("column", ["XFE", "ZZZ", "AAAA", "ZZZZZZZZZZ"])
+def test_a_cell_in_a_column_no_spreadsheet_has_is_refused(tmp_path: Path, column: str) -> None:
+    """Past ``XFD`` there are no columns; a row of billions of cells is never built."""
+    refused_quickly(fx.make_sparse_xlsx(tmp_path / "wide.xlsx", row=2, column=column))
+
+
+def test_the_last_row_and_the_last_column_are_read(tmp_path: Path) -> None:
+    """The limits are the spreadsheet's own: row 1 048 576 and column XFD are fine."""
+    last_row = read(fx.make_sparse_xlsx(tmp_path / "row.xlsx", row=1_048_576))
+    assert last_row.parts[0].label == "Sheet1!A1:B1"
+    assert last_row.next_part == "Sheet1!A1048576:B1048775"
+    assert read(fx.make_sparse_xlsx(tmp_path / "row.xlsx", row=1_048_576), last_row.next_part).parts[0].text == (
+        "1048576: c | d"
+    )
+    wide = read(fx.make_sparse_xlsx(tmp_path / "col.xlsx", row=2, column="XFD"), max_chars=100_000)
+    assert wide.parts[0].label == "Sheet1!A1:XFD2"
+
+
+def test_a_workbook_with_too_many_sheets_is_refused(tmp_path: Path) -> None:
+    """More than 1 000 sheets is not a workbook, and its sheets are not opened one by one."""
+    refused_quickly(fx.make_many_sheets_xlsx(tmp_path / "many.xlsx", 1001))
+    assert read(fx.make_many_sheets_xlsx(tmp_path / "limit.xlsx", 1000)).total_parts == 1000
+
+
+def test_html_with_many_blocks_is_read_in_time_in_proportion_to_its_size(tmp_path: Path) -> None:
+    """20 000 paragraphs side by side took twenty seconds when every block was inserted into a list of its siblings."""
+    for count in (20_000, 40_000):
+        path = fx.make_many_blocks_html(tmp_path / f"many-{count}.html", count)
+        began = time.monotonic()
+        doc = read(path, max_chars=100_000)
+        pieces = list(readers.units(path))
+        assert time.monotonic() - began < 5
+        assert len(pieces) == count
+        assert doc.total_parts == count
+
+
+def test_html_blocks_tables_and_breaks_keep_their_lines(tmp_path: Path) -> None:
+    """The one-pass walk gives what the insertions did: a line per block, a table row on one line."""
+    path = tmp_path / "page.html"
+    path.write_text(
+        "<html><head><title>T</title><style>p{}</style></head><body><div>one<br>two</div>"
+        "<table><tr><td>a</td><td><table><tr><td>x</td><td>y</td></tr></table></td><td>c</td></tr></table>"
+        "<ul><li>first</li><li>second <b>bold</b> end</li></ul><script>hidden()</script><!-- c --></body></html>",
+        encoding="utf-8",
+    )
+    assert read(path).parts[0].text.splitlines() == ["T", "one", "two", "a | x | y | c", "first", "second bold end"]
+
+
+def test_an_ods_with_many_empty_sheets_is_refused_and_the_limit_reads_fast(tmp_path: Path) -> None:
+    """The file was streamed once for every sheet; now it is streamed once, and more than 1 000 sheets is refused."""
+    refused_quickly(fx.make_many_sheets_ods(tmp_path / "many.ods", 20_000))
+    refused_quickly(fx.make_many_sheets_ods(tmp_path / "over.ods", 1001))
+    path = fx.make_many_sheets_ods(tmp_path / "limit.ods", 1000, data_in_last=True)
+    began = time.monotonic()
+    doc = read(path)
+    assert time.monotonic() - began < 5
+    assert labels(doc) == ["last!A1:A1"]
+    assert doc.parts[0].text == "1: only data"
+    assert doc.total_parts == 1000
+    assert [p.label for p in readers.units(path)] == ["last!A1"]
+
+
+def test_a_sheet_with_a_very_long_name_is_refused(tmp_path: Path) -> None:
+    """A reference carries the sheet's name; Excel's names have 31 characters at the most, and a label may have 300."""
+    from openpyxl import Workbook
+
+    book = Workbook()
+    sheet: Any = book.active
+    sheet.title = "x" * 31
+    path = tmp_path / "long-name.xlsx"
+    book.save(str(path))
+    with zipfile.ZipFile(path) as src:
+        items = [(info, src.read(info.filename)) for info in src.infolist()]
+    with zipfile.ZipFile(path, "w") as out:
+        for info, data in items:
+            out.writestr(info, data.replace(b"x" * 31, b"x" * 500) if info.filename == "xl/workbook.xml" else data)
+    refused_quickly(path)
+    ods = fx.make_many_sheets_ods(tmp_path / "long-name.ods", 2)
+    with zipfile.ZipFile(ods) as src:
+        content = src.read("content.xml").replace(b'table:name="s0"', b'table:name="' + b"y" * 500 + b'"')
+    with zipfile.ZipFile(ods, "w") as out:
+        out.writestr("content.xml", content)
+    refused_quickly(ods)
+
+
+def test_an_ods_sheet_after_empty_ones_is_found_with_no_part_and_by_name(tmp_path: Path) -> None:
+    """Empty sheets are passed over; asking for an empty one says where the next content is."""
+    path = fx.make_many_sheets_ods(tmp_path / "gaps.ods", 5, data_in_last=True)
+    assert labels(read(path)) == ["last!A1:A1"]
+    empty = read(path, "s1")
+    assert (empty.parts, empty.next_part) == ([], "last")
+
+
+def test_the_deadline_stops_a_read_that_is_slow(big_xlsx: Path) -> None:
+    """The row walk checks the clock: deep in a 100 000-row sheet 0.3 s is not enough, and it is ``ReadTimeout``."""
+    began = time.monotonic()
+    readers.set_deadline(began + 0.3)
+    try:
+        with pytest.raises(ReadTimeout):
+            read(big_xlsx, "Sheet1!A99000")
+        assert time.monotonic() - began < 3
+        readers.set_deadline(time.monotonic() + 0.3)
+        with pytest.raises(ReadTimeout):
+            list(readers.units(big_xlsx))
+    finally:
+        readers.set_deadline(None)
+
+
+def test_no_deadline_no_timeout(tmp_path: Path) -> None:
+    """With the deadline taken away nothing stops a read."""
+    readers.set_deadline(time.monotonic() - 10)
+    readers.set_deadline(None)
+    assert read(fx.make_docx(tmp_path / "a.docx")).parts
+
+
+def test_a_deadline_that_has_passed_stops_the_next_page_or_sheet(tmp_path: Path) -> None:
+    """Page, slide and sheet loops look at the clock on every step."""
+    pdf = fx.make_pdf(tmp_path / "three.pdf", ["a", "b", "c"])
+    readers.set_deadline(time.monotonic() - 1)
+    try:
+        with pytest.raises(ReadTimeout):
+            read(pdf)
+        with pytest.raises(ReadTimeout):
+            list(readers.units(fx.make_pptx(tmp_path / "s.pptx")))
+        with pytest.raises(ReadTimeout):
+            read(fx.make_xlsx(tmp_path / "s.xlsx"))
+    finally:
+        readers.set_deadline(None)
+
+
+# --- PDFs that restrict only what a reader may do --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("algorithm", ["RC4-128", "AES-128", "AES-256"])
+def test_a_pdf_with_an_owner_password_and_no_user_password_is_read(tmp_path: Path, algorithm: str) -> None:
+    """The password only restricts printing and copying: a reader opens it, and so do we."""
+    pdf = fx.make_restricted_pdf(tmp_path / "restricted.pdf", ["Owner restricted page", None], algorithm=algorithm)
+    doc = read(pdf)
+    assert labels(doc) == ["page 1"]
+    assert doc.parts[0].text == "Owner restricted page"
+    assert doc.pages_without_text == [2]
+    assert [p.label for p in readers.units(pdf)] == ["page 1", "page 2"]
+
+
+@pytest.mark.parametrize("algorithm", ["RC4-128", "AES-128", "AES-256"])
+def test_a_pdf_that_needs_a_user_password_is_refused_as_protected(tmp_path: Path, algorithm: str) -> None:
+    """Only a password that really is needed makes a PDF unreadable."""
+    pdf = fx.make_restricted_pdf(
+        tmp_path / "locked.pdf", ["secret"], user_password="synthetic-user", algorithm=algorithm
+    )
+    with pytest.raises(UnreadableFile, match=r"password-protected"):
+        read(pdf)
+
+
+def test_a_missing_decryption_library_is_not_reported_as_a_page_without_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the AES library were missing, an unreadable page must not turn into 'needs OCR': the file is refused."""
+    from pypdf import PageObject
+    from pypdf.errors import DependencyError
+
+    def missing(self: PageObject, *args: object, **kwargs: object) -> str:
+        raise DependencyError("cryptography>=3.1 is required for AES algorithm")
+
+    monkeypatch.setattr(PageObject, "extract_text", missing)
+    pdf = fx.make_restricted_pdf(tmp_path / "restricted.pdf", ["Owner restricted page"])
+    with pytest.raises(UnreadableFile, match="cannot be decrypted here"):
+        read(pdf)
+
+
+# --- entities in XML parts -------------------------------------------------------------------------------------
+
+#: The main XML part of each format, and some text in it.
+ENTITY_TARGETS = {
+    "docx": (fx.make_docx, "word/document.xml", "The harbour project is on schedule."),
+    "odt": (fx.make_odt, "content.xml", "Survey summary"),
+    "ods": (fx.make_ods, "content.xml", "North"),
+    "pptx": (fx.make_pptx, "ppt/slides/slide1.xml", "Harbour project status"),
+    "xlsx": (fx.make_xlsx, "xl/worksheets/sheet1.xml", "item 2"),
+}
+SECRET = "SYNTHETIC-SECRET-CONTENT"
+
+
+def entity_file(tmp_path: Path, kind: str, use: str) -> Path:
+    """Build a file of ``kind`` whose main part declares entities, and a secret they point to."""
+    (tmp_path / "secret.txt").write_text(SECRET, encoding="utf-8")
+    make, member, text = ENTITY_TARGETS[kind]
+    return fx.with_entities(make(tmp_path / f"entities.{kind}"), member, text, tmp_path / "secret.txt", use=use)
+
+
+@pytest.mark.parametrize("kind", ["docx", "odt", "ods", "pptx"])
+def test_a_document_type_with_entities_that_are_not_used_reads_as_usual(tmp_path: Path, kind: str) -> None:
+    """The control: the declarations alone are harmless, and the text is the document's own."""
+    plain = read(ENTITY_TARGETS[kind][0](tmp_path / f"plain.{kind}"))
+    declared = read(entity_file(tmp_path, kind, "none"))
+    assert texts(declared) == texts(plain)
+
+
+@pytest.mark.parametrize("kind", ["docx", "odt", "ods", "pptx"])
+def test_an_external_entity_is_not_loaded(tmp_path: Path, kind: str) -> None:
+    """The reference to a local file is left unresolved: the read succeeds, with the text around it and not the file."""
+    path = entity_file(tmp_path, kind, "external")
+    for text in (texts(read(path)), "\n".join(p.text for p in readers.units(path))):
+        assert "before" in text
+        assert SECRET not in text
+
+
+def test_an_xlsx_with_entities_is_refused_because_openpyxl_forbids_them(tmp_path: Path) -> None:
+    """Openpyxl reads with defusedxml (which odfpy brings), and defusedxml refuses any entity declaration."""
+    import openpyxl.xml
+
+    assert openpyxl.xml.DEFUSEDXML is True
+    for use in ("none", "external", "bomb"):
+        refused_quickly(entity_file(tmp_path, "xlsx", use))
+
+
+@pytest.mark.parametrize("kind", ["docx", "odt", "ods", "pptx", "xlsx"])
+def test_an_entity_bomb_is_refused_without_being_expanded(tmp_path: Path, kind: str) -> None:
+    """A chain of entities that would make twenty megabytes of text is stopped by the parser: the file is unreadable."""
+    refused_quickly(entity_file(tmp_path, kind, "bomb"))
