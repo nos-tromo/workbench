@@ -1,0 +1,447 @@
+"""The ``read_document`` and ``search_files`` runners: what the model is told, and how a search is bounded."""
+
+import json
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.fixtures import make_fixtures as fx
+from workbench.executor.runners import RUNNERS, JobContext
+from workbench.executor.runners import documents as docs
+
+CHAT = "chat-1"
+
+
+@pytest.fixture
+def work(tmp_path: Path) -> Path:
+    """The job's working folder: the chat folder, with the job's own empty ``out/`` in it."""
+    folder = tmp_path / "job" / "workspace" / CHAT
+    (folder / "out").mkdir(parents=True)
+    return folder
+
+
+def context(work: Path, *, max_chars: int = 16384, file_mb: int = 50) -> JobContext:
+    """The context the job entry point builds for a working folder."""
+    return JobContext(work_dir=work, out_dir=work / "out", chat_id=CHAT, max_chars=max_chars, file_mb=file_mb)
+
+
+def search(work: Path, query: str, **args: Any) -> dict[str, Any]:
+    """Run the search runner on a working folder."""
+    return RUNNERS["search_files"]({"query": query, **args}, context(work))
+
+
+def read_doc(work: Path, path: str, part: str | None = None, **ctx: Any) -> dict[str, Any]:
+    """Run the read runner on a working folder."""
+    return RUNNERS["read_document"]({"path": path, "part": part}, context(work, **ctx))
+
+
+def populate(work: Path) -> None:
+    """Put a PDF, a workbook and a Word file that all mention the same word into the folder."""
+    fx.make_pdf(work / "report.pdf", ["The harbour inspection is complete.", "Nothing else here."])
+    fx.make_xlsx(work / "figures.xlsx", rows=3)
+    fx.make_docx(work / "review.docx")
+
+
+# --- search ----------------------------------------------------------------------------------------------------
+
+
+def test_search_finds_text_across_formats(work: Path) -> None:
+    """A PDF page, a spreadsheet cell and a Word paragraph, each with its own kind of location."""
+    populate(work)
+    result = search(work, "HARBOUR")
+    hits = {(h["path"], h["location"]) for h in result["hits"]}
+    assert hits == {
+        (f"/workspace/{CHAT}/report.pdf", "page 1"),
+        (f"/workspace/{CHAT}/figures.xlsx", "Summary!B1"),
+        (f"/workspace/{CHAT}/review.docx", "paragraph 2"),
+    }
+    by_location = {h["location"]: h["snippet"] for h in result["hits"]}
+    assert by_location["page 1"] == "The harbour inspection is complete."
+    assert by_location["Summary!B1"] == "harbour budget"
+    assert (result["truncated"], result["files_searched"], result["unsupported_files"]) == (False, 3, 0)
+    assert "hint" not in result
+    assert "skipped" not in result
+
+
+def test_search_hits_are_in_file_order_then_document_order(work: Path) -> None:
+    """Files by name, and within a file the order of the document."""
+    (work / "b.txt").write_text("match one\nno\nmatch two\n", encoding="utf-8")
+    (work / "a.txt").write_text("match zero\n", encoding="utf-8")
+    result = search(work, "match")
+    assert [(h["path"].rsplit("/", 1)[1], h["location"]) for h in result["hits"]] == [
+        ("a.txt", "line 1"),
+        ("b.txt", "line 1"),
+        ("b.txt", "line 3"),
+    ]
+
+
+def test_search_looks_into_folders_but_not_the_jobs_out_folder(work: Path) -> None:
+    """A file in a folder is found by its path; what is in ``out/`` is the job's, not the chat's."""
+    (work / "reports").mkdir()
+    (work / "reports" / "q1.txt").write_text("needle in a folder\n", encoding="utf-8")
+    (work / "out" / "made.txt").write_text("needle in out\n", encoding="utf-8")
+    result = search(work, "needle")
+    assert [h["path"] for h in result["hits"]] == [f"/workspace/{CHAT}/reports/q1.txt"]
+
+
+def test_a_plain_query_is_text_not_a_pattern(work: Path) -> None:
+    """Dots and brackets in a plain query mean themselves."""
+    (work / "t.txt").write_text("abc\na.c\n[x]\n", encoding="utf-8")
+    assert [h["location"] for h in search(work, "a.c")["hits"]] == ["line 2"]
+    assert [h["location"] for h in search(work, "[x]")["hits"]] == ["line 3"]
+
+
+def test_a_regex_is_a_pattern_and_ignores_case(work: Path) -> None:
+    """``regex`` makes the query a regular expression."""
+    (work / "t.txt").write_text("Order 12\nOrder 7\nINVOICE 340\n", encoding="utf-8")
+    hits = search(work, r"(order|invoice) \d{2,}", regex=True)["hits"]
+    assert [h["snippet"] for h in hits] == ["Order 12", "INVOICE 340"]
+
+
+def test_an_invalid_regex_is_an_error_with_a_reason(work: Path) -> None:
+    """The model is told what is wrong with its expression, in the re module's own words."""
+    (work / "t.txt").write_text("x\n", encoding="utf-8")
+    result = search(work, "(unclosed", regex=True)
+    assert set(result) == {"error"}
+    assert result["error"].startswith("bad_regex: missing ), unterminated subpattern at position 0")
+
+
+def test_a_catastrophic_regex_stops_after_two_seconds(work: Path) -> None:
+    """Backtracking that would take minutes is cut off: the error is ``regex_timeout``, and the alarm is disarmed."""
+    (work / "t.txt").write_text("a" * 40 + "b\n", encoding="utf-8")
+    before = signal.getsignal(signal.SIGALRM)
+    began = time.monotonic()
+    result = search(work, "(a+)+$", regex=True)
+    assert 1.5 < time.monotonic() - began < 6
+    assert result["error"].startswith("regex_timeout: ")
+    assert "2 s" in result["error"]
+    assert signal.getsignal(signal.SIGALRM) is before
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_the_two_seconds_are_for_the_whole_search_not_for_each_line(work: Path) -> None:
+    """Each line takes about a quarter of a second, 200 of them would take a minute: the budget is spent once."""
+    (work / "t.txt").write_text(("a" * 22 + "b\n") * 200, encoding="utf-8")
+    began = time.monotonic()
+    result = search(work, "(a+)+$", regex=True)
+    assert 1.5 < time.monotonic() - began < 4
+    assert result["error"].startswith("regex_timeout: ")
+
+
+def test_a_plain_query_is_never_timed(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No alarm handler is installed for a plain query."""
+    (work / "t.txt").write_text("needle\n", encoding="utf-8")
+    before = signal.getsignal(signal.SIGALRM)
+    seen: list[Any] = []
+    original = docs.Matcher.find
+
+    def spy(self: docs.Matcher, text: str) -> list[re.Match[str]]:
+        seen.append(signal.getsignal(signal.SIGALRM))
+        return original(self, text)
+
+    monkeypatch.setattr(docs.Matcher, "find", spy)
+    search(work, "needle")
+    assert seen == [before]
+
+
+def test_snippets_are_at_most_200_characters_around_the_match(work: Path) -> None:
+    """The match is in the middle, with context on both sides, whatever the length of the line."""
+    (work / "t.txt").write_text("x " * 300 + "NEEDLE" + " y" * 300 + "\n", encoding="utf-8")
+    (hit,) = search(work, "needle")["hits"]
+    assert len(hit["snippet"]) <= 200
+    assert "NEEDLE" in hit["snippet"]
+    assert hit["snippet"].startswith("…")
+    assert hit["snippet"].endswith("…")
+    assert hit["snippet"].index("NEEDLE") in range(80, 120)
+
+
+def test_snippets_at_the_edges_and_for_long_matches() -> None:
+    """A match at the start has no leading ellipsis; a match longer than the limit is cut."""
+    text = "Start " + "." * 500
+    match = re.search("Start", text)
+    assert match is not None
+    start = docs.snippet(text, match)
+    assert start.startswith("Start ") and start.endswith("…") and len(start) <= 200
+    tail = "." * 500 + " End"
+    end_match = re.search("End", tail)
+    assert end_match is not None
+    end = docs.snippet(tail, end_match)
+    assert end.startswith("…") and end.endswith(" End") and len(end) <= 200
+    long = "b" * 500
+    long_match = re.search("b+", long)
+    assert long_match is not None
+    assert len(docs.snippet(long, long_match)) <= 200
+    short = "all of it"
+    short_match = re.search("of", short)
+    assert short_match is not None
+    assert docs.snippet(short, short_match) == "all of it"
+
+
+def test_max_hits_caps_the_answer_and_says_so(work: Path) -> None:
+    """One hit more than allowed is found, to be able to say there are more."""
+    (work / "t.txt").write_text("match\n" * 60, encoding="utf-8")
+    result = search(work, "match", max_hits=10)
+    assert len(result["hits"]) == 10
+    assert result["truncated"] is True
+    assert "max_hits" in result["hint"]
+    assert len(search(work, "match", max_hits=60)["hits"]) == 60
+    assert search(work, "match", max_hits=60)["truncated"] is False
+
+
+def test_max_hits_is_at_most_200_and_at_least_1(work: Path) -> None:
+    """Whatever the model asks for, the number is clamped."""
+    (work / "t.txt").write_text("match\n" * 300, encoding="utf-8")
+    assert len(search(work, "match", max_hits=5000)["hits"]) == 200
+    assert len(search(work, "match", max_hits=0)["hits"]) == 1
+
+
+def test_one_page_gives_a_few_hits_not_all(work: Path) -> None:
+    """A page that says the word thirty times does not use up the hits of the other files."""
+    (work / "a.txt").write_text("hit hit hit hit hit hit hit hit\n", encoding="utf-8")
+    (work / "b.txt").write_text("hit\n", encoding="utf-8")
+    result = search(work, "hit")
+    assert [(h["path"].rsplit("/", 1)[1]) for h in result["hits"]] == ["a.txt"] * docs.HITS_PER_UNIT + ["b.txt"]
+
+
+def test_empty_matches_are_not_hits(work: Path) -> None:
+    """A pattern that matches the empty string everywhere finds nothing."""
+    (work / "t.txt").write_text("abc\n", encoding="utf-8")
+    assert search(work, "x*", regex=True)["hits"] == []
+
+
+def test_the_hits_of_a_search_are_bounded_in_size_too(work: Path) -> None:
+    """Long paths and snippets cannot make an answer the executor refuses to read: hits stop at 3 x ``max_chars``."""
+    (work / ("d" * 150)).mkdir()
+    for n in range(40):
+        (work / ("d" * 150) / f"{'n' * 100}{n:02d}.txt").write_text(("x " * 150 + "needle") + "\n", encoding="utf-8")
+    result = RUNNERS["search_files"]({"query": "needle", "max_hits": 200}, context(work, max_chars=2000))
+    assert len(json.dumps(result["hits"])) <= 3 * 2000
+    assert 1 < len(result["hits"]) < 40
+    assert result["truncated"] is True
+    assert "fit in an answer" in result["hint"]
+    assert "raise max_hits" not in result["hint"]
+
+
+def test_files_that_cannot_be_searched_are_named_with_the_reason(work: Path) -> None:
+    """Encrypted, scanned and broken files are listed; other types are only counted."""
+    populate(work)
+    fx.make_pdf(work / "locked.pdf", ["harbour"], password="synthetic-password")
+    fx.make_pdf(work / "scan.pdf", ["harbour on page one", None, None])
+    fx.make_truncated(work / "review.docx", work / "cut.docx")
+    (work / "chart.png").write_bytes(b"\x89PNG")
+    (work / "mail.msg").write_bytes(b"x")
+    result = search(work, "harbour")
+    skipped = {s["path"].rsplit("/", 1)[1]: s["reason"] for s in result["skipped"]}
+    assert skipped == {
+        "locked.pdf": "the PDF is password-protected (encrypted)",
+        "scan.pdf": "no text on pages 2, 3",
+        "cut.docx": "the file is damaged or truncated, or is not what its extension says",
+    }
+    assert result["unsupported_files"] == 2
+    assert result["files_searched"] == 6
+    assert "harbour on page one" in [h["snippet"] for h in result["hits"]]
+
+
+def test_a_search_with_no_files_finds_nothing(work: Path) -> None:
+    """An empty chat is not an error."""
+    assert search(work, "anything") == {"hits": [], "truncated": False, "files_searched": 0, "unsupported_files": 0}
+
+
+def test_the_search_stops_opening_files_at_its_time_budget(work: Path) -> None:
+    """A search over many heavy files returns what it has, and says how many files it did not reach."""
+    for n in range(5):
+        (work / f"f{n}.txt").write_text("needle\n", encoding="utf-8")
+    result = search(work, "needle", budget_s=0)
+    assert result["truncated"] is True
+    assert "stopped after 0 s" in result["hint"]
+    assert "5 files were not searched" in result["hint"]
+
+
+def test_skipped_files_are_listed_up_to_a_limit(work: Path) -> None:
+    """Thirty broken files do not make a thirty-line answer."""
+    for n in range(30):
+        (work / f"broken{n:02d}.docx").write_bytes(b"not a zip")
+    result = search(work, "x")
+    assert len(result["skipped"]) == docs.SKIPPED_LISTED == 20
+    assert "10 more files could not be searched" in result["hint"]
+
+
+def test_results_never_hold_the_jobs_real_path(work: Path) -> None:
+    """Every path is virtual, in hits, skips and errors alike."""
+    populate(work)
+    fx.make_ole(work / "locked.docx")
+    result = search(work, "harbour")
+    assert str(work.parent.parent) not in json.dumps(result)
+    assert all(h["path"].startswith(f"/workspace/{CHAT}/") for h in result["hits"])
+
+
+# --- read_document ---------------------------------------------------------------------------------------------
+
+
+def test_read_document_answers_with_the_virtual_path_and_the_parts(work: Path) -> None:
+    """The answer is the reader's, with the path the model knows."""
+    fx.make_docx(work / "review.docx")
+    result = read_doc(work, "review.docx")
+    assert result["path"] == f"/workspace/{CHAT}/review.docx"
+    assert result["kind"] == "docx"
+    assert [p["label"] for p in result["parts"]] == [
+        "paragraph 1",
+        "paragraph 2",
+        "paragraph 3",
+        "table 1",
+        "paragraph 4",
+    ]
+    assert (result["total_parts"], result["pages_without_text"], result["truncated"]) == (5, [], False)
+    assert "next_part" not in result
+    assert "hint" not in result
+
+
+def test_a_file_in_a_folder_keeps_its_folder_in_the_path(work: Path) -> None:
+    """The virtual path of ``reports/q1.txt`` is below ``/workspace/<chat>/reports``."""
+    (work / "reports").mkdir()
+    (work / "reports" / "q1.txt").write_text("hello\n", encoding="utf-8")
+    assert read_doc(work, "reports/q1.txt")["path"] == f"/workspace/{CHAT}/reports/q1.txt"
+
+
+def test_a_pdf_with_a_scanned_page_carries_a_hint_about_ocr(work: Path) -> None:
+    """The page is listed, never returned as blank, and the model is told what to say."""
+    fx.make_pdf(work / "scan.pdf", ["text on page one", None])
+    result = read_doc(work, "scan.pdf")
+    assert [p["label"] for p in result["parts"]] == ["page 1"]
+    assert result["pages_without_text"] == [2]
+    assert "page 2" in result["hint"]
+    assert "OCR" in result["hint"]
+    assert "do not treat them as blank" in result["hint"]
+
+
+def test_a_deck_with_a_picture_slide_says_slides_not_pages(work: Path) -> None:
+    """The same report for slides, in the right word."""
+    from pptx import Presentation
+
+    deck = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    deck.slides.add_slide(deck.slide_layouts[5]).shapes.title.text = "Only this one"  # pyrefly: ignore
+    deck.save(str(work / "pictures.pptx"))
+    result = read_doc(work, "pictures.pptx")
+    assert result["pages_without_text"] == [1]
+    assert result["hint"].startswith("slide 1 hold no text")
+
+
+def test_a_long_list_of_empty_pages_is_shortened_in_the_hint(work: Path) -> None:
+    """Forty scanned pages are listed in the field, and summarised in the sentence."""
+    fx.make_pdf(work / "scan.pdf", [None] * 40 + ["finally text"])
+    result = read_doc(work, "scan.pdf")
+    assert len(result["pages_without_text"]) == 40
+    assert "and 20 more" in result["hint"]
+
+
+def test_paging_through_the_runner(work: Path) -> None:
+    """``next_part`` of one answer is ``part`` of the next."""
+    (work / "long.txt").write_text("\n".join(f"line number {n} " + "w" * 80 for n in range(1, 400)), encoding="utf-8")
+    first = read_doc(work, "long.txt", max_chars=4096)
+    assert first["truncated"] is True
+    second = read_doc(work, "long.txt", first["next_part"], max_chars=4096)
+    assert second["parts"][0]["label"].startswith(f"lines {first['next_part'].split()[1]}-")
+
+
+def test_the_answer_leaves_room_for_what_is_not_text(work: Path) -> None:
+    """The parts are budgeted below ``max_chars``, so the path, the hint and the rest fit too."""
+    fx.make_pdf(work / "scan.pdf", ["word " * 3000])
+    result = read_doc(work, "scan.pdf", max_chars=4096)
+    assert len(json.dumps(result, ensure_ascii=False).encode()) <= 4096
+
+
+@pytest.mark.parametrize(
+    ("make", "code", "text"),
+    [
+        (lambda w: (w / "mail.msg").write_bytes(b"x"), "unsupported_format", ".eml or PDF"),
+        (lambda w: (w / "pic.png").write_bytes(b"x"), "unsupported_format", "readable are PDF"),
+        (lambda w: fx.make_pdf(w / "locked.pdf", ["x"], password="synthetic-password"), "unreadable_file", "password"),
+        (lambda w: fx.make_ole(w / "locked.xlsx"), "unreadable_file", "password-protected"),
+    ],
+)
+def test_failures_are_one_key_with_a_code_and_a_message(work: Path, make: Any, code: str, text: str) -> None:
+    """The api turns ``code: message`` into the model's answer; the job reports the tool as failed."""
+    make(work)
+    name = next(p.name for p in work.iterdir() if p.is_file())
+    result = read_doc(work, name)
+    assert set(result) == {"error"}
+    assert result["error"].startswith(f"{code}: ")
+    assert text in result["error"]
+    assert str(work.parent.parent) not in result["error"]
+
+
+def test_a_missing_file_and_a_missing_part_are_errors(work: Path) -> None:
+    """The file may have been deleted since the api looked; a part may not exist."""
+    assert (
+        read_doc(work, "gone.docx")["error"]
+        == f"file_not_found: /workspace/{CHAT}/gone.docx is not in this conversation's workspace"
+    )
+    fx.make_pdf(work / "two.pdf", ["a", "b"])
+    result = read_doc(work, "two.pdf", "page 9")
+    assert result["error"] == "no_such_part: this document has 2 pages"
+    assert read_doc(work, "out/anything.txt")["error"].startswith("file_not_found: ")
+
+
+@pytest.mark.parametrize("path", ["../secret.txt", "/etc/passwd", "a//b.txt", ""])
+def test_a_path_that_is_not_inside_the_chat_folder_is_refused(work: Path, path: str) -> None:
+    """The api only sends names it got from the store; the runner does not trust that."""
+    with pytest.raises(ValueError):
+        read_doc(work, path)
+
+
+def test_the_zip_bomb_guard_uses_the_jobs_file_limit(work: Path) -> None:
+    """With a 1 MB file limit, 25 MB unpacked is refused through the runner as well."""
+    fx.make_zip_bomb(work / "bomb.docx", mb=25)
+    began = time.monotonic()
+    refused = read_doc(work, "bomb.docx", file_mb=1)
+    assert time.monotonic() - began < 5
+    assert refused["error"].startswith("unreadable_file: the file unpacks to more than 20 MB")
+    # Under a 2 MB limit the zip check lets it through; the XML parser's own text limit still stops it.
+    assert "unpacks to more than" not in read_doc(work, "bomb.docx", file_mb=2).get("error", "")
+
+
+# --- through the job entry point -------------------------------------------------------------------------------
+
+
+def run_job(work: Path, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Run a tool exactly as the supervisor does: a spec next to the working folder, in isolated mode."""
+    job = work.parent.parent
+    spec = job / "spec.json"
+    spec.write_text(json.dumps({"tool": tool, "args": args, "chat_id": CHAT, "max_chars": 16384, "file_mb": 50}))
+    done = subprocess.run(
+        [sys.executable, "-I", "-m", "workbench.executor.job", str(spec)],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads((job / "result.json").read_text())  # type: ignore[no-any-return]
+
+
+def test_read_document_runs_as_a_job(work: Path) -> None:
+    """The registered runner works in a fresh interpreter in isolated mode, with the real path nowhere in the answer."""
+    fx.make_docx(work / "review.docx")
+    result = run_job(work, "read_document", {"path": "review.docx", "part": "table 1"})
+    assert result["path"] == f"/workspace/{CHAT}/review.docx"
+    assert [p["label"] for p in result["parts"]] == ["table 1", "paragraph 4"]
+    assert str(work.parent.parent) not in json.dumps(result)
+
+
+def test_search_files_runs_as_a_job_and_a_failure_is_an_error_result(work: Path) -> None:
+    """A search finds its hit; an unsupported file read fails with the code the api maps."""
+    populate(work)
+    hits = run_job(work, "search_files", {"query": "harbour", "regex": False, "max_hits": 50, "budget_s": 30})["hits"]
+    assert len(hits) == 3
+    (work / "mail.msg").write_bytes(b"x")
+    failed = run_job(work, "read_document", {"path": "mail.msg", "part": None})
+    assert failed["error"].startswith("unsupported_format: ")
+    assert ".eml or PDF" in failed["error"]

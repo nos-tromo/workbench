@@ -1107,14 +1107,16 @@ def test_display_of_a_file_in_a_folder_gives_its_base_name(client: TestClient) -
 
 
 def test_list_files_tool_is_in_the_schema(app: FastAPI, client: TestClient) -> None:
-    """Exactly the two tools, each with an operationId set on its route, and every parameter typed."""
+    """Exactly the tools there are, each with an operationId set on its route, and every parameter typed."""
     doc = client.get("/openapi.json", headers=KEY_ONLY).json()
     assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == {
         "list_files",
         "display_file",
+        "read_document",
+        "search_files",
     }
     tools = [r for r in iter_route_contexts(app.routes) if TOOL_TAG in (r.tags or [])]
-    assert {r.operation_id for r in tools} == {"list_files", "display_file"}
+    assert {r.operation_id for r in tools} == {"list_files", "display_file", "read_document", "search_files"}
     assert doc["paths"]["/tools/list_files"]["post"]["operationId"] == "list_files"
     display = doc["paths"]["/files/display"]["get"]
     assert display["operationId"] == "display_file"

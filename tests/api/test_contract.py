@@ -142,7 +142,13 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/hidden", echo, methods=["POST"], tags=[TOOL_TAG], include_in_schema=False, operation_id="hidden_op"
     )
     doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert set(doc["paths"]) == {"/tools/list_files", DISPLAY_TOOL, "/tools/echo"}
+    assert set(doc["paths"]) == {
+        "/tools/list_files",
+        "/tools/read_document",
+        "/tools/search_files",
+        DISPLAY_TOOL,
+        "/tools/echo",
+    }
     assert doc["paths"]["/tools/echo"]["post"]["operationId"] == "echo_tool"
 
 

@@ -6,6 +6,7 @@ from fastapi import Depends, Request
 
 from workbench.api.audit import AuditLog
 from workbench.api.auth import require_principal
+from workbench.api.jobs import Busy, JobQueue
 from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.models import Principal
@@ -50,8 +51,27 @@ async def get_audit(request: Request) -> AuditLog:
     return audit
 
 
+async def get_jobs(request: Request) -> JobQueue:
+    """Return the job queue the application was created with.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The queue.
+
+    Raises:
+        Busy: The application has no queue, so no tool can run; answered as "busy, retry later".
+    """
+    jobs: JobQueue | None = request.app.state.jobs
+    if jobs is None:
+        raise Busy("executor_busy")
+    return jobs
+
+
 #: Route parameter types: the authenticated user and chat, and the collaborators the app was built with.
 PrincipalDep = Annotated[Principal, Depends(require_principal)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 StoreDep = Annotated[Store, Depends(get_store)]
 AuditDep = Annotated[AuditLog, Depends(get_audit)]
+JobsDep = Annotated[JobQueue, Depends(get_jobs)]
