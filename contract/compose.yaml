@@ -9,8 +9,9 @@
 ###
 ### Open WebUI runs without edge-guard, straight on the test's network, with the switches of its production
 ### environment that bear on the contract (open-webui-service docker/compose.yaml). It reaches workbench by its
-### alias, workbench-api. This stack pulls the Open WebUI image: a test for CI and a developer's machine, never for
-### the airgapped host.
+### alias, workbench-api. Its one model is stub-model (contract/stub_model.py, test-only), so a chat can run its own
+### tool calls. This stack pulls the Open WebUI image: a test for CI and a developer's machine, never for the
+### airgapped host.
 
 name: workbench-contract
 
@@ -71,8 +72,11 @@ services:
       FORWARD_USER_INFO_HEADER_JWT_SECRET: ${WORKBENCH_CONTRACT_JWT_SECRET:?make test-contract sets it}
       # As in production: every account after the first (the admin) is active at once.
       DEFAULT_USER_ROLE: user
-      # No model is needed, and nothing is fetched: no provider, no local model, no update check.
-      ENABLE_OPENAI_API: "false"
+      # One provider, as in production: an OpenAI-compatible endpoint, here the stub model. Nothing is fetched: no
+      # second provider, no local model, no update check.
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://stub-model:9000/v1
+      OPENAI_API_KEY: synthetic-stub-key-not-a-secret
       ENABLE_OLLAMA_API: "false"
       RAG_EMBEDDING_ENGINE: openai
       AUDIO_STT_ENGINE: openai
@@ -88,10 +92,41 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      stub-model:
+        condition: service_healthy
     healthcheck:
       # The image's own probe (/health), tried every 3 s while it starts so that `up --wait` returns soon after.
       start_period: 300s
       start_interval: 3s
+    restart: "no"
+
+  stub-model:
+    # Test-only: the stand-in model Open WebUI calls (contract/stub_model.py), standard library only, in the api's
+    # test image, so nothing is pulled. Hardened as the other services; on the test's network only, no port.
+    image: workbench-api:test
+    command: ["python", "/stub/stub_model.py"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m
+    volumes:
+      - ./stub_model.py:/stub/stub_model.py:ro
+    networks:
+      - workbench-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://localhost:9000/v1/models', timeout=4).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
     restart: "no"
 
 volumes:

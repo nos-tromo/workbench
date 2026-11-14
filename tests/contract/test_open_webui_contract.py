@@ -6,16 +6,18 @@ Open WebUI as its browser does, so every workbench path goes through Open WebUI'
 What Open WebUI passes on is read back where workbench shows it: ``/files/cwd`` names the chat ``X-Session-Id``
 carried, and workbench's audit events name ``X-User-Id`` as their actor and that chat as their folder.
 
-No model runs here, so the calls Open WebUI makes itself while a chat runs (the per-chat handshake and the model's
-tool calls) are not exercised; only the admin's verify call is.
+One chat also runs for real, against the stack's stub model (``contract/stub_model.py``): Open WebUI then calls
+workbench itself, server side, to load the tools, for the per-chat handshake and for the model's tool call. That call
+is seen where workbench records it, in its audit events; what Open WebUI gave the model is seen in the stub's log.
 """
 
 import json
 import os
 import secrets
 import subprocess
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -47,9 +49,23 @@ TERMINAL_PATHS: Final = (
     "/files/read",
     "/files/display",
     "/openapi.json",
+    "/system",
     "/tools/list_files",
     "/tools/read_document",
 )
+
+#: The paths a chat makes Open WebUI call on workbench itself, server side, in order: loading the tools
+#: (``/openapi.json``, key only; ``/api/config``, then ``/system`` for the prompt), the per-chat handshake
+#: (``/files/cwd``, then ``/files/read`` of ``<home>/AGENTS.md``), and the model's tool call. The chat test pins
+#: ``/openapi.json`` (the model is offered the nine tools), ``/api/config`` and ``/system`` (workbench's prompt reaches
+#: the model) and ``/tools/read_document`` (its audit event, its answer back to the model). The handshake leaves no
+#: trace it can see: the cwd only ever describes a ``run_command`` tool workbench has none of, and workbench answers
+#: 404 for ``<home>/AGENTS.md`` (files live in chat folders), so those two stay unpinned.
+CHAT_PATHS: Final = ("/openapi.json", "/api/config", "/system", "/files/cwd", "/files/read", "/tools/read_document")
+
+#: The stack's one model (contract/stub_model.py) and the text it answers with once a tool has answered.
+STUB_MODEL: Final = "stub-model"
+STUB_ANSWER: Final = "The stub model read the file."
 
 #: The tools of version 1, by ``operationId``: exactly what the model is offered.
 TOOLS: Final = {
@@ -117,6 +133,20 @@ def workbench_events() -> list[dict[str, Any]]:
     """Read workbench's audit events so far: the JSON lines of the api container's standard output."""
     lines = docker("logs", container_of("api")).splitlines()
     return [event for line in lines if line.startswith("{") and "operation" in (event := json.loads(line))]
+
+
+def stub_requests(chat: str) -> list[dict[str, Any]]:
+    """Read what Open WebUI sent the stub model for one chat: one JSON line per request, in order."""
+    lines = docker("logs", container_of("stub-model")).splitlines()
+    return [request for line in lines if line.startswith("{") and (request := json.loads(line))["chat"] == chat]
+
+
+def eventually(read: Callable[[], list[Any]], count: int, seconds: float = 30.0) -> list[Any]:
+    """Read again until ``read`` finds at least ``count`` items, or the time is up; then the last reading."""
+    deadline = time.monotonic() + seconds
+    while len(found := read()) < count and time.monotonic() < deadline:
+        time.sleep(0.5)
+    return found
 
 
 @dataclass(frozen=True)
@@ -398,3 +428,63 @@ def test_open_webui_audit_skips_the_terminal_proxy(admin: Account, chat: str) ->
     uris = [str(record["request_uri"]) for record in records]
     assert any(uri.endswith("/api/v1/auths/") for uri in uris), uris[-5:]
     assert [uri for uri in uris if name in uri or "/terminals" in uri] == []
+
+
+# --- a chat's own tool call ---------------------------------------------------------------------------------------
+
+
+def test_a_chats_own_tool_call(admin: Account) -> None:
+    """A saved chat with the workbench terminal and native function calling, as the browser starts one.
+
+    The stub model asks for ``read_document`` on a file of the chat; Open WebUI makes that call on workbench itself.
+    workbench records exactly that tool event, its actor the account's id and its folder the saved chat (``X-User-Id``
+    and ``X-Session-Id`` on the server-side call). The model was offered the nine tools (``/openapi.json``) and
+    workbench's prompt (``/api/config``, ``/system``), and got the tool's answer back. :data:`CHAT_PATHS` says what
+    stays unpinned.
+    """
+    new: dict[str, Any] = {
+        "title": "Synthetic chat",
+        "models": [STUB_MODEL],
+        "messages": [],
+        "history": {"messages": {}},
+    }
+    made = admin.client.post("/api/v1/chats/new", json={"chat": new})
+    assert made.status_code == 200, made.text
+    chat = made.json()["id"]
+    path = admin.upload(chat, "quarterly-figures.csv", CSV).json()["path"]
+    (upload,) = [
+        e for e in workbench_events() if e["operation"] == "file.upload" and e["target"]["container"] == f"chat:{chat}"
+    ]
+    prompt = admin.terminal("GET", "/system").json()["prompt"]
+    body = {
+        "model": STUB_MODEL,
+        "messages": [{"role": "user", "content": f"What is in {path}?"}],
+        "chat_id": chat,
+        "id": str(uuid.uuid4()),
+        "terminal_id": TERMINAL,
+        "stream": True,
+        "params": {"function_calling": "native"},
+    }
+    with admin.client.stream("POST", "/api/chat/completions", json=body) as r:
+        assert r.status_code == 200, r.read()
+        r.read()
+
+    def tool_events() -> list[dict[str, Any]]:
+        return [
+            e
+            for e in workbench_events()
+            if e["operation"].startswith("tool.") and e.get("target", {}).get("container") == f"chat:{chat}"
+        ]
+
+    (event,) = eventually(tool_events, 1)
+    assert event["operation"] == "tool.read_document"
+    assert event["actor"] == {"user": admin.id, "via": "service"}
+    assert event["target"]["container"] == f"chat:{chat}"
+    assert event["target"]["ids"] == upload["target"]["ids"]
+    asked, answered = eventually(lambda: stub_requests(chat), 2)[:2]
+    assert set(asked["tools"]) == TOOLS
+    assert prompt.strip() in asked["system"]
+    assert asked["tool_answers"] == []
+    (tool_answer,) = answered["tool_answers"]
+    assert "Dredging" in tool_answer
+    assert len(stub_requests(chat)) == 2

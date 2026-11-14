@@ -299,12 +299,35 @@ def test_the_contract_stack_keeps_nothing_of_a_developers_or_the_test_stacks() -
     assert open_webui["networks"] == ["workbench-net"]
 
 
+def test_the_contract_stacks_stub_model_is_hardened_and_publishes_nothing() -> None:
+    """The test-only model: the api's test image, the script read-only, hardened as the services are, no port."""
+    stub = contract_stack()["services"]["stub-model"]
+    assert stub["image"] == "workbench-api:test"
+    assert "build" not in stub and "ports" not in stub
+    assert stub["volumes"] == ["./stub_model.py:/stub/stub_model.py:ro"]
+    assert stub["networks"] == ["workbench-net"]
+    assert stub["read_only"] is True
+    assert stub["security_opt"] == ["no-new-privileges:true"]
+    assert stub["cap_drop"] == ["ALL"]
+    assert "cap_add" not in stub and "user" not in stub  # the image's own uid, 10001
+    assert (ROOT / "contract" / "stub_model.py").is_file()
+
+
 def test_the_contract_runs_open_webui_as_production_does() -> None:
-    """The image open-webui-service deploys, its switches, one bearer connection to workbench-api, Dependabot's."""
+    """The image open-webui-service deploys, its switches, one bearer connection to workbench-api, Dependabot's.
+
+    Its one provider is an OpenAI-compatible endpoint, as in production, here the stub model; Ollama stays off.
+    """
     open_webui = contract_stack()["services"]["open-webui"]
     assert open_webui["image"] == OPEN_WEBUI_IMAGE
     env = open_webui["environment"]
     assert {key: env.get(key) for key in CONTRACT_SWITCHES} == CONTRACT_SWITCHES
+    assert (env["ENABLE_OPENAI_API"], env["OPENAI_API_BASE_URL"], env["ENABLE_OLLAMA_API"]) == (
+        "true",
+        "http://stub-model:9000/v1",
+        "false",
+    )
+    assert open_webui["depends_on"]["stub-model"] == {"condition": "service_healthy"}
     key = "${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}"
     (connection,) = json.loads(env["TERMINAL_SERVER_CONNECTIONS"].replace(key, "synthetic-key"))
     assert (connection["id"], connection["url"], connection["auth_type"]) == (
