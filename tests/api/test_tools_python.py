@@ -7,11 +7,12 @@ model is told when the job could not finish.
 """
 
 import asyncio
+import contextlib
 import dataclasses
+import inspect
 import io
 import itertools
 import json
-import logging
 from collections.abc import Callable, Coroutine, Sequence
 from typing import Any, override
 
@@ -20,12 +21,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from tests.api.test_files import CHAT, ME, AuditLines, H, put, tick
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue
+from workbench.api.jobs import JobQueue, Keeper
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.openapi import TOOL_TAG
@@ -119,7 +120,7 @@ def test_every_file_of_the_chat_goes_to_the_job_newest_first(
     put(store, "new.docx")
     put(store, "elsewhere.txt", directory="/workspace/chat-2")
     theirs = Principal("open-webui", "user-b", "chat-1")
-    store.add_upload(theirs, CHAT, "theirs.txt", io.BytesIO(b"x"), max_bytes=10, quota_bytes=100)
+    store.add_upload(theirs, CHAT, "theirs.txt", io.BytesIO(b"x"), max_bytes=10, quota_bytes=100, record=unrecorded)
     assert run(client, "print('hello')").status_code == 200
     (req,) = fake_executor.requests
     assert req.tool == "run_python"
@@ -341,31 +342,71 @@ def test_outputs_of_an_answer_that_cannot_be_read_are_removed_and_the_run_is_an_
     assert (event["outcome"], event["target"]["ids"], event["criteria"]["outputs"]) == ("error", [a.id], 0)
 
 
-def test_an_output_that_cannot_be_removed_is_logged_and_named_by_the_event(
+def test_an_output_of_an_answer_that_cannot_be_read_never_becomes_a_file(
     client: TestClient,
     store: Store,
     fake_executor: Scripted,
     audit_lines: AuditLines,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A file that stays although it should go is never unknown: the log says so, by error type; the event names it."""
+    """The run is recorded first, as an error that keeps no file, so its output is never moved into the chat."""
     fake_executor.files = {"r.xlsx": b"PK"}
     fake_executor.payload = {"stdout": 1}
-
-    def refuse(_record: Any) -> None:
-        raise OSError("synthetic: read-only file system")
-
-    monkeypatch.setattr(store, "remove", refuse)
-    with caplog.at_level(logging.WARNING):
-        r = run(client)
-    assert r.status_code == 500
-    (left,) = [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
+    moved: list[str] = []
+    monkeypatch.setattr(store, "register_output", lambda *args, **_: moved.append(args[2]))
+    r = run(client)
+    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
+    assert moved == []
     (event,) = events(audit_lines)
-    assert (event["outcome"], event["target"]["ids"], event["criteria"]["outputs"]) == ("error", [left.id], 1)
-    assert "OSError" in caplog.text
-    assert "r.xlsx" not in caplog.text
-    assert "read-only" not in caplog.text
+    assert (event["outcome"], event["target"].get("ids"), event["criteria"]["outputs"]) == ("error", None, 0)
+
+
+def test_the_run_is_recorded_before_its_outputs_are_files_and_names_them(
+    client: TestClient,
+    store: Store,
+    fake_executor: Scripted,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the event is written, no output of the run is a file of the chat yet; then each is, by the id it names."""
+    fake_executor.files = {"r.xlsx": b"PK", "chart.png": b"png"}
+    seen: list[list[str]] = []
+    write = audit_stream.write
+
+    def look(text: str, /) -> int:
+        if '"tool.run_python"' in text:
+            seen.append([rec.name for rec in store.files_in_chat(ME)])
+        return write(text)
+
+    monkeypatch.setattr(audit_stream, "write", look)
+    r = run(client)
+    assert r.status_code == 200
+    assert seen == [[]]
+    (event,) = [json.loads(line) for line in audit_stream.getvalue().splitlines() if "tool.run_python" in line]
+    assert sorted(event["target"]["ids"]) == sorted(rec.id for rec in store.files_in_chat(ME))
+
+
+def test_an_output_over_the_users_quota_is_not_kept_and_is_recorded_again(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, fake_executor: Scripted
+) -> None:
+    """Outputs count against the workspace quota: one that does not fit is refused, named again by an error event."""
+    small = dataclasses.replace(settings, workspace_max_mb=1)
+    put(store, "q.csv", b"x" * (1024 * 1024 - 10))
+    fake_executor.files = {"fits.txt": b"12345", "too-big.bin": b"y" * 100}
+    app = create_app(
+        small, store=store, audit=audit, jobs=JobQueue(small, fake_executor, store, Metrics(small.data_dir))
+    )
+    with TestClient(app) as tight:
+        r = run(tight)
+    assert r.status_code == 200
+    assert r.json()["files"] == [f"{CHAT}/fits.txt"]
+    assert "1 output could not be kept (quota)" in r.json()["hint"]
+    first, again = events(audit_lines)
+    kept = {rec.name: rec.id for rec in store.files_in_chat(ME)}
+    assert (first["outcome"], first["criteria"]["outputs"]) == ("ok", 2)
+    assert kept["fits.txt"] in first["target"]["ids"]
+    (lost,) = set(first["target"]["ids"]) - set(kept.values())
+    assert (again["outcome"], again["target"]["ids"], again["criteria"]["outputs"]) == ("error", [lost], 1)
 
 
 class CancelledOnReturn(JobQueue):
@@ -373,10 +414,15 @@ class CancelledOnReturn(JobQueue):
 
     @override
     async def submit(
-        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str]
+        self,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        input_files: Sequence[str],
+        keeper: Keeper | None = None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
-        answer = await super().submit(p, tool, args, input_files)
+        answer = await super().submit(p, tool, args, input_files, keeper)
         caller = asyncio.current_task()
         assert caller is not None
         caller.cancel()
@@ -410,7 +456,7 @@ MAKERS: dict[str, tuple[Callable[..., Coroutine[Any, Any, Any]], BaseModel, dict
 def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
     settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, tool: str
 ) -> None:
-    """The job's file is in the workspace once ``submit`` returns; the step to its record runs to its end regardless."""
+    """The job's file is recorded before it is in the workspace: a cancellation as ``submit`` returns finds it named."""
     route, body, payload = MAKERS[tool]
     put(store, "form.docx", b"PK")
     executor = Scripted(settings.data_dir)
@@ -420,10 +466,11 @@ def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
     audit.start({})
 
     async def call() -> None:
-        with pytest.raises(asyncio.CancelledError):
-            await route(body=body, p=ME, settings=settings, store=store, audit=audit, jobs=queue)
+        given = {"body": body, "p": ME, "settings": settings, "store": store, "audit": audit, "jobs": queue}
+        await route(**{name: given[name] for name in inspect.signature(route).parameters})
 
-    asyncio.run(call())
+    with contextlib.suppress(asyncio.CancelledError):
+        asyncio.run(call())
     made = [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
     named = {
         i for event in audit_lines() if event["operation"] == f"tool.{tool}" for i in event["target"].get("ids", [])
@@ -531,3 +578,29 @@ def test_the_cap_counts_bytes_of_the_json_not_characters(small: TestClient, fake
     assert r.status_code == 200
     assert len(r.content) <= 1024
     assert r.json()["truncated"] is True
+
+
+# --- refusals are recorded (R72) ---------------------------------------------------------------------------------
+
+
+def test_a_run_python_refusal_is_recorded_as_an_error_by_its_code_alone(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """A runner refusal of ``run_python`` is an ``error`` event with its code, never its text."""
+    a = put(store, "q.csv")
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "read_timeout: the work on 'salaries-of-user-b.csv' ran past its time limit"}
+    assert run(client).status_code == 422
+    (event,) = events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [a.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "read_timeout"}
+    assert "salaries" not in json.dumps(audit_lines())
+
+
+def test_a_run_python_refusal_whose_record_cannot_be_written_never_reaches_the_model(
+    client: TestClient, fake_executor: Scripted, broken_audit: None
+) -> None:
+    """The audit failure is the answer, never the refusal's text."""
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "read_timeout: the work on 'salaries-of-user-b.csv' ran past its time limit"}
+    assert run(client).json() == {"detail": "audit unavailable"}

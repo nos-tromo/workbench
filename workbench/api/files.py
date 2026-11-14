@@ -5,16 +5,18 @@ delete, mkdir and move, all hidden from the tool document. Only ``GET /files/dis
 it, as the ``display_file`` tool.
 
 Every read or change of content is one audit event, by file id and never by name, and it is
-written *before* the content leaves or the file goes: an action that cannot be recorded does
-not happen (the only exception is an upload, whose file id exists only once it is stored, so
-an upload whose record fails is taken back out). Listing, ``mkdir`` and ``move`` touch no
-content and are not recorded (spec section 7).
+written *before* the content leaves, the file becomes visible or the file goes: an action that
+cannot be recorded does not happen. An upload is recorded by the id it was given before its first
+byte was written, before the rename makes it a file of the chat. An upload that could not be
+stored after its record, and a delete that failed after its record, are recorded again as
+``error``. Listing, ``mkdir`` and ``move`` touch no content and are not recorded (spec section 7).
 
 An error answers short fixed text from :mod:`workbench.api.errors`; no answer here carries a
 name, a path or a user id the caller did not just send.
 """
 
 import dataclasses
+import logging
 import os
 import posixpath
 from collections.abc import Iterator
@@ -34,7 +36,8 @@ from workbench.api.routing import EncodableRoute
 from workbench.api.store import NotFound, Store
 from workbench.config import Settings
 from workbench.models import VIRTUAL_ROOT, FileRecord, Principal
-from workbench.utils.audit_event import AuditWriteError
+
+_log = logging.getLogger(__name__)
 
 #: The browser's routes; none of them is a tool.
 router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
@@ -190,7 +193,9 @@ def _disposition(rec: FileRecord) -> str:
 def _save_upload(
     store: Store, audit: AuditLog, settings: Settings, p: Principal, directory: str, upload: UploadFile
 ) -> FileRecord:
-    """Store an upload and record it; if it cannot be recorded, take it back out.
+    """Store an upload, recording it by its id before it becomes a file of the chat.
+
+    The event's container is the chat folder the file goes to, never the chat of the request.
 
     Args:
         store: The file store.
@@ -204,22 +209,21 @@ def _save_upload(
         The new record.
 
     Raises:
-        AuditWriteError: If the event cannot be written; the file is removed again.
+        AuditWriteError: If the event cannot be written; nothing is stored.
     """
-    rec = store.add_upload(
+
+    def record(chat_id: str, file_id: str, outcome: str) -> None:
+        audit.record("upload", dataclasses.replace(p, chat_id=chat_id), file_ids=[file_id], outcome=outcome)
+
+    return store.add_upload(
         p,
         directory,
         upload.filename or "",
         upload.file,
         max_bytes=settings.upload_max_mb * _MIB,
         quota_bytes=settings.workspace_max_mb * _MIB,
+        record=record,
     )
-    try:
-        audit.record("upload", _in_folder_of(p, rec), file_ids=[rec.id])
-    except AuditWriteError:
-        store.remove(rec)
-        raise
-    return rec
 
 
 @router.get("/files/list")
@@ -334,7 +338,7 @@ def read_file(path: str, p: PrincipalDep, settings: SettingsDep, store: StoreDep
 
 @router.delete("/files/delete")
 def delete_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> dict[str, str]:
-    """Delete a file, after recording it.
+    """Delete a file, after recording it; a delete that then fails is recorded again as ``error``.
 
     Args:
         path: The file's virtual path.
@@ -344,10 +348,22 @@ def delete_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) ->
 
     Returns:
         The path that was deleted.
+
+    Raises:
+        Exception: What the removal raised; the file stays, and the error event names it. If that event cannot be
+            written either, the removal's error is still what is raised, and the failed record is logged by its type.
     """
     rec = store.get(p, path)
-    audit.record("delete", _in_folder_of(p, rec), file_ids=[rec.id])
-    store.remove(rec)  # by id, so the file recorded is the file removed
+    where = _in_folder_of(p, rec)
+    audit.record("delete", where, file_ids=[rec.id])
+    try:
+        store.remove(rec)  # by id, so the file recorded is the file removed
+    except Exception:
+        try:
+            audit.record("delete", where, file_ids=[rec.id], outcome="error")
+        except Exception as exc:  # the removal's error is the answer
+            _log.warning("could not record a delete that failed (%s)", type(exc).__name__)
+        raise
     return {"path": rec.virtual_path}
 
 

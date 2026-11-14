@@ -21,6 +21,10 @@ from workbench.utils.audit_event import AuditEmitter
 KEY = "k" * 32
 
 
+def unrecorded(*_: object) -> None:
+    """Record nothing: for files a test puts in the store directly, where no event is under test."""
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     """Settings for the api with the synthetic caller key, on a throwaway data volume."""

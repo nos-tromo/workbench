@@ -9,7 +9,13 @@ directories. Nothing here follows a symlink.
 An upload is streamed to ``<file id>.part`` in its folder and then renamed into
 place, so a reader never sees half a file and a failed upload leaves nothing.
 Names, quota and the row are settled under one lock, so concurrent uploads of one
-name each get their own file.
+name each get their own file. The file id is chosen before any byte is written, so
+the upload is recorded by it before the rename makes the file visible: no file is
+ever stored without its record. A job's output is registered under an id the
+caller chose and recorded before it called, for the same reason.
+
+The store never deletes a file of its own accord; :meth:`Store.remove` is called
+only once its deletion is recorded.
 """
 
 import dataclasses
@@ -46,12 +52,29 @@ _FULL = frozenset({errno.ENOSPC, errno.EDQUOT})
 _BUSY_TIMEOUT_S = 30
 _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 
+#: A file id: 32 lowercase hex digits (``uuid4().hex``).
+_FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
+
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
+
+
+def new_file_id() -> str:
+    """Choose the id of a new file, before anything of it is stored, so that its event can name it first.
+
+    Returns:
+        32 lowercase hex digits.
+    """
+    return uuid.uuid4().hex
+
 
 #: Records orphans of one chat folder: called with the chat id, the file ids their names carry, how many there are, and
 #: the outcome, ``ok`` before they go or ``error`` for those that could not be removed.
 OrphanRecord = Callable[[str, Sequence[str], int, str], object]
+
+#: Records an upload: called with the chat id of its folder, its file id and the outcome, ``ok`` before the file
+#: becomes visible or ``error`` when it could not be stored after all. It raises when the record cannot be written.
+UploadRecord = Callable[[str, str, str], object]
 
 _OFFICE_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -591,11 +614,19 @@ class Store:
         *,
         max_bytes: int,
         quota_bytes: int,
+        record: UploadRecord,
     ) -> FileRecord:
-        """Stream an upload into a chat folder, or a folder inside one.
+        """Stream an upload into a chat folder, or a folder inside one, recording it before it becomes visible.
 
         A chat folder is made on first use; a folder below it must exist (``mkdir``).
         On a name clash the new file gets ``name (1).ext``, never replacing the old one.
+
+        The id is chosen first and names the ``.part`` file the bytes go to. Once the quota and the name are settled,
+        ``record`` writes the upload's event by that id, and only then is the file renamed into place and its row
+        committed. A record that cannot be written leaves nothing stored. A rename or commit that fails after the record
+        takes the file back out and records the upload again as ``error``; the store's error is what is raised, even if
+        that second record fails too (it is logged by its type). A process that ends between the two leaves a recorded
+        ``<id>.part``, which retention removes and records by that id.
 
         Args:
             p: The caller and user; the chat comes from ``directory``.
@@ -604,6 +635,7 @@ class Store:
             src: The bytes; read in chunks until empty.
             max_bytes: Largest file allowed.
             quota_bytes: Most bytes the user may hold in all chats together.
+            record: Writes the upload's event (:data:`UploadRecord`), under the store's lock.
 
         Returns:
             The new record.
@@ -615,6 +647,7 @@ class Store:
             TooLarge: If the file is over ``max_bytes``.
             QuotaExceeded: If it would take the user over ``quota_bytes``.
             StorageFull: If the volume is full.
+            Exception: Whatever ``record`` raises when the event cannot be written; nothing is stored.
         """
         _check_new_name(check_filename(filename))
         folder, segments = self._locate(p, directory)
@@ -632,8 +665,7 @@ class Store:
                 if self.usage(p) + size > quota_bytes:
                     raise QuotaExceeded("workspace quota exceeded")
                 name = self._free_name(p, folder, segments[1:], segments[0], filename)
-                final = folder / name
-                os.replace(part, final)
+                record(segments[0], file_id, "ok")
                 rec = FileRecord(
                     id=file_id,
                     caller=p.caller,
@@ -646,15 +678,41 @@ class Store:
                     created_at=self._clock(),
                     job_id=None,
                 )
-                try:
-                    self._insert(rec)
-                except BaseException:
-                    _unlink(final)
-                    raise
+                self._place(part, folder / name, rec, again=lambda: record(segments[0], file_id, "error"))
         except BaseException:
             _unlink(part)
             raise
         return rec
+
+    def _place(self, source: Path, final: Path, rec: FileRecord, *, again: Callable[[], object] | None = None) -> None:
+        """Rename a recorded file into place and commit its row; on a failure take it back out and record that.
+
+        Call it under the store's lock, once the file's event is written.
+
+        Args:
+            source: The file, already complete.
+            final: Where it goes; a free name.
+            rec: Its row.
+            again: Records the file again as ``error``; a failure of it is logged by its type and never raised. ``None``
+                when the caller records the failure itself.
+
+        Raises:
+            Exception: Whatever the rename or the commit raised; the file is not left at ``final``.
+        """
+        try:
+            os.replace(source, final)
+            try:
+                self._insert(rec)
+            except BaseException:
+                _unlink(final)
+                raise
+        except BaseException:
+            if again is not None:
+                try:
+                    again()
+                except Exception as exc:  # the store's error is the answer; this one is only logged
+                    _log.warning("could not record a file that was not stored (%s)", type(exc).__name__)
+            raise
 
     def _write_part(self, fd: int, part: Path, src: BinaryIO, *, max_bytes: int, room: int) -> int:
         """Stream ``src`` into a new private file, stopping at the limits; the file goes on any failure.
@@ -693,18 +751,26 @@ class Store:
             raise
         return size
 
-    def register_output(self, p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
-        """Move a file a job produced into the principal's chat folder.
+    def register_output(
+        self, p: Principal, staged: Path, name: str, job_id: str, *, file_id: str, quota_bytes: int
+    ) -> FileRecord:
+        """Move a file a job produced into the principal's chat folder, under an id its event already names.
 
         ``staged`` must be on the same filesystem as the workspaces (the staging folder of
-        the data volume is). Outputs are not counted against the quota when they are made, but
-        they use up the room of later uploads. A name clash gets ``name (1).ext``.
+        the data volume is). Outputs count against the user's quota like uploads: one that would
+        take the user past it is refused, under the same lock as the name and the row. A name
+        clash gets ``name (1).ext``.
+
+        The caller records the output by ``file_id`` before it calls, so that the file is never visible without its
+        event, and records it again as ``error`` if this raises.
 
         Args:
             p: The caller, user and chat that ran the job.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
             name: The name for the file in the chat folder.
             job_id: The job that made it.
+            file_id: The file's id, chosen and recorded by the caller: 32 lowercase hex digits.
+            quota_bytes: Most bytes the user may hold in all chats together.
 
         Returns:
             The new record.
@@ -712,6 +778,7 @@ class Store:
         Raises:
             PathError: If the name is invalid, or ``staged`` is not a regular file.
             NotFound: If ``staged`` does not exist.
+            QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
         _check_new_name(check_filename(name))
@@ -730,13 +797,15 @@ class Store:
             os.fchmod(fd, _PRIVATE_FILE)
         finally:
             os.close(fd)
+        if _FILE_ID.fullmatch(file_id) is None:
+            raise ValueError("a file id is 32 lowercase hex digits")
         with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
+            if self.usage(p) + st.st_size > quota_bytes:
+                raise QuotaExceeded("workspace quota exceeded")
             folder = self._ws.chat_dir(p)
             final_name = self._free_name(p, folder, [], p.chat_id, name)
-            final = folder / final_name
-            os.replace(staged, final)
             rec = FileRecord(
-                id=uuid.uuid4().hex,
+                id=file_id,
                 caller=p.caller,
                 user_id=p.user_id,
                 chat_id=p.chat_id,
@@ -747,11 +816,7 @@ class Store:
                 created_at=self._clock(),
                 job_id=job_id,
             )
-            try:
-                self._insert(rec)
-            except BaseException:
-                _unlink(final)
-                raise
+            self._place(staged, folder / final_name, rec)
         return rec
 
     def list_dir(self, p: Principal, directory: str) -> list[DirEntry]:
@@ -872,27 +937,6 @@ class Store:
             row = db.execute("SELECT COUNT(*) FROM files").fetchone()
         return int(row[0])
 
-    def delete(self, p: Principal, path: str) -> FileRecord:
-        """Delete a file of the user's: its bytes and its record.
-
-        Args:
-            p: The caller and user.
-            path: ``/workspace/<chat-id>/<name>``.
-
-        Returns:
-            The record that was deleted.
-
-        Raises:
-            PathError: If the path is outside the user's root, or is ``/workspace`` or a chat folder.
-            NotFound: If the user has no such file.
-        """
-        real, chat_id, name = self._file_target(p, path)
-        with self._lock:
-            rec = self._row(p, chat_id, name)
-            _unlink(real)
-            self._delete_row(rec.id)
-        return rec
-
     def mkdir(self, p: Principal, path: str) -> str:
         """Make a folder, and its parents; one that exists is left as it is.
 
@@ -1000,6 +1044,9 @@ class Store:
 
     def remove(self, record: FileRecord) -> None:
         """Delete a file's bytes and its record; already gone is fine.
+
+        It records nothing: call it only once the deletion is recorded (the user's delete, retention), or for a file
+        whose own call's event covers its removal within the same request.
 
         The file is found by ``record.id``, at the path its row has now: a record that
         went stale (the file was moved or deleted meanwhile) never reaches a file that

@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute, iter_route_contexts
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue, Reason, RequestTooLarge
 from workbench.api.main import app_factory, create_app
@@ -134,6 +134,7 @@ def test_files_total_is_counted_when_the_app_starts(settings: Settings, store: S
             io.BytesIO(b"x"),
             max_bytes=100,
             quota_bytes=1000,
+            record=unrecorded,
         )
     with TestClient(create_app(settings, store=store, audit=audit)) as client:
         assert "workbench_files_total 2.0" in client.get("/metrics").text

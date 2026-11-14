@@ -10,7 +10,6 @@ import csv
 import dataclasses
 import io
 import json
-import logging
 from typing import Any
 
 import openpyxl
@@ -367,57 +366,56 @@ def test_a_lone_surrogate_in_a_value_is_written_as_a_replacement_character(clien
 # --- the job's answer ---------------------------------------------------------------------------------------------
 
 
-def test_an_ok_answer_that_cannot_be_read_keeps_no_output_and_records_nothing(
+def test_an_ok_answer_that_cannot_be_read_keeps_no_output_and_is_recorded_as_an_error(
     client: TestClient, store: Store, fake_executor: Local, audit_lines: AuditLines
 ) -> None:
-    """The model is told the tool failed and never learns of the file, so it does not stay."""
+    """The model is told the tool failed and never learns of the file, so it never becomes one; the job is an error."""
     fake_executor.files = {"quarterly-figures.xlsx": b"PK"}
     fake_executor.payload = {"hint": 1}
     r = table(client)
     assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
     assert outputs(store) == []
-    assert events(audit_lines, "write_table") == []
+    (event,) = events(audit_lines, "write_table")
+    assert (event["outcome"], event["target"].get("ids"), event["criteria"]["outputs"]) == ("error", None, 0)
 
 
 def test_an_answer_whose_file_was_not_kept_says_so(
     client: TestClient, fake_executor: Local, audit_lines: AuditLines
 ) -> None:
-    """An ok answer with no file kept is not a success, and nothing is recorded."""
+    """An ok answer with no file kept is not a success: the model is told why, and the job is an error."""
     fake_executor.payload = {"hint": None}
     fake_executor.message = "dropped 1 output: not the job's own file"
     r = document(client)
     assert r.status_code == 500
     assert "dropped 1 output" in r.json()["detail"]
-    assert events(audit_lines, "write_document") == []
+    (event,) = events(audit_lines, "write_document")
+    assert (event["outcome"], event["criteria"]) == ("error", {"caller": "open-webui", "outputs": 0})
 
 
 @pytest.mark.parametrize("tool", ["write_table", "write_document"])
-def test_an_output_of_an_unreadable_answer_that_cannot_be_removed_is_named_by_an_event(
+def test_the_new_file_is_recorded_before_it_is_a_file_of_the_chat(
     client: TestClient,
     store: Store,
-    fake_executor: Local,
+    audit_stream: io.StringIO,
     audit_lines: AuditLines,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
     tool: str,
 ) -> None:
-    """A file that stays although it should go is never unknown: the log names the error, an error event the file."""
-    fake_executor.files = {"quarterly-figures.xlsx": b"PK"}
-    fake_executor.payload = {"hint": 1}
+    """When the ``collect`` is written, the chat holds no file yet; the file it names is the one kept."""
+    seen: list[list[str]] = []
+    write = audit_stream.write
 
-    def refuse(_record: Any) -> None:
-        raise OSError("synthetic: read-only file system")
+    def look(text: str, /) -> int:
+        if f'"tool.{tool}"' in text:
+            seen.append([rec.name for rec in store.files_in_chat(ME)])
+        return write(text)
 
-    monkeypatch.setattr(store, "remove", refuse)
-    with caplog.at_level(logging.WARNING):
-        r = table(client) if tool == "write_table" else document(client)
-    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
-    (left,) = outputs(store)
+    monkeypatch.setattr(audit_stream, "write", look)
+    r = table(client) if tool == "write_table" else document(client)
+    assert r.status_code == 200
+    assert seen == [[]]
     (event,) = events(audit_lines, tool)
-    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("collect", "error", [left.id])
-    assert event["criteria"] == {"caller": "open-webui", "outputs": 1}
-    assert "OSError" in caplog.text
-    assert "quarterly-figures" not in caplog.text
+    assert event["target"]["ids"] == [rec.id for rec in outputs(store)]
 
 
 def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake_executor: Local) -> None:
@@ -554,3 +552,36 @@ def test_a_422_with_20_errors_counts_none_more(
     assert body.get("more_errors", None) == more
     assert ("more_errors" in body) is (more is not None)
     assert fake_executor.requests == []
+
+
+# --- refusals are recorded (R72) ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool", ["write_table", "write_document"])
+def test_a_write_refusal_is_recorded_as_an_error_by_its_code_alone(
+    client: TestClient, store: Store, fake_executor: Local, audit_lines: AuditLines, tool: str
+) -> None:
+    """The model gets the runner's text; the trail one ``error`` event with the code, and no file is made."""
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "invalid_value: row 1, column 1: 'salaries-of-user-b' is not a number"}
+    r = table(client) if tool == "write_table" else document(client)
+    assert r.status_code == 422
+    assert outputs(store) == []
+    (event,) = events(audit_lines, tool)
+    assert (event["outcome"], event["target"].get("ids")) == ("error", None)
+    expected = {"caller": "open-webui", "outputs": 0, "refused": "invalid_value"}
+    if tool == "write_table":
+        expected |= {"rows": 2, "columns": 2}
+    assert event["criteria"] == expected
+    assert "salaries" not in json.dumps(audit_lines())
+
+
+@pytest.mark.parametrize("tool", ["write_table", "write_document"])
+def test_a_write_refusal_whose_record_cannot_be_written_never_reaches_the_model(
+    client: TestClient, fake_executor: Local, broken_audit: None, tool: str
+) -> None:
+    """The audit failure is the answer, never the refusal's text."""
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "invalid_value: row 1, column 1: 'salaries-of-user-b' is not a number"}
+    r = table(client) if tool == "write_table" else document(client)
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})

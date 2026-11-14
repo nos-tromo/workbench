@@ -9,7 +9,6 @@ checks of the sources the api can make, the output's name and record, the audit 
 import dataclasses
 import io
 import json
-import logging
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -19,7 +18,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from tests.api.test_files import CHAT, ME, AuditLines, H, put
 from tests.api.test_jobs import FakeClient
 from tests.fixtures import make_fixtures as mk
@@ -187,7 +186,7 @@ def test_another_users_template_is_not_found(client: TestClient, store: Store, t
     """A path outside the caller's own files is a 404, as for every tool."""
     theirs = Principal("open-webui", "user-b", "chat-1")
     data = mt.make_controls_docx(tmp_path / "built" / "form.docx").read_bytes()
-    store.add_upload(theirs, CHAT, "form.docx", io.BytesIO(data), max_bytes=10**7, quota_bytes=10**8)
+    store.add_upload(theirs, CHAT, "form.docx", io.BytesIO(data), max_bytes=10**7, quota_bytes=10**8, record=unrecorded)
     assert inspect(client, f"{CHAT}/form.docx").status_code == 404
     assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).status_code == 404
 
@@ -412,60 +411,59 @@ def test_outputs_whose_fill_cannot_be_recorded_are_removed(
     assert outputs(store) == []
 
 
-def test_an_ok_answer_that_cannot_be_read_keeps_no_output_and_records_nothing(
+def test_an_ok_answer_that_cannot_be_read_keeps_no_output_and_is_recorded_as_an_error(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
 ) -> None:
-    """The model is told the tool failed and never learns of the file, so it does not stay."""
-    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    """The model is told the tool failed and never learns of the file, so it never becomes one; the job is an error."""
+    form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.files = {"form-filled.docx": b"PK"}
     fake_executor.payload = {"filled": "all"}
     r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
     assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
     assert outputs(store) == []
-    assert events(audit_lines, "fill_template") == []
+    (event,) = events(audit_lines, "fill_template")
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("modify", "error", [form.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 0}
 
 
 def test_a_fill_whose_output_was_not_kept_says_so(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
 ) -> None:
-    """An ok answer with no file kept (the executor dropped it) is not a success, and nothing is recorded."""
+    """An ok answer with no file kept (the executor dropped it) is not a success: the model is told why; an error."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.payload = {"filled": ["customer"], "unfilled": [], "warnings": []}
     fake_executor.message = "dropped 1 output: not the job's own file"
     r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
     assert r.status_code == 500
     assert "dropped 1 output" in r.json()["detail"]
-    assert events(audit_lines, "fill_template") == []
+    (event,) = events(audit_lines, "fill_template")
+    assert (event["outcome"], event["criteria"]["outputs"]) == ("error", 0)
 
 
-def test_an_output_of_an_unreadable_answer_that_cannot_be_removed_is_named_by_an_event(
+def test_the_filled_file_is_recorded_before_it_is_a_file_of_the_chat(
     client: TestClient,
     store: Store,
-    fake_executor: Local,
     tmp_path: Path,
+    audit_stream: io.StringIO,
     audit_lines: AuditLines,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A file that stays although it should go is never unknown: the log names the error, an error event the file."""
+    """When the ``modify`` is written, the chat holds only the template; the new file it names is the one kept."""
     form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    fake_executor.files = {"form-filled.docx": b"PK"}
-    fake_executor.payload = {"filled": "all"}
+    seen: list[list[str]] = []
+    write = audit_stream.write
 
-    def refuse(_record: Any) -> None:
-        raise OSError("synthetic: read-only file system")
+    def look(text: str, /) -> int:
+        if '"tool.fill_template"' in text:
+            seen.append([rec.name for rec in store.files_in_chat(ME)])
+        return write(text)
 
-    monkeypatch.setattr(store, "remove", refuse)
-    with caplog.at_level(logging.WARNING):
-        r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
-    (left,) = outputs(store)
+    monkeypatch.setattr(audit_stream, "write", look)
+    assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).status_code == 200
+    assert seen == [["form.docx"]]
     (event,) = events(audit_lines, "fill_template")
-    assert (event["action"], event["outcome"]) == ("modify", "error")
-    assert event["target"]["ids"] == [form.id, left.id]
-    assert event["criteria"] == {"caller": "open-webui", "outputs": 1}
-    assert "OSError" in caplog.text
-    assert "form-filled" not in caplog.text
+    (new,) = outputs(store)
+    assert event["target"]["ids"] == [form.id, new.id]
 
 
 def test_unknown_names_the_model_sends_never_cost_the_filled_file(
@@ -698,3 +696,50 @@ def test_a_422_keeps_300_characters_of_a_part_and_cuts_the_301st(
     assert by_type["string_too_long"]["loc"] == ["body", "values", shown_key, "[key]"]
     assert by_type["union_tag_invalid"]["msg"] == shown_message
     assert fake_executor.requests == []
+
+
+# --- refusals are recorded (R72) ---------------------------------------------------------------------------------
+
+
+def test_an_inspection_refusal_quoting_the_template_is_recorded_by_its_code_alone(
+    client: TestClient, store: Store, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """The real runner quotes the line that does not compile; the event holds the code ``invalid_template`` only."""
+    form = stored(store, tmp_path, "form.docx", mt.make_jinja_docx, extra="{% if salaries_of_user_b %}never closed")
+    r = inspect(client, f"{CHAT}/form.docx")
+    assert r.status_code == 422
+    assert r.json()["detail"].startswith("invalid_template: ")
+    assert "salaries_of_user_b" in r.json()["detail"]
+    (event,) = events(audit_lines, "inspect_template")
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("query", "error", [form.id])
+    assert event["criteria"] == {"caller": "open-webui", "refused": "invalid_template"}
+    assert "salaries" not in json.dumps(audit_lines())
+
+
+def test_a_fill_refusal_quoting_the_drop_downs_entries_is_recorded_by_its_code_alone(
+    client: TestClient, store: Store, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """The real runner names the drop-down's entries; the event holds the template's id and ``invalid_value``."""
+    form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    r = fill(client, f"{CHAT}/form.docx", {"status": "pending"})
+    assert r.status_code == 422
+    assert '"open", "closed"' in r.json()["detail"]
+    assert outputs(store) == []
+    (event,) = events(audit_lines, "fill_template")
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("modify", "error", [form.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "invalid_value"}
+    assert "closed" not in json.dumps(audit_lines())
+
+
+@pytest.mark.parametrize("tool", ["inspect_template", "fill_template"])
+def test_a_template_refusal_whose_record_cannot_be_written_never_reaches_the_model(
+    client: TestClient, store: Store, tmp_path: Path, broken_audit: None, tool: str
+) -> None:
+    """The audit failure is the answer, never the refusal's text."""
+    stored(store, tmp_path, "form.docx", mt.make_jinja_docx, extra="{% if approved %}never closed")
+    r = (
+        inspect(client, f"{CHAT}/form.docx")
+        if tool == "inspect_template"
+        else fill(client, f"{CHAT}/form.docx", {"x": 1})
+    )
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})

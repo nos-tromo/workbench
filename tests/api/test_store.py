@@ -11,6 +11,7 @@ from typing import override
 
 import pytest
 
+from tests.api.conftest import unrecorded
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
@@ -20,6 +21,7 @@ from workbench.api.store import (
     Store,
     StoreError,
     TooLarge,
+    new_file_id,
 )
 from workbench.models import DirEntry, FileRecord, Principal
 from workbench.paths import PathError, Workspaces, check_filename
@@ -74,7 +76,7 @@ def put(
     store: Store, p: Principal, name: str = "q.xlsx", data: bytes = b"x" * 10, directory: str = "/workspace/chat-1"
 ) -> FileRecord:
     """Upload ``data`` as ``name`` with roomy limits."""
-    return store.add_upload(p, directory, name, io.BytesIO(data), max_bytes=MAX, quota_bytes=QUOTA)
+    return store.add_upload(p, directory, name, io.BytesIO(data), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded)
 
 
 def stage(tmp_path: Path, job: str, name: str, data: bytes = b"out") -> Path:
@@ -100,7 +102,7 @@ def test_upload_streams_to_disk_and_records_metadata(
 ) -> None:
     """The bytes land under the user's root and the record says what was stored."""
     rec = store.add_upload(
-        alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"x" * 10), max_bytes=MAX, quota_bytes=QUOTA
+        alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"x" * 10), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded
     )
     assert (rec.kind, rec.size, rec.virtual_path) == ("upload", 10, "/workspace/chat-1/q.xlsx")
     assert (rec.caller, rec.user_id, rec.chat_id, rec.name) == ("open-webui", "user-a", "chat-1", "q.xlsx")
@@ -208,7 +210,13 @@ def test_upload_over_the_limit_leaves_nothing(store: Store, alice: Principal, wo
     """Too many bytes raise ``TooLarge``; no file, no temporary and no row remain."""
     with pytest.raises(TooLarge):
         store.add_upload(
-            alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"x" * (MAX + 1)), max_bytes=MAX, quota_bytes=QUOTA
+            alice,
+            "/workspace/chat-1",
+            "q.xlsx",
+            io.BytesIO(b"x" * (MAX + 1)),
+            max_bytes=MAX,
+            quota_bytes=QUOTA,
+            record=unrecorded,
         )
     assert disk_names(workspaces.chat_dir(alice)) == []
     assert store.files_in_chat(alice) == []
@@ -218,7 +226,7 @@ def test_upload_over_the_limit_leaves_nothing(store: Store, alice: Principal, wo
 def test_upload_of_exactly_the_limit_is_accepted(store: Store, alice: Principal) -> None:
     """``max_bytes`` is inclusive."""
     rec = store.add_upload(
-        alice, "/workspace/chat-1", "q.bin", io.BytesIO(b"x" * MAX), max_bytes=MAX, quota_bytes=QUOTA
+        alice, "/workspace/chat-1", "q.bin", io.BytesIO(b"x" * MAX), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded
     )
     assert rec.size == MAX
 
@@ -230,13 +238,25 @@ def test_an_empty_upload_is_a_file(store: Store, alice: Principal) -> None:
 
 def test_quota_counts_all_chats_of_the_user(store: Store, alice: Principal, workspaces: Workspaces) -> None:
     """Files in ``chat-1`` use up the room for ``chat-2``; the refused upload leaves nothing."""
-    store.add_upload(alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 60), max_bytes=MAX, quota_bytes=100)
+    store.add_upload(
+        alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 60), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
     with pytest.raises(QuotaExceeded):
-        store.add_upload(alice, "/workspace/chat-2", "b.bin", io.BytesIO(b"x" * 50), max_bytes=MAX, quota_bytes=100)
+        store.add_upload(
+            alice,
+            "/workspace/chat-2",
+            "b.bin",
+            io.BytesIO(b"x" * 50),
+            max_bytes=MAX,
+            quota_bytes=100,
+            record=unrecorded,
+        )
     assert disk_names(workspaces.resolve(alice, "/workspace/chat-2")) == []
     assert store.files_in_chat(Principal("open-webui", "user-a", "chat-2")) == []
     assert store.usage(alice) == 60
-    store.add_upload(alice, "/workspace/chat-2", "b.bin", io.BytesIO(b"x" * 40), max_bytes=MAX, quota_bytes=100)
+    store.add_upload(
+        alice, "/workspace/chat-2", "b.bin", io.BytesIO(b"x" * 40), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
     assert store.usage(alice) == 100
 
 
@@ -260,7 +280,9 @@ def test_concurrent_uploads_cannot_both_fit_the_last_room(store: Store, alice: P
 
     def work(name: str) -> None:
         try:
-            store.add_upload(alice, "/workspace/chat-1", name, Gated(), max_bytes=MAX, quota_bytes=100)
+            store.add_upload(
+                alice, "/workspace/chat-1", name, Gated(), max_bytes=MAX, quota_bytes=100, record=unrecorded
+            )
             outcomes.append("stored")
         except QuotaExceeded:
             outcomes.append("quota")
@@ -277,17 +299,31 @@ def test_concurrent_uploads_cannot_both_fit_the_last_room(store: Store, alice: P
 
 def test_quota_is_per_user(store: Store, alice: Principal, bob: Principal) -> None:
     """One user's files never use up another user's quota."""
-    store.add_upload(alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 90), max_bytes=MAX, quota_bytes=100)
-    store.add_upload(bob, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 90), max_bytes=MAX, quota_bytes=100)
+    store.add_upload(
+        alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 90), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
+    store.add_upload(
+        bob, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 90), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
     assert (store.usage(alice), store.usage(bob)) == (90, 90)
 
 
 def test_quota_counts_outputs_too(store: Store, alice: Principal, tmp_path: Path) -> None:
     """Outputs a tool made use the same room as uploads."""
     job = store.add_job(alice, "run_python")
-    store.register_output(alice, stage(tmp_path, job.id, "r.csv", b"y" * 70), "r.csv", job.id)
+    store.register_output(
+        alice, stage(tmp_path, job.id, "r.csv", b"y" * 70), "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     with pytest.raises(QuotaExceeded):
-        store.add_upload(alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 40), max_bytes=MAX, quota_bytes=100)
+        store.add_upload(
+            alice,
+            "/workspace/chat-1",
+            "a.bin",
+            io.BytesIO(b"x" * 40),
+            max_bytes=MAX,
+            quota_bytes=100,
+            record=unrecorded,
+        )
 
 
 def test_disk_full_maps_to_storage_full(
@@ -306,7 +342,9 @@ def test_disk_full_maps_to_storage_full(
     monkeypatch.setattr(store_module, "_write_all", failing)
     big = io.BytesIO(b"x" * (3 * 1024 * 1024))
     with pytest.raises(StorageFull):
-        store.add_upload(alice, "/workspace/chat-1", "q.bin", big, max_bytes=10**9, quota_bytes=10**9)
+        store.add_upload(
+            alice, "/workspace/chat-1", "q.bin", big, max_bytes=10**9, quota_bytes=10**9, record=unrecorded
+        )
     assert len(calls) == 2
     assert disk_names(workspaces.chat_dir(alice)) == []
     assert store.files_in_chat(alice) == []
@@ -343,7 +381,9 @@ def test_a_failing_source_leaves_nothing(store: Store, alice: Principal, workspa
             raise ConnectionResetError
 
     with pytest.raises(ConnectionResetError):
-        store.add_upload(alice, "/workspace/chat-1", "q.bin", Broken(), max_bytes=MAX, quota_bytes=QUOTA)
+        store.add_upload(
+            alice, "/workspace/chat-1", "q.bin", Broken(), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded
+        )
     assert disk_names(workspaces.chat_dir(alice)) == []
     assert store.files_in_chat(alice) == []
 
@@ -384,7 +424,9 @@ def test_part_names_are_reserved(store: Store, alice: Principal, tmp_path: Path)
         store.move(alice, keep.virtual_path, "/workspace/chat-1/x.part")
     job = store.add_job(alice, "run_python")
     with pytest.raises(PathError):
-        store.register_output(alice, stage(tmp_path, job.id, "x.part"), "x.part", job.id)
+        store.register_output(
+            alice, stage(tmp_path, job.id, "x.part"), "x.part", job.id, file_id=new_file_id(), quota_bytes=10**12
+        )
 
 
 # --- isolation between users ------------------------------------------------
@@ -396,7 +438,7 @@ def test_other_users_files_are_not_found(store: Store, alice: Principal, bob: Pr
     with pytest.raises(NotFound):
         store.get(bob, rec.virtual_path)
     with pytest.raises(NotFound):
-        store.delete(bob, rec.virtual_path)
+        deleted(store, bob, rec.virtual_path)
     with pytest.raises(NotFound):
         store.move(bob, rec.virtual_path, "/workspace/chat-1/stolen.xlsx")
     assert store.list_dir(bob, "/workspace/chat-1") == []
@@ -440,7 +482,7 @@ def test_hostile_paths_are_refused_everywhere(store: Store, alice: Principal, ba
     with pytest.raises(PathError):
         store.get(alice, bad)
     with pytest.raises(PathError):
-        store.delete(alice, bad)
+        deleted(store, alice, bad)
     with pytest.raises(PathError):
         store.move(alice, bad, ok + ".moved")
     with pytest.raises(PathError):
@@ -462,7 +504,7 @@ def test_hostile_file_names_are_refused(store: Store, alice: Principal, tmp_path
     job = store.add_job(alice, "run_python")
     staged = stage(tmp_path, job.id, "ok.txt")
     with pytest.raises(PathError):
-        store.register_output(alice, staged, name, job.id)
+        store.register_output(alice, staged, name, job.id, file_id=new_file_id(), quota_bytes=10**12)
     assert staged.exists()
     assert store.files_in_chat(alice) == []
 
@@ -493,7 +535,7 @@ def test_files_never_live_outside_a_chat_folder(store: Store, alice: Principal, 
     with pytest.raises(PathError):
         store.get(alice, target)
     with pytest.raises(PathError):
-        store.delete(alice, target)
+        deleted(store, alice, target)
     with pytest.raises(PathError):
         store.move(alice, target, "/workspace/chat-1/other.xlsx")
     with pytest.raises(PathError):
@@ -611,42 +653,49 @@ def test_get_of_a_folder_or_a_missing_file_is_not_found(store: Store, alice: Pri
 def test_a_record_whose_file_is_gone_is_not_found_but_can_be_deleted(
     store: Store, alice: Principal, workspaces: Workspaces
 ) -> None:
-    """``get`` checks the disk; ``delete`` still clears the orphan row."""
+    """``get`` checks the disk; ``remove``, by the record, still clears the orphan row."""
     rec = put(store, alice)
     workspaces.resolve(alice, rec.virtual_path).unlink()
     with pytest.raises(NotFound):
         store.get(alice, rec.virtual_path)
-    assert store.delete(alice, rec.virtual_path) == rec
+    store.remove(rec)
     assert store.files_in_chat(alice) == []
 
 
-def test_delete_removes_file_and_row(store: Store, alice: Principal, workspaces: Workspaces) -> None:
-    """The record is returned; the file and the row are gone; the usage drops."""
+def deleted(store: Store, p: Principal, path: str) -> FileRecord:
+    """Delete a file as ``/files/delete`` does, with no event under test: ``get``, then ``remove`` by the record."""
+    rec = store.get(p, path)
+    store.remove(rec)
+    return rec
+
+
+def test_get_then_remove_deletes_file_and_row(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """The route's delete, ``get`` then ``remove``: the file and the row are gone; the usage drops."""
     rec = put(store, alice)
     real = workspaces.resolve(alice, rec.virtual_path)
     assert real.exists()
-    assert store.delete(alice, rec.virtual_path) == rec
+    assert deleted(store, alice, rec.virtual_path) == rec
     assert not real.exists()
     assert store.files_in_chat(alice) == []
     assert store.usage(alice) == 0
     with pytest.raises(NotFound):
         store.get(alice, rec.virtual_path)
     with pytest.raises(NotFound):
-        store.delete(alice, rec.virtual_path)
+        deleted(store, alice, rec.virtual_path)
 
 
 def test_delete_of_a_folder_is_not_found(store: Store, alice: Principal, workspaces: Workspaces) -> None:
     """Folders have no record; delete answers ``NotFound`` and leaves them."""
     store.mkdir(alice, "/workspace/chat-1/reports")
     with pytest.raises(NotFound):
-        store.delete(alice, "/workspace/chat-1/reports")
+        deleted(store, alice, "/workspace/chat-1/reports")
     assert workspaces.resolve(alice, "/workspace/chat-1/reports").is_dir()
 
 
 def test_a_deleted_name_can_be_used_again(store: Store, alice: Principal) -> None:
     """The name is free once the file is gone, with no suffix."""
     rec = put(store, alice)
-    store.delete(alice, rec.virtual_path)
+    deleted(store, alice, rec.virtual_path)
     assert put(store, alice).name == "q.xlsx"
 
 
@@ -766,7 +815,7 @@ def test_register_output_moves_the_staged_file_in(
     """The staged file becomes an output of the principal's chat, tied to its job."""
     job = store.add_job(alice, "run_python")
     staged = stage(tmp_path, job.id, "r.csv", b"a,b\n1,2\n")
-    rec = store.register_output(alice, staged, "r.csv", job.id)
+    rec = store.register_output(alice, staged, "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
     assert (rec.kind, rec.job_id, rec.size, rec.virtual_path) == ("output", job.id, 8, "/workspace/chat-1/r.csv")
     assert (rec.mime, rec.created_at) == ("text/csv", clock.now)
     real = workspaces.resolve(alice, rec.virtual_path)
@@ -780,8 +829,12 @@ def test_register_output_clash_gets_a_suffix(store: Store, alice: Principal, tmp
     """Outputs never replace an upload or an earlier output of the same name."""
     put(store, alice, "r.csv", b"upload")
     job = store.add_job(alice, "run_python")
-    first = store.register_output(alice, stage(tmp_path, job.id, "r.csv", b"one"), "r.csv", job.id)
-    second = store.register_output(alice, stage(tmp_path, job.id, "s.csv", b"two"), "r.csv", job.id)
+    first = store.register_output(
+        alice, stage(tmp_path, job.id, "r.csv", b"one"), "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
+    second = store.register_output(
+        alice, stage(tmp_path, job.id, "s.csv", b"two"), "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     assert (first.name, second.name) == ("r (1).csv", "r (2).csv")
 
 
@@ -794,11 +847,11 @@ def test_register_output_refuses_links_and_other_non_files(store: Store, alice: 
     link.parent.mkdir(parents=True)
     link.symlink_to(target)
     with pytest.raises(PathError):
-        store.register_output(alice, link, "link.txt", job.id)
+        store.register_output(alice, link, "link.txt", job.id, file_id=new_file_id(), quota_bytes=10**12)
     folder = link.parent / "folder"
     folder.mkdir()
     with pytest.raises(PathError):
-        store.register_output(alice, folder, "folder", job.id)
+        store.register_output(alice, folder, "folder", job.id, file_id=new_file_id(), quota_bytes=10**12)
     assert link.is_symlink()
     assert target.read_text() == "synthetic"
     assert store.files_in_chat(alice) == []
@@ -808,7 +861,7 @@ def test_register_output_of_a_missing_staged_file_is_not_found(store: Store, ali
     """A staged path that is not there is ``NotFound``."""
     job = store.add_job(alice, "run_python")
     with pytest.raises(NotFound):
-        store.register_output(alice, tmp_path / "gone.csv", "r.csv", job.id)
+        store.register_output(alice, tmp_path / "gone.csv", "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
 
 
 def test_register_output_lands_in_the_principals_chat_only(
@@ -816,7 +869,9 @@ def test_register_output_lands_in_the_principals_chat_only(
 ) -> None:
     """The output belongs to the principal who ran the job, and to nobody else."""
     job = store.add_job(alice, "run_python")
-    rec = store.register_output(alice, stage(tmp_path, job.id, "r.csv"), "r.csv", job.id)
+    rec = store.register_output(
+        alice, stage(tmp_path, job.id, "r.csv"), "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     with pytest.raises(NotFound):
         store.get(bob, rec.virtual_path)
     assert store.files_in_chat(bob) == []
@@ -832,7 +887,9 @@ def test_files_in_chat_lists_only_that_chat_in_creation_order(
     first = put(store, alice, "b.txt")
     clock.now += 10
     job = store.add_job(alice, "run_python")
-    second = store.register_output(alice, stage(tmp_path, job.id, "a.txt"), "a.txt", job.id)
+    second = store.register_output(
+        alice, stage(tmp_path, job.id, "a.txt"), "a.txt", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     clock.now += 10
     store.mkdir(alice, "/workspace/chat-1/folder")
     third = put(store, alice, "c.txt", directory="/workspace/chat-1/folder")
@@ -868,7 +925,9 @@ def test_due_returns_files_older_than_the_cutoff(
     mid = put(store, bob, "mid.txt")
     clock.now = 3000.0
     job = store.add_job(alice, "run_python")
-    new = store.register_output(alice, stage(tmp_path, job.id, "new.txt"), "new.txt", job.id)
+    new = store.register_output(
+        alice, stage(tmp_path, job.id, "new.txt"), "new.txt", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     assert store.due(1000.0) == []
     assert store.due(1500.0) == [old]
     assert store.due(2500.0) == [old, mid]
@@ -919,7 +978,9 @@ def test_summarize_due_counts_by_kind_and_opens_the_database_read_only(
     clock.now = 2000.0
     b = put(store, alice, "b.txt")
     job = store.add_job(alice, "run_python")
-    out = store.register_output(alice, stage(tmp_path, job.id, "chart.png"), "chart.png", job.id)
+    out = store.register_output(
+        alice, stage(tmp_path, job.id, "chart.png"), "chart.png", job.id, file_id=new_file_id(), quota_bytes=10**12
+    )
     clock.now = 3000.0
     put(store, alice, "c.txt")
     database = tmp_path / "data" / "workbench.db"
@@ -984,7 +1045,7 @@ def test_remove_after_a_delete_and_a_new_upload_of_the_same_name_changes_nothing
     old = put(store, alice, "q.xlsx", b"old")
     clock.now += 100
     (stale,) = store.due(clock.now)
-    store.delete(alice, old.virtual_path)
+    deleted(store, alice, old.virtual_path)
     fresh = put(store, alice, "q.xlsx", b"new")
     store.remove(stale)
     chat = workspaces.chat_dir(alice)
@@ -1114,8 +1175,67 @@ def test_deleted_rows_are_overwritten_in_the_database_file(tmp_path: Path, store
     try:
         check.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
         assert marker.encode() in db.read_bytes()
-        store.delete(alice, rec.virtual_path)
+        deleted(store, alice, rec.virtual_path)
         check.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
     finally:
         check.close()
     assert marker.encode() not in db.read_bytes()
+
+
+def test_an_output_past_the_users_quota_is_refused_and_stays_staged(
+    store: Store, alice: Principal, tmp_path: Path
+) -> None:
+    """Outputs count against the quota, as uploads do; the refused file is left where it was staged."""
+    store.add_upload(
+        alice, "/workspace/chat-1", "a.bin", io.BytesIO(b"x" * 90), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
+    job = store.add_job(alice, "run_python")
+    staged = stage(tmp_path, job.id, "r.csv", b"y" * 11)
+    with pytest.raises(QuotaExceeded):
+        store.register_output(alice, staged, "r.csv", job.id, file_id=new_file_id(), quota_bytes=100)
+    assert staged.exists()
+    assert [rec.name for rec in store.files_in_chat(alice)] == ["a.bin"]
+    kept = store.register_output(
+        alice, stage(tmp_path, job.id, "s.csv", b"y" * 10), "s.csv", job.id, file_id="a" * 32, quota_bytes=100
+    )
+    assert (kept.id, store.usage(alice)) == ("a" * 32, 100)
+
+
+def test_an_output_takes_the_id_its_event_named(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """The id is the caller's, chosen before anything was recorded; anything but 32 hex digits is refused."""
+    job = store.add_job(alice, "run_python")
+    with pytest.raises(ValueError, match="32 lowercase hex"):
+        store.register_output(
+            alice, stage(tmp_path, job.id, "r.csv"), "r.csv", job.id, file_id="../x", quota_bytes=10**6
+        )
+    assert store.files_in_chat(alice) == []
+
+
+def test_an_upload_is_recorded_under_the_lock_before_its_rename(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """The record sees the ``<id>.part`` and no file of the chat; the stored file has that id and the record's chat."""
+    seen: list[tuple[str, str, str, list[str], list[str]]] = []
+
+    def record(chat_id: str, file_id: str, outcome: str) -> None:
+        names = sorted(path.name for path in workspaces.chat_dir(alice).iterdir())
+        seen.append((chat_id, file_id, outcome, names, [rec.name for rec in store.files_in_chat(alice)]))
+
+    rec = store.add_upload(
+        alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"PK"), max_bytes=MAX, quota_bytes=QUOTA, record=record
+    )
+    assert seen == [("chat-1", rec.id, "ok", [f"{rec.id}.part"], [])]
+
+
+def test_an_upload_whose_record_fails_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """Nothing is stored without its record: the ``.part`` goes, no row is made, and the record's error goes up."""
+
+    def refuse(*_: object) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    with pytest.raises(RuntimeError):
+        store.add_upload(
+            alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"PK"), max_bytes=MAX, quota_bytes=QUOTA, record=refuse
+        )
+    assert disk_names(workspaces.chat_dir(alice)) == []
+    assert store.files_in_chat(alice) == []

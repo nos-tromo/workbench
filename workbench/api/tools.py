@@ -14,13 +14,16 @@ Nothing the job answers is trusted: its answer is validated into the models belo
 replaced by the store's or checked against the files the job was given, its failures are mapped to
 fixed codes (anything else is "the tool failed"), and the whole answer is cut to ``result_max_kb``
 measured as the bytes that are sent.
+
+Every job whose answer reached the api is recorded before anything of that answer goes out, a refusal
+too: a runner's refusal can quote the file (a sheet's name, a line of a template, a drop-down's
+entries), so it is an ``error`` event whose criteria name the refusal's code, never its text
+(:func:`record_answer`). A tool that makes files records its job before any of them becomes visible
+(:class:`OutputKeeper`, the queue's :class:`~workbench.api.jobs.Keeper`).
 """
 
-import asyncio
-import contextlib
 import dataclasses
-import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
@@ -31,15 +34,10 @@ from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
-from workbench.api.jobs import outlast
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
-from workbench.api.store import Store
-from workbench.models import FileRecord, Principal
+from workbench.models import Principal
 from workbench.protocol import MAX_INPUT_FILES, JobResult
-from workbench.utils.audit_event import AuditWriteError
-
-_log = logging.getLogger(__name__)
 
 router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
@@ -381,6 +379,112 @@ def _parse[M: BaseModel](model: type[M], payload: object) -> M:
         raise HTTPException(status_code=500, detail="the tool returned an answer that could not be read") from None
 
 
+def refusal(result: JobResult) -> str | None:
+    """Name the refusal a job answered with, by its code alone.
+
+    Args:
+        result: The executor's answer.
+
+    Returns:
+        The runner's code, one of the fixed words the model is told (``no_such_part``, ``invalid_template``…), when the
+        job failed with one; ``None`` otherwise. Never the message, which can quote the file.
+    """
+    if result.status != "error":
+        return None
+    error = result.result.get("error")
+    if not isinstance(error, str):
+        return None
+    code = error.partition(": ")[0]
+    return code if code in _RUNNER_ERRORS else None
+
+
+def judged(result: JobResult, ok: bool) -> tuple[str, dict[str, object]]:
+    """Say how a job's event ends, and what its criteria add for a refusal.
+
+    Args:
+        result: The executor's answer.
+        ok: Whether the answer is one the api sends on: an ``ok`` job whose answer it can read.
+
+    Returns:
+        ``("ok", {})``; or ``("error", {"refused": <code>})`` for a refusal; or ``("error", {})`` for any other failure
+        (a job past its time or a limit, a failed tool, an answer that could not be read or used).
+    """
+    if ok:
+        return "ok", {}
+    code = refusal(result)
+    return "error", {} if code is None else {"refused": code}
+
+
+def record_answer(
+    audit: AuditLog,
+    key: str,
+    p: Principal,
+    file_ids: Sequence[str],
+    criteria: Mapping[str, object],
+    result: JobResult,
+    model: type[BaseModel],
+    payload: object,
+) -> None:
+    """Record the answer of a job that makes no file, whatever it is, before anything of it goes out.
+
+    Args:
+        audit: The audit log.
+        key: The tool, a key of the audit's operations.
+        p: The caller, user and the chat folder of the files.
+        file_ids: The files the job was given.
+        criteria: The event's criteria, flags and counts.
+        result: The executor's answer.
+        model: The shape an ``ok`` answer must have to be sent on.
+        payload: The answer as the route checks it against ``model``.
+
+    Raises:
+        AuditWriteError: The event could not be written; the answer must not go out.
+    """
+    outcome, more = judged(result, result.status == "ok" and _readable(model, payload))
+    audit.record(key, p, file_ids=file_ids, outcome=outcome, criteria={**criteria, **more})
+
+
+@dataclasses.dataclass(frozen=True)
+class OutputKeeper:
+    """Records a job of a tool that makes files before any of them is visible (:class:`~workbench.api.jobs.Keeper`).
+
+    Attributes:
+        audit: The audit log.
+        p: The caller, user and the chat folder the files go to.
+        tool: The tool, a key of the audit's operations.
+        used: Ids of the files the job was given, named first in its event.
+        decide: Given the answer and the ids planned for its outputs, the ids to keep, the outcome and the criteria.
+    """
+
+    audit: AuditLog
+    p: Principal
+    tool: str
+    used: Sequence[str]
+    decide: Callable[[JobResult, Sequence[str]], tuple[list[str], str, dict[str, object]]]
+
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Write the job's event, naming the files given and the outputs to keep, and say which those are.
+
+        Args:
+            result: The executor's answer.
+            planned: The ids the job's outputs will have.
+
+        Returns:
+            The ids to keep.
+        """
+        keep, outcome, criteria = self.decide(result, planned)
+        self.audit.record(self.tool, self.p, file_ids=[*self.used, *keep], outcome=outcome, criteria=criteria)
+        return keep
+
+    def again(self, ids: Sequence[str]) -> None:
+        """Name outputs that did not end as the event said (not kept, or kept and not removed) in an ``error`` event.
+
+        Args:
+            ids: Their file ids.
+        """
+        self.audit.record(self.tool, self.p, file_ids=ids, outcome="error", criteria={"outputs": len(ids)})
+
+
 def _join(*sentences: str | None) -> str | None:
     """Join sentences with a space, leaving out the missing ones.
 
@@ -589,8 +693,9 @@ async def read_document(
     """Read one of the user's files in the executor and answer with its text, cut to the result limit.
 
     The job runs in the chat folder the file lives in, whatever chat the request came from, with that one
-    file as its input. The use is recorded by the file's id once the job has answered and before
-    the text goes out; neither the name, the part nor the text is recorded.
+    file as its input. The job is recorded by the file's id once it has answered and before anything of
+    the answer goes out, a refusal as ``error`` with its code; neither the name, the part nor the text is
+    recorded.
 
     Args:
         body: The path and where to start.
@@ -607,12 +712,13 @@ async def read_document(
     in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     args = {"path": rec.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
     _, result, _ = await jobs.submit(in_chat, "read_document", args, [rec.name])
-    payload = _payload(result, "file")
-    answer = _parse(DocumentRead, {**payload, "path": rec.virtual_path} if isinstance(payload, dict) else None)
+    shown = {**result.result, "path": rec.virtual_path} if isinstance(result.result, dict) else None
+    criteria = {"paged": body.part is not None}
     await run_in_threadpool(
-        audit.record, "read_document", in_chat, file_ids=[rec.id], criteria={"paged": body.part is not None}
+        record_answer, audit, "read_document", in_chat, [rec.id], criteria, result, DocumentRead, shown
     )
-    return _fit_read(answer, settings.result_max_kb)
+    _payload(result, "file")
+    return _fit_read(_parse(DocumentRead, shown), settings.result_max_kb)
 
 
 @router.post(
@@ -640,8 +746,9 @@ async def search_files(
     """Search the chat's files in the executor and answer with the hits, cut to the result limit.
 
     Every file of the chat goes to the job, the newest 1000 if there are more (the protocol's limit), and
-    the answer says so. The use is recorded by the ids of the files looked into, once the job has answered
-    and before the hits go out; the query, which may be a name, is not recorded.
+    the answer says so. The job is recorded by the ids of the files given to it, once it has answered
+    and before anything of the answer goes out, a refusal as ``error`` with its code; the query, which may be
+    a name, is not recorded.
 
     Args:
         body: The query, whether it is a regular expression, and how many hits to return.
@@ -672,6 +779,18 @@ async def search_files(
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
     _, result, _ = await jobs.submit(p, "search_files", args, [rec.name for rec in chosen])
+    criteria = {"regex": body.regex, "max_hits": max_hits}
+    await run_in_threadpool(
+        record_answer,
+        audit,
+        "search_files",
+        p,
+        [rec.id for rec in chosen],
+        criteria,
+        result,
+        SearchResult,
+        result.result,
+    )
     answer = _parse(SearchResult, _payload(result, "search"))
     sent = {rec.virtual_path for rec in chosen}
     answer = answer.model_copy(
@@ -679,13 +798,6 @@ async def search_files(
             "hits": [hit for hit in answer.hits if hit.path in sent][:max_hits],
             "skipped": [skip for skip in answer.skipped or [] if skip.path in sent] or None,
         }
-    )
-    await run_in_threadpool(
-        audit.record,
-        "search_files",
-        p,
-        file_ids=[rec.id for rec in chosen],
-        criteria={"regex": body.regex, "max_hits": max_hits},
     )
     notes: list[str] = []
     if len(files) > len(chosen):
@@ -789,116 +901,6 @@ def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
     raise HTTPException(status_code=422, detail=f"the code could not be completed: {reason}")
 
 
-def _record_run(
-    audit: AuditLog,
-    store: Store,
-    p: Principal,
-    inputs: Sequence[FileRecord],
-    outputs: Sequence[FileRecord],
-    outcome: str,
-) -> None:
-    """Record a run by the ids of every file it was given and every file it made.
-
-    As with an upload, a file whose making cannot be recorded does not stay: the outputs are removed again.
-
-    Args:
-        audit: The audit log.
-        store: The file store.
-        p: The caller, user and chat.
-        inputs: The files the job was given.
-        outputs: The files it made.
-        outcome: ``ok`` when the job answered, ``error`` when it failed or kept no file it made.
-
-    Raises:
-        AuditWriteError: The event could not be written.
-    """
-    try:
-        audit.record(
-            "run_python",
-            p,
-            file_ids=[rec.id for rec in [*inputs, *outputs]],
-            outcome=outcome,
-            criteria={"outputs": len(outputs)},
-        )
-    except AuditWriteError:
-        _remove_outputs(store, outputs)  # the audit failure is the answer
-        raise
-
-
-def _remove_outputs(store: Store, outputs: Sequence[FileRecord]) -> list[FileRecord]:
-    """Remove files a job made that must not stay; one that cannot be removed does not stop the others.
-
-    A failure is logged, by its type alone, and never raised: the caller's own answer is the one that goes out.
-
-    Args:
-        store: The file store.
-        outputs: The files.
-
-    Returns:
-        The files that could not be removed and are still in the workspace, for the event to name.
-    """
-    left: list[FileRecord] = []
-    for rec in outputs:
-        try:
-            store.remove(rec)
-        except Exception as exc:
-            _log.warning("could not remove an output that must not stay (%s)", type(exc).__name__)
-            left.append(rec)
-    return left
-
-
-def _remove_unsent(
-    audit: AuditLog, store: Store, p: Principal, tool: str, outputs: Sequence[FileRecord], used: Sequence[str] = ()
-) -> None:
-    """Remove the files of a job the model is not told of; an event names any that could not be removed.
-
-    The model is told the tool failed and never learns of these files, so none of them may stay. One that stays all the
-    same is named, by an ``error`` event of the tool, with the files the job was given, so that no file stays that the
-    audit does not know of.
-
-    Args:
-        audit: The audit log.
-        store: The file store.
-        p: The caller, user and the chat the files are in.
-        tool: The tool, a key of the audit's operations.
-        outputs: The files the job made.
-        used: Ids of the files the job was given.
-
-    Raises:
-        AuditWriteError: The event for a file that stays could not be written.
-    """
-    left = _remove_outputs(store, outputs)
-    if left:
-        ids = [*used, *(rec.id for rec in left)]
-        audit.record(tool, p, file_ids=ids, outcome="error", criteria={"outputs": len(left)})
-
-
-async def _to_the_end[T](step: Callable[[], T]) -> T:
-    """Run the step from a job's answer to its audit record to its end, whatever cancellation comes meanwhile.
-
-    Once ``submit`` returns, what the job made is in the workspace. A cancellation (the client went away) that stopped
-    the route before the record would leave a file no event names. So the step, the removal of what must not stay
-    included, is one call in a thread, a plain future of the loop's executor as in
-    :meth:`~workbench.api.jobs.JobQueue._keep`: a cancellation waits for it to end, then goes on.
-
-    Args:
-        step: The step; it records, or removes, every file the job made.
-
-    Returns:
-        What the step returned.
-
-    Raises:
-        Exception: What the step raised, such as the ``HTTPException`` the model is to be told.
-    """
-    work = asyncio.get_running_loop().run_in_executor(None, step)
-    try:
-        return await asyncio.shield(work)
-    except asyncio.CancelledError:
-        with contextlib.suppress(Exception):  # the caller is gone; its cancellation is the answer
-            await outlast(work)
-        raise
-
-
 def _readable(model: type[BaseModel], payload: object) -> bool:
     """Tell whether a runner's answer has the shape the api sends on.
 
@@ -997,8 +999,8 @@ async def run_python(
 
     Every file of the chat goes to the job, the newest 1000 if there are more (the protocol's limit), except
     files below a folder named ``out``, which the executor never copies; the answer says what was left out. The
-    run is recorded by the ids of the files it was given and the files it made, whenever it ran, before the
-    answer goes out; the code is never recorded.
+    run is recorded by the ids of the files it was given and the files it made, whenever it ran, before any of
+    those files becomes visible and before the answer goes out; the code is never recorded.
 
     Args:
         body: The code.
@@ -1015,18 +1017,16 @@ async def run_python(
     readable = [rec for rec in files if rec.name.split("/")[0] != _OUT]
     chosen = readable[:MAX_INPUT_FILES]
     args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
-    job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen])
 
-    def record() -> list[FileRecord]:
-        kept, outcome = made, "ok" if result.status == "ok" else "error"
-        if result.status == "ok" and not _readable(_CodeRun, result.result):
-            # The model is told the tool failed and never learns of the files: none of them may stay, and the event
-            # names any that could not be removed.
-            kept, outcome = _remove_outputs(store, made), "error"
-        _record_run(audit, store, p, chosen, kept, outcome)
-        return kept
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        # An answer the model cannot be given keeps no file: it would never learn of it.
+        usable = result.status == "ok" and _readable(_CodeRun, result.result)
+        keep = list(planned) if usable else []
+        outcome, more = judged(result, usable)
+        return keep, outcome, {"outputs": len(keep), **more}
 
-    made = await _to_the_end(record)
+    keeper = OutputKeeper(audit, p, "run_python", [rec.id for rec in chosen], decide)
+    job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen], keeper)
     payload, note = _python_payload(result)
     run = _parse(_CodeRun, payload)
     notes: list[str | None] = [run.hint, note]

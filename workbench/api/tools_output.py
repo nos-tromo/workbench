@@ -9,11 +9,12 @@ field, or the row and the column counted from 1, and costs no job. A number that
 the request goes to the executor as JSON, which has no NaN or infinity. A Markdown table wider than Word's 63 columns
 is refused by the runner, which parses the Markdown, before it writes anything.
 
-Each is recorded as a ``collect`` of the new file, by its id; ``write_table`` with how many rows and columns the table
-has. Never a name, a column's name or a value. A new file whose event cannot be written is removed again.
+Each is recorded as a ``collect`` of the new file, by its id, before the file becomes visible; ``write_table`` with how
+many rows and columns the table has. Never a name, a column's name or a value. A new file whose event cannot be written
+is never kept, and a job that refused is recorded too, by the refusal's code.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Final, Literal
 
 from fastapi import HTTPException
@@ -21,26 +22,24 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
-from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
+from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep
 from workbench.api.jobs import JobQueue
-from workbench.api.store import Store
 from workbench.api.tools import (
     MAX_HINT,
+    OutputKeeper,
     _capped,
     _clean,
     _parse,
     _payload,
     _readable,
-    _remove_outputs,
-    _remove_unsent,
-    _to_the_end,
     _within,
+    judged,
     router,
 )
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, check_filename
+from workbench.protocol import JobResult
 from workbench.tables import MAX_COLUMNS, MAX_ROWS, MAX_SHEET_NAME, MAX_WORD_COLUMNS, Delimiter, table_problem
-from workbench.utils.audit_event import AuditWriteError
 
 #: Most characters of a document's Markdown; the runner checks it again (a test ties the two).
 MAX_MARKDOWN: Final = 200_000
@@ -173,45 +172,18 @@ def _output_name(wanted: str, extension: str) -> str:
     return name
 
 
-def _record_output(
-    audit: AuditLog, store: Store, p: Principal, tool: str, output: FileRecord, criteria: Mapping[str, object] | None
-) -> None:
-    """Record a new file by its id.
-
-    As with an upload, a file whose making cannot be recorded does not stay: it is removed again.
-
-    Args:
-        audit: The audit log.
-        store: The file store.
-        p: The caller, user and chat.
-        tool: ``write_table`` or ``write_document``.
-        output: The new file.
-        criteria: The event's criteria, never content.
-
-    Raises:
-        AuditWriteError: The event could not be written.
-    """
-    try:
-        audit.record(tool, p, file_ids=[output.id], criteria=criteria)
-    except AuditWriteError:
-        _remove_outputs(store, [output])  # the audit failure is the answer
-        raise
-
-
 async def _write(
     p: Principal,
-    store: Store,
     audit: AuditLog,
     jobs: JobQueue,
     tool: str,
     args: dict[str, Any],
     criteria: Mapping[str, object] | None = None,
 ) -> tuple[FileRecord, _Written]:
-    """Write the file in the executor, keep it and record it.
+    """Write the file in the executor, record it, then keep it.
 
     Args:
         p: The caller, user and chat.
-        store: The file store.
         audit: The audit log.
         jobs: The job queue.
         tool: ``write_table`` or ``write_document``.
@@ -225,21 +197,22 @@ async def _write(
         HTTPException: The runner refused a value (its 422), the job failed or ran out of time, its answer cannot be
             read, or its file was not kept (500).
     """
-    _, result, made = await jobs.submit(p, tool, args, [])
+    base = dict(criteria or {})
 
-    def record() -> tuple[FileRecord, _Written]:
-        if result.status == "ok" and (not _readable(_Written, result.result) or len(made) != 1):
-            # Nothing the model is not told of may stay.
-            _remove_unsent(audit, store, p, tool, made)
-            if _readable(_Written, result.result):
-                note = _clean(result.message) or "the job made no file"
-                raise HTTPException(status_code=500, detail=f"the file could not be kept: {note}")
-        done = _parse(_Written, _payload(result, "file"))
-        (new,) = made
-        _record_output(audit, store, p, tool, new, criteria)
-        return new, done
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        # One new file, of an answer the model can be given; otherwise nothing is kept, the model never learning of it.
+        if result.status == "ok" and _readable(_Written, result.result) and len(planned) == 1:
+            return list(planned), "ok", base
+        outcome, more = judged(result, False)
+        return [], outcome, {**base, "outputs": 0, **more}
 
-    return await _to_the_end(record)
+    _, result, made = await jobs.submit(p, tool, args, [], OutputKeeper(audit, p, tool, [], decide))
+    done = _parse(_Written, _payload(result, "file"))
+    if len(made) != 1:
+        note = _clean(result.message) or "the job made no file"
+        raise HTTPException(status_code=500, detail=f"the file could not be kept: {note}")
+    (new,) = made
+    return new, done
 
 
 @router.post(
@@ -265,7 +238,6 @@ async def write_table(
     body: WriteTableRequest,
     p: PrincipalDep,
     settings: SettingsDep,
-    store: StoreDep,
     audit: AuditDep,
     jobs: JobsDep,
 ) -> WrittenTable:
@@ -275,7 +247,6 @@ async def write_table(
         body: The name, the format, the columns, the rows, the sheet and the CSV's delimiter.
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
-        store: The file store.
         audit: The audit log.
         jobs: The job queue.
 
@@ -300,7 +271,7 @@ async def write_table(
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
     criteria = {"rows": len(body.rows), "columns": len(body.columns)}
-    new, done = await _write(p, store, audit, jobs, "write_table", args, criteria)
+    new, done = await _write(p, audit, jobs, "write_table", args, criteria)
     answer = WrittenTable(path=new.virtual_path, rows=len(body.rows), hint=_capped(done.hint, MAX_HINT))
     return _within(answer, settings.result_max_kb * 1024)
 
@@ -325,7 +296,6 @@ async def write_document(
     body: WriteDocumentRequest,
     p: PrincipalDep,
     settings: SettingsDep,
-    store: StoreDep,
     audit: AuditDep,
     jobs: JobsDep,
 ) -> WrittenDocument:
@@ -335,7 +305,6 @@ async def write_document(
         body: The name, the format and the Markdown.
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
-        store: The file store.
         audit: The audit log.
         jobs: The job queue.
 
@@ -352,6 +321,6 @@ async def write_document(
         "markdown": body.markdown,
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
-    new, done = await _write(p, store, audit, jobs, "write_document", args)
+    new, done = await _write(p, audit, jobs, "write_document", args)
     answer = WrittenDocument(path=new.virtual_path, hint=_capped(done.hint, MAX_HINT))
     return _within(answer, settings.result_max_kb * 1024)

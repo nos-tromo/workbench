@@ -22,16 +22,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from tests.api.test_files import ME, AuditLines
-from tests.api.test_jobs import FakeClient, until
+from tests.api.test_jobs import KEEP, FakeClient, until
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
 from workbench.api.main import app_factory, create_app
 from workbench.api.metrics import Metrics
 from workbench.api.retention import Sweeper, SweepReport, main
-from workbench.api.store import NotFound, Store
+from workbench.api.store import NotFound, Store, new_file_id
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import Workspaces
@@ -106,7 +106,9 @@ def broken_audit(sweeper: Sweeper, audit_stream: io.StringIO, monkeypatch: pytes
 
 def put(store: Store, name: str, p: Principal = ME) -> FileRecord:
     """Store a small upload for ``p`` in its chat folder."""
-    return store.add_upload(p, f"/workspace/{p.chat_id}", name, io.BytesIO(b"x"), max_bytes=100, quota_bytes=10**9)
+    return store.add_upload(
+        p, f"/workspace/{p.chat_id}", name, io.BytesIO(b"x"), max_bytes=100, quota_bytes=10**9, record=unrecorded
+    )
 
 
 def sweeps(audit_lines: AuditLines) -> list[dict[str, Any]]:
@@ -235,6 +237,46 @@ def test_failed_removal_is_recorded_as_error(
     assert "synthetic" not in caplog.text
 
 
+def test_an_error_record_that_cannot_be_written_halts_too(
+    sweeper: Sweeper,
+    store: Store,
+    clock: Clock,
+    audit_stream: io.StringIO,
+    audit_lines: AuditLines,
+    exits: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``ok`` record is written, a removal fails, and its ``error`` record cannot be written: the process ends."""
+    kept, stuck = put(store, "a.txt"), put(store, "salaries-of-user-b.txt")
+    clock.now = T0 + 8 * DAY
+    remove = store.remove
+
+    def failing(rec: FileRecord) -> None:
+        if rec.id == stuck.id:
+            raise OSError("synthetic: device busy")
+        remove(rec)
+
+    write = audit_stream.write
+
+    def no_error_record(text: str, /) -> int:
+        if '"outcome":"error"' in text.replace(" ", ""):
+            raise OSError("synthetic audit stream failure")
+        return write(text)
+
+    monkeypatch.setattr(store, "remove", failing)
+    monkeypatch.setattr(audit_stream, "write", no_error_record)
+    with pytest.raises(AuditWriteError):
+        sweeper.sweep_once()
+    assert exits == [1]
+    (ok,) = sweeps(audit_lines)
+    assert (ok["outcome"], sorted(ok["target"]["ids"])) == ("ok", sorted([kept.id, stuck.id]))
+    assert [rec.id for rec in store.due(T0 + 1)] == [stuck.id]
+    err = capsys.readouterr().err
+    assert "1 file " in err
+    assert "salaries" not in err
+
+
 def test_batches_never_mix_users(sweeper: Sweeper, store: Store, clock: Clock, audit_lines: AuditLines) -> None:
     """Each event is one caller's user, at most 200 files; together they name every due file once."""
     people = [
@@ -305,7 +347,7 @@ async def test_sweep_during_running_job(
     executor.files = {"chart.png": b"\x89PNG"}
     queue = JobQueue(settings, executor, store, metrics)
     clock.now = T0 + 8 * DAY
-    running = asyncio.create_task(queue.submit(ME, "run_python", {"code": "print(1)"}, [old.name]))
+    running = asyncio.create_task(queue.submit(ME, "run_python", {"code": "print(1)"}, [old.name], KEEP))
     await until(lambda: executor.running == 1)
     report = await asyncio.to_thread(sweeper.sweep_once)
     assert report == SweepReport(deleted=1, errors=0)
@@ -370,7 +412,8 @@ def test_empty_folders_untouched_for_an_hour_go_bottom_up(
     assert not (root / "chat-3" / "kept").exists()
     assert (root / "chat-4").is_symlink() and outside.is_dir()
     assert (root / "chat-5" / "link").is_symlink()
-    store.delete(Principal("open-webui", "user-a", "chat-3"), "/workspace/chat-3/notes.txt")
+    gone = Principal("open-webui", "user-a", "chat-3")
+    store.remove(store.get(gone, "/workspace/chat-3/notes.txt"))
     for chat in ("chat-2", "chat-3", "chat-5"):
         (root / chat / "link").unlink(missing_ok=True)
         for folder in sorted(p for p in (root / chat).rglob("*") if p.is_dir()):
@@ -613,7 +656,9 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
         if staged is None:
             made.append(put(store, "quarterly-figures.xlsx"))
         else:
-            made.append(store.register_output(ME, staged, "chart.png", "e" * 32))
+            made.append(
+                store.register_output(ME, staged, "chart.png", "e" * 32, file_id=new_file_id(), quota_bytes=10**12)
+            )
 
     arriving = threading.Thread(target=arrive)
     arriving.start()
@@ -646,7 +691,7 @@ def test_an_empty_user_root_untouched_for_an_hour_goes(
     sweeper.sweep_once()
     assert sorted(p.name for p in (workspaces / "open-webui").iterdir()) == ["user-b", "user-c"]
     user_c = Principal("open-webui", "user-c", "chat-1")
-    store.delete(user_c, "/workspace/chat-1/notes.txt")
+    store.remove(store.get(user_c, "/workspace/chat-1/notes.txt"))
     for folder in (fresh, busy / "chat-1", busy):
         age(folder, 2 * HOUR, clock.now)
     sweeper.sweep_once()
@@ -1193,12 +1238,14 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
     who = Principal("open-webui", "user-7f3a9c", "chat-5e1b2d")
     secrets = [who.user_id, who.chat_id]
     for name in ("harbour-survey-2026.xlsx", "pier-inspection.docx", "fresh-notes.txt"):
-        rec = store.add_upload(who, f"/workspace/{who.chat_id}", name, io.BytesIO(b"x"), max_bytes=10, quota_bytes=100)
+        rec = store.add_upload(
+            who, f"/workspace/{who.chat_id}", name, io.BytesIO(b"x"), max_bytes=10, quota_bytes=100, record=unrecorded
+        )
         secrets += [name, rec.id]
     staged = volume / "staging" / ("e" * 32) / "dredging-chart.png"
     staged.parent.mkdir(parents=True)
     staged.write_bytes(b"\x89PNG")
-    out = store.register_output(who, staged, "dredging-chart.png", "e" * 32)
+    out = store.register_output(who, staged, "dredging-chart.png", "e" * 32, file_id=new_file_id(), quota_bytes=10**12)
     secrets += [out.name, out.id, "e" * 32]
     database = volume / "workbench.db"
     before, listed = database.read_bytes(), {p.name for p in volume.iterdir()}

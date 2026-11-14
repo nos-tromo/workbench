@@ -21,6 +21,11 @@ that is too large for the protocol's line is not a refusal and not worth a retry
 :class:`RequestTooLarge`, ``422``. The queue is the only user of the staging folder: it moves what
 a job wrote into the chat folder (:meth:`~workbench.api.store.Store.register_output`) and removes
 the job's staging folder afterwards, whatever came of the job.
+
+No output becomes a file without its record. Once the executor has answered, the caller's
+:class:`Keeper` records the job by the ids the queue chose for its outputs, and only then are they
+moved into the chat folder; one that cannot be kept, or must go again and cannot, is recorded
+again as an error. A call without a keeper keeps no output at all.
 """
 
 import asyncio
@@ -31,10 +36,10 @@ import shutil
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Final, Literal, get_args
+from typing import Any, Final, Literal, Protocol, get_args
 
 from workbench.api.metrics import Metrics
-from workbench.api.store import QuotaExceeded, StorageFull, Store, StoreError
+from workbench.api.store import QuotaExceeded, StorageFull, Store, StoreError, new_file_id
 from workbench.config import Settings
 from workbench.layout import STAGING
 from workbench.models import FileRecord, JobRecord, Principal
@@ -59,6 +64,44 @@ _READ_GRACE_S: Final = 300
 
 #: Why a job was refused.
 Reason = Literal["queue_full", "wait_timeout", "executor_busy"]
+
+_MIB: Final = 1024 * 1024
+
+
+class Keeper(Protocol):
+    """What the caller of :meth:`JobQueue.submit` does with a job's answer before any file of it becomes visible.
+
+    Both methods run in a worker thread of the loop, under the queue's guard against cancellation: once called, they
+    run to their end.
+    """
+
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Record the job, by the ids its outputs will have, and say which outputs to keep.
+
+        Args:
+            result: The executor's answer, whatever its status.
+            planned: One new file id per staged output, in order; empty unless the job is ``ok``.
+
+        Returns:
+            The ids of the outputs to keep: some or all of ``planned``, each named by the event just written.
+
+        Raises:
+            Exception: The event could not be written (``AuditWriteError``); then no output is kept, and the error is
+                what ``submit`` raises.
+        """
+        ...
+
+    def again(self, ids: Sequence[str]) -> None:
+        """Record as ``error`` outputs the event named that did not end as it said: not kept, or kept and not removed.
+
+        Args:
+            ids: Their file ids.
+
+        Raises:
+            Exception: The event could not be written.
+        """
+        ...
+
 
 #: The tools a job may run; it keeps the metrics' ``tool`` label and the job table to a fixed set.
 TOOLS: Final = frozenset(
@@ -253,7 +296,12 @@ class JobQueue:
         return len(self._gates)
 
     async def submit(
-        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str]
+        self,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        input_files: Sequence[str],
+        keeper: Keeper | None = None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run a tool in the executor, when its turn comes, and keep what it makes.
 
@@ -262,6 +310,8 @@ class JobQueue:
             tool: Name of the runner to run.
             args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
             input_files: Paths relative to the chat folder that the job may read.
+            keeper: Records the job once the executor has answered, before any output is moved into the chat folder,
+                and picks the outputs to keep. Without one, no output is kept: a tool that makes no file has none.
 
         Returns:
             The job record with its final status, the executor's answer and the files the job
@@ -277,8 +327,9 @@ class JobQueue:
             Busy: The queue is full, the user's share of it is, the turn did not come in time,
                 or the executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
-            Exception: Whatever the store raises, such as a failure to settle the job's record.
-                Files the job made are removed again first: the caller gets none of them to record.
+            Exception: What the keeper raised (no output is kept), or what the store raises, such as a failure to
+                settle the job's record. Files the job made are removed again first, and one that stays is recorded
+                again by the keeper.
         """
         if tool not in TOOLS:
             raise ValueError("unknown tool")
@@ -291,7 +342,7 @@ class JobQueue:
         try:
             await self._admit(gate)
             try:
-                return await self._run(p, tool, args, input_files)
+                return await self._run(p, tool, args, input_files, keeper)
             finally:
                 self._slots.release()
                 gate.running.release()
@@ -356,7 +407,7 @@ class JobQueue:
             self.metrics.queue_wait_seconds.observe(time.monotonic() - began)
 
     async def _run(
-        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str]
+        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str], keeper: Keeper | None
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Record the job, run it, keep its outputs and settle its record and staging folder.
 
@@ -365,6 +416,7 @@ class JobQueue:
             tool: Name of the runner.
             args: The runner's arguments.
             input_files: Paths relative to the chat folder.
+            keeper: Records the answer and picks the outputs to keep; ``None`` keeps none.
 
         Returns:
             What :meth:`submit` returns.
@@ -396,8 +448,8 @@ class JobQueue:
                 max_chars=settings.result_max_kb * 1024,
             )
             result = await self._execute(req)
-            if result.status == "ok":
-                result, files = await self._keep(p, job.id, result)
+            if keeper is not None:
+                result, files = await self._keep(p, job.id, result, keeper)
             result = result.model_copy(update={"outputs": []})  # staged paths are gone once the job settles
             status = result.status
             completed = True
@@ -412,23 +464,32 @@ class JobQueue:
             try:
                 await self._settle(job.id, status, pending=not completed)
             except BaseException:
-                # The caller gets this error and records no event, so no file the job made may stay.
-                await asyncio.to_thread(self._discard, files)
+                # The caller gets this error and tells the model of no file, so no file the job made may stay.
+                await asyncio.to_thread(self._discard, files, keeper)
                 raise
 
-    def _discard(self, files: Sequence[FileRecord]) -> None:
-        """Remove outputs no event will record: the job could not be settled, or its caller went away.
+    def _discard(self, files: Sequence[FileRecord], keeper: Keeper | None) -> None:
+        """Remove outputs the model will not be told of: the job could not be settled, or its caller went away.
 
-        A failure is logged and never raised.
+        Their event, written before they were kept, covers their removal within the same call. One that cannot be
+        removed is named again, by an ``error`` event of the keeper. A failure is logged by its type and never raised.
 
         Args:
             files: The outputs already moved into the chat folder.
+            keeper: Records the outputs that stayed.
         """
+        left: list[str] = []
         for rec in files:
             try:
                 self._store.remove(rec)
             except Exception as exc:
-                _log.warning("could not remove an output no event will record (%s)", type(exc).__name__)
+                _log.warning("could not remove an output the model will not be told of (%s)", type(exc).__name__)
+                left.append(rec.id)
+        if left and keeper is not None:
+            try:
+                keeper.again(left)
+            except Exception as exc:
+                _log.warning("could not record outputs that stayed (%s)", type(exc).__name__)
 
     async def _settle(self, job_id: str, status: str, *, pending: bool) -> None:
         """Record the job's final status and remove its staging folder; the folder always goes.
@@ -478,30 +539,34 @@ class JobQueue:
         self.metrics.job_duration_seconds.labels(req.tool).observe(time.monotonic() - began)
         return result
 
-    async def _keep(self, p: Principal, job_id: str, result: JobResult) -> tuple[JobResult, list[FileRecord]]:
-        """Move the job's outputs into the chat folder.
+    async def _keep(
+        self, p: Principal, job_id: str, result: JobResult, keeper: Keeper
+    ) -> tuple[JobResult, list[FileRecord]]:
+        """Record the job's answer, then move the outputs the keeper picked into the chat folder.
 
-        The registration runs as one call in a thread. A cancellation does not cut it off half way: it finishes,
-        what it registered is removed again (the caller that is going away records no event for it), and then the
-        cancellation goes on. Both calls are plain futures of the loop's executor, not tasks: ``asyncio.run`` cancels
-        every task as it shuts down, and a cancelled task would stop waiting while its thread goes on moving files.
+        The record and the registration run as one call in a thread. A cancellation does not cut it off half way: it
+        finishes, what it registered is removed again (the caller that is going away tells the model of none of it),
+        and then the cancellation goes on. Both calls are plain futures of the loop's executor, not tasks:
+        ``asyncio.run`` cancels every task as it shuts down, and a cancelled task would stop waiting while its thread
+        goes on moving files.
 
         Args:
             p: The caller, user and chat the job ran for.
             job_id: The job's id.
-            result: The executor's ``ok`` answer.
+            result: The executor's answer, whatever its status.
+            keeper: Records the answer and picks the outputs to keep.
 
         Returns:
             The answer, its message extended by a note on outputs that could not be kept, and the new files.
         """
         loop = asyncio.get_running_loop()
-        registering = loop.run_in_executor(None, self._register, p, job_id, result.outputs)
+        registering = loop.run_in_executor(None, self._register, p, job_id, result, keeper)
         try:
             kept, lost = await asyncio.shield(registering)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):  # a registration that failed has removed its files itself
                 kept, _ = await outlast(registering)
-                await outlast(loop.run_in_executor(None, self._discard, kept))
+                await outlast(loop.run_in_executor(None, self._discard, kept, keeper))
             raise
         if lost:
             count = sum(lost.values())
@@ -510,32 +575,45 @@ class JobQueue:
         return result, kept
 
     def _register(
-        self, p: Principal, job_id: str, outputs: Sequence[OutputFile]
+        self, p: Principal, job_id: str, result: JobResult, keeper: Keeper
     ) -> tuple[list[FileRecord], dict[str, int]]:
-        """Register each staged output of a job as a file of the chat.
+        """Have the keeper record the job, then register each output it picked as a file of the chat.
 
-        The store trusts the path it is given, so only a file the executor staged for this job, under
-        ``staging/<job-id>/``, is handed to it. An output that cannot be kept does not stop the others; an
-        unexpected failure removes the files registered before it, then goes on up.
+        Each staged output gets its file id before anything is recorded, so the keeper's event names every file that
+        may become visible. The store trusts the path it is given, so only a file the executor staged for this job,
+        under ``staging/<job-id>/``, is handed to it. An output that cannot be kept (the user's quota, a full volume,
+        an invalid name) does not stop the others; those are recorded again as errors once all are through. An
+        unexpected failure, or an error record that cannot be written, removes the files registered before it, then
+        goes on up.
 
         Args:
             p: The caller, user and chat the job ran for.
             job_id: The job's id.
-            outputs: The executor's staged outputs.
+            result: The executor's answer; only an ``ok`` one has outputs.
+            keeper: Records the answer and picks the outputs to keep.
 
         Returns:
             The new files, and how many outputs could not be kept, by reason.
         """
+        outputs: list[OutputFile] = result.outputs if result.status == "ok" else []
+        planned = [new_file_id() for _ in outputs]
+        chosen = set(keeper.record(result, planned))
         folder = self._staging / job_id
+        quota = self._settings.workspace_max_mb * _MIB
         kept: list[FileRecord] = []
         lost: dict[str, int] = {}
+        missed: list[str] = []
         try:
-            for output in outputs:
+            for output, file_id in zip(outputs, planned, strict=True):
+                if file_id not in chosen:
+                    continue
                 try:
                     staged = folder / check_filename(output.name)
                     if Path(output.staged_path) != staged:
                         raise PathError("not the job's staging folder")
-                    kept.append(self._store.register_output(p, staged, output.name, job_id))
+                    kept.append(
+                        self._store.register_output(p, staged, output.name, job_id, file_id=file_id, quota_bytes=quota)
+                    )
                 except QuotaExceeded:
                     why = "quota"
                 except StorageFull:
@@ -547,8 +625,11 @@ class JobQueue:
                 else:
                     continue
                 lost[why] = lost.get(why, 0) + 1
+                missed.append(file_id)
+            if missed:
+                keeper.again(missed)
         except BaseException:
-            self._discard(kept)
+            self._discard(kept, keeper)
             raise
         return kept, lost
 

@@ -196,11 +196,12 @@ After the job, before anything is staged (`supervisor.py:_find_outputs`,
   (device and inode) as when it was found; it is copied to
   `staging/<job-id>/`, handed to the api and given mode `0600`.
 
-The api then moves each staged file into the chat folder under a free name
-(`workbench/api/store.py:Store.register_output`). What it cannot keep (a full
-disk, an invalid name) is removed with the staging folder and counted in the
-answer. Outputs are not held to the user's quota when they are made; they use
-up the room of later uploads.
+The api records the job by the ids its outputs will have, then moves each
+staged file into the chat folder under a free name
+(`workbench/api/store.py:Store.register_output`). Outputs count against the
+user's quota (`WORKBENCH_WORKSPACE_MAX_MB`) like uploads. What it cannot keep
+(the quota, a full disk, an invalid name) is removed with the staging folder,
+counted in the answer and recorded again as an error.
 
 ### The healthcheck
 

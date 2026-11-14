@@ -44,10 +44,10 @@ The browser's routes (`workbench/api/files.py`).
 
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
-| upload, `POST /files/upload` | the uploaded bytes | one new file in a chat folder or a folder inside one; a taken name gets a number | `collect` / `file.upload` | the file |
+| upload, `POST /files/upload` | the uploaded bytes | one new file in a chat folder or a folder inside one; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
 | view and download, `GET /files/view` | one file's bytes, sent to the browser | nothing | `disclose` / `file.view` | nothing |
 | read as text, `GET /files/read` | one text file, sent whole | nothing | `disclose` / `file.read` | nothing |
-| delete, `DELETE /files/delete` | nothing | removes one file and its row | `delete` / `file.delete`, before the file goes | nothing |
+| delete, `DELETE /files/delete` | nothing | removes one file and its row | `delete` / `file.delete`, before the file goes; again as `error` if it could not go | nothing |
 | mkdir, `POST /files/mkdir` | nothing | one folder, with its parents | not recorded: no content | the folder, until retention removes it empty |
 | move, `POST /files/move` | nothing | a new name or folder for one file of the same user; nothing is overwritten | not recorded: no content | the file keeps its id and its creation time |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
@@ -128,23 +128,30 @@ file browser, or by retention after the period
 
 ## Which runs are audited
 
-- `run_python` is recorded for every job whose result reached the api, failed
-  ones included (`outcome: error`). The event names the files the job was given
-  and the files it made (`workbench/api/tools.py:_record_run`).
-- The other tools record completed work only. A read, search or inspection that
-  failed is not recorded. A fill or a write whose job answer cannot be used
-  leaves no file and no event; a new file that could not be removed again is
-  recorded with `outcome: error` (`workbench/api/tools.py:_remove_unsent`).
+- Every tool job whose answer reached the api is recorded before anything of
+  that answer goes out: `ok` for an answer the api sends on, `error` for any
+  other (`workbench/api/tools.py:record_answer`, `OutputKeeper`).
+- A refusal is recorded too, as `error` with `refused: <code>`. Its message
+  goes to the model and can quote the file: a workbook's sheet names, a line of
+  a template, a drop-down's entries, the sheets and range of a value's source.
+  The event holds the code alone, and if it cannot be written the model gets
+  `audit unavailable`, never the refusal.
+- `run_python` names the files the job was given and the files it made; a fill
+  or a write names its new file. Each is recorded before any file it made
+  becomes visible. A new file the model is not told of (the answer could not be
+  used) is never moved into the chat.
 - A job whose answer never reached the api (the connection dropped, or the
-  request was cancelled) is not recorded as a tool call. Nothing of it reached
-  the model, and the files it made are removed, staged or already kept
+  request was cancelled while the job ran) is not recorded as a tool call.
+  Nothing of it reached the model, and the files it made are never kept
   (`workbench/api/jobs.py:JobQueue`). Its job record stays, until retention.
 - What a call makes and removes within the same request is covered by that
-  call's event: the job's folder in the executor, and outputs the api cannot
-  keep (a full disk, an invalid name). Only what outlives its
-  request gets an event of its own, from retention.
-- A new file whose event cannot be written is removed again, and the call
-  fails (see [audit.md](audit.md#fail-closed)).
+  call's event: the job's folder in the executor, and a new file named in the
+  event that is removed again. A new file that could not be stored after its
+  event (the user's quota, a full disk, an invalid name), or that should have
+  gone again and could not, is recorded again with `outcome: error`. Only what
+  outlives its request otherwise gets an event of its own, from retention.
+- A new file whose event cannot be written is never stored, and the call fails
+  (see [audit.md](audit.md#fail-closed)).
 
 ## What the model is told
 

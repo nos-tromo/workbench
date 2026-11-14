@@ -7,9 +7,16 @@ from collections.abc import Iterator
 from typing import Any, override
 
 import pytest
+from fastapi.testclient import TestClient
 
+from tests.api.conftest import KEY as CALLER_KEY
+from tests.api.test_tools_documents import Scripted
 from workbench.api.audit import OPERATIONS, SERVICE, AuditLog
-from workbench.config import load_settings
+from workbench.api.jobs import JobQueue
+from workbench.api.main import create_app
+from workbench.api.metrics import Metrics
+from workbench.api.store import Store
+from workbench.config import Settings, load_settings
 from workbench.models import Principal
 from workbench.utils.audit_event import ACTIONS, AuditEmitter, AuditWriteError, Purpose, verify_chain
 
@@ -240,12 +247,56 @@ def test_record_system_without_files_has_no_target(log: AuditLog, stream: Stream
     assert event["outcome"] == "error"
 
 
-def test_no_file_name_reaches_the_stream(log: AuditLog, stream: Stream, alice: Principal) -> None:
-    """Only ids go in: nothing here takes a name, so a name cannot appear."""
-    log.record("upload", alice, file_ids=["f1"])
-    log.record_system("delete", "retention.sweep", file_ids=["f1"])
+def test_no_file_name_reaches_the_stream_through_any_audited_route(
+    settings: Settings, store: Store, audit: AuditLog, audit_stream: io.StringIO
+) -> None:
+    """Every audited operation runs, on files whose names the user and the model chose; none of the names is recorded.
 
-    assert "quarterly-figures" not in stream.raw
+    The names, the template's field and the model's values all carry one telling word, and every key of
+    ``OPERATIONS`` must have been recorded, so the test cannot pass by recording nothing.
+    """
+    executor = Scripted(settings.data_dir)
+    app = create_app(
+        settings, store=store, audit=audit, jobs=JobQueue(settings, executor, store, Metrics(settings.data_dir))
+    )
+    word = "salaries"
+    h = {"Authorization": f"Bearer {CALLER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
+    with TestClient(app) as client:
+        for name, data in ((f"{word}-of-user-b.csv", b"a,b\n"), (f"{word}-form.docx", b"PK")):
+            where = {"directory": "/workspace/chat-1"}
+            assert (
+                client.post("/files/upload", params=where, headers=h, files={"file": (name, data)}).status_code == 200
+            )
+        csv, form = f"/workspace/chat-1/{word}-of-user-b.csv", f"/workspace/chat-1/{word}-form.docx"
+        for route in ("view", "read", "display"):
+            assert client.get(f"/files/{route}", params={"path": csv}, headers=h).status_code == 200
+        executor.payload = {"path": csv, "kind": "csv", "parts": [], "total_parts": 0, "pages_without_text": []}
+        executor.payload["truncated"] = False
+        assert client.post("/tools/read_document", json={"path": csv}, headers=h).status_code == 200
+        executor.payload = {"hits": [], "truncated": False, "files_searched": 2, "unsupported_files": 0}
+        assert client.post("/tools/search_files", json={"query": word}, headers=h).status_code == 200
+        executor.files = {f"{word}-chart.png": b"png"}
+        executor.payload = {"stdout": "", "stderr": "", "truncated": False}
+        assert client.post("/tools/run_python", json={"code": f"print('{word}')"}, headers=h).status_code == 200
+        executor.files = {}
+        executor.payload = {"template_kind": "none", "fields": [], "total": 0, "truncated": False}
+        assert client.post("/tools/inspect_template", json={"path": form}, headers=h).status_code == 200
+        executor.files = {f"{word}-filled.docx": b"PK"}
+        executor.payload = {"filled": [word], "unfilled": [], "warnings": []}
+        values = {word: {"value": word, "source": {"kind": "assistant"}}}
+        body = {"path": form, "values": values, "output_name": f"{word}-filled.docx"}
+        assert client.post("/tools/fill_template", json=body, headers=h).status_code == 200
+        executor.files = {f"{word}-table.csv": b"a"}
+        executor.payload = {}
+        table = {"name": f"{word}-table", "format": "csv", "columns": [word], "rows": [[word]]}
+        assert client.post("/tools/write_table", json=table, headers=h).status_code == 200
+        executor.files = {f"{word}-notes.md": b"#"}
+        document = {"name": f"{word}-notes", "format": "md", "markdown": word}
+        assert client.post("/tools/write_document", json=document, headers=h).status_code == 200
+        assert client.delete("/files/delete", params={"path": csv}, headers=h).status_code == 200
+    events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
+    assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
+    assert word not in audit_stream.getvalue()
 
 
 def test_open_writes_to_the_selected_stream_under_the_service_name(

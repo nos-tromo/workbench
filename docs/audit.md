@@ -11,10 +11,20 @@ read it belong to obs-plane: see its
 
 Every read, change, disclosure and deletion of a file's content is one event.
 Each names its files by id, never by name, and the chat folder they are in as
-`container`. The event is written before the content leaves or the file goes.
-A new file is the exception: an upload, and a file a tool made, is recorded once
-it is stored, because its file id exists only then; one whose event cannot be
-written is removed again.
+`container`. The event is written before the content leaves, before the file
+goes, and before a new file becomes visible:
+
+- an upload gets its id before its first byte is written (the bytes go to
+  `<id>.part`), and its event names that id before the rename makes it a file of
+  the chat (`workbench/api/store.py:Store.add_upload`);
+- a file a tool made gets its id once the job has answered, and the tool's event
+  names it before the file is moved into the chat
+  (`workbench/api/jobs.py:JobQueue`, its `Keeper`).
+
+A new file whose event cannot be written is never stored. One that could not be
+stored after its event (a full disk, the user's quota, a failed commit) is
+recorded again with `outcome: error`. A process that ends between the two leaves
+a recorded `<id>.part`, which retention removes and records by that id.
 
 Every event a user's request causes has this shape (`workbench/api/audit.py:AuditLog.record`):
 
@@ -36,29 +46,40 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 
 | Key | `action` / `operation` | `target.ids` | `criteria` besides `caller` | Outcome |
 |---|---|---|---|---|
-| `upload` | `collect` / `file.upload` | the new file | — | `ok`, once the file is stored |
+| `upload` | `collect` / `file.upload` | the new file | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
 | `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
 | `read` | `disclose` / `file.read` | the text file read whole | — | `ok`, before the text goes; a file that is not text or is too large is refused and not recorded |
 | `display` | `disclose` / `file.display` | the file shown as a card | — | `ok`; a file that does not exist is not recorded |
-| `delete` | `delete` / `file.delete` | the file deleted by the user | — | `ok`, before the file goes |
-| `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | `ok`, once the job has answered and before the text goes |
-| `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | `ok`, once the job has answered and before the hits go |
-| `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made | `outputs`: how many files it made that were kept | `ok` when the job ran to an answer: the code may have raised (its traceback is the answer) or run out of its own time, 9/10 of the wall time (stderr then says it timed out); `error` when the job failed, was stopped at the wall time or on a resource limit, its outputs broke the executor's limits, or its answer could not be used |
-| `inspect_template` | `query` / `tool.inspect_template` | the template | — | `ok`, once the job has answered and before the fields go |
-| `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`) | `ok`, once the new file is kept |
-| `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size | `ok`, once the new file is kept |
-| `write_document` | `collect` / `tool.write_document` | the new file | — | `ok`, once the new file is kept |
+| `delete` | `delete` / `file.delete` | the file deleted by the user | — | `ok`, before the file goes; `error` again when the removal then failed |
+| `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
+| `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
+| `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made that is kept | `outputs`: how many files it made that are kept | before any file it made is visible and before the answer goes. `ok` when the job ran to an answer: the code may have raised (its traceback is the answer) or run out of its own time, 9/10 of the wall time (stderr then says it timed out); `error` when the job failed, was stopped at the wall time or on a resource limit, its outputs broke the executor's limits, or its answer could not be used |
+| `inspect_template` | `query` / `tool.inspect_template` | the template | — | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
+| `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
+| `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size; `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
+| `write_document` | `collect` / `tool.write_document` | the new file | `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 
 An event about more than 200 files is followed by continuation events under
 `<operation>.ids` (`tool.search_files.ids`, `tool.run_python.ids`,
 `tool.fill_template.ids`), each naming up to 200 more of its files (see
 [Long lists of files](#long-lists-of-files)).
 
-`fill_template`, `write_table` and `write_document` also write an `error`
-event in one case: the job's answer could not be used, so the new file must
-go, and it could not be removed. That event names the files the job was given
-and the file that stayed, with `outputs` counting the files that stayed
-(`workbench/api/tools.py:_remove_unsent`).
+Every tool job whose answer reached the api is recorded, whatever the answer
+(`workbench/api/tools.py:record_answer`, `OutputKeeper`). It is `error` when the
+job did not end in an answer the api sends on: it refused, ran out of time or
+memory, failed, or answered something that could not be read or used. A refusal
+adds `refused: <code>`, the runner's fixed word (`no_such_part`,
+`invalid_template`, `invalid_value`, `bad_regex`…), never its message. The
+message goes to the model and can quote the file: a workbook's sheet names, a
+template's line, a drop-down's entries, a source's sheets and range. Since it
+discloses content, it is recorded like a read. If the event cannot be written,
+the answer is `audit unavailable`, never the refusal.
+
+A tool that makes files writes a second, `error` event, with `outputs` counting
+them, for new files its event named that did not end as it said: not stored
+after all (the user's quota, a full disk, an invalid name), or stored and then
+not removed when the call failed (`workbench/api/jobs.py:JobQueue`). Within the
+same call, the first event covers a new file that is removed again.
 
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.
@@ -71,17 +92,18 @@ recorded and which are not.
 - The handshake routes (`/api/config`, `/system`, `/openapi.json`,
   `/files/cwd`, `/skills`), `/healthz` and `/metrics`.
 - A request refused before it becomes an operation: no or a wrong key (`401`),
-  a missing or invalid user (`400`), a body that does not validate (`422`), a
-  full queue (`503`), a file that does not exist (`404`).
-- A tool call that failed before its work was done, and a job whose answer
-  never reached the api (see
+  a body too large (`413`), a missing or invalid user (`400`), a body that does
+  not validate (`422`), a full queue (`503`), a file that does not exist
+  (`404`).
+- A tool call refused before its job ran (an invalid name, a source that is not
+  in the chat), and a job whose answer never reached the api (see
   [permissions.md](permissions.md#which-runs-are-audited)).
 
 ### What is never recorded
 
 No event holds a file's content, a file name or a path, a search query, code,
-a value the model wrote, Markdown, a template's field names, or the text a tool
-returned. The api's audit methods take file ids and counts and no name
+a value the model wrote, Markdown, a template's field names, the text a tool
+returned, or the message of a refusal (only its code). The api's audit methods take file ids and counts and no name
 (`workbench/api/audit.py`). The criteria are flags and counts.
 
 ### Long lists of files
@@ -182,9 +204,13 @@ Open WebUI's access log is a separate stream and still carries those URLs (see
 
 - An action whose event cannot be written does not happen. The request gets
   `500` with `{"detail": "audit unavailable"}` (`workbench/api/errors.py`). An
-  upload is removed again; a tool's new files are removed again; a view, read
-  or display sends nothing; a delete leaves the file. A continuation that cannot
-  be written fails the action the same way; the events written before it stay.
+  upload or a tool's new file is never stored; a view, read, display or tool
+  answer, a refusal included, sends nothing; a delete leaves the file. A
+  continuation that cannot be written fails the action the same way; the events
+  written before it stay.
+- When a second, `error` event cannot be written after a store or a removal
+  failed, the failure it was about decides the answer; the failed record is
+  logged by its type.
 - A retention record that cannot be written ends the api process
   (`os._exit(1)`) before anything more is deleted. stderr names how many files
   the record was about; `restart: unless-stopped` brings the api back. The

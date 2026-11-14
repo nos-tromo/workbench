@@ -8,15 +8,16 @@ that each ``file`` source is a file of the template's chat and each ``job`` sour
 the user in that chat. The job is given the template and every file a source names, so it can check a page, sheet
 or cell in its copy.
 
-``inspect_template`` is recorded as a ``query`` of the template. ``fill_template`` is recorded as a ``modify`` once
-its file is kept, by the ids of the template, of every file source and of the new file, with how many fields each
-kind of source filled; never a value, a field's name or a job's content. A new file whose event cannot be written is
-removed again.
+``inspect_template`` is recorded as a ``query`` of the template. ``fill_template`` is recorded as a ``modify`` before
+its file becomes visible, by the ids of the template, of every file source and of the new file, with how many fields
+each kind of source filled; never a value, a field's name or a job's content. A new file whose event cannot be written
+is never kept. Both record a job that refused, by the refusal's code: a template's line or a drop-down's entries can
+be in its message.
 """
 
 import dataclasses
 import posixpath
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Final, Literal
 
 from fastapi import HTTPException
@@ -24,11 +25,11 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from pydantic.json_schema import JsonDict
 
-from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
     MAX_HINT,
+    OutputKeeper,
     _capped,
     _clean,
     _join,
@@ -36,16 +37,14 @@ from workbench.api.tools import (
     _parse,
     _payload,
     _readable,
-    _remove_outputs,
-    _remove_unsent,
-    _to_the_end,
     _within,
+    judged,
+    record_answer,
     router,
 )
 from workbench.models import FileRecord, Principal
 from workbench.paths import MAX_FILENAME, MAX_FILENAME_BYTES, PathError, check_filename
-from workbench.protocol import MAX_INPUT_FILES
-from workbench.utils.audit_event import AuditWriteError
+from workbench.protocol import MAX_INPUT_FILES, JobResult
 
 #: The templates, by extension, and the extension of what they are filled into.
 OUTPUTS: Final = {".docx": ".docx", ".dotx": ".docx", ".xlsx": ".xlsx"}
@@ -443,31 +442,6 @@ def _sources(
     return sent, list(inputs), list(ids)
 
 
-def _record_fill(
-    audit: AuditLog, store: Store, p: Principal, file_ids: list[str], counts: dict[str, int], output: FileRecord
-) -> None:
-    """Record a fill by the ids of its files and how many fields each kind of source filled.
-
-    As with an upload, a file whose making cannot be recorded does not stay: the new file is removed again.
-
-    Args:
-        audit: The audit log.
-        store: The file store.
-        p: The caller, user and the template's chat.
-        file_ids: The template's, the source files' and the new file's ids.
-        counts: The fields filled, by kind of source.
-        output: The new file.
-
-    Raises:
-        AuditWriteError: The event could not be written.
-    """
-    try:
-        audit.record("fill_template", p, file_ids=file_ids, criteria={"filled_by_source": counts})
-    except AuditWriteError:
-        _remove_outputs(store, [output])  # the audit failure is the answer
-        raise
-
-
 def _fit_inspection(answer: TemplateInfo, total: int, limit_kb: int) -> TemplateInfo:
     """Keep as many fields as fit within the result limit, and say how many of how many are listed.
 
@@ -557,8 +531,9 @@ async def inspect_template(
 ) -> TemplateInfo:
     """List a template's fields in the executor and answer with them, cut to the result limit.
 
-    The job runs in the chat folder the template lives in, with that one file as its input. The use is recorded by
-    the template's id once the job has answered and before the fields go out.
+    The job runs in the chat folder the template lives in, with that one file as its input. The job is recorded by
+    the template's id once it has answered and before anything of the answer goes out, a refusal as ``error`` with its
+    code.
 
     Args:
         body: The template's path.
@@ -576,8 +551,10 @@ async def inspect_template(
     in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     args = {"path": rec.name, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
     _, result, _ = await jobs.submit(in_chat, "inspect_template", args, [rec.name])
+    await run_in_threadpool(
+        record_answer, audit, "inspect_template", in_chat, [rec.id], {}, result, _Inspected, result.result
+    )
     found = _parse(_Inspected, _payload(result, "file"))
-    await run_in_threadpool(audit.record, "inspect_template", in_chat, file_ids=[rec.id])
     answer = TemplateInfo(
         path=rec.virtual_path,
         template_kind=found.template_kind,
@@ -643,25 +620,29 @@ async def fill_template(
         "include_sources": body.include_sources,
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
-    _, result, made = await jobs.submit(in_chat, "fill_template", args, inputs)
     used = list(dict.fromkeys([rec.id, *source_ids]))
 
-    def record() -> tuple[FileRecord, _Filled, int]:
-        if result.status == "ok" and (not _readable(_Filled, result.result) or len(made) != 1):
-            # Nothing the model is not told of may stay.
-            _remove_unsent(audit, store, in_chat, "fill_template", made, used)
-            if _readable(_Filled, result.result):
-                note = _clean(result.message) or "the job made no file"
-                raise HTTPException(status_code=500, detail=f"the filled file could not be kept: {note}")
-        done = _parse(_Filled, _payload(result, "file"))
-        (new,) = made
-        filled = [name for name in dict.fromkeys(done.filled) if name in body.values]
+    def counted(done: _Filled) -> dict[str, int]:
         counts = dict.fromkeys(SOURCE_KINDS, 0)
-        for name in filled:
-            counts[body.values[name].source.kind] += 1
-        _record_fill(audit, store, in_chat, [*used, new.id], counts, new)
-        return new, done, len(filled)
+        for name in dict.fromkeys(done.filled):
+            if name in body.values:
+                counts[body.values[name].source.kind] += 1
+        return counts
 
-    new, done, filled = await _to_the_end(record)
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        # One new file, of an answer the model can be given; otherwise nothing is kept, the model never learning of it.
+        if result.status == "ok" and _readable(_Filled, result.result) and len(planned) == 1:
+            return list(planned), "ok", {"filled_by_source": counted(_Filled.model_validate(result.result))}
+        outcome, more = judged(result, False)
+        return [], outcome, {"outputs": 0, **more}
+
+    keeper = OutputKeeper(audit, in_chat, "fill_template", used, decide)
+    _, result, made = await jobs.submit(in_chat, "fill_template", args, inputs, keeper)
+    done = _parse(_Filled, _payload(result, "file"))
+    if len(made) != 1:
+        note = _clean(result.message) or "the job made no file"
+        raise HTTPException(status_code=500, detail=f"the filled file could not be kept: {note}")
+    (new,) = made
+    filled = sum(counted(done).values())
     answer = FilledTemplate(path=new.virtual_path, filled=filled, unfilled=done.unfilled, warnings=done.warnings)
     return _fit_fill(answer, settings.result_max_kb)

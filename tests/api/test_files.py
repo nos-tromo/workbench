@@ -21,16 +21,16 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.main import create_app
 from workbench.api.openapi import TOOL_TAG
-from workbench.api.store import NotFound, Store
+from workbench.api.store import NotFound, StorageFull, Store
 from workbench.api.upload_limit import UploadLimit
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
-from workbench.paths import Workspaces
+from workbench.paths import PathError, Workspaces
 
 H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 H_B = {**H, "X-User-Id": "user-b"}
@@ -51,7 +51,9 @@ def upload(
 
 def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT) -> FileRecord:
     """Store ``data`` as ``name`` for the synthetic user, without going through the api."""
-    return store.add_upload(ME, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB)
+    return store.add_upload(
+        ME, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
+    )
 
 
 def file_operations(audit_lines: AuditLines) -> list[str]:
@@ -637,6 +639,138 @@ def test_a_failed_audit_write_logs_nothing_with_a_name(
     client.delete("/files/delete", params={"path": rec.virtual_path}, headers=H)
     assert "secret-name" not in " ".join(record.getMessage() for record in server_log(caplog))
     assert [record for record in server_log(caplog) if record.exc_info] == []
+
+
+def test_an_unrecorded_upload_answers_the_audit_failure_even_if_nothing_could_be_removed(
+    client: TestClient, broken_audit: None, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No removal's error can replace the audit failure: the upload is never stored, so nothing has to be taken out."""
+
+    def refuse(_record: FileRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    r = upload(client, "q.csv", b"data")
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    assert store.files_in_chat(ME) == []
+
+
+def test_an_upload_is_recorded_by_its_id_before_it_is_a_file_of_the_chat(
+    client: TestClient, store: Store, settings: Settings, audit_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the ``collect`` is written, the bytes are only the ``<id>.part`` its id names; the kept file has that id."""
+    seen: list[tuple[list[str], list[str]]] = []
+    write = audit_stream.write
+    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+
+    def look(text: str, /) -> int:
+        if '"file.upload"' in text:
+            seen.append(([rec.name for rec in store.files_in_chat(ME)], sorted(p.name for p in chat.iterdir())))
+        return write(text)
+
+    monkeypatch.setattr(audit_stream, "write", look)
+    r = upload(client, "quarterly-figures.xlsx", b"PK")
+    assert r.status_code == 200
+    (rec,) = store.files_in_chat(ME)
+    assert seen == [([], [f"{rec.id}.part"])]
+    (event,) = [json.loads(line) for line in audit_stream.getvalue().splitlines() if '"file.upload"' in line]
+    assert event["target"]["ids"] == [rec.id]
+
+
+def test_an_upload_that_cannot_be_stored_after_its_record_is_recorded_again_as_an_error(
+    client: TestClient, store: Store, settings: Settings, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row's commit fails after the ``ok``: the file is taken out, and an ``error`` event names the same id."""
+
+    def full(_rec: FileRecord) -> None:
+        raise StorageFull("storage is full")
+
+    monkeypatch.setattr(store, "_insert", full)
+    r = upload(client, "q.csv", b"data")
+    assert (r.status_code, r.json()) == (507, {"detail": "storage is full"})
+    first, again = [e for e in audit_lines() if e["operation"] == "file.upload"]
+    assert (first["outcome"], again["outcome"]) == ("ok", "error")
+    assert first["target"]["ids"] == again["target"]["ids"]
+    assert [p for p in (settings.data_dir / "workspaces").rglob("*") if p.is_file()] == []
+
+
+def test_an_error_record_that_fails_too_does_not_hide_the_stores_error(
+    client: TestClient,
+    store: Store,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The store's failure decides the answer; the failed second record is logged by its type alone."""
+
+    def full(_rec: FileRecord) -> None:
+        raise StorageFull("storage is full")
+
+    write = audit_stream.write
+
+    def only_ok(text: str, /) -> int:
+        if '"outcome":"error"' in text.replace(" ", ""):
+            raise OSError("synthetic audit stream failure")
+        return write(text)
+
+    monkeypatch.setattr(store, "_insert", full)
+    monkeypatch.setattr(audit_stream, "write", only_ok)
+    with caplog.at_level(logging.WARNING):
+        r = upload(client, "salaries-of-user-b.csv", b"data")
+    assert (r.status_code, r.json()) == (507, {"detail": "storage is full"})
+    assert "AuditWriteError" in caplog.text
+    assert "salaries" not in caplog.text
+
+
+def test_a_delete_that_fails_after_its_record_is_recorded_again_as_an_error(
+    client: TestClient, store: Store, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``ok`` event is not the last word: a removal that fails adds an ``error`` event for the same file."""
+    rec = put(store, "q.csv")
+
+    def refuse(_record: FileRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    r = client.delete("/files/delete", params={"path": rec.virtual_path}, headers=H)
+    assert (r.status_code, r.json()) == (500, {"detail": "internal error"})
+    deletes = [e for e in audit_lines() if e["operation"] == "file.delete"]
+    assert [(e["outcome"], e["target"]["ids"]) for e in deletes] == [("ok", [rec.id]), ("error", [rec.id])]
+    assert store.get(ME, rec.virtual_path) == rec
+
+
+def test_a_failed_delete_whose_error_record_fails_too_answers_the_removals_error(
+    client: TestClient,
+    store: Store,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The removal's failure decides the answer; the failed error record is logged by its type, with no name."""
+    rec = put(store, "salaries-of-user-b.csv")
+
+    def refuse(_record: FileRecord) -> None:
+        raise PathError("a symlink is in the way")
+
+    write = audit_stream.write
+
+    def only_ok(text: str, /) -> int:
+        if '"outcome":"error"' in text.replace(" ", ""):
+            raise OSError("synthetic audit stream failure")
+        return write(text)
+
+    monkeypatch.setattr(store, "remove", refuse)
+    monkeypatch.setattr(audit_stream, "write", only_ok)
+    with caplog.at_level(logging.WARNING):
+        r = client.delete("/files/delete", params={"path": rec.virtual_path}, headers=H)
+    assert (r.status_code, r.json()) == (400, {"detail": "a symlink is in the way"})
+    assert "AuditWriteError" in caplog.text
+    assert "salaries" not in caplog.text
+
+
+def test_the_store_has_no_delete_that_records_nothing() -> None:
+    """Only ``remove`` deletes, and the routes call it once the deletion is recorded."""
+    assert not hasattr(Store, "delete")
 
 
 # --- isolation -----------------------------------------------------------------------------------------------------

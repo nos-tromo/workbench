@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import io
 import logging
 import shutil
 import socket
@@ -15,6 +16,7 @@ from typing import Any, override
 
 import pytest
 
+from tests.api.conftest import unrecorded
 from workbench.api.jobs import Busy, ExecutorClient, ExecutorUnavailable, JobQueue, RequestTooLarge
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, Store
@@ -22,10 +24,12 @@ from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, Workspaces
 from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, OutputFile, decode_request, encode
+from workbench.utils.audit_event import AuditWriteError
 
 pytestmark = pytest.mark.anyio
 
 ARGS: dict[str, Any] = {"code": "print(1)"}
+MIB = 1024 * 1024
 
 
 @pytest.fixture
@@ -108,6 +112,38 @@ class FakeClient(ExecutorClient):
             return sample_result(req.job_id, outputs, status=self.status, message=self.message)
         finally:
             self.running -= 1
+
+
+class KeepAll:
+    """A keeper that keeps every output, as a tool that makes files does, and remembers what it was asked.
+
+    Attributes:
+        recorded: Per answer recorded: its status, the ids planned, and the names of the chat's files at that moment.
+        again: Every list of ids recorded again as errors.
+        store: Where it looks, at the moment it records, for files of the chat.
+        p: Whose chat it looks into.
+    """
+
+    def __init__(self, store: Store | None = None, p: Principal | None = None) -> None:
+        """Look into ``p``'s chat in ``store`` when recording, if both are given."""
+        self.recorded: list[tuple[str, list[str], list[str]]] = []
+        self.again_ids: list[list[str]] = []
+        self.store = store
+        self.p = p
+
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Keep every output."""
+        seen = [] if self.store is None or self.p is None else [r.name for r in self.store.files_in_chat(self.p)]
+        self.recorded.append((result.status, list(planned), seen))
+        return planned
+
+    def again(self, ids: Sequence[str]) -> None:
+        """Remember the ids."""
+        self.again_ids.append(list(ids))
+
+
+#: A keeper for the tests that only need the outputs kept.
+KEEP = KeepAll()
 
 
 @pytest.fixture
@@ -583,7 +619,7 @@ async def test_outputs_are_registered_as_files(
     executor.files = {"summary.docx": b"doc", "chart.png": b"png!"}
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [])
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert result.status == "ok"
     assert {(f.name, f.kind, f.job_id, f.size) for f in files} == {
         ("summary.docx", "output", job.id, 3),
@@ -603,8 +639,8 @@ async def test_a_name_clash_gets_a_numbered_name(
     """A second run's output of the same name does not replace the first."""
     executor.files = {"out.txt": b"1"}
     queue = queue_for(settings, executor, store, metrics)
-    _, _, first = await queue.submit(user("user-a"), "run_python", ARGS, [])
-    _, _, second = await queue.submit(user("user-a"), "run_python", ARGS, [])
+    _, _, first = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+    _, _, second = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert [f.name for f in first] == ["out.txt"]
     assert [f.name for f in second] == ["out (1).txt"]
 
@@ -615,7 +651,7 @@ async def test_the_executors_own_note_is_kept(
     """An ``ok`` answer with a message such as "dropped 1 outputs" passes it on."""
     executor.message = "dropped 1 outputs"
     queue = queue_for(settings, executor, store, metrics)
-    _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [])
+    _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert result.message == "dropped 1 outputs"
 
 
@@ -629,7 +665,7 @@ async def test_a_failed_job_is_returned_without_registering_outputs(
     executor.message = "the job did not finish"
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [])
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert (result.status, result.message, files) == (status, "the job did not finish", [])
     assert result.outputs == []
     assert chat_files(store, p) == []
@@ -647,7 +683,7 @@ async def test_a_busy_executor_is_a_refusal(
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
     with pytest.raises(Busy) as refused:
-        await queue.submit(p, "run_python", ARGS, [])
+        await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert refused.value.reason == "executor_busy"
     assert store.get_job(p, executor.requests[0].job_id).status == "busy"
     assert chat_files(store, p) == []
@@ -680,7 +716,7 @@ async def test_an_unreachable_executor_is_busy_and_logs_no_path(
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
     with caplog.at_level(logging.DEBUG), pytest.raises(Busy) as refused:
-        await queue.submit(p, "run_python", ARGS, [])
+        await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert refused.value.reason == "executor_busy"
     assert store.get_job(p, executor.requests[0].job_id).status == "busy"
     assert sample(metrics, "workbench_job_refusals_total", reason="executor_busy") == 1
@@ -702,15 +738,15 @@ async def test_one_output_over_quota_does_not_stop_the_rest(
     executor.files = {"a.txt": b"a", "big.bin": b"b" * 5, "c.txt": b"c"}
     real = store.register_output
 
-    def register(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+    def register(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
         if name == "big.bin":
             raise QuotaExceeded("quota exceeded")
-        return real(p, staged, name, job_id)
+        return real(p, staged, name, job_id, **more)
 
     monkeypatch.setattr(store, "register_output", register)
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [])
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert result.status == "ok"
     assert sorted(f.name for f in files) == ["a.txt", "c.txt"]
     assert result.message == "1 output could not be kept (quota)"
@@ -729,12 +765,12 @@ async def test_the_note_counts_and_joins_the_executors(
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
     executor.message = "dropped 1 outputs"
 
-    def register(_p: Principal, _staged: Path, _name: str, _job_id: str) -> FileRecord:
+    def register(_p: Principal, _staged: Path, _name: str, _job_id: str, **_more: Any) -> FileRecord:
         raise QuotaExceeded("quota exceeded")
 
     monkeypatch.setattr(store, "register_output", register)
     queue = queue_for(settings, executor, store, metrics)
-    _, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [])
+    _, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert files == []
     assert result.message == "dropped 1 outputs; 2 outputs could not be kept (quota)"
 
@@ -758,7 +794,7 @@ async def test_an_output_that_is_not_in_the_jobs_staging_folder_is_not_registere
 
     queue = queue_for(settings, Lying(settings.data_dir), store, metrics)
     p = user("user-a")
-    _, result, files = await queue.submit(p, "run_python", ARGS, [])
+    _, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
     assert files == []
     assert chat_files(store, p) == []
     assert secret.read_bytes() == b"not an output"
@@ -776,7 +812,7 @@ async def test_an_answer_for_another_job_is_refused(settings: Settings, store: S
 
     queue = queue_for(settings, Wrong(settings.data_dir), store, metrics)
     with pytest.raises(Busy) as refused:
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert refused.value.reason == "executor_busy"
 
 
@@ -790,13 +826,13 @@ async def test_an_unexpected_failure_finishes_the_job_as_an_error(
     """A store failure while registering is not hidden, and the job record does not stay ``running``."""
     executor.files = {"a.txt": b"a"}
 
-    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str) -> FileRecord:
+    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str, **_more: Any) -> FileRecord:
         raise RuntimeError("synthetic store failure")
 
     monkeypatch.setattr(store, "register_output", explode)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert store.get_job(user("user-a"), executor.requests[0].job_id).status == "error"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
@@ -824,7 +860,7 @@ async def test_a_failed_job_record_does_not_hide_a_busy_executor(
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG), pytest.raises(Busy) as refused:
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert refused.value.reason == "executor_busy"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert "synthetic" not in caplog.text
@@ -841,14 +877,14 @@ async def test_a_failed_job_record_does_not_hide_the_original_error(
     """The error that ended the job is the one raised, and the staging folder is cleared all the same."""
     executor.files = {"a.txt": b"a"}
 
-    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str) -> FileRecord:
+    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str, **_more: Any) -> FileRecord:
         raise RuntimeError("the original failure")
 
     monkeypatch.setattr(store, "register_output", explode)
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError, match="the original failure"):
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
 
@@ -863,7 +899,7 @@ async def test_a_failed_job_record_does_not_hide_a_cancellation(
     executor.hold = {"open-webui/user-a"}
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics, executor_slots=1)
-    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], KEEP))
     await until(lambda: executor.running == 1)
     job_id = executor.requests[0].job_id
     executor.staged(job_id, "left.txt").parent.mkdir(parents=True)
@@ -874,7 +910,7 @@ async def test_a_failed_job_record_does_not_hide_a_cancellation(
     assert not (settings.data_dir / "staging" / job_id).exists()
     executor.hold = set()
     monkeypatch.undo()
-    await queue.submit(user("user-b"), "run_python", ARGS, [])
+    await queue.submit(user("user-b"), "run_python", ARGS, [], KEEP)
 
 
 async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is_cleared(
@@ -889,7 +925,7 @@ async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(sqlite3.OperationalError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert queue.tracked_users == 0
 
@@ -912,7 +948,7 @@ async def test_outputs_kept_before_a_failed_job_record_are_removed(
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(sqlite3.OperationalError):
-        await queue.submit(me, "run_python", ARGS, [])
+        await queue.submit(me, "run_python", ARGS, [], KEEP)
     assert store.files_in_chat(me) == []
     assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
@@ -936,8 +972,8 @@ async def test_a_cancel_while_outputs_are_registered_leaves_none_of_them(
     go_on = threading.Event()
     real = store.register_output
 
-    def slow(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
-        record = real(p, staged, name, job_id)
+    def slow(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
+        record = real(p, staged, name, job_id, **more)
         if not moved.is_set():
             moved.set()
             go_on.wait(10)
@@ -945,7 +981,7 @@ async def test_a_cancel_while_outputs_are_registered_leaves_none_of_them(
 
     monkeypatch.setattr(store, "register_output", slow)
     queue = queue_for(settings, executor, store, metrics)
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
     await until(moved.is_set)
     running.cancel()
     await asyncio.sleep(0.05)
@@ -979,9 +1015,9 @@ def hold_the_first_move(store: Store, monkeypatch: pytest.MonkeyPatch) -> HeldMo
     held = HeldMoves(threading.Event(), threading.Event(), [])
     real = store.register_output
 
-    def slow(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+    def slow(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
         try:
-            record = real(p, staged, name, job_id)
+            record = real(p, staged, name, job_id, **more)
             if not held.moved.is_set():
                 held.moved.set()
                 held.go_on.wait(10)
@@ -1010,7 +1046,7 @@ async def test_outputs_registered_while_the_loop_shuts_down_are_removed(
     held = hold_the_first_move(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     before = asyncio.all_tasks()
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
     await until(held.moved.is_set)
     for task in asyncio.all_tasks() - before:
         task.cancel()  # every task the call made, as asyncio.run's shutdown cancels every task there is
@@ -1036,7 +1072,7 @@ async def test_a_second_cancel_while_outputs_are_registered_still_leaves_none_of
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
     held = hold_the_first_move(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
     await until(held.moved.is_set)
     running.cancel()
     await asyncio.sleep(0.05)
@@ -1064,15 +1100,15 @@ async def test_an_unexpected_failure_of_the_registration_removes_what_it_moved_i
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
     real = store.register_output
 
-    def fail_the_second(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+    def fail_the_second(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
         if name == "b.txt":
             raise RuntimeError("synthetic: an unexpected failure")
-        return real(p, staged, name, job_id)
+        return real(p, staged, name, job_id, **more)
 
     monkeypatch.setattr(store, "register_output", fail_the_second)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError):
-        await queue.submit(me, "run_python", ARGS, [])
+        await queue.submit(me, "run_python", ARGS, [], KEEP)
     assert store.files_in_chat(me) == []
     assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
     assert store.get_job(me, executor.requests[0].job_id).status == "error"
@@ -1097,7 +1133,7 @@ async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure
     monkeypatch.setattr(store, "remove", refuse)
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG), pytest.raises(sqlite3.OperationalError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [])
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert "a.txt" not in caplog.text
     assert str(settings.data_dir) not in caplog.text
@@ -1254,6 +1290,136 @@ async def test_the_real_client_works_through_the_queue(
 
     queue = JobQueue(settings, ExecutorClient(path), store, metrics)
     async with serve(path, handler):
-        job, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [])
+        job, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
     assert result.status == "ok"
     assert [(f.name, f.job_id) for f in files] == [("made.txt", job.id)]
+
+
+# --- the keeper: recorded before visible (R73) --------------------------------------------------------------------
+
+
+async def test_without_a_keeper_no_output_becomes_a_file(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A tool that makes no file has no keeper: whatever its job left in out/ never reaches the chat."""
+    me = user("user-a")
+    executor.files = {"planted.txt": b"x"}
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, files = await queue.submit(me, "read_document", {}, [])
+    assert (result.status, files) == ("ok", [])
+    assert store.files_in_chat(me) == []
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_the_keeper_records_before_any_output_is_a_file_and_by_the_ids_they_get(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The keeper sees the answer and the planned ids while the chat holds none of the outputs; they keep those ids."""
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    keeper = KeepAll(store, me)
+    _, _, files = await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+    ((status, planned, seen),) = keeper.recorded
+    assert (status, seen) == ("ok", [])
+    assert sorted(planned) == sorted(rec.id for rec in files)
+    assert keeper.again_ids == []
+
+
+async def test_a_keeper_that_cannot_record_keeps_nothing(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The keeper's failure is what the caller gets, and no output became a file."""
+    me = user("user-a")
+    executor.files = {"a.txt": b"a"}
+
+    class Broken(KeepAll):
+        @override
+        def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+            raise AuditWriteError("synthetic audit stream failure")
+
+    with pytest.raises(AuditWriteError):
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], Broken())
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_an_output_past_the_users_quota_is_not_kept_and_is_recorded_again(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Outputs count against the quota like uploads; the one that does not fit is named again, by its planned id."""
+    me = user("user-a")
+    store.add_upload(
+        me,
+        "/workspace/chat-1",
+        "q.bin",
+        io.BytesIO(b"x" * (MIB - 8)),
+        max_bytes=MIB,
+        quota_bytes=MIB,
+        record=unrecorded,
+    )
+    executor.files = {"small.txt": b"1234", "large.txt": b"y" * 64}
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics, workspace_max_mb=1)
+    _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper)
+    assert [rec.name for rec in files] == ["small.txt"]
+    assert result.message == "1 output could not be kept (quota)"
+    ((_, planned, _),) = keeper.recorded
+    assert keeper.again_ids == [[planned[1]]]
+    assert store.usage(me) <= MIB
+
+
+async def test_an_output_that_stays_after_a_failed_job_record_is_recorded_again(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The output must go again and cannot: the log names the error's type, the keeper's error event the file."""
+    me = user("user-a")
+    executor.files = {"salaries-of-user-b.txt": b"a"}
+    break_finish(store, monkeypatch)
+
+    def refuse(_record: FileRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    keeper = KeepAll()
+    with caplog.at_level(logging.WARNING), pytest.raises(sqlite3.OperationalError):
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+    (left,) = store.files_in_chat(me)
+    assert keeper.again_ids == [[left.id]]
+    assert "OSError" in caplog.text
+    assert "salaries" not in caplog.text
+
+
+async def test_a_failed_error_record_and_a_failed_removal_do_not_hide_the_audit_failure(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lost output's error record fails, and so does the removal of the kept one: the audit failure is raised.
+
+    The removal's error never replaces it; it is logged by its type.
+    """
+    me = user("user-a")
+    executor.files = {"fits.txt": b"1", "large.txt": b"y" * (2 * MIB)}
+
+    class NoAgain(KeepAll):
+        @override
+        def again(self, ids: Sequence[str]) -> None:
+            raise AuditWriteError("synthetic audit stream failure")
+
+    def refuse(_record: FileRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(store, "remove", refuse)
+    queue = queue_for(settings, executor, store, metrics, workspace_max_mb=1)
+    with caplog.at_level(logging.WARNING), pytest.raises(AuditWriteError):
+        await queue.submit(me, "run_python", ARGS, [], NoAgain())
+    assert "OSError" in caplog.text

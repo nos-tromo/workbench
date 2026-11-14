@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import ALL_TOOLS, CallerRegistry
@@ -315,8 +315,12 @@ def test_read_refuses_paths_outside_the_root(client: TestClient) -> None:
 def test_read_of_a_stored_text_file_returns_its_content(client: TestClient, store: Store) -> None:
     """The file browser serves ``/files/read``: a text file answers its content, any other type 415."""
     me = Principal("open-webui", "user-a", "chat-1")
-    store.add_upload(me, "/workspace/chat-1", "notes.txt", io.BytesIO(b"hello"), max_bytes=100, quota_bytes=1000)
-    store.add_upload(me, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"PK"), max_bytes=100, quota_bytes=1000)
+    store.add_upload(
+        me, "/workspace/chat-1", "notes.txt", io.BytesIO(b"hello"), max_bytes=100, quota_bytes=1000, record=unrecorded
+    )
+    store.add_upload(
+        me, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"PK"), max_bytes=100, quota_bytes=1000, record=unrecorded
+    )
     r = client.get("/files/read", params={"path": "/workspace/chat-1/notes.txt"}, headers=H)
     assert (r.status_code, r.json()) == (200, {"content": "hello"})
     assert client.get("/files/read", params={"path": "/workspace/chat-1/q.xlsx"}, headers=H).status_code == 415

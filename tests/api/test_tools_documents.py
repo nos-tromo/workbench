@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
+from tests.api.conftest import KEY, unrecorded
 from tests.api.test_files import CHAT, H_B, ME, AuditLines, H, put, tick
 from tests.api.test_jobs import FakeClient
 from workbench.api.audit import AuditLog
@@ -442,6 +442,7 @@ def test_search_files_sends_every_file_of_the_chat_newest_first(
         io.BytesIO(b"x"),
         max_bytes=10,
         quota_bytes=100,
+        record=unrecorded,
     )
     executor.payload = hits((f"{CHAT}/new.docx", "paragraph 1", "match here"))
     r = find(client, "match", regex=True, max_hits=5)
@@ -677,3 +678,73 @@ def test_the_tools_need_the_callers_key(client: TestClient, route: str, body: di
     """No key, no tool."""
     assert client.post(route, json=body).status_code == 401
     assert client.post(route, json=body, headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+# --- refusals are recorded (R72) ---------------------------------------------------------------------------------
+
+#: A refusal that quotes the file, as the sheet reader's does: the names of a workbook's sheets.
+SHEET_REFUSAL = "no_such_part: this workbook has no such sheet; its sheets are: 'salaries-of-user-b', 'Summary'"
+
+
+def tool_events(audit_lines: AuditLines, tool: str) -> list[dict[str, Any]]:
+    """The audit events of one tool."""
+    return [e for e in audit_lines() if e["operation"] == f"tool.{tool}"]
+
+
+def test_a_read_refusal_is_recorded_as_an_error_by_its_code_alone(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """The model gets the refusal, sheet names and all; the trail gets one ``error`` event with the code, no text."""
+    rec = put(store, "quarterly-figures.xlsx")
+    executor.status = "error"
+    executor.payload = {"error": SHEET_REFUSAL}
+    r = read(client, f"{CHAT}/quarterly-figures.xlsx", "Nope!A1:B2")
+    assert (r.status_code, r.json()) == (422, {"detail": SHEET_REFUSAL})
+    (event,) = tool_events(audit_lines, "read_document")
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("query", "error", [rec.id])
+    assert event["criteria"] == {"caller": "open-webui", "paged": True, "refused": "no_such_part"}
+    assert "salaries" not in json.dumps(audit_lines())
+
+
+def test_a_search_refusal_is_recorded_as_an_error_by_its_code_alone(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """A search's refusal is recorded like a read's, by the ids of every file given to it."""
+    recs = [put(store, "quarterly-figures.xlsx"), put(store, "harbour-report.pdf")]
+    executor.status = "error"
+    executor.payload = {"error": "bad_regex: missing ), unterminated subpattern at position 0 in 'salaries-of-(user-b'"}
+    r = find(client, "salaries-of-(user-b", regex=True)
+    assert r.status_code == 422
+    (event,) = tool_events(audit_lines, "search_files")
+    assert (event["outcome"], sorted(event["target"]["ids"])) == ("error", sorted(rec.id for rec in recs))
+    assert event["criteria"] == {"caller": "open-webui", "regex": True, "max_hits": 50, "refused": "bad_regex"}
+    assert "salaries" not in json.dumps(audit_lines())
+
+
+@pytest.mark.parametrize("tool", ["read_document", "search_files"])
+def test_a_refusal_whose_record_cannot_be_written_never_reaches_the_model(
+    client: TestClient, store: Store, executor: Scripted, broken_audit: None, tool: str
+) -> None:
+    """The audit failure is the answer, never the refusal's text."""
+    put(store, "quarterly-figures.xlsx")
+    executor.status = "error"
+    executor.payload = {"error": SHEET_REFUSAL}
+    r = read(client, f"{CHAT}/quarterly-figures.xlsx", "Nope!A1:B2") if tool == "read_document" else find(client, "x")
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+
+
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [("timeout", {}), ("killed", {}), ("error", {"error": "KeyError: /data/jobs/abc"}), ("ok", {"parts": "no"})],
+)
+def test_every_other_answer_that_reached_the_api_is_recorded_as_an_error(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines, status: str, payload: Any
+) -> None:
+    """Out of time or memory, a failed tool, an answer that cannot be read: an ``error`` event, with no code."""
+    rec = put(store, "a.docx")
+    executor.status = status
+    executor.payload = payload
+    assert read(client, f"{CHAT}/a.docx").status_code in {422, 500}
+    (event,) = tool_events(audit_lines, "read_document")
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [rec.id])
+    assert event["criteria"] == {"caller": "open-webui", "paged": False}
