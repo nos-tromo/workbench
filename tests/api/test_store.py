@@ -1054,6 +1054,13 @@ def test_due_jobs_and_forget_jobs(store: Store, alice: Principal, bob: Principal
     store.forget_jobs([old.id])
 
 
+def test_find_job_looks_a_job_up_by_its_id_alone(store: Store, alice: Principal) -> None:
+    """Retention names the owner of a job's leftover staging folder; it has the job's id and nothing else."""
+    job = store.add_job(alice, "run_python")
+    assert store.find_job(job.id) == job
+    assert store.find_job("0" * 32) is None
+
+
 # --- persistence and storage ------------------------------------------------------
 
 

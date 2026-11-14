@@ -15,9 +15,11 @@ name each get their own file.
 import dataclasses
 import errno
 import itertools
+import logging
 import mimetypes
 import os
 import posixpath
+import re
 import sqlite3
 import stat
 import threading
@@ -27,10 +29,12 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO, Final, Literal
+from typing import Any, BinaryIO, Final, Literal, TypeGuard
 
-from workbench.models import DirEntry, FileRecord, JobRecord, Principal
-from workbench.paths import PathError, Workspaces, check_filename, check_id
+from workbench.models import VIRTUAL_ROOT, DirEntry, FileRecord, JobRecord, Principal
+from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
+
+_log = logging.getLogger(__name__)
 
 #: The database's name in the data volume's root.
 DATABASE_NAME: Final = "workbench.db"
@@ -42,6 +46,14 @@ _PART = ".part"
 _GENERIC_MIME = "application/octet-stream"
 _FULL = frozenset({errno.ENOSPC, errno.EDQUOT})
 _BUSY_TIMEOUT_S = 30
+_NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
+
+#: The name of an upload while it is written: its file id, then ``.part``.
+_PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
+
+#: Records the orphans of one chat folder before they go: called with the chat id, the file ids their names carry, and
+#: how many there are.
+OrphanRecord = Callable[[str, Sequence[str], int], object]
 
 _OFFICE_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -166,6 +178,50 @@ def _unlink(path: Path) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+def _remove_empty(path: Path) -> None:
+    """Remove a folder if it is empty; one that is not, or is gone, stays as it is, silently.
+
+    Args:
+        path: The folder; ``rmdir`` never follows a link.
+    """
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno not in _NOT_EMPTY:
+            _log.warning("could not remove an empty folder (%s)", type(exc).__name__)
+
+
+def _is_folder(st: os.stat_result | None, device: int) -> TypeGuard[os.stat_result]:
+    """Tell whether an ``lstat`` is of a folder, not a link, on the data volume.
+
+    Args:
+        st: The ``lstat``, or ``None`` for nothing there.
+        device: The data volume's device.
+
+    Returns:
+        ``True`` for a folder of the volume.
+    """
+    return st is not None and stat.S_ISDIR(st.st_mode) and st.st_dev == device
+
+
+def _is_chat_id(name: str) -> bool:
+    """Tell whether a folder's name is a chat id, as every chat folder's is.
+
+    Args:
+        name: The name.
+
+    Returns:
+        ``True`` if :func:`check_id` takes it.
+    """
+    try:
+        check_id(name, what="chat id")
+    except PathError:
+        return False
+    return True
 
 
 def _is_full(exc: OSError) -> bool:
@@ -529,10 +585,13 @@ class Store:
         folder, segments = self._locate(p, directory)
         if not segments:
             raise PathError("files live inside a chat folder")
-        self._require_folder(folder, segments)
         file_id = uuid.uuid4().hex
         part = folder / f"{file_id}{_PART}"
-        size = self._write_part(part, src, max_bytes=max_bytes, room=quota_bytes - self.usage(p))
+        room = quota_bytes - self.usage(p)
+        with self._lock:  # the folder is found or made and the part is in it before retention may look at the folder
+            self._require_folder(folder, segments)
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
+        size = self._write_part(fd, part, src, max_bytes=max_bytes, room=room)
         try:
             with self._lock:
                 if self.usage(p) + size > quota_bytes:
@@ -562,11 +621,12 @@ class Store:
             raise
         return rec
 
-    def _write_part(self, part: Path, src: BinaryIO, *, max_bytes: int, room: int) -> int:
-        """Stream ``src`` to a new private file, stopping at the limits.
+    def _write_part(self, fd: int, part: Path, src: BinaryIO, *, max_bytes: int, room: int) -> int:
+        """Stream ``src`` into a new private file, stopping at the limits; the file goes on any failure.
 
         Args:
-            part: The file to create; it must not exist.
+            fd: The file, just created and open for writing; it is closed here.
+            part: Its path.
             src: The bytes.
             max_bytes: Largest size allowed.
             room: Bytes of quota left.
@@ -579,7 +639,6 @@ class Store:
             QuotaExceeded: If it holds more than ``room``.
             StorageFull: If the volume ran out of room.
         """
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
         size = 0
         try:
             try:
@@ -621,7 +680,6 @@ class Store:
             StorageFull: If the volume is full.
         """
         _check_new_name(check_filename(name))
-        folder = self._ws.chat_dir(p)
         try:
             fd = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW)
         except FileNotFoundError as exc:
@@ -637,7 +695,8 @@ class Store:
             os.fchmod(fd, _PRIVATE_FILE)
         finally:
             os.close(fd)
-        with self._lock:
+        with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
+            folder = self._ws.chat_dir(p)
             final_name = self._free_name(p, folder, [], p.chat_id, name)
             final = folder / final_name
             os.replace(staged, final)
@@ -817,7 +876,8 @@ class Store:
         real, segments = self._locate(p, path)
         if segments:
             _check_new_name(segments[-1])
-        self._make_dirs(real)
+        with self._lock:  # retention removes empty folders under the same lock
+            self._make_dirs(real)
         return self._ws.to_virtual(p, real)
 
     def move(self, p: Principal, source: str, destination: str) -> FileRecord:
@@ -952,6 +1012,90 @@ class Store:
             busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         return busy == 0
 
+    def sweep_user(
+        self, caller: str, user_id: str, *, untouched_before: float, device: int, record: OrphanRecord
+    ) -> tuple[int, int]:
+        """Remove the files of a user's root that have no record, then the folders left empty, all under the lock.
+
+        An orphan is a regular file in a chat folder that has no row and was last changed before ``untouched_before``:
+        the ``<id>.part`` of an upload the api died during, or a file a kill left between its rename into place and
+        its row's commit (``add_upload``, ``register_output``, ``move``). The look and the removal hold the store's
+        lock, which every rename into place holds until its row is committed, so a file on its way in is never taken
+        for one. Each chat folder's orphans are recorded first, by ``record``, still under the lock; if it raises,
+        nothing more is removed and the error goes on.
+
+        Then every folder below the root, deepest first, the chat folders too, and the root itself go if they are
+        empty and were last changed before ``untouched_before``. Their ages are taken before anything is removed, so
+        an old tree of empty folders goes at once. Nothing is followed: links, anything but folders and regular files,
+        and anything of another device are left alone, and so is a folder in the root whose name is no chat id.
+
+        Args:
+            caller: The caller's folder's name.
+            user_id: The user's folder's name.
+            untouched_before: A file or folder last changed before this may go.
+            device: The data volume's device.
+            record: Records one chat folder's orphans before they go.
+
+        Returns:
+            How many orphans were removed, and how many could not be.
+
+        Raises:
+            PathError: A name is no safe id, or a link is in the root's path.
+            Exception: What ``record`` raised.
+        """
+        p = Principal(caller, user_id, DEFAULT_CHAT)
+        with self._lock:
+            root = self._ws.resolve(p, VIRTUAL_ROOT)
+            root_st = _lstat(root)
+            if not _is_folder(root_st, device):
+                return 0, 0
+            folders: list[tuple[Path, os.stat_result]] = []
+            candidates: dict[str, list[tuple[str, Path]]] = {}
+            for here, names, files in os.walk(root):
+                where = Path(here)
+                below = where.relative_to(root).parts
+                kept: list[str] = []
+                for name in sorted(names):
+                    st = _lstat(where / name)
+                    if _is_folder(st, device) and (below or _is_chat_id(name)):
+                        kept.append(name)
+                        folders.append((where / name, st))
+                names[:] = kept  # never into a link, another filesystem or a folder that is no chat's
+                if not below:
+                    continue  # a file in the root is in no chat folder
+                for name in files:
+                    st = _lstat(where / name)
+                    if st is None or not stat.S_ISREG(st.st_mode) or st.st_dev != device:
+                        continue
+                    if st.st_mtime < untouched_before:
+                        candidates.setdefault(below[0], []).append(("/".join([*below[1:], name]), where / name))
+            removed = failed = 0
+            if candidates:
+                with self._db() as db:
+                    rows = db.execute(
+                        "SELECT chat_id, name FROM files WHERE caller = ? AND user_id = ?", (caller, user_id)
+                    ).fetchall()
+                known = {(chat, name) for chat, name in rows}
+                for chat in sorted(candidates):
+                    orphans = [(name, path) for name, path in candidates[chat] if (chat, name) not in known]
+                    if not orphans:
+                        continue
+                    ids = [found.group(1) for _, path in orphans if (found := _PART_NAME.fullmatch(path.name))]
+                    record(chat, ids, len(orphans))
+                    for _, path in orphans:
+                        try:
+                            _unlink(path)
+                        except OSError:
+                            failed += 1
+                        else:
+                            removed += 1
+            for folder, st in reversed(folders):  # a folder comes after every folder above it
+                if st.st_mtime < untouched_before:
+                    _remove_empty(folder)
+            if root_st is not None and root_st.st_mtime < untouched_before:
+                _remove_empty(root)
+        return removed, failed
+
     # --- jobs ----------------------------------------------------------------
 
     def add_job(self, p: Principal, tool: str) -> JobRecord:
@@ -1015,6 +1159,19 @@ class Store:
         if row is None:
             raise NotFound("job not found")
         return _job(row)
+
+    def find_job(self, job_id: str) -> JobRecord | None:
+        """Look up a job by its id alone, for retention, which knows a leftover staging folder by its job's id.
+
+        Args:
+            job_id: The job's id.
+
+        Returns:
+            The job, or ``None`` if there is no such record (any more).
+        """
+        with self._db() as db:
+            row = db.execute(f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return None if row is None else _job(row)
 
     def due_jobs(self, cutoff: float) -> list[str]:
         """List jobs started before a time.

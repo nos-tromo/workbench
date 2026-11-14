@@ -10,6 +10,7 @@ import dataclasses
 import io
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -24,6 +25,7 @@ from fastapi.testclient import TestClient
 from tests.api.conftest import KEY
 from tests.api.test_files import ME, AuditLines
 from tests.api.test_jobs import FakeClient, until
+from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
 from workbench.api.main import app_factory, create_app
@@ -201,14 +203,15 @@ def test_failed_removal_is_recorded_as_error(
     audit_lines: AuditLines,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
     """A file that cannot go keeps its row and is recorded again as an error; the sweep goes on with the others."""
     gone, busy, odd = put(store, "a.txt"), put(store, "b.txt"), put(store, "c.txt")
     elsewhere = Principal("open-webui", "user-a", "chat-2")
     linked = put(store, "d.txt", elsewhere)
     chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-2"
-    chat.rename(chat.with_name("moved"))
-    chat.symlink_to(chat.with_name("moved"))  # a link in the path: the store refuses it with a PathError
+    chat.rename(tmp_path / "moved")
+    chat.symlink_to(tmp_path / "moved")  # a link in the path: the store refuses it with a PathError
     clock.now = T0 + 8 * DAY
     remove = store.remove
 
@@ -379,7 +382,7 @@ def test_empty_folders_untouched_for_an_hour_go_bottom_up(
 
 
 def test_staging_folders_older_than_an_hour_go(
-    sweeper: Sweeper, settings: Settings, clock: Clock, tmp_path: Path
+    sweeper: Sweeper, settings: Settings, clock: Clock, tmp_path: Path, audit_lines: AuditLines
 ) -> None:
     """A job's staging folder its client never collected goes with what is in it; nothing a link points to does."""
     staging = settings.data_dir / "staging"
@@ -398,6 +401,257 @@ def test_staging_folders_older_than_an_hour_go(
     sweeper.sweep_once()
     assert sorted(p.name for p in staging.iterdir()) == sorted(["b" * 32, "c" * 32, "stray"])
     assert (outside / "keep.txt").exists()
+    (event,) = sweeps(audit_lines)
+    assert event["criteria"] == {"rule": "staging", "job": "a" * 32, "count": 1}
+    assert event["target"] == {"kind": "file", "count": 1}
+
+
+def test_staging_residue_is_recorded_with_its_jobs_owner_then_removed(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outputs the api never registered go after a record that names their job and its owner.
+
+    They hold content made from the user's files.
+    """
+    clock.now = time.time()
+    job = store.add_job(ME, "run_python")
+    residue = settings.data_dir / "staging" / job.id
+    (residue / "deep").mkdir(parents=True)
+    (residue / "harbour-chart.png").write_bytes(b"\x89PNG")
+    (residue / "deep" / "figures.csv").write_bytes(b"a,b\n")
+    (residue / "link").symlink_to(residue / "harbour-chart.png")
+    for path in (residue, residue / "deep"):
+        age(path, 2 * HOUR, clock.now)
+    removed_after: list[bool] = []
+    rmtree = shutil.rmtree
+
+    def watched(path: Path, *args: Any, **kwargs: Any) -> None:
+        removed_after.append(bool(sweeps(audit_lines)))
+        rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", watched)
+    sweeper.sweep_once()
+    assert removed_after == [True]
+    assert not residue.exists()
+    (event,) = sweeps(audit_lines)
+    assert (event["action"], event["outcome"]) == ("delete", "ok")
+    assert event["criteria"] == {
+        "rule": "staging",
+        "job": job.id,
+        "count": 2,
+        "caller": "open-webui",
+        "owner": "user-a",
+    }
+    assert event["target"] == {"kind": "file", "count": 2, "container": "chat:chat-1"}
+    assert "harbour-chart" not in json_text(audit_lines)
+
+
+def orphan(path: Path, now: float, seconds: float = 2 * HOUR) -> Path:
+    """Write a file the store has no row for, last changed ``seconds`` before ``now``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"synthetic")
+    age(path, seconds, now)
+    return path
+
+
+def test_orphans_are_recorded_then_removed(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash's ``.part`` and a file whose row was never committed go after an hour, recorded first.
+
+    One record per chat folder, by the ids their names carry, never by a name. A file with its row, or changed within
+    the hour, stays.
+    """
+    clock.now = time.time()
+    kept = put(store, "notes.txt")
+    chat = on_disk(settings, kept).parent
+    age(on_disk(settings, kept), 2 * HOUR, clock.now)
+    part = orphan(chat / ("f" * 32 + ".part"), clock.now)
+    lost = orphan(chat / "sub" / "lost-report.docx", clock.now)
+    age(chat / "sub", 2 * HOUR, clock.now)
+    fresh = orphan(chat / "fresh-orphan.txt", clock.now, seconds=10 * 60)
+    elsewhere = orphan(chat.with_name("chat-2") / "stray-sheet.xlsx", clock.now)
+    unlinked_after: list[bool] = []
+    unlink = store_module._unlink
+    root = chat.parent
+
+    def watched(path: Path) -> None:
+        container = f"chat:{path.relative_to(root).parts[0]}"
+        unlinked_after.append(any(e["target"].get("container") == container for e in sweeps(audit_lines)))
+        unlink(path)
+
+    monkeypatch.setattr(store_module, "_unlink", watched)
+    sweeper.sweep_once()
+    assert unlinked_after == [True, True, True]
+    assert not part.exists() and not lost.exists() and not elsewhere.exists()
+    assert not (chat / "sub").exists()  # emptied by the sweep, untouched for an hour before it
+    assert fresh.exists() and on_disk(settings, kept).exists()
+    first, second = sweeps(audit_lines)
+    assert first["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 2}
+    assert first["target"] == {"kind": "file", "ids": ["f" * 32], "count": 2, "container": "chat:chat-1"}
+    assert second["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 1}
+    assert second["target"] == {"kind": "file", "count": 1, "container": "chat:chat-2"}
+    text = json_text(audit_lines)
+    assert [name for name in ("lost-report", "stray-sheet", "fresh-orphan", "notes.txt") if name in text] == []
+
+
+@pytest.mark.parametrize("left", ["orphan", "staging"])
+def test_an_unwritable_record_of_an_orphan_or_staging_halts_with_nothing_removed(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    broken_audit: None,
+    exits: list[int],
+    left: str,
+) -> None:
+    """The same rule as for the files with rows: no record, no removal, and the process ends."""
+    clock.now = time.time()
+    if left == "orphan":
+        path = orphan(settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1" / "lost.txt", clock.now)
+    else:
+        path = orphan(settings.data_dir / "staging" / ("a" * 32) / "chart.png", clock.now)
+        age(path.parent, 2 * HOUR, clock.now)
+    with pytest.raises(AuditWriteError):
+        sweeper.sweep_once()
+    assert exits == [1]
+    assert path.exists()
+
+
+def test_a_move_in_progress_is_never_taken_for_an_orphan(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file between a move's rename and its row's commit has no row at its new name, and is never taken for an orphan.
+
+    The store's lock, which the sweep holds to look and remove, keeps the sweep out of that moment.
+    """
+    clock.now = time.time()
+    rec = put(store, "draft.docx")
+    store.mkdir(ME, "/workspace/chat-1/final")
+    age(on_disk(settings, rec), 2 * HOUR, clock.now)  # a rename keeps the time, so the moved file looks old
+    renamed, go_on = threading.Event(), threading.Event()
+    replace = os.replace
+
+    def slow(source: Any, target: Any) -> None:
+        replace(source, target)
+        if str(target).endswith("report.docx"):
+            renamed.set()
+            go_on.wait(5)
+
+    monkeypatch.setattr(os, "replace", slow)
+    mover = threading.Thread(target=store.move, args=(ME, rec.virtual_path, "/workspace/chat-1/final/report.docx"))
+    mover.start()
+    assert renamed.wait(5)
+    sweeping = threading.Thread(target=sweeper.sweep_once)
+    sweeping.start()
+    time.sleep(0.2)
+    assert sweeping.is_alive()  # waiting for the lock the move holds
+    go_on.set()
+    mover.join(5)
+    sweeping.join(5)
+    assert store.get(ME, "/workspace/chat-1/final/report.docx").id == rec.id
+    assert (on_disk(settings, rec).parent / "final" / "report.docx").exists()
+    assert sweeps(audit_lines) == []
+
+
+@pytest.mark.parametrize("way", ["upload", "output"])
+def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, monkeypatch: pytest.MonkeyPatch, way: str
+) -> None:
+    """A file on its way into an old, empty chat folder never finds the folder gone.
+
+    The store finds or makes the folder and puts the file into it under its lock, which the sweep's removal holds too.
+    """
+    clock.now = time.time()
+    store.mkdir(ME, "/workspace/chat-1")
+    root = settings.data_dir / "workspaces" / "open-webui" / "user-a"
+    for folder in (root / "chat-1", root):
+        age(folder, 2 * HOUR, clock.now)
+    found, go_on = threading.Event(), threading.Event()
+    if way == "upload":
+        original: Callable[..., Any] = store._require_folder
+
+        def slow(*args: Any) -> Any:
+            answer = original(*args)
+            found.set()
+            go_on.wait(5)
+            return answer
+
+        monkeypatch.setattr(store, "_require_folder", slow)
+        staged = None
+    else:
+        original = store._ws.chat_dir
+
+        def slow(*args: Any) -> Any:
+            answer = original(*args)
+            found.set()
+            go_on.wait(5)
+            return answer
+
+        monkeypatch.setattr(store._ws, "chat_dir", slow)
+        staged = settings.data_dir / "staging" / ("e" * 32) / "chart.png"
+        staged.parent.mkdir(parents=True)
+        staged.write_bytes(b"\x89PNG")
+    made: list[FileRecord] = []
+
+    def arrive() -> None:
+        if staged is None:
+            made.append(put(store, "quarterly-figures.xlsx"))
+        else:
+            made.append(store.register_output(ME, staged, "chart.png", "e" * 32))
+
+    arriving = threading.Thread(target=arrive)
+    arriving.start()
+    assert found.wait(5)
+    sweeping = threading.Thread(target=sweeper.sweep_once)
+    sweeping.start()
+    time.sleep(0.2)
+    go_on.set()
+    arriving.join(5)
+    sweeping.join(5)
+    (rec,) = made
+    assert on_disk(settings, rec).exists()
+    assert store.files_in_chat(ME) == [rec]
+
+
+def test_an_empty_user_root_untouched_for_an_hour_goes(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock
+) -> None:
+    """It names a pseudonymous user past the period; ``workspaces/`` and the caller's folder stay, even empty."""
+    clock.now = time.time()
+    workspaces = settings.data_dir / "workspaces"
+    gone, fresh, busy = (workspaces / "open-webui" / name for name in ("user-a", "user-b", "user-c"))
+    for folder in (gone, fresh):
+        folder.mkdir(parents=True)
+    put(store, "notes.txt", Principal("open-webui", "user-c", "chat-1"))
+    for folder in (gone, busy, busy / "chat-1", workspaces / "open-webui", workspaces):
+        age(folder, 2 * HOUR, clock.now)
+    age(on_disk(settings, store.files_in_chat(Principal("open-webui", "user-c", "chat-1"))[0]), 2 * HOUR, clock.now)
+    age(fresh, 10 * 60, clock.now)
+    sweeper.sweep_once()
+    assert sorted(p.name for p in (workspaces / "open-webui").iterdir()) == ["user-b", "user-c"]
+    user_c = Principal("open-webui", "user-c", "chat-1")
+    store.delete(user_c, "/workspace/chat-1/notes.txt")
+    for folder in (fresh, busy / "chat-1", busy):
+        age(folder, 2 * HOUR, clock.now)
+    sweeper.sweep_once()
+    assert list((workspaces / "open-webui").iterdir()) == []
+    assert workspaces.is_dir() and (workspaces / "open-webui").is_dir()
 
 
 def test_staging_and_workspaces_that_are_links_are_not_followed(

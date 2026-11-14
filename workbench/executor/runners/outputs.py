@@ -554,10 +554,10 @@ class _Word:
                 self.lists.pop()
             elif kind == "list_item_open" and self.lists:
                 self.lists[-1].fresh = True
-            elif kind == "list_item_close" and self.lists and self.lists[-1].fresh:
-                # An item without a paragraph of its own (empty, or a heading or code first) keeps its bullet or
-                # number, so the numbers after it hold.
-                self.paragraph()
+                if tokens[index + 1].type != "paragraph_open":
+                    # An item that is empty or opens with a heading, code or a list gets its bullet or number first,
+                    # so what it holds reads as its own and the numbers after it hold.
+                    self.paragraph()
             elif kind == "hr":
                 self.run(self.paragraph(), THEMATIC_BREAK)
             elif kind in {"fence", "code_block"}:

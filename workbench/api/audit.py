@@ -151,16 +151,21 @@ class AuditLog:
         file_ids: Sequence[str] = (),
         criteria: Mapping[str, object] | None = None,
         outcome: str = "ok",
+        count: int | None = None,
+        container: str | None = None,
     ) -> str:
         """Record an action of the service itself, such as a retention sweep.
+
+        The event has a target when it names a file or gives a count or a container; otherwise it has none.
 
         Args:
             action: One of the audit actions.
             operation: What exactly happened, dotted, e.g. ``retention.sweep``.
-            file_ids: Ids of the files it touched; never names. Without any,
-                the event carries no target.
+            file_ids: Ids of the files it touched; never names.
             criteria: The rule or parameters, never content.
             outcome: ``ok``, ``denied`` or ``error``.
+            count: How many files it touched, when not every one has an id to name; ``len(file_ids)`` by default.
+            container: The chat folder of the files, as ``chat:<chat-id>``.
 
         Returns:
             The id of the written event.
@@ -170,7 +175,11 @@ class AuditLog:
             AuditWriteError: If the event cannot be written.
             RuntimeError: If the chain is not started or already closed.
         """
-        target = Target(kind=_FILE, ids=file_ids, count=len(file_ids)) if file_ids else None
+        target = None
+        if file_ids or count is not None or container is not None:
+            target = Target(
+                kind=_FILE, ids=file_ids, count=len(file_ids) if count is None else count, container=container
+            )
         event = self.emitter.emit(action, operation, _SYSTEM_ACTOR, outcome=outcome, target=target, criteria=criteria)
         return str(event["event_id"])
 

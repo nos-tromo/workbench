@@ -15,11 +15,22 @@ allowed: a sweep stopped between a batch's record and the end of its removals (t
 the rest of the batch to the next sweep, which records those files again. A double record is acceptable; a deletion
 without a record is not.
 
-Besides the files, and without a record, since they hold no content: job records older than the period are forgotten;
-empty folders in chat folders, the chat folders they leave empty, and ``staging/<job-id>`` folders whose outputs were
-never collected (a client that went away) go once untouched for an hour. Nothing is followed: a link, a file or a
-folder of another filesystem is left alone, and neither ``workspaces/``, a caller's folder nor a user's root ever goes.
-A sweep that deleted something ends with a ``TRUNCATE`` checkpoint, so the log's older pages, which hold file names, are
+Every other regular file the sweep removes is recorded first too, on the same halt, once untouched for an hour:
+
+- an orphan, a file in a chat folder that has no row: the ``<id>.part`` of an upload the api died during, or a file a
+  kill left between its rename into place and its row's commit. One record per chat folder, with the chat as its
+  container, ``rule: orphan``, the ``caller``, the ``owner`` and the ``count``, and the file ids the ``.part`` names
+  carry; never a name. The store looks and removes under its lock (:meth:`~workbench.api.store.Store.sweep_user`),
+  which every rename into place holds until its row is committed, so a file on its way in is never taken for one;
+- the residue of ``staging/<job-id>``: outputs the api never registered (a client that went away, a crash before the
+  job settled), made from the user's files. ``rule: staging``, the ``job``, the ``count`` of regular files, and the
+  job's ``caller``, ``owner`` and chat while its record exists; then the folder goes.
+
+Without a record, since they hold no content: job records older than the period are forgotten, and the folders the
+store finds empty go once untouched for an hour, under its lock (folders in chat folders, the chat folders and a user's
+root), so a file on its way into one never loses it. Nothing is followed: a link, anything but a folder or a regular
+file, or anything of another filesystem is left alone, and neither ``workspaces/`` nor a caller's folder ever goes. A
+sweep that deleted something ends with a ``TRUNCATE`` checkpoint, so the log's older pages, which hold file names, are
 copied over; then the metrics' gauges are measured again.
 
 ``python -m workbench.api.retention dry-run [--days N]`` (``make retention-dry-run``) says what the period, or ``N``
@@ -30,7 +41,7 @@ read-only, and records and deletes nothing.
 import argparse
 import asyncio
 import contextlib
-import errno
+import functools
 import logging
 import math
 import os
@@ -52,6 +63,8 @@ from workbench.api.metrics import Metrics
 from workbench.api.store import DATABASE_NAME, DueSummary, Store, summarize_due
 from workbench.config import ConfigError, Settings, load_settings
 from workbench.models import FileRecord
+from workbench.paths import PathError
+from workbench.protocol import JOB_ID
 from workbench.utils.audit_event import MAX_IDS, AuditWriteError
 
 _log = logging.getLogger(__name__)
@@ -69,7 +82,6 @@ FOLDER_GRACE_S: Final = 3600
 KINDS: Final = ("upload", "output")
 
 _WORKSPACES: Final = "workspaces"
-_NOT_EMPTY: Final = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 
 
 @dataclass
@@ -170,19 +182,27 @@ def _subfolders(path: Path, device: int) -> Iterator[tuple[Path, os.stat_result]
             yield path / name, st
 
 
-def _remove_empty(path: Path) -> None:
-    """Remove a folder if it is empty; one that is not stays, silently.
+def _regular_files(path: Path, device: int) -> int:
+    """Count the regular files in a folder and the folders in it, as :func:`shutil.rmtree` would remove them.
 
     Args:
-        path: The folder.
+        path: A folder already checked with :func:`_folder`.
+        device: The data volume's device.
+
+    Returns:
+        How many; links, anything but a regular file, and anything of another filesystem are not counted.
     """
-    try:
-        os.rmdir(path)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        if exc.errno not in _NOT_EMPTY:
-            _log.warning("retention could not remove an empty folder (%s)", type(exc).__name__)
+    count = 0
+    for here, names, files in os.walk(path):
+        names[:] = [name for name in names if _folder(Path(here) / name, device) is not None]
+        for name in files:
+            try:
+                st = os.lstat(Path(here) / name)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_dev == device:
+                count += 1
+    return count
 
 
 class Sweeper:
@@ -313,7 +333,7 @@ class Sweeper:
             "owner": first.user_id,
             "count": len(batch),
         }
-        self._record(batch, criteria, "ok")
+        self._record([rec.id for rec in batch], criteria)
         failed: list[FileRecord] = []
         for rec in batch:
             if stop.is_set():
@@ -326,26 +346,42 @@ class Sweeper:
             else:
                 report.deleted += 1
         if failed:
-            self._record(failed, {**criteria, "count": len(failed)}, "error")
+            self._record([rec.id for rec in failed], {**criteria, "count": len(failed)}, outcome="error")
             report.errors += len(failed)
 
-    def _record(self, files: Sequence[FileRecord], criteria: dict[str, object], outcome: str) -> None:
+    def _record(
+        self,
+        file_ids: Sequence[str],
+        criteria: dict[str, object],
+        *,
+        outcome: str = "ok",
+        count: int | None = None,
+        container: str | None = None,
+    ) -> None:
         """Write one ``delete`` / ``retention.sweep`` event, or end the process.
 
         Args:
-            files: The files it names, by id.
+            file_ids: The ids of the files it names; never a name.
             criteria: The rule, the caller, the owner and the count.
-            outcome: ``ok`` before a batch goes, ``error`` for the files that did not.
+            outcome: ``ok`` before files go, ``error`` for files that did not.
+            count: How many files it is about, when not every one has an id; ``len(file_ids)`` by default.
+            container: Their chat folder, as ``chat:<chat-id>``.
 
         Raises:
             AuditWriteError: The event could not be written and ``exit_process`` returned.
         """
         try:
             self._audit.record_system(
-                "delete", "retention.sweep", file_ids=[rec.id for rec in files], criteria=criteria, outcome=outcome
+                "delete",
+                "retention.sweep",
+                file_ids=file_ids,
+                criteria=criteria,
+                outcome=outcome,
+                count=count,
+                container=container,
             )
         except AuditWriteError:
-            self._halt(len(files))
+            self._halt(len(file_ids) if count is None else count)
             raise
 
     def _halt(self, count: int) -> None:
@@ -393,10 +429,10 @@ class Sweeper:
         return len(ids)
 
     def _prune(self, untouched_before: float) -> None:
-        """Remove the empty folders of chat folders and the stale staging folders; nothing of it is recorded.
+        """Remove the orphans and the empty folders of every user's root, then the leftover staging folders.
 
         Args:
-            untouched_before: A folder last changed before this may go.
+            untouched_before: A file or folder last changed before this may go.
         """
         data = self._settings.data_dir
         try:
@@ -407,41 +443,58 @@ class Sweeper:
         if _folder(data / _WORKSPACES, device) is not None:
             for caller, _ in _subfolders(data / _WORKSPACES, device):
                 for user, _ in _subfolders(caller, device):
-                    for chat, chat_st in _subfolders(user, device):
-                        self._prune_chat(chat, chat_st, device, untouched_before)
+                    record = functools.partial(self._record_orphans, caller.name, user.name)
+                    try:
+                        _, failed = self._store.sweep_user(
+                            caller.name, user.name, untouched_before=untouched_before, device=device, record=record
+                        )
+                    except PathError:
+                        continue  # not a folder the store made, or a link in its path: left alone
+                    if failed:
+                        _log.warning("retention could not delete %d files that had no record", failed)
         if _folder(data / _STAGING, device) is not None:
             for job, job_st in _subfolders(data / _STAGING, device):
-                if job_st.st_mtime < untouched_before:
-                    try:
-                        shutil.rmtree(job)  # never follows a link inside
-                    except OSError as exc:
-                        _log.warning("retention could not remove a staging folder (%s)", type(exc).__name__)
+                if JOB_ID.fullmatch(job.name) is not None and job_st.st_mtime < untouched_before:
+                    self._clear_staging(job, device)
 
-    @staticmethod
-    def _prune_chat(chat: Path, chat_st: os.stat_result, device: int, untouched_before: float) -> None:
-        """Remove the empty folders of one chat folder, deepest first, and the chat folder if that leaves it empty.
-
-        Every folder's age is taken before anything is removed, so an old tree of empty folders goes in one sweep: the
-        removal of a folder's own empty folders does not make it new.
+    def _record_orphans(self, caller: str, user_id: str, chat_id: str, file_ids: Sequence[str], count: int) -> None:
+        """Record the orphans of one chat folder before the store removes them.
 
         Args:
-            chat: The chat folder.
-            chat_st: Its ``lstat``.
-            device: The data volume's device.
-            untouched_before: A folder last changed before this may go.
+            caller: The caller.
+            user_id: The caller's id of the user.
+            chat_id: The chat folder.
+            file_ids: The ids their names carry.
+            count: How many there are.
+
+        Raises:
+            AuditWriteError: The event could not be written and ``exit_process`` returned.
         """
-        found: list[tuple[Path, os.stat_result]] = [(chat, chat_st)]
-        for here, names, _ in os.walk(chat):
-            kept: list[str] = []
-            for name in names:
-                st = _folder(Path(here) / name, device)
-                if st is not None:
-                    kept.append(name)
-                    found.append((Path(here) / name, st))
-            names[:] = kept  # never into a link or another filesystem
-        for folder, st in reversed(found):  # a folder comes after every folder above it
-            if st.st_mtime < untouched_before:
-                _remove_empty(folder)
+        criteria: dict[str, object] = {"rule": "orphan", "caller": caller, "owner": user_id, "count": count}
+        self._record(file_ids, criteria, count=count, container=f"chat:{chat_id}")
+
+    def _clear_staging(self, job: Path, device: int) -> None:
+        """Remove a job's leftover staging folder, its regular files recorded first.
+
+        Args:
+            job: ``staging/<job-id>``, older than the grace.
+            device: The data volume's device.
+
+        Raises:
+            AuditWriteError: The event could not be written and ``exit_process`` returned; nothing was removed.
+        """
+        count = _regular_files(job, device)
+        if count:
+            criteria: dict[str, object] = {"rule": "staging", "job": job.name, "count": count}
+            owner = self._store.find_job(job.name)
+            if owner is not None:
+                criteria |= {"caller": owner.caller, "owner": owner.user_id}
+            container = None if owner is None else f"chat:{owner.chat_id}"
+            self._record((), criteria, count=count, container=container)
+        try:
+            shutil.rmtree(job)  # never follows a link inside
+        except OSError as exc:
+            _log.warning("retention could not remove a staging folder (%s)", type(exc).__name__)
 
 
 # --- the dry run --------------------------------------------------------------------------------------------------

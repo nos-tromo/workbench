@@ -334,7 +334,10 @@ def _numbered(path: Path) -> list[tuple[str, str, str | None]]:
 
 
 def test_an_item_without_a_paragraph_keeps_its_number(job: Job) -> None:
-    """An empty item, or one that starts with a code block, still has its number, and the numbers after it hold."""
+    """An empty item, or one that opens with a code block, a heading or a list, has its number before what it holds.
+
+    So the block reads as the item's, not the one before, and the numbers after it hold.
+    """
     assert job.document("items.docx", "1. a\n2.\n3. c\n") == {}
     found = _numbered(job.output("items.docx"))
     assert [(style, text) for style, text, _ in found] == [
@@ -346,7 +349,19 @@ def test_an_item_without_a_paragraph_keeps_its_number(job: Job) -> None:
     assert found[0][2] is not None
     assert job.document("code.docx", "- a\n-     code\n- c\n") == {}
     bullets = [(style, text) for style, text, _ in _numbered(job.output("code.docx"))]
-    assert bullets == [("List Bullet", "a"), ("Normal", "code"), ("List Bullet", ""), ("List Bullet", "c")]
+    assert bullets == [("List Bullet", "a"), ("List Bullet", ""), ("Normal", "code"), ("List Bullet", "c")]
+    assert job.document("heading.docx", "1. a\n2. # Findings\n3. c\n") == {}
+    found = _numbered(job.output("heading.docx"))
+    assert [(style, text) for style, text, _ in found] == [
+        ("List Number", "a"),
+        ("List Number", ""),
+        ("Heading 1", "Findings"),
+        ("List Number", "c"),
+    ]
+    assert len({number for style, _, number in found if style == "List Number"}) == 1
+    assert job.document("nested.docx", "- - inner\n  - more\n- c\n") == {}
+    bullets = [(style, text) for style, text, _ in _numbered(job.output("nested.docx"))]
+    assert bullets == [("List Bullet", ""), ("List Bullet 2", "inner"), ("List Bullet 2", "more"), ("List Bullet", "c")]
 
 
 def test_nested_numbered_lists_take_the_levels_numbering(job: Job) -> None:
