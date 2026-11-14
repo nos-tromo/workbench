@@ -496,3 +496,17 @@ def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> 
         ["Item", "Total"],
         ["Piers", "351"],
     ]
+
+
+def test_the_retention_dry_run_runs_in_the_api_container(api_info: dict[str, Any], api: httpx.Client) -> None:
+    """What ``make retention-dry-run`` runs, in the shipped api image as uid 10001 on a read-only root: counts only.
+
+    The test stack's volume is its own, so a fresh upload is there to be counted as kept.
+    """
+    name = _upload(api, "retention-dry-run-sample.txt", b"synthetic", chat="chat-retention")
+    printed = docker("exec", api_info["Id"], "python", "-m", "workbench.api.retention", "dry-run")
+    assert "nothing is recorded, deleted or changed" in printed
+    assert "Files are deleted 7 days after they were made." in printed
+    assert "upload: none due; " in printed
+    assert name not in printed
+    assert "chat-retention" not in printed

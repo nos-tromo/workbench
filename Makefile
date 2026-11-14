@@ -38,6 +38,16 @@ help:
 	@echo "  make test       run pytest (test-backend)"
 	@echo "  make test-executor-root  executor tests as root in the executor image: production shape, then Docker's default /dev/shm"
 	@echo "  make test-isolation      build + start the test stack (own project, volume, network), run pytest -m isolation, remove it"
+	@echo "  make retention-dry-run [DAYS=n]"
+	@echo "                  what retention would delete now, in the running api: counts and ages only;"
+	@echo "                  nothing is recorded or deleted (DAYS=n previews another period)"
+
+### What retention would delete now (workbench/api/retention.py), asked of the running api container: counts and ages
+### by kind, never a name, an id, a user or a chat. It reads the database read-only and records and deletes nothing.
+### DAYS=n previews another period than WORKBENCH_RETENTION_DAYS.
+.PHONY: retention-dry-run
+retention-dry-run:
+	$(COMPOSE) exec -T api python -m workbench.api.retention dry-run $(if $(DAYS),--days '$(DAYS)')
 
 ### Root executor tests, in the executor image (its `test` stage adds pytest).
 ### Shape 1 is the executor's production shape: root-only /dev/shm and /tmp, no

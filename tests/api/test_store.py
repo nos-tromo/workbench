@@ -876,6 +876,64 @@ def test_due_returns_files_older_than_the_cutoff(
     assert store.due(9999.0, limit=2) == [old, mid]
 
 
+def test_due_pages_on_past_the_last_file_of_a_page(
+    store: Store, alice: Principal, bob: Principal, clock: Clock
+) -> None:
+    """``after`` is the last ``(created_at, id)`` seen: a sweep goes on past files it could not delete, ties by id."""
+    clock.now = 1000.0
+    tied = sorted(
+        [put(store, alice, "a.txt"), put(store, bob, "b.txt"), put(store, alice, "c.txt")], key=lambda r: r.id
+    )
+    clock.now = 2000.0
+    later = put(store, bob, "d.txt")
+    first = store.due(9999.0, limit=2)
+    assert first == tied[:2]
+    rest = store.due(9999.0, limit=2, after=(first[-1].created_at, first[-1].id))
+    assert rest == [tied[2], later]
+    assert store.due(9999.0, after=(later.created_at, later.id)) == []
+    assert store.due(1500.0, after=(tied[0].created_at, tied[0].id)) == tied[1:]
+
+
+def test_checkpoint_empties_the_write_ahead_log(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """``secure_delete`` zeroes the deleted rows in the database; their older pages stay in ``-wal`` until then."""
+    database = tmp_path / "data" / "workbench.db"
+    reader = sqlite3.connect(database)  # an open connection keeps the log from going with the store's last one
+    try:
+        reader.execute("SELECT COUNT(*) FROM files").fetchone()
+        rec = put(store, alice, "quarterly-figures.xlsx")
+        store.remove(rec)
+        wal = database.with_name("workbench.db-wal")
+        assert wal.stat().st_size > 0
+        assert store.checkpoint() is True
+        assert wal.stat().st_size == 0
+    finally:
+        reader.close()
+
+
+def test_summarize_due_counts_by_kind_and_opens_the_database_read_only(
+    store: Store, alice: Principal, clock: Clock, tmp_path: Path
+) -> None:
+    """What the dry run reads: counts and ages per kind, through a connection that cannot write."""
+    clock.now = 1000.0
+    a = put(store, alice, "a.txt")
+    clock.now = 2000.0
+    b = put(store, alice, "b.txt")
+    job = store.add_job(alice, "run_python")
+    out = store.register_output(alice, stage(tmp_path, job.id, "chart.png"), "chart.png", job.id)
+    clock.now = 3000.0
+    put(store, alice, "c.txt")
+    database = tmp_path / "data" / "workbench.db"
+    before = database.read_bytes()
+    summary = store_module.summarize_due(database, 2500.0)
+    assert summary["upload"] == store_module.DueSummary(due=2, oldest=a.created_at, newest=b.created_at, kept=1)
+    assert summary["output"] == store_module.DueSummary(due=1, oldest=out.created_at, newest=out.created_at, kept=0)
+    assert store_module.summarize_due(database, 0.0)["output"] == store_module.DueSummary(0, None, None, 1)
+    assert database.read_bytes() == before
+    with pytest.raises(sqlite3.OperationalError):
+        store_module.summarize_due(tmp_path / "data" / "missing.db", 2500.0)
+    assert not (tmp_path / "data" / "missing.db").exists()
+
+
 def test_remove_deletes_file_and_row(store: Store, alice: Principal, workspaces: Workspaces, clock: Clock) -> None:
     """What ``due`` returns can be removed: the file and its row go; usage drops."""
     rec = put(store, alice)

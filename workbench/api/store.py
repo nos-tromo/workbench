@@ -22,14 +22,18 @@ import sqlite3
 import stat
 import threading
 import time
+import urllib.parse
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Final, Literal
 
 from workbench.models import DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import PathError, Workspaces, check_filename, check_id
+
+#: The database's name in the data volume's root.
+DATABASE_NAME: Final = "workbench.db"
 
 _CHUNK = 1024 * 1024
 _PRIVATE_DIR = 0o700
@@ -876,20 +880,26 @@ class Store:
             ).fetchone()
         return int(row[0])
 
-    def due(self, cutoff: float, limit: int = 200) -> list[FileRecord]:
+    def due(self, cutoff: float, limit: int = 200, *, after: tuple[float, str] | None = None) -> list[FileRecord]:
         """List files created before a time, for the retention sweep.
 
         Args:
             cutoff: Files with ``created_at`` strictly below this are due.
             limit: Most records to return.
+            after: Only files past this ``(created_at, id)``, the last of the page before: a sweep pages on past the
+                files it could not delete, which keep their rows.
 
         Returns:
-            The oldest due files, of every user.
+            The oldest due files, of every user, in ``(created_at, id)`` order.
         """
+        where, params = "created_at < ?", [cutoff]
+        if after is not None:
+            where += " AND (created_at, id) > (?, ?)"
+            params += [*after]
         with self._db() as db:
             rows = db.execute(
-                f"SELECT {_FILE_COLUMNS} FROM files WHERE created_at < ? ORDER BY created_at, id LIMIT ?",
-                (cutoff, limit),
+                f"SELECT {_FILE_COLUMNS} FROM files WHERE {where} ORDER BY created_at, id LIMIT ?",
+                (*params, limit),
             ).fetchall()
         return [_file(row) for row in rows]
 
@@ -925,6 +935,22 @@ class Store:
         """
         with self._db() as db:
             db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+    def checkpoint(self) -> bool:
+        """Copy the write-ahead log into the database file and empty it.
+
+        ``secure_delete`` zeroes the pages that held deleted rows, but the log can still hold earlier versions of
+        them, file names among them. A ``TRUNCATE`` checkpoint copies every frame into the database file, where the
+        zeroed pages replace the old ones, and truncates the log. It waits for readers and writers up to the busy
+        timeout.
+
+        Returns:
+            Whether the log was emptied: ``False`` when a reader or writer kept it busy, and a later checkpoint, or the
+            one SQLite makes as the last connection closes, carries the frames on.
+        """
+        with self._db() as db:
+            busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return busy == 0
 
     # --- jobs ----------------------------------------------------------------
 
@@ -1011,3 +1037,53 @@ class Store:
         """
         with self._db() as db:
             db.executemany("DELETE FROM jobs WHERE id = ?", [(i,) for i in ids])
+
+
+@dataclasses.dataclass(frozen=True)
+class DueSummary:
+    """What retention would delete of one kind of file now, and what it keeps.
+
+    Attributes:
+        due: Files created before the cutoff.
+        oldest: ``created_at`` of the oldest of them, or ``None`` when none is due.
+        newest: ``created_at`` of the newest of them, or ``None`` when none is due.
+        kept: Files created at the cutoff or after it.
+    """
+
+    due: int
+    oldest: float | None
+    newest: float | None
+    kept: int
+
+
+def summarize_due(db_path: Path, cutoff: float) -> dict[str, DueSummary]:
+    """Count the due and the kept files of each kind, through a connection that cannot write.
+
+    The database is never created, and nothing in it changes. SQLite does make an empty ``-wal`` and ``-shm`` beside a
+    database in WAL mode that no other connection holds open, because a reader needs them; the api's next connection
+    takes them over.
+
+    Args:
+        db_path: The store's database.
+        cutoff: Files with ``created_at`` strictly below this are due.
+
+    Returns:
+        By kind, ``upload`` or ``output``; a kind of which there is no file is missing.
+
+    Raises:
+        sqlite3.Error: The database does not exist or cannot be read.
+    """
+    conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db_path))}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_S)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        rows = conn.execute(
+            "SELECT kind, COALESCE(SUM(created_at < :cutoff), 0), "
+            "MIN(CASE WHEN created_at < :cutoff THEN created_at END), "
+            "MAX(CASE WHEN created_at < :cutoff THEN created_at END), "
+            "COALESCE(SUM(created_at >= :cutoff), 0) "
+            "FROM files GROUP BY kind",
+            {"cutoff": cutoff},
+        ).fetchall()
+    finally:
+        conn.close()
+    return {kind: DueSummary(int(due), oldest, newest, int(kept)) for kind, due, oldest, newest, kept in rows}
