@@ -35,6 +35,9 @@ def _ipc_shape() -> str | None:
 
 
 IPC_SHAPE = _ipc_shape()
+# Where ``public_tmp`` makes its folders. ``/tmp`` unless named otherwise: in the production shape
+# ``/tmp`` is root's alone (R30), so ``make test-executor-root`` mounts a folder every uid may enter.
+PUBLIC_TMP = os.environ.get("WORKBENCH_TEST_PUBLIC_TMP", "/tmp")
 SHARED_IPC_ONLY = pytest.mark.skipif(
     IPC_SHAPE != "shared",
     reason="the defence-in-depth cleanup of /dev/shm and /dev/mqueue needs a host where slots can write "
@@ -50,12 +53,12 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 def public_tmp() -> Iterator[Path]:
-    """A fresh folder under ``/tmp`` that every uid may enter, unlike pytest's own ``0700`` temporary root.
+    """A fresh folder under ``PUBLIC_TMP`` that every uid may enter, unlike pytest's own ``0700`` temporary root.
 
     Root-only tests put a data volume here, so the api's uid and the slot uids can reach what they own
     in it; the folder is removed afterwards. Its path is short, which also suits Unix sockets.
     """
-    folder = Path(tempfile.mkdtemp(prefix="wb-", dir="/tmp"))
+    folder = Path(tempfile.mkdtemp(prefix="wb-", dir=PUBLIC_TMP))
     folder.chmod(0o755)
     try:
         yield folder

@@ -835,6 +835,17 @@ def _mountinfo(tmp_path: Path, content: str = MOUNTINFO) -> Path:
     return path
 
 
+# The supervisor's /proc/self/status under Docker's default seccomp profile, in part.
+STATUS = "Name:\tpython\nUmask:\t0077\nState:\tR (running)\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t1\n"
+
+
+def _status(tmp_path: Path, content: str = STATUS) -> Path:
+    """A ``/proc/self/status`` holding ``content``."""
+    path = tmp_path / "status"
+    path.write_text(content)
+    return path
+
+
 def _sysctls(
     tmp_path: Path, hardlinks: str | None = "1", symlinks: str | None = "1", queues_max: str | None = "0"
 ) -> Path:
@@ -865,6 +876,8 @@ def test_a_well_set_up_host_passes_the_start_up_checks(memory: str | None, tmp_p
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -882,6 +895,8 @@ def test_too_little_container_memory_refuses_to_start(tmp_path: Path) -> None:
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -899,6 +914,8 @@ def test_missing_slot_users_refuse_to_start(tmp_path: Path) -> None:
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -916,6 +933,8 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -932,6 +951,8 @@ def test_a_supervisor_that_is_not_root_refuses_to_start(tmp_path: Path) -> None:
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=1000,
     )
 
@@ -958,6 +979,8 @@ def test_a_host_without_link_protection_refuses_to_start(
         sysctls=_sysctls(tmp_path, hardlinks, symlinks),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -982,6 +1005,8 @@ def test_a_dev_mqueue_that_is_not_a_mounted_mqueue_refuses_to_start(content: str
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path, content),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -997,6 +1022,8 @@ def test_unreadable_mount_information_refuses_to_start(tmp_path: Path) -> None:
         sysctls=_sysctls(tmp_path),
         mountinfo=tmp_path / "absent-mountinfo",
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -1006,26 +1033,30 @@ def test_unreadable_mount_information_refuses_to_start(tmp_path: Path) -> None:
 SHM_REFUSED = "/dev/shm must be a folder of root's that no one else may write, so no job can leave anything there"
 
 
-def _shm(tmp_path: Path, trap: str) -> Path:
-    """A ``/dev/shm`` set up as ``trap`` names; as root, made root's unless the trap is its owner."""
-    shm = tmp_path / "shm"
+TMP_REFUSED = "/tmp must be a folder of root's that no one else may write, so no job can leave anything there"
+TRAPS = ["world-writable", "group-writable", "not-root-owned", "symlink", "file", "missing"]
+
+
+def _shared_folder(tmp_path: Path, trap: str, name: str) -> Path:
+    """A ``/dev/shm`` or ``/tmp`` set up as ``trap`` names; as root, made root's unless the trap is its owner."""
+    folder = tmp_path / name
     if trap == "missing":
-        return shm
+        return folder
     if trap == "symlink":
-        shm.symlink_to(ROOT_ONLY)
-        return shm
+        folder.symlink_to(ROOT_ONLY)
+        return folder
     if trap == "file":
-        shm.write_text("")
-        shm.chmod(0o644)
-        return shm
-    shm.mkdir()
-    shm.chmod({"world-writable": 0o1777, "group-writable": 0o775, "not-root-owned": 0o755}[trap])
+        folder.write_text("")
+        folder.chmod(0o644)
+        return folder
+    folder.mkdir()
+    folder.chmod({"world-writable": 0o1777, "group-writable": 0o775, "not-root-owned": 0o755}[trap])
     if trap == "not-root-owned" and os.geteuid() == 0:
-        os.lchown(shm, 1000, 1000)
-    return shm
+        os.lchown(folder, 1000, 1000)
+    return folder
 
 
-@pytest.mark.parametrize("trap", ["world-writable", "group-writable", "not-root-owned", "symlink", "file", "missing"])
+@pytest.mark.parametrize("trap", TRAPS)
 def test_a_dev_shm_slots_could_write_refuses_to_start(trap: str, tmp_path: Path) -> None:
     """Docker's default ``1777`` among them: a listing of a folder other slots write can be made to skip entries."""
     problem = startup_problem(
@@ -1034,11 +1065,89 @@ def test_a_dev_shm_slots_could_write_refuses_to_start(trap: str, tmp_path: Path)
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm=_shm(tmp_path, trap),
+        shm=_shared_folder(tmp_path, trap, "shm"),
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
     assert problem == SHM_REFUSED
+
+
+@pytest.mark.parametrize("trap", TRAPS)
+def test_a_tmp_slots_could_write_refuses_to_start(trap: str, tmp_path: Path) -> None:
+    """R30: jobs have a ``TMPDIR`` of their own, so ``/tmp`` is the last place slots could share; it must be root's."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=_shared_folder(tmp_path, trap, "tmp"),
+        status=_status(tmp_path),
+        euid=0,
+    )
+
+    assert problem == TMP_REFUSED
+
+
+SECCOMP_REFUSED = (
+    "the supervisor must run under a seccomp filter such as Docker's default profile, "
+    "so no job can use the kernel's keyrings"
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        STATUS.replace("Seccomp:\t2", "Seccomp:\t0"),
+        STATUS.replace("Seccomp:\t2", "Seccomp:\t1"),
+        STATUS.replace("Seccomp:\t2", "Seccomp:\t22"),
+        STATUS.replace("Seccomp:\t2\n", ""),
+        "Seccomp_filters:\t2\n",
+        "",
+        None,
+    ],
+    ids=["disabled", "strict", "other-value", "no-line", "only-a-longer-name", "empty", "missing"],
+)
+def test_a_supervisor_without_a_seccomp_filter_refuses_to_start(content: str | None, tmp_path: Path) -> None:
+    """R31: without the default profile ``add_key`` and ``keyctl`` are open, and kernel keyrings outlive a job."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=tmp_path / "absent-status" if content is None else _status(tmp_path, content),
+        euid=0,
+    )
+
+    assert problem == SECCOMP_REFUSED
+
+
+@pytest.mark.parametrize(
+    "content",
+    [STATUS, "Seccomp:\t2\n", "Seccomp: 2\nSeccomp_filters:\t3\n", "NoNewPrivs:\t1\nSeccomp:\t2"],
+    ids=["docker-default", "only-the-line", "spaces-and-more-filters", "no-final-newline"],
+)
+def test_a_seccomp_filter_passes_the_start_up_check(content: str, tmp_path: Path) -> None:
+    """Mode 2 is a filter; how many are stacked does not matter."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path, content),
+        euid=0,
+    )
+
+    assert problem is None
 
 
 @pytest.mark.parametrize(
@@ -1067,10 +1176,12 @@ def test_a_root_only_folder_is_roots_a_folder_and_writable_by_no_group_or_others
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="making a folder of root's needs root")
 def test_as_root_a_folder_of_roots_that_no_one_else_may_write_passes(tmp_path: Path) -> None:
-    """The production ``/dev/shm``: a tmpfs of root's, mode ``0755``."""
-    shm = tmp_path / "shm"
+    """The production ``/dev/shm`` and ``/tmp``: tmpfs folders of root's, modes ``0755`` and ``0700``."""
+    shm, tmp = tmp_path / "shm", tmp_path / "tmp"
     shm.mkdir()
     shm.chmod(0o755)
+    tmp.mkdir()
+    tmp.chmod(0o700)
 
     problem = startup_problem(
         _settings(tmp_path),
@@ -1079,6 +1190,8 @@ def test_as_root_a_folder_of_roots_that_no_one_else_may_write_passes(tmp_path: P
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
         shm=shm,
+        tmp=tmp,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -1095,6 +1208,8 @@ def test_a_host_where_slots_could_make_posix_queues_refuses_to_start(queues_max:
         sysctls=_sysctls(tmp_path, queues_max=queues_max),
         mountinfo=_mountinfo(tmp_path),
         shm=ROOT_ONLY,
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
@@ -1113,10 +1228,34 @@ def test_this_hosts_dev_shm_and_queue_limit_pass_only_in_the_production_shape(tm
         sysctls=_sysctls(tmp_path, queues_max=queues_max),
         mountinfo=_mountinfo(tmp_path),
         shm=Path("/dev/shm"),
+        tmp=ROOT_ONLY,
+        status=_status(tmp_path),
         euid=0,
     )
 
     assert problem == (None if IPC_SHAPE == "production" else SHM_REFUSED)
+
+
+@pytest.mark.skipif(
+    IPC_SHAPE != "production",
+    reason="needs the production shape (make test-executor-root): /tmp a tmpfs of root's, mode 0700, "
+    "and Docker's default seccomp profile",
+)
+def test_in_the_production_shape_this_hosts_tmp_and_seccomp_filter_pass(tmp_path: Path) -> None:
+    """The real ``/tmp`` and ``/proc/self/status`` of the container the root tests run in."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        tmp=Path("/tmp"),
+        status=Path("/proc/self/status"),
+        euid=0,
+    )
+
+    assert problem is None
 
 
 def test_main_exits_with_one_short_line_when_no_slot_is_left(
@@ -1525,13 +1664,12 @@ async def test_as_root_a_job_folder_that_cannot_be_removed_belongs_to_root(
     assert (_ids(left), _mode(left)) == ((0, 0), 0o700)
 
 
-LEAVE_IPC = """
+# The SysV halves run in every shape; the POSIX halves need slots that may write /dev/shm and make
+# queues, which only Docker's default allows (R28).
+LEAVE_SYSV = """
 import ctypes, struct
 libc = ctypes.CDLL(None, use_errno=True)
 libc.shmat.restype = ctypes.c_void_p
-pathlib.Path("/dev/shm/wb-drop").write_text("user-a: synthetic figures")
-pathlib.Path("/dev/shm/wb-dir").mkdir()
-pathlib.Path("/dev/shm/wb-dir/note").write_text("user-a: synthetic note")
 shm = libc.shmget(0x5742, 4096, 0o1000 | 0o600)
 at = libc.shmat(shm, None, 0)
 ctypes.memmove(at, b"user-a: sysv note\\0", 18)
@@ -1539,23 +1677,39 @@ libc.shmdt(ctypes.c_void_p(at))
 msq = libc.msgget(0x5743, 0o1000 | 0o600)
 sent = libc.msgsnd(msq, ctypes.create_string_buffer(struct.pack("q6s", 1, b"user-a")), 6, 0)
 sem = libc.semget(0x5744, 1, 0o1000 | 0o600)
+result = {"uid": os.getuid(), "made": [shm >= 0, msq >= 0, sent == 0, sem >= 0]}
+"""
+LEAVE_IPC = (
+    LEAVE_SYSV
+    + """
+pathlib.Path("/dev/shm/wb-drop").write_text("user-a: synthetic figures")
+pathlib.Path("/dev/shm/wb-dir").mkdir()
+pathlib.Path("/dev/shm/wb-dir/note").write_text("user-a: synthetic note")
 mq = libc.mq_open(b"/wb-q", os.O_CREAT | os.O_RDWR, 0o600, None)
 queued = libc.mq_send(mq, b"user-a", 6, 0)
-result = {"uid": os.getuid(), "made": [shm >= 0, msq >= 0, sent == 0, sem >= 0, mq >= 0, queued == 0]}
+result["made"] += [mq >= 0, queued == 0]
 """
-LOOK_FOR_IPC = """
+)
+LOOK_FOR_SYSV = """
 import ctypes
 libc = ctypes.CDLL(None, use_errno=True)
-tops = ("/dev/shm", "/dev/mqueue")
-mine = [n for top in tops for n in os.listdir(top) if os.lstat(f"{top}/{n}").st_uid == os.getuid()]
 result = {
     "uid": os.getuid(),
-    "files": [os.path.exists("/dev/shm/wb-drop"), os.path.exists("/dev/shm/wb-dir")],
     "sysv": [libc.shmget(0x5742, 0, 0), libc.msgget(0x5743, 0), libc.semget(0x5744, 0, 0)],
+}
+"""
+LOOK_FOR_IPC = (
+    LOOK_FOR_SYSV
+    + """
+tops = ("/dev/shm", "/dev/mqueue")
+mine = [n for top in tops for n in os.listdir(top) if os.lstat(f"{top}/{n}").st_uid == os.getuid()]
+result |= {
+    "files": [os.path.exists("/dev/shm/wb-drop"), os.path.exists("/dev/shm/wb-dir")],
     "mq": libc.mq_open(b"/wb-q", os.O_RDONLY),
     "mine": mine,
 }
 """
+)
 
 
 @SHARED_IPC_ONLY
@@ -1577,6 +1731,24 @@ async def test_as_root_the_next_job_in_a_slot_finds_nothing_of_the_last(
     assert first.result == {"uid": 20001, "made": [True] * 6}
     assert second.status == "ok", second
     assert second.result == {"uid": 20001, "files": [False, False], "sysv": [-1, -1, -1], "mq": -1, "mine": []}
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_the_next_job_in_a_slot_finds_no_sysv_ipc_of_the_last(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SysV half, in the production shape too: a filled segment, a queued message and a semaphore set are gone."""
+    _chat(root_volume)
+    (root_volume / "workspaces" / CALLER / "user-b" / CHAT).mkdir(parents=True)
+    sup = Supervisor(_settings(root_volume, WORKBENCH_EXECUTOR_SLOTS="1"))
+
+    _runner(monkeypatch, LEAVE_SYSV)
+    first = await sup.run_job(_request())
+    _runner(monkeypatch, LOOK_FOR_SYSV)
+    second = await sup.run_job(_request(user_id="user-b"))
+
+    assert (first.status, first.result) == ("ok", {"uid": 20001, "made": [True] * 4})
+    assert (second.status, second.result) == ("ok", {"uid": 20001, "sysv": [-1, -1, -1]})
 
 
 TRY_TO_LEAVE_IPC = """

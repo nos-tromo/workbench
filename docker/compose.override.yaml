@@ -1,0 +1,13 @@
+### Dev-only override: publish the api to the host.
+###
+### Production reaches the api only over workbench-net (Open WebUI as its
+### caller) and relies on the internal `expose` port in compose.yaml, so this
+### file is intentionally *not* loaded by direct
+### `docker compose -f docker/compose.yaml` invocations. `make up-dev` layers
+### both files so the api is reachable on localhost; `make up` runs
+### compose.yaml alone (production shape).
+
+services:
+  api:
+    ports:
+      - "${WORKBENCH_HOST_PORT:-8100}:8000"

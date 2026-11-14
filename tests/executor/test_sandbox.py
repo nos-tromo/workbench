@@ -1246,19 +1246,26 @@ def test_an_ipc_folder_that_is_a_symlink_is_not_looked_through(tmp_path: Path) -
         sandbox._folder_holds(str(tmp_path / "link"), os.getuid())
 
 
-MAKE_IPC = """\
+# The SysV half runs in every shape; the POSIX half needs slots that may write /dev/shm and make
+# queues, which only Docker's default allows (R28).
+MAKE_SYSV = """\
 import ctypes, os, pathlib, sys
 libc = ctypes.CDLL(None, use_errno=True)
 tag, key = sys.argv[1], int(sys.argv[2])
-pathlib.Path(f"/dev/shm/wb-{tag}").write_text("synthetic note")
-pathlib.Path(f"/dev/shm/wb-{tag}-d/inner").mkdir(parents=True)
-pathlib.Path(f"/dev/shm/wb-{tag}-d/inner/note").write_text("synthetic note")
 assert libc.shmget(key, 4096, 0o1000 | 0o600) >= 0
 assert libc.shmget(0, 4096, 0o1000 | 0o600) >= 0
 assert libc.msgget(key + 1, 0o1000 | 0o600) >= 0
 assert libc.semget(key + 2, 1, 0o1000 | 0o600) >= 0
+"""
+MAKE_IPC = (
+    MAKE_SYSV
+    + """\
+pathlib.Path(f"/dev/shm/wb-{tag}").write_text("synthetic note")
+pathlib.Path(f"/dev/shm/wb-{tag}-d/inner").mkdir(parents=True)
+pathlib.Path(f"/dev/shm/wb-{tag}-d/inner/note").write_text("synthetic note")
 assert libc.mq_open(f"/wb-{tag}".encode(), os.O_CREAT | os.O_RDWR, 0o600, None) >= 0
 """
+)
 
 
 def _ipc_of(uid: int) -> list[str]:
@@ -1277,8 +1284,8 @@ def _ipc_of(uid: int) -> list[str]:
     return found
 
 
-def _make_ipc_as(slot: Slot, tag: str, key: int) -> None:
-    """Leave SysV objects, POSIX shared memory files and a message queue of the slot's uid, then exit."""
+def _make_ipc_as(slot: Slot, tag: str, key: int, code: str = MAKE_IPC) -> None:
+    """Leave SysV objects and, with ``MAKE_IPC``, POSIX shared memory files and a message queue of the slot's uid."""
 
     def drop() -> None:
         """Become the slot."""
@@ -1286,7 +1293,7 @@ def _make_ipc_as(slot: Slot, tag: str, key: int) -> None:
         os.setgid(slot.gid)
         os.setuid(slot.uid)
 
-    subprocess.run([sys.executable, "-I", "-c", MAKE_IPC, tag, str(key)], preexec_fn=drop, check=True, timeout=60)
+    subprocess.run([sys.executable, "-I", "-c", code, tag, str(key)], preexec_fn=drop, check=True, timeout=60)
 
 
 @SHARED_IPC_ONLY
@@ -1301,6 +1308,23 @@ def test_as_root_a_slot_cleanup_removes_its_ipc_and_nothing_of_others() -> None:
         kill_slot_processes(slot)
         assert _ipc_of(slot.uid) == []
         assert len(_ipc_of(other.uid)) == 9
+        assert sandbox._slot_has_ipc(slot.uid) is False
+    finally:
+        kill_slot_processes(other)
+    assert _ipc_of(other.uid) == []
+
+
+@pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
+def test_as_root_a_slot_cleanup_removes_its_sysv_ipc_and_nothing_of_others() -> None:
+    """The SysV half, in the production shape too: segments, message queues and semaphore sets outlive processes."""
+    slot, other = Slot(index=6, uid=20007, gid=20007), Slot(index=7, uid=20008, gid=20008)
+    _make_ipc_as(slot, "slot", 0x57C0, MAKE_SYSV)
+    _make_ipc_as(other, "other", 0x57D0, MAKE_SYSV)
+    assert len(_ipc_of(slot.uid)) == 4  # 2 segments, 1 message queue, 1 semaphore set
+    try:
+        kill_slot_processes(slot)
+        assert _ipc_of(slot.uid) == []
+        assert len(_ipc_of(other.uid)) == 4
         assert sandbox._slot_has_ipc(slot.uid) is False
     finally:
         kill_slot_processes(other)

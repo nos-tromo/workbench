@@ -19,9 +19,42 @@ jobs:
     # bundle-lib + audit-library drift-checks; nos-tromo style tuning:
     # line-length=120, ANN401 ignored, local pyrefly hook. Canonical configs at
     # nos-tromo/.github/configs/{python-strict,make-common,bundle,audit}/.
-    # docker-build stays off until the images exist (Task 9 turns it on).
+    # docker-build builds both images and scans them.
     uses: nos-tromo/.github/.github/workflows/python-app-ci.yml@2715bedabe594a449e411182393e68da59c791f3 # v3.22
     with:
       python-versions: '["3.12"]'
       uv-sync-args: '--locked --group dev --extra executor'
-      docker-build: false
+      docker-build: true
+
+  executor-root:
+    # The executor's tests as root in its own image, in the production shape
+    # (root-only /dev/shm and /tmp, no POSIX queues) and with Docker's default
+    # /dev/shm, where the defence-in-depth IPC cleanup is exercised.
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Root executor tests, both shapes
+        run: make test-executor-root
+
+  isolation:
+    # The executor's isolation on the running test stack
+    # (docker/compose.test.yaml): a project, volume and network of its own.
+    runs-on: ubuntu-latest
+    needs: ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.12.11'
+          enable-cache: true
+          cache-dependency-glob: '**/uv.lock'
+      - name: Pin Python
+        run: uv python pin 3.12
+      - name: Isolation tests
+        # Docker refuses a CPU limit above the runner's CPUs; the default is 4.
+        run: |
+          if [ "$(nproc)" -lt 4 ]; then export WORKBENCH_EXECUTOR_CPUS="$(nproc)"; fi
+          make test-isolation

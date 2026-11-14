@@ -79,3 +79,6 @@ docker/
 
 # Exceptions
 !workbench/api/system_prompt.md
+# pyproject.toml declares both; building the package reads them.
+!README.md
+!LICENSE

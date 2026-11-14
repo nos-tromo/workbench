@@ -62,6 +62,12 @@ workbench = ["api/system_prompt.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "isolation: against the running test stack; make test-isolation brings it up",
+    "contract: against a real Open WebUI; make test-contract",
+    "load: the load test against the running test stack; make test-load",
+]
+addopts = "-m 'not isolation and not contract and not load'"
 
 [tool.ruff]
 # Mirrors nos-tromo/.github/configs/python-strict/ruff.toml. target-version

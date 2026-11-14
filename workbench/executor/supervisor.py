@@ -75,6 +75,8 @@ _MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
 _SYSCTLS = Path("/proc/sys/fs")
 _MOUNTINFO = Path("/proc/self/mountinfo")
 _SHM = Path("/dev/shm")
+_SHARED_TMP = Path("/tmp")
+_STATUS = Path("/proc/self/status")
 _QUEUES_MAX = Path("mqueue/queues_max")  # below /proc/sys/fs
 _CLOSE_GRACE_S = 5.0  # for the answer to the request that retired the last slot
 # Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
@@ -185,6 +187,8 @@ def startup_problem(
     sysctls: Path = _SYSCTLS,
     mountinfo: Path = _MOUNTINFO,
     shm: Path = _SHM,
+    tmp: Path = _SHARED_TMP,
+    status: Path = _STATUS,
     euid: int | None = None,
 ) -> str | None:
     """Find a reason the supervisor must not start.
@@ -197,6 +201,8 @@ def startup_problem(
             the IPC namespace's own.
         mountinfo: The process's mount table, ``/proc/self/mountinfo``.
         shm: The folder of POSIX shared memory and semaphores, ``/dev/shm``.
+        tmp: The shared temporary folder, ``/tmp``.
+        status: The process's status, ``/proc/self/status``.
         euid: The effective uid to judge; the process's own by default.
 
     Returns:
@@ -211,7 +217,11 @@ def startup_problem(
         ``CAP_SYS_RESOURCE`` it may not make a queue past that limit. The slot cleanup still
         looks in both folders, as defence in depth; on its own it cannot be relied on there, since
         another slot renaming and removing entries while a folder is listed can make the listing
-        skip entries nobody touched.
+        skip entries nobody touched. ``tmp`` must be root's alone too: every job has a ``TMPDIR`` of
+        its own, so ``/tmp`` is the last folder two slots could share. Last, ``status`` must show
+        the process under a seccomp filter (``Seccomp: 2``), such as Docker's default profile: it
+        refuses ``add_key``, ``keyctl`` and ``request_key``, and a kernel keyring a job filled
+        would outlive the job and its slot's cleanup.
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return "the supervisor must run as root"
@@ -250,6 +260,17 @@ def startup_problem(
         queues_max = ""
     if queues_max != "0":
         return "fs.mqueue.queues_max must be 0, so no job can make a POSIX message queue"
+    try:
+        tmp_root_only = _root_only(os.lstat(tmp))
+    except OSError:
+        tmp_root_only = False
+    if not tmp_root_only:
+        return "/tmp must be a folder of root's that no one else may write, so no job can leave anything there"
+    if not _seccomp_filtered(status):
+        return (
+            "the supervisor must run under a seccomp filter such as Docker's default profile, "
+            "so no job can use the kernel's keyrings"
+        )
     return None
 
 
@@ -263,6 +284,27 @@ def _root_only(st: os.stat_result) -> bool:
         Whether it is a folder, owned by uid 0, with neither the group nor the others write bit.
     """
     return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and st.st_mode & 0o022 == 0
+
+
+def _seccomp_filtered(status: Path) -> bool:
+    """Tell from a process's status whether a seccomp filter confines it.
+
+    Args:
+        status: A ``/proc/<pid>/status`` file: its ``Seccomp`` line reads 0 (none), 1 (strict) or
+            2 (filter).
+
+    Returns:
+        Whether the ``Seccomp`` line reads 2; ``False`` when there is none or the file cannot be read.
+    """
+    try:
+        lines = status.read_text(encoding="ascii", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        name, colon, value = line.partition(":")
+        if colon and name == "Seccomp":
+            return value.strip() == "2"
+    return False
 
 
 def _mqueue_mounted(mountinfo: Path) -> bool:
