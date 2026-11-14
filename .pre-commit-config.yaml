@@ -7,7 +7,7 @@ repos:
       - id: ruff-format
 
   # pyrefly is a local hook so it uses the project venv — resolving every dep's
-  # types (FastAPI, the OpenAI SDK, pydantic, etc.) needs the installed deps;
+  # types (FastAPI, pydantic, etc.) needs the installed deps;
   # pre-commit's isolated env can't keep up. Pinned to pyrefly==<canonical> in
   # dev deps; canonical at
   # nos-tromo/.github/configs/python-strict/precommit-versions.yaml.

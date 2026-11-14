@@ -20,16 +20,238 @@ root (e.g. `docker/compose.yaml`).
 
 ## What this repo is
 
-`workbench` is the nos-tromo federation's shared tool tier: a FastAPI `api` that
-holds a short-lived workspace per user and runs typed tools over it, plus a
-sandboxed `executor` that runs free Python and office-document work with no
-network. Its first caller is Open WebUI. The design, decisions and boundaries
-are in `docs/superpowers/specs/2026-11-13-workbench-design.md`; the build plan
-is `docs/superpowers/plans/2026-11-13-workbench-v1.md`. This file is a stub
-until the release task completes it.
+`workbench` is the nos-tromo federation's shared tool tier: the place where
+tools run on users' files, so that no app runs a code sandbox or office tooling
+of its own ("tool execution is shared, never embedded"). Version 1 has one
+caller, Open WebUI, which connects as a "terminal server". Users drop files
+into a chat; the model lists, reads and searches them, runs Python over them,
+inspects and fills report templates, and writes tables and documents, through
+nine typed tools. Every file is recorded in the audit trail by id and deleted
+`WORKBENCH_RETENTION_DAYS` (7) days after it was made.
 
-Toolchain: `uv` (`pyproject.toml` + `uv.lock`), `ruff` + `pyrefly` via
-`pre-commit`, `pytest`. `make verify` before pushing, `make test` for the suite.
-`make/common.mk`, `scripts/bundle-lib.sh` and the two files under
-`workbench/utils/` (`audit_event.py`, `audit_runtime.py`) are vendored verbatim
-from `nos-tromo/.github`; never edit them, CI fails on drift.
+workbench holds compute tools only. Data tools stay with the data's owner:
+docint's search stays in docint, and workbench never joins `data-net`.
+
+The design is `docs/superpowers/specs/2026-11-13-workbench-design.md`, the
+build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`. Where they and
+`docs/` differ, `docs/` describes the code.
+
+## Planning
+
+For any non-trivial change (>1 file or any root-cause fix), present a plan and wait for approval BEFORE editing code. Do not start with Edit/Write on a fresh investigation.
+
+## Architecture
+
+```
+browser ── edge-plane :8443 ── Open WebUI ── agent loop (native tool calls → vllm-router)
+                                   │
+                                   │ terminal-server HTTP: Bearer key, X-User-Id, X-Session-Id
+                                   │ over workbench-net (only callers and obs-plane's scraper)
+                                   ▼
+                           workbench / api ─── workbench-data (workspaces, staging, jobs, database)
+                                   │           audit chain → stdout → obs-plane
+                                   │ one job per connection, Unix socket in workbench-run
+                                   ▼
+                           workbench / executor (network_mode: none; one uid per slot)
+```
+
+- **`api`** (`workbench/api/`): FastAPI, one process, uid 10001. The key check,
+  workspaces and path rules, the tools, the audit chain, the retention sweep,
+  the job queue and `/metrics`. It never parses a user file.
+- **`executor`** (`workbench/executor/`): a supervisor, root with six
+  capabilities, that runs every job touching file content as a fresh process
+  under a slot uid (`20001`…`20016`), copy-in and copy-out, with limits. The
+  readers, the search, the templates, the writers and `run_python` all run
+  there.
+- **`volume-permissions`**: a one-shot that lays out `workbench-data`
+  (`workbench/executor/prepare_volume.py`) before the other two start.
+- **Networks**: the external `workbench-net`, the federation's fourth seam.
+  The api joins it as `workbench-api`, port 8000, never published; its other
+  members are the callers and obs-plane's scraper. Nothing joins
+  `inference-net` or `data-net`; the api calls no model.
+- **State**: the external volume `workbench-data` at `/data`
+  (`workbench/layout.py`): `workspaces/<caller>/<user-id>/<chat-id>/`,
+  `staging/<job-id>/`, `jobs/<job-id>/` and `workbench.db` (SQLite, WAL). Only
+  `make nuke` removes it. `workbench-run` holds only the executor's socket.
+- **Bring-up order**: inference → data → obs → workbench → apps → edge.
+
+Shared modules: `workbench/config.py` (settings for both roles),
+`workbench/paths.py` (virtual paths, ids, file names), `workbench/protocol.py`
+(the job request and answer, one JSON line each), `workbench/layout.py` (names
+on the volume), `workbench/tables.py` (table rules both sides apply). The
+executor imports nothing of the api.
+
+## The tool core and the terminal door
+
+**The tools are routes.** Each tool is a FastAPI route tagged `TOOL_TAG` with
+an explicit `operation_id`, a description written for the model and an
+explicit type on every parameter. `workbench/api/openapi.py:tool_openapi` builds
+the document of those routes only, once, and serves it from memory: Open WebUI
+makes a tool of every operation in it. The nine: `list_files`,
+`display_file`, `read_document`, `search_files`, `run_python`,
+`inspect_template`, `fill_template`, `write_table`, `write_document`.
+
+- `workbench/api/tools.py`: `list_files`, `read_document`, `search_files`,
+  `run_python`, and the helpers the other tool modules share.
+- `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
+  template and output tools, on the same router. A new tool gets a module of
+  its own on that router.
+- `workbench/api/files.py`: the file browser and `display_file`.
+- `workbench/executor/runners/`: one runner per tool that needs file content
+  (`RUNNERS`). `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made
+  and settles its record.
+
+Adding a tool touches: its route; its runner and `jobs.TOOLS`, if it runs in
+the executor; `auth.ALL_TOOLS`; `audit.OPERATIONS`, if it is recorded;
+`docs/permissions.md` and `docs/audit.md` (`tests/test_docs.py` fails without
+them); and the contract test's `TOOLS`.
+
+**The terminal door** (`workbench/api/contract.py`) is what Open WebUI
+v0.13.3 calls besides the tools: `GET /api/v1/policies` must answer non-2xx (so
+no route exists for it), `/api/config` says `features.system`, `/system` serves
+the prompt (`workbench/api/system_prompt.md`), `/openapi.json` (key only),
+`/files/cwd`, `/files/read` of `<home>/AGENTS.md` (404), `/skills` (`[]`).
+Every route that is not registered answers 404: Open WebUI's proxy forwards
+every method and path the browser sends, so the allow-list is workbench's.
+Handshake routes answer from memory or the database, never through the queue.
+
+**Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
+key and allowed tools. Version 1 has `open-webui`; docint joins in version 2.
+
+## The boundaries
+
+`docs/permissions.md` has them in full. In short:
+
+- **The user is the boundary; the chat is a folder.** The caller is its bearer
+  key; the user is `X-User-Id`, Open WebUI's opaque account id; the chat is
+  `X-Session-Id`, or `default`. Every path resolves below the user's root
+  (`workbench/paths.py:Workspaces`); another user's file is a 404.
+- **Files live only inside chat folders.** Nothing is ever a file directly
+  under `/workspace`.
+- **No network** in the executor. A job sees copies of its own chat's files,
+  read-only, and writes only its `out/`.
+- **The agent deletes nothing.** No tool deletes or overwrites a file; the user
+  (file browser) and retention do.
+- **Never a name in a log or an event.** Audit events name files by id; error
+  answers are short fixed texts (`workbench/api/errors.py`); no handler logs a
+  traceback or a cause of a path or store error.
+- **Fail closed.** An action whose audit event cannot be written does not
+  happen; a retention record that cannot be written stops the api.
+
+## Container hardening (deploy ADR 0001)
+
+Every service has a read-only root, `no-new-privileges`, `cap_drop: [ALL]` and
+a `/tmp` tmpfs. The api runs as uid 10001 with no capability. Two root services
+add back only what they need: the executor `SETUID`, `SETGID`, `CHOWN`,
+`FOWNER`, `DAC_OVERRIDE`, `KILL`; `volume-permissions` `CHOWN`, `FOWNER`,
+`DAC_READ_SEARCH`. `docs/sandbox.md` justifies each one; the executor refuses
+to start unless the container is set up as compose sets it.
+
+## Audit and retention
+
+- **Audit** (`workbench/api/audit.py`, `docs/audit.md`): one chain per api
+  process, `service: workbench`, emitter `workbench` / `api` in obs-plane's
+  verifier, `AUDIT_OUTPUT=container`. `workbench/utils/audit_event.py` and
+  `workbench/utils/audit_runtime.py` are vendored verbatim from
+  `nos-tromo/.github` (`configs/audit/`); never edit them, CI fails on drift.
+  No purpose in version 1; no `recipient` on `disclose`.
+- **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
+  is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
+  first; leftovers of interrupted work after an hour, recorded first; empty
+  folders and old job records without a record. A changed period applies at
+  once, with no notice. `make retention-dry-run [DAYS=n]`.
+
+## Commands
+
+Python 3.12 (`requires-python = ">=3.12,<3.13"`), `uv`, run from the repo root.
+
+```bash
+uv sync --group dev --extra executor   # dev tools + the executor's libraries
+make verify               # pre-commit: ruff + pyrefly (tracked files; git add new ones first)
+make test                 # pytest (no frontend/ here)
+uv run pytest tests/api/test_files.py -q   # one file
+make test-executor-root   # executor tests as root in its image, in both /dev/shm shapes
+make test-isolation       # the sandbox on a real stack (project workbench-test)
+make test-load            # the 10-user load test on that stack (manual, not in CI)
+make test-contract        # against the pinned Open WebUI (project workbench-contract)
+
+cp .env.example .env      # set OPEN_WEBUI_WORKBENCH_KEY (at least 32 characters)
+make network volumes      # the external workbench-net and workbench-data
+make build && make up     # production shape, no host port; make dev = build + up-dev (:8100)
+make health               # container status, then the api's /healthz from inside
+make retention-dry-run    # what retention would delete now: counts and ages only
+make bundle               # airgap bundle of both images, from the latest release tag
+make nuke                 # DESTROY workbench-data (type 'workbench' to confirm)
+```
+
+`make/common.mk` and `scripts/bundle-lib.sh` are vendored verbatim from
+`nos-tromo/.github` like the audit modules; never edit them.
+
+## Configuration
+
+`docs/configuration.md` lists every variable. `.env.example` follows deploy's
+shared format; check it with `python3 -B ../deploy/scripts/check_env_examples.py .`.
+The settings live in `workbench/config.py`; compose gives the api and the
+executor one shared block (`x-settings`), since the executor bounds every job by
+its own copy. `WORKBENCH_DATA_DIR`, `WORKBENCH_EXECUTOR_SOCKET` and
+`WORKBENCH_SLOT_UID_BASE` are tied to the images and mounts and are never set
+in compose. `OPEN_WEBUI_WORKBENCH_KEY` holds the same value as
+open-webui-service's.
+
+## Gotchas (verified)
+
+- **The font cache is built into the executor image.** Every `run_python` job
+  imports matplotlib, which rescans the fonts when its config folder is not
+  writable. The image scans them once (`/opt/mpl-cache`, root's, read-only), and
+  each job copies that cache into a config folder in its private tmp
+  (`workbench/executor/runners/python.py`). A change of the base image or of
+  matplotlib rebuilds it with the image.
+- **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
+  socket's path with the listening flag `00010000` and never connects. The
+  socket file alone is not enough: it outlives a killed supervisor in
+  `workbench-run`. The probe is in `docker/compose.yaml`;
+  `make test-executor-root` mounts `docker/` so its test runs in the image.
+- **No multiprocessing in jobs.** `/dev/shm` is root's and
+  `fs.mqueue.queues_max` is 0, so `multiprocessing` and process pools fail in a
+  job; threads work. The supervisor refuses to start without that shape. The
+  root executor tests run in both shapes; the tests that need Docker's default
+  `/dev/shm` are marked `SHARED_IPC_ONLY`.
+- **The test stacks are their own projects.** `make test-isolation` and
+  `make test-load` use `docker/compose.test.yaml` (project `workbench-test`,
+  volume `workbench-test-data`, network `workbench-test-net`, `:test` images,
+  no `.env`); `make test-contract` uses `contract/compose.yaml` (project
+  `workbench-contract`, its own volume and network, a key made per run). Each
+  is torn down with `down -v` by a trap on every way out. Never point them at
+  `workbench-data` or `workbench-net`.
+- **The test process limits BLAS threads.** `tests/conftest.py` sets
+  `OPENBLAS_NUM_THREADS` and `OMP_NUM_THREADS` to 1 before anything imports
+  numpy, as every job has them: the timer tests hold `SIGALRM` back in one
+  thread, and another thread would take the signal.
+- **A bare `docker compose` from `docker/` publishes the api.** It loads
+  `compose.override.yaml` on its own, which publishes `:8100` on all interfaces.
+  Use `make`, or `docker compose --env-file .env -f docker/compose.yaml` from the
+  repo root.
+- **`WORKBENCH_EXECUTOR_CPUS` must not pass the host's CPUs.** Docker refuses to
+  start the executor otherwise (default 4); CI lowers it on small runners.
+- **The Open WebUI pin lives in `contract/compose.yaml` only.** It must stay
+  the tag and digest open-webui-service deploys. Dependabot bumps it on its own;
+  merge such a bump only with the same bump there. The static tests check its
+  shape, not its value, so a bump reaches the contract job.
+
+## Git & PR Workflow
+
+- Never commit directly to `main`; always branch (`feat/`, `fix/`) and open a PR.
+- Never create a NEW PR when an existing PR for the work is open — push additional commits to that branch.
+- Release order is strict: bump `[project].version` in `pyproject.toml` and run `uv lock` in the release PR. On merge, `.github/workflows/release-tag.yml` mints the annotated `vX.Y.Z` tag. Never tag by hand.
+- Use single, non-compound shell commands for `gh` operations (no `&&` chains); if `gh pr merge` is blocked, fall back to the GitHub MCP merge tool.
+
+## Verification
+
+Before claiming a check is green, run the actual command and paste the output. `git ls-files` does not cover untracked files — use `pre-commit run --all-files`. After opening a PR, confirm CI actually triggered on the latest push before declaring done.
+
+## Communication Style
+
+Examples, fixtures, tests and docs use synthetic names only (`user-a`, `chat-1`,
+`quarterly-figures.xlsx`, `harbour-report.pdf`), and `<EDGE_HOST>` for a host.
+
+Keep changes minimal and scoped. Do not add explanatory code comments for trivial or self-evident changes. Do not overwrite existing test files with Write — use Edit to append or modify tests.

@@ -1,0 +1,276 @@
+# Sandbox
+
+Every file a user uploads is opened in the `executor`, never in the api: the
+document readers, the search, the template work, the writers and the model's
+free Python. This page says how the executor is confined, why it holds each
+capability it has, what it checks before it starts, and the risks that remain.
+
+## The executor container
+
+`docker/compose.yaml`, service `executor`:
+
+- `network_mode: none`: no network interface but its own loopback. The api
+  reaches it over a Unix socket in the project-local volume `workbench-run`
+  (mode `0660`, the api's group; its folder is root's alone).
+- `read_only: true`, `no-new-privileges`, `cap_drop: [ALL]` and six
+  capabilities added back (below).
+- `user: "0:0"`: the supervisor runs as root, so that it can run each job as
+  another uid. No job runs as root.
+- `init: true`: an init reaps the processes a job leaves behind.
+- tmpfs `/tmp` (`mode=0700`, root's alone) and `/dev/shm` (`mode=0755`, root's
+  alone, 1 MiB).
+- sysctls `fs.mqueue.queues_max: 0` (no POSIX message queue can be made) and
+  `kernel.shm_rmid_forced: 1` (a SysV shared memory segment dies once nothing is
+  attached to it).
+- `pids_limit`, `mem_limit` equal to `memswap_limit`, and `cpus` (see
+  [Limits](#limits)).
+- No secret: the executor never reads the caller key, and compose gives it
+  none.
+
+## Capabilities
+
+### The executor's six
+
+| Capability | Why |
+|---|---|
+| `SETUID`, `SETGID` | The job's process, between `fork` and `exec`, drops every group and becomes its slot's uid and gid for good, and checks that no other id is left (`workbench/executor/sandbox.py:preexec`, `_drop_to`). The cleanup helpers drop to the slot the same way. |
+| `CHOWN` | It hands the job's folder, `out/` and `tmp/` to the slot, and the staged outputs to the api (`workbench/executor/fs.py:settle`). |
+| `FOWNER` | It sets the modes of what it has just handed to another uid, and of folders it does not own. |
+| `DAC_OVERRIDE` | It reaches into folders other uids own: it copies the inputs out of the api's `0700` workspaces, makes the job's folder in the api's `0700` staging, and reads the result out of the slot's `0700` job folder and removes it after the job. |
+| `KILL` | It signals the job's process group, which runs as the slot's uid, when the job ends or runs out of time (`sandbox.py:_kill_group`). Every other process of the slot is killed by a helper that is the slot itself. |
+
+The supervisor refuses to start as anything but root
+(`workbench/executor/supervisor.py:startup_problem`).
+
+### `volume-permissions`' three
+
+A one-shot service runs `workbench.executor.prepare_volume` as root before the
+api and the executor start, with no network and three capabilities:
+
+| Capability | Why |
+|---|---|
+| `CHOWN` | It hands each part of the layout to its owner. |
+| `FOWNER` | It sets the modes of the parts it does not own, such as the api's `workspaces/` on a later run. |
+| `DAC_READ_SEARCH` | It opens the api's `0700` folders and `0600` database, read-only, to change their owner and mode through the open descriptor. |
+
+`DAC_OVERRIDE` is not needed there. It never writes through another uid's
+permissions: it makes new parts only in the volume root, which is root's, and
+changes owners and modes through descriptors, which `CHOWN` and `FOWNER`
+cover.
+
+## Isolation
+
+### The uid pool and the slot lifecycle
+
+The executor runs `WORKBENCH_EXECUTOR_SLOTS` jobs at once (4 by default, at
+most 16). Slot `n` runs as uid and gid `20001 + n`. The image creates the users
+`slot1` to `slot16`, uids `20001` to `20016`, none of which can log in or owns a
+home (`docker/Dockerfile.executor`). The pool never holds root or the api's uid
+`10001` (`supervisor.py:make_slots`).
+
+One job runs in a slot at a time:
+
+1. The supervisor makes the job's folder `jobs/<job-id>/` and copies the
+   requested files of the chat folder into it (below).
+2. It runs `python -I -m workbench.executor.job <spec>` as a fresh process in
+   that folder, as the slot's uid, with the limits below
+   (`sandbox.py:run_in_slot`). The process leads its own session, has a clean
+   environment (`sandbox.py:CLEAN_ENV`, with `HOME` and `TMPDIR` in the job's
+   folder) and a `077` umask; its stdin, stdout and stderr are `/dev/null`.
+3. When the job ends, by itself, on the wall clock or because the request was
+   cancelled, its process group is killed. Then every process of the slot's uid
+   is killed: a helper that drops to the slot calls `kill(-1, SIGKILL)`, and
+   `/proc` is checked, up to six times with a growing pause
+   (`sandbox.py:kill_slot_processes`).
+4. Then whatever IPC the slot left is removed, as the slot: SysV shared memory
+   (emptied first), message queues and semaphores it owns or made, and its
+   entries in `/dev/shm` and `/dev/mqueue`. A second look must find nothing.
+5. Only then is the result read and the outputs staged, and the job's folder
+   removed. The slot is free again once its folder is gone.
+
+A slot whose processes or IPC could not be cleared, whose folder could not be
+removed, or whose job was cancelled in the middle, is retired for the life of
+the process. Its next job could otherwise share a uid with what is left. Once
+the last slot is retired the supervisor exits non-zero, and
+`restart: unless-stopped` brings it back with fresh slots, a fresh IPC
+namespace and a fresh `/dev/shm`.
+
+### What a job sees
+
+- `jobs/<job-id>/`, the slot's, `0700`; nobody may list `jobs/` itself
+  (root's, `0711`).
+- `workspace/<chat-id>/` below it, root's, `0755`: the job's working folder,
+  with root-owned `0444` copies of its input files. The job can read them and
+  change nothing.
+- `workspace/<chat-id>/out/`, the slot's, `0700`: the only place its outputs
+  go.
+- `tmp/`, the slot's, `0700`: its `TMPDIR`.
+- `/workspace` in the image is a link to `/proc/self/cwd/..`, so
+  `/workspace/<chat-id>/<name>` is the job's own copy, whichever job asks.
+
+A job cannot reach the users' files, the staging folder, the database, the
+socket or another job's folder: each is another uid's and closed to others.
+The files of the user's other chats are never copied in. A file below a folder
+named `out` is never copied in either: `out/` is where a job writes.
+
+### Limits
+
+Per job (`workbench/protocol.py:Limits`, set by `sandbox.py:preexec`). The
+supervisor caps whatever a request asks at its own settings
+(`supervisor.py:Supervisor._bounded`):
+
+| Limit | Value |
+|---|---|
+| Wall time | `WORKBENCH_JOB_WALL_S` (120 s); then the group is killed and the answer is a timeout |
+| The code's own time | 9/10 of the wall time for `run_python`, 3/4 for every other tool, stopped by `SIGALRM` inside the job (`workbench/executor/timer.py`); the wall time is the backstop |
+| `RLIMIT_AS` | `WORKBENCH_JOB_MEMORY_MB` (1536 MB) of address space |
+| `RLIMIT_CPU` | `WORKBENCH_JOB_WALL_S` seconds of CPU |
+| `RLIMIT_FSIZE` | `WORKBENCH_UPLOAD_MAX_MB` (50 MB) per file written |
+| `RLIMIT_NPROC` | 64 processes of the slot's uid |
+| `RLIMIT_NOFILE` | 256 open files |
+| `RLIMIT_CORE` | 0 |
+| Priority | niceness 10 or more, which a job cannot lower again (`sandbox.py:JOB_NICENESS`) |
+
+For the container (`docker/compose.yaml`, see
+[configuration.md](configuration.md#the-executor-container)):
+
+- `cpus`: `WORKBENCH_EXECUTOR_CPUS` (4), every job together;
+- `pids_limit`: `WORKBENCH_EXECUTOR_PIDS_LIMIT` (320): 64 per slot plus 64
+  for the supervisor and its cleanup helpers;
+- `mem_limit` and `memswap_limit`, the same value:
+  `WORKBENCH_EXECUTOR_MEM_LIMIT` (6656 MiB): every slot's job memory plus
+  512 MiB for the supervisor. Memory and swap together are that one limit, so
+  no job swaps past it.
+
+Documents get guards of their own before a library parses them: an Office file
+may unpack to at most 20 times the upload limit, with at most 10 000 members
+(`workbench/executor/readers/__init__.py:check_zip`), and a workbook's sheets,
+names and shared strings are counted before it is loaded.
+
+### What the supervisor checks before it starts
+
+`supervisor.py:startup_problem` refuses to start, with a one-line reason,
+unless:
+
+- it runs as root;
+- the slot pool is sound: at most 16 slots, uids between 1000 and 65533, not the
+  api's;
+- every slot uid is a user of the image;
+- the container's cgroup memory limit (`memory.max`) holds every slot's job
+  memory. Without a cgroup v2 limit to read, this check passes; compose's
+  limit still applies;
+- `fs.protected_hardlinks` and `fs.protected_symlinks` read 1. These are the
+  host's kernel settings. The first keeps a job from giving `out/` a second name
+  for a file it does not own, such as the database, which root would then copy
+  out; the second keeps anyone from following a link a job left;
+- `/dev/mqueue` is a mounted mqueue file system, so a slot's queues can be
+  found and removed;
+- `/dev/shm` is root's and neither group nor others may write it, and
+  `fs.mqueue.queues_max` reads 0. No slot can then leave anything in POSIX
+  shared memory, semaphores or queues;
+- `/tmp` is root's and neither group nor others may write it: every job has a
+  `TMPDIR` of its own, so `/tmp` would be the last folder two slots could share;
+- `/proc/self/status` shows `Seccomp: 2`, a seccomp filter such as Docker's
+  default profile. It refuses the kernel keyring calls, and a keyring a job
+  filled would outlive the job.
+
+Compose sets the container up this way. `seccomp=unconfined` or Docker's
+default `/dev/shm` make it refuse.
+
+### Output validation
+
+After the job, before anything is staged (`supervisor.py:_find_outputs`,
+`_stage_one`):
+
+- Only regular files directly in `out/` count. Links, folders and anything
+  else are left out, and so are names a workspace refuses.
+- Each must be the slot's own: owned by the slot's uid, with exactly one link.
+  A file with a second name could be another uid's file, linked in. Others are
+  dropped, and the answer counts them.
+- At most 20 files, and together at most `WORKBENCH_UPLOAD_MAX_MB`. Past either
+  bound no file is kept, and the answer says why. Each file is also bounded by
+  `RLIMIT_FSIZE` while it is written.
+- Each file is opened again without following a link and must be the same file
+  (device and inode) as when it was found; it is copied to
+  `staging/<job-id>/`, handed to the api and given mode `0600`.
+
+The api then moves each staged file into the chat folder under a free name
+(`workbench/api/store.py:Store.register_output`). What it cannot keep (a full
+disk, an invalid name) is removed with the staging folder and counted in the
+answer. Outputs are not held to the user's quota when they are made; they use
+up the room of later uploads.
+
+### The healthcheck
+
+The executor is healthy once its socket listens: the probe looks for the
+socket's path in `/proc/net/unix` with the listening flag, `00010000`
+(`docker/compose.yaml`, `healthcheck`). The socket file alone does not count:
+it outlives a supervisor that was killed, in `workbench-run`. The probe never
+connects, since a connection without a request line would be a malformed
+request. The api starts only once the executor is healthy.
+
+## Residual risks
+
+Each of these is accepted. Each says what it would take.
+
+- **A shared kernel.** The jobs run in containers, on the host's kernel. A job
+  that exploits a kernel flaw reachable from an unprivileged uid with no
+  capabilities, no network and Docker's default seccomp profile could escape
+  to the host. That takes a kernel vulnerability of that kind. The federation is
+  single-host Docker; gVisor (below) narrows this where a host has it.
+- **A covert channel between two jobs that run at once.** Two slots share the
+  container's kernel objects while both run: abstract Unix sockets, SysV IPC,
+  CPU and timing. Two jobs that cooperate could pass data between them. That
+  takes code in both jobs written to do so, for example a listener of one user
+  and a sender in another user's chat, put there by a prompt hidden in a
+  document. Nothing survives the end of a job: each slot is cleared before its
+  next one.
+- **`fs.protected_regular` and `fs.protected_fifos` are not required.** They are
+  the host's settings, not namespaced, and 0 on many Docker hosts, so requiring
+  them would refuse most hosts. They guard opens in world-writable sticky
+  folders. The executor has none a slot can write: `/tmp` and `/dev/shm` are
+  root's, and each job's `TMPDIR` is its own. It would take such a folder, which
+  the start-up checks rule out.
+- **The root-side look at the IPC folders checks only their top.** After the
+  helper's cleanup, the supervisor looks for the slot's entries at the top of
+  `/dev/shm` and `/dev/mqueue`, and one level into folders of other uids there,
+  within a budget (`sandbox.py:_folder_holds`). An entry a job put deeper inside
+  another uid's folder can be missed. In production no slot can write either
+  folder, so the look finds nothing and is defence in depth. It would take
+  Docker's default `/dev/shm`, which the start-up checks refuse, and two jobs
+  that cooperate.
+- **userns-remap is untested.** The executor has not been run on a host whose
+  Docker daemon remaps user namespaces (deploy `docs/runbooks/userns-remap.md`).
+
+## gVisor
+
+`runtime: runsc` on the `executor` service runs its jobs on gVisor's user-space
+kernel, which narrows the shared-kernel risk. It is an optional hardening for
+hosts that have gVisor installed, and it is untested: the start-up checks read
+`/proc` and `/sys` values that gVisor emulates, so try it on the host before
+relying on it.
+
+## Limits of `run_python`
+
+The model's code runs in the job process itself, as a script
+(`workbench/executor/runners/python.py:run_python`). What follows from that:
+
+- **Only Python-level output is captured.** `print` and writes to `sys.stdout`
+  and `sys.stderr` come back. Writes straight to file descriptors 1 and 2 (a C
+  extension, `os.system`, a child process) go to `/dev/null`.
+- **`os.chdir` breaks `/workspace/<chat>/x` paths.** `/workspace` is a link to
+  the parent of the current folder, so after `os.chdir` those paths point
+  elsewhere. Relative paths in the job's own folder keep working until the code
+  changes folder; the runner puts the folder back after the code.
+- **A lingering non-daemon thread ends the job as a wall timeout.** The process
+  waits for such a thread before it exits. The job then runs into the wall time
+  and is answered as a timeout, even though its result was already written.
+- **No multiprocessing.** No slot can write `/dev/shm` or make a POSIX queue, so
+  `multiprocessing`, its process pools and the libraries built on them (such as
+  joblib's process backend) fail. Threads work. The tool description and the
+  system prompt say so.
+- **Path rewriting depends on the supervisor's layout.** The answer never shows
+  the job's real folder: paths below `jobs/<job-id>/workspace/<chat>` are written
+  as `/workspace/<chat>/…`, the rest of the job's folder as `<job>`, other paths
+  on the volume as `<data>` (`python.py:_Rewriter`). The rewriting is textual
+  and built from that layout; a change to the layout must change it too.
