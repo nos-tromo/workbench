@@ -279,6 +279,21 @@ def test_wall_time_limit(api: httpx.Client) -> None:
     assert "wall time" in sleeper.text.lower()
 
 
+def test_code_that_ignores_its_soft_limit_is_killed_at_the_wall_time(api: httpx.Client) -> None:
+    """The runner's own limit rides on ``SIGALRM``; code that ignores the signal is stopped by the executor (R40).
+
+    The answer is the executor's, through the api: the job ran past its wall time, the test stack's 20 s.
+    """
+    code = "import signal, time\nsignal.signal(signal.SIGALRM, signal.SIG_IGN)\ntime.sleep(10_000)"
+    stubborn = run_python(api, code)
+
+    assert (stubborn.status_code, stubborn.json()) == (
+        422,
+        {"detail": "the code could not be completed: the job ran past its wall time of 20 s"},
+    )
+    assert stdout_of(run_python(api, 'print("still here")')) == "still here"
+
+
 def _upload(api: httpx.Client, name: str, data: bytes, *, user: str = "user-a", chat: str = "chat-1") -> str:
     """Upload a synthetic file into a chat; return the name the workspace gave it."""
     answer = api.post(

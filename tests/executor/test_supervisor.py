@@ -1385,6 +1385,32 @@ async def test_serve_answers_one_request_per_connection(served: Path, monkeypatc
     assert stat.S_ISSOCK(os.lstat(_sock(served)).st_mode)
 
 
+async def test_a_lone_surrogate_in_a_runners_answer_never_costs_the_run_its_outputs(
+    served: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every string of the answer, keys and nested ones too, is sent with U+FFFD for a lone surrogate.
+
+    The job writes a lone surrogate as an escape that JSON reads back; the answer could not be encoded before, and the
+    run lost its outputs to "the job's result could not be encoded". A pair written as two escapes stays one character.
+    """
+    _runner(
+        monkeypatch,
+        """
+        pathlib.Path("out/r.txt").write_text("x")
+        result = {"text": "\\ud800", "\\udc80": ["a\\udfff", {"pair": "\\ud83d\\ude00"}]}
+        """,
+    )
+    request = _request()
+
+    async with _serving(Supervisor(_settings(served), use_slots=False)):
+        answer = decode_result(await _ask(_sock(served), encode(request)))
+
+    assert (answer.status, answer.message) == ("ok", "")
+    assert answer.result == {"text": "�", "�": ["a�", {"pair": "\U0001f600"}]}
+    assert [output.name for output in answer.outputs] == ["r.txt"]
+    assert (served / "staging" / request.job_id / "r.txt").read_text() == "x"
+
+
 @pytest.mark.parametrize(
     "line",
     [

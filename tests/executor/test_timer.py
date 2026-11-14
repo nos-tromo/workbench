@@ -333,6 +333,45 @@ def test_a_limit_is_not_raised_inside_a_finalizer_where_it_would_be_lost(monkeyp
     assert timer._limits == []
 
 
+def test_an_uninterrupted_function_puts_a_limit_off_whichever_thread_the_signal_comes_through() -> None:
+    """A deadline that passes while a marked function runs is raised just after it, in the code that called it.
+
+    A second thread is alive, as when the code a job runs has started one. The kernel then hands ``SIGALRM`` to that
+    thread while the main one has it blocked, and Python runs the handler in the main thread all the same: a shield
+    of the signal mask would not hold here (``shielded()`` lets the error into the block), a mark the handler looks
+    for does.
+    """
+
+    @timer.uninterrupted
+    def bookkeeping() -> None:
+        spin(0.2)  # what it calls is inside it too
+
+    stop = threading.Event()
+    other = threading.Thread(target=stop.wait, args=(10,))
+    other.start()
+    returned: list[float] = []
+    try:
+        began = time.monotonic()
+        with pytest.raises(Inner):
+            with limit_until(began + 0.05, Inner):
+                bookkeeping()
+                returned.append(time.monotonic() - began)
+                spin()
+    finally:
+        stop.set()
+        other.join()
+    assert returned
+    assert returned[0] >= 0.19
+    assert time.monotonic() - began < 3.0
+    assert timer._limits == []
+
+
+def test_only_a_python_function_can_be_marked_uninterrupted() -> None:
+    """A builtin has no code to recognise it by in a frame."""
+    with pytest.raises(TypeError):
+        timer.uninterrupted(len)
+
+
 def test_a_second_limit_that_is_due_too_fires_even_if_the_first_error_is_swallowed() -> None:
     """Both deadlines pass while the signal cannot be handled (one long call into C, here a shield).
 
@@ -553,8 +592,10 @@ def test_a_deadline_that_lands_anywhere_in_starting_or_stopping_a_meter_leaves_i
                         run(meter, 0.003)
             assert steps == path[: at + 1]
             assert meter.until is None
-            # stop: the 3 ms run is charged; start: the error lands before the run, so at most the start is
-            assert meter.left <= (0.012 if method == "stop" else 0.015)
+            if method == "stop":
+                assert meter.left <= 0.012  # the 3 ms run is charged
+            # start: the error lands before the run, so no bound on what is left could fail; that the meter is
+            # stopped (``until`` above) and stays as it is through the spin below carry the check.
             left = meter.left
             meter.stop()  # what the search does at the end of every file: a stopped meter stays as it is
             spin(0.05)

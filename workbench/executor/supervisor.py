@@ -360,10 +360,34 @@ def _read_result(job: int, limit: int) -> dict[str, Any] | None:
         return None
     data = b"".join(chunks)
     try:
-        value = json.loads(data)
+        value = _encodable(json.loads(data))
     except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _encodable(value: Any) -> Any:
+    """Replace every lone surrogate in the strings of a JSON value, its keys included, with U+FFFD.
+
+    JSON reads the escape of a surrogate half that has no partner as a lone surrogate, which UTF-8 cannot hold: the
+    answer could not be sent, and a run would lose its outputs over one character of its runner's text.
+
+    Args:
+        value: A value as :func:`json.loads` returns it.
+
+    Returns:
+        The value, every string of it encodable as UTF-8.
+
+    Raises:
+        RecursionError: The value is nested too deeply to walk.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(value, list):
+        return [_encodable(item) for item in value]
+    if isinstance(value, dict):
+        return {_encodable(key): _encodable(item) for key, item in value.items()}
+    return value
 
 
 def _own_file(st: os.stat_result, owner: int) -> bool:

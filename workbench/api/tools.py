@@ -181,6 +181,9 @@ _RUNNER_ERRORS: Final = {
 }
 _ERROR_CAP: Final = 300
 _CUT_MARK: Final = " [cut]"
+
+#: The longest hint an answer carries.
+MAX_HINT: Final = 2000
 _STRING: Final[JsonDict] = {"type": "string"}
 
 
@@ -376,6 +379,19 @@ def _join(*sentences: str | None) -> str | None:
         The text, or ``None`` if there is none.
     """
     return " ".join(sentence for sentence in sentences if sentence) or None
+
+
+def _capped(text: str | None, limit: int) -> str | None:
+    """Cut a text to the most characters a field of an answer takes.
+
+    Args:
+        text: The text, or ``None``.
+        limit: The most characters.
+
+    Returns:
+        Its first ``limit`` characters, or ``None``.
+    """
+    return None if text is None else text[:limit]
 
 
 def _with_paging(answer: DocumentRead, limit_kb: int) -> DocumentRead:
@@ -706,7 +722,7 @@ class _CodeRun(BaseModel):
     stdout: str
     stderr: str
     truncated: bool
-    hint: str | None = Field(default=None, max_length=2000)
+    hint: str | None = Field(default=None, max_length=MAX_HINT)
 
 
 class PythonRun(BaseModel):
@@ -726,7 +742,7 @@ class PythonRun(BaseModel):
     files: list[str] = Field(description="The files it wrote into out/, now in the workspace: their paths.")
     truncated: bool = Field(description="True if stdout or stderr was cut in the middle to fit the result limit.")
     job_id: str = Field(description="The id of this run; cite it as the source of what the code computed.")
-    hint: str | None = Field(default=None, max_length=2000, description="What to tell the user, or how to go on.")
+    hint: str | None = Field(default=None, max_length=MAX_HINT, description="What to tell the user, or how to go on.")
 
 
 def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
@@ -792,10 +808,37 @@ def _record_run(
             criteria={"outputs": len(outputs)},
         )
     except AuditWriteError:
-        for rec in outputs:
-            with contextlib.suppress(PathError, OSError):  # the audit failure is the answer
-                store.remove(rec)
+        _remove_outputs(store, outputs)  # the audit failure is the answer
         raise
+
+
+def _remove_outputs(store: Store, outputs: Sequence[FileRecord]) -> None:
+    """Remove files a job made that must not stay; one that cannot be removed does not stop the others.
+
+    Args:
+        store: The file store.
+        outputs: The files.
+    """
+    for rec in outputs:
+        with contextlib.suppress(PathError, OSError):
+            store.remove(rec)
+
+
+def _readable(model: type[BaseModel], payload: object) -> bool:
+    """Tell whether a runner's answer has the shape the api sends on.
+
+    Args:
+        model: The answer's model.
+        payload: What the runner returned.
+
+    Returns:
+        Whether it validates.
+    """
+    try:
+        model.model_validate(payload)
+    except ValidationError:
+        return False
+    return True
 
 
 def _middle(text: str, keep: int) -> str:
@@ -899,6 +942,11 @@ async def run_python(
     args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
     job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen])
     outcome = "ok" if result.status == "ok" else "error"
+    if result.status == "ok" and not _readable(_CodeRun, result.result):
+        # The model is told the tool failed and never learns of the files: none of them may stay.
+        await run_in_threadpool(_remove_outputs, store, made)
+        made.clear()
+        outcome = "error"
     await run_in_threadpool(_record_run, audit, store, p, chosen, made, outcome)
     payload, note = _python_payload(result)
     run = _parse(_CodeRun, payload)
@@ -920,6 +968,6 @@ async def run_python(
         files=[rec.virtual_path for rec in made],
         truncated=run.truncated,
         job_id=job.id,
-        hint=_join(*notes),
+        hint=_capped(_join(*notes), MAX_HINT),
     )
     return _fit_python(answer, settings.result_max_kb)

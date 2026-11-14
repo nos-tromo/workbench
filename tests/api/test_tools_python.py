@@ -295,6 +295,31 @@ def test_outputs_whose_use_cannot_be_recorded_are_removed(
     assert [rec for rec in store.files_in_chat(ME) if rec.kind == "output"] == []
 
 
+def test_outputs_of_an_answer_that_cannot_be_read_are_removed_and_the_run_is_an_error(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """The model is told the tool failed and never learns of the files, so none of them stays."""
+    a = put(store, "q.csv")
+    fake_executor.files = {"r.xlsx": b"PK"}
+    fake_executor.payload = {"stdout": 1}
+    r = run(client)
+    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
+    assert [rec for rec in store.files_in_chat(ME) if rec.kind == "output"] == []
+    (event,) = events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"], event["criteria"]["outputs"]) == ("error", [a.id], 0)
+
+
+def test_a_long_hint_from_the_runner_is_cut_never_a_500(client: TestClient, fake_executor: Scripted) -> None:
+    """The runner's hint at its cap and the executor's note together are longer than a hint may be: cut to it."""
+    fake_executor.message = "dropped 1 output: not the job's own file"
+    fake_executor.payload = ran("ok\n", hint="h" * 2000)
+    r = run(client)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["stdout"] == "ok\n"
+    assert body["hint"] == "h" * 2000
+
+
 # --- the request -----------------------------------------------------------------------------------------------
 
 

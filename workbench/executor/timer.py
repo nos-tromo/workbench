@@ -37,6 +37,11 @@ Limits nest and share the one real-time interval timer of the process:
   the last limit leaves (the kernel's delivery of a signal can lag behind the code that disarmed the timer) finds
   nothing due and does nothing, instead of reaching a handler that was put back or killing the process by default.
   It is looked for, and installed over another one, when the first limit is entered.
+- A function marked :func:`uninterrupted` is never split by a limit's error: the handler looks at the code it
+  interrupted and, while such a function runs, comes back a moment later instead, as it does in a finalizer. This
+  holds whichever thread the signal reached the process through; :func:`shielded` blocks the signal for one thread
+  only, and with a second thread alive the kernel hands it to that one, after which Python runs the handler in the
+  main thread all the same.
 
 The errors are :class:`BaseException` subclasses, like ``KeyboardInterrupt``: a library that catches
 ``Exception`` around its own work does not swallow a timeout that lands in it.
@@ -46,12 +51,12 @@ import math
 import signal
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from types import FrameType
+from types import CodeType, FrameType
 
-__all__ = ["Meter", "TimeLimit", "limit_spending", "limit_until", "shielded"]
+__all__ = ["Meter", "TimeLimit", "limit_spending", "limit_until", "shielded", "uninterrupted"]
 
 #: A signal that arrives this much before a deadline counts as arriving at it.
 _EARLY = 1e-3
@@ -176,6 +181,32 @@ _limits: list[_Limit] = []
 #: Whether :func:`_fire` is running: a signal that comes meanwhile waits until it has raised its error.
 _firing = False
 
+#: The code of the functions marked :func:`uninterrupted`.
+_UNINTERRUPTED: set[CodeType] = set()
+
+
+def uninterrupted[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """Mark a function that a limit's error must never interrupt: one that falls due while it runs comes just after.
+
+    For short bookkeeping that runs often and must never be left half done, such as a write to a captured stream:
+    :func:`shielded` costs three system calls a time and holds only while no other thread is alive. The handler puts
+    its error off while the function, or anything it calls, runs, and tries again a moment later.
+
+    Args:
+        function: A plain Python function or method.
+
+    Returns:
+        The function itself.
+
+    Raises:
+        TypeError: It has no code of its own to recognise it by (a builtin, a ``functools.partial``).
+    """
+    code = getattr(function, "__code__", None)
+    if not isinstance(code, CodeType):
+        raise TypeError("only a Python function can be marked uninterrupted")
+    _UNINTERRUPTED.add(code)
+    return function
+
 
 def _block() -> set[int]:
     """Block ``SIGALRM`` in this thread and say what the mask was.
@@ -227,20 +258,22 @@ def _arm() -> _Limit | None:
     return None
 
 
-def _in_finalizer(frame: FrameType | None) -> bool:
-    """Tell whether a frame is running inside a ``__del__``, where an exception cannot go anywhere.
+def _must_wait(frame: FrameType | None) -> bool:
+    """Tell whether a frame is running where a limit's error must not be raised.
 
-    Python prints and drops an exception raised in a finalizer, so a timeout raised there would be lost and the
-    code that ought to have been stopped would run on.
+    One is inside a ``__del__``: Python prints and drops an exception raised in a finalizer, so a timeout raised
+    there would be lost and the code that ought to have been stopped would run on. The other is inside a function
+    marked :func:`uninterrupted`, which would be left half done.
 
     Args:
         frame: The frame the signal interrupted.
 
     Returns:
-        ``True`` if it, or a frame that called it, is a ``__del__``.
+        ``True`` if it, or a frame that called it, is a ``__del__`` or an uninterrupted function.
     """
     while frame is not None:
-        if frame.f_code.co_name == "__del__":
+        code = frame.f_code
+        if code.co_name == "__del__" or code in _UNINTERRUPTED:
             return True
         frame = frame.f_back
     return False
@@ -301,7 +334,7 @@ def _fire(_signum: int, _frame: FrameType | None) -> None:
         if not due:
             _rearm()
             return
-        if _in_finalizer(_frame):
+        if _must_wait(_frame):
             signal.setitimer(signal.ITIMER_REAL, _RETRY)  # try again in a moment, outside it
             return
         error = _spend(min(due, key=lambda pair: pair[0])[1])

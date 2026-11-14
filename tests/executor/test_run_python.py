@@ -5,22 +5,28 @@ Most tests call the runner in this process, in a folder laid out as the supervis
 as its own process, as the supervisor does.
 """
 
+import dis
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import tracemalloc
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import CodeType, FrameType
 from typing import Any
 
 import pytest
 
+from workbench.executor import timer
 from workbench.executor.runners import JobContext
-from workbench.executor.runners.python import _Capture, run_python
+from workbench.executor.runners.python import CodeTimeout, _Capture, run_python
 from workbench.protocol import JobResult, encode
 
 JOB_ID = "0123456789abcdef0123456789abcdef"
@@ -373,9 +379,16 @@ def _fragments(text: str) -> list[str]:
 
 
 def test_a_path_across_the_split_of_a_stream_below_twice_the_cap_is_rewritten(tmp_job: Job) -> None:
-    """A stream between the cap and twice it is kept whole; a real path across the cap's mark is rewritten whole."""
+    """A stream that each end of the capture holds in part is kept whole; a real path across their split is rewritten.
+
+    Each end keeps the cap and 4096 characters more (``KEEP + 4096``), so that is where a stream shorter than twice
+    it is split in two. Every line puts the path across that split: rewriting the two halves apart, as the runner once
+    did, leaves the real path in the answer.
+    """
     real = str(tmp_job.ctx.work_dir / "f.csv")
-    for start in range(KEEP - len(real) + 1, KEEP):
+    split = KEEP + 4096
+    for start in range(split - len(real) + 1, split):
+        assert start + len(real) + 102 < 2 * split  # the stream stays below twice the split: nothing is dropped
         line = f'print("x" * {start - 1} + " " + p + " " + "x" * 100)'
         stdout = tmp_job.run(PRINT_A_PATH + line)["stdout"]
         assert _fragments(stdout) == [], start
@@ -464,3 +477,127 @@ for thread in threads:
     (cut,) = MARK.findall(result["stdout"])
     kept = MARK.sub("", result["stdout"])
     assert int(cut) + len(kept) == 8 * 20_000 * 5
+
+
+# --- a signal in the middle of a write ----------------------------------------------------------------------------
+
+
+def _dropping_code() -> tuple[CodeType, int]:
+    """Find the capture's function that drops pieces off the end it keeps, and the instruction just after a drop."""
+    for function in vars(_Capture).values():
+        code = getattr(function, "__code__", None)
+        if not isinstance(code, CodeType) or "popleft" not in code.co_names:
+            continue
+        instructions = list(dis.get_instructions(code))
+        for index, instruction in enumerate(instructions):
+            if instruction.opname == "LOAD_ATTR" and instruction.argval == "popleft":
+                call = next(i for i in range(index + 1, len(instructions)) if instructions[i].opname == "CALL")
+                return code, instructions[call + 1].offset
+    pytest.fail("no function of the capture drops pieces off its tail")
+
+
+@contextmanager
+def after_a_drop(action: Callable[[FrameType], None], when: Callable[[], bool] = lambda: True) -> Iterator[list[int]]:
+    """Run ``action`` once, just after the capture has dropped a piece off its tail, as a signal handled there would.
+
+    ``action`` gets the frame of the capture's code; it runs the first time a drop happens while ``when()`` holds.
+
+    Yields:
+        A list that holds one entry once the action has run.
+    """
+    code, offset = _dropping_code()
+    monitoring = sys.monitoring
+    tool = next((t for t in (3, 4) if monitoring.get_tool(t) is None), None)
+    if tool is None:
+        pytest.skip("no free sys.monitoring tool id")
+    ran: list[int] = []
+
+    def step(_code: CodeType, at: int) -> None:
+        if at == offset and not ran and when():
+            ran.append(at)
+            action(sys._getframe(1))
+
+    monitoring.use_tool_id(tool, "test_run_python")
+    try:
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, step)
+        monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+        yield ran
+    finally:
+        monitoring.set_local_events(tool, code, 0)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+
+
+@contextmanager
+def alarm_held() -> Iterator[None]:
+    """Hold ``SIGALRM`` back in this thread, so that the only place a deadline is handled is where a test lands it."""
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, before)
+
+
+def _counts_are_exact(capture: _Capture) -> None:
+    """The sizes the capture counts are the sizes of what it holds."""
+    assert capture._head_size == sum(map(len, capture._head))
+    assert capture._tail_size == sum(map(len, capture._tail))
+
+
+def test_a_timeout_just_after_a_drop_waits_until_the_write_is_whole() -> None:
+    """A deadline handled just after a piece left the tail used to leave that piece counted in the tail's size.
+
+    The next write then dropped pieces that were not there and raised ``IndexError``, so that the runner's own note
+    that the code timed out ended as "the tool failed". The error now waits for the end of the write and comes
+    just after it.
+    """
+    capture = _Capture(8)
+    capture.write("a" * 20)
+    whole = False
+    with alarm_held(), pytest.raises(CodeTimeout):
+        with timer.limit_until(time.monotonic() + 0.01, CodeTimeout):
+            time.sleep(0.02)  # the deadline passes with its signal held back: the landing below is the only one
+            with after_a_drop(lambda frame: timer._fire(signal.SIGALRM, frame)) as ran:
+                capture.write("b" * 20)
+            whole = True
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+            time.sleep(2)  # the error comes now, once the signal is let through
+    assert ran
+    assert whole
+    _counts_are_exact(capture)
+    capture.write("c" * 3)  # the write that used to raise IndexError
+    assert capture.parts() == ("a" * 8, "bbbbbccc", 43 - 16)
+    _counts_are_exact(capture)
+
+
+def test_a_signal_handler_that_prints_in_the_middle_of_a_write_follows_it() -> None:
+    """A handler of the code's that prints while a write is half done: its text comes after that write's, counted."""
+    capture = _Capture(8)
+    capture.write("a" * 20)
+    with after_a_drop(lambda _frame: print("handler", end="", file=capture)) as ran:
+        capture.write("b" * 20)
+    assert ran
+    _counts_are_exact(capture)
+    assert capture.written == 47
+    assert capture.parts() == ("a" * 8, "bhandler", 47 - 16)
+
+
+def test_a_timeout_in_the_middle_of_a_write_of_the_code_still_answers_that_it_timed_out(tmp_job: Job) -> None:
+    """The deadline lands just after a drop in code that writes long lines: the answer is the code's timeout."""
+    began = time.monotonic()
+
+    def let_it_through(_frame: FrameType) -> None:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})  # the deadline's signal is handled here
+
+    code = (
+        "import sys, time\nend = time.monotonic() + 5\nwhile time.monotonic() < end:\n    sys.stderr.write('y' * 9**5)"
+    )
+    with alarm_held(), after_a_drop(let_it_through, when=lambda: time.monotonic() > began + 0.3) as ran:
+        result = tmp_job.run(code, budget_s=0.2)
+    assert ran
+    assert result["truncated"] is True
+    assert (
+        result["stderr"]
+        .rstrip()
+        .endswith("timed out: the code was stopped after 0.2 s, its share of the job's wall time")
+    )

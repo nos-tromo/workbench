@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Final, override
 
 from workbench.executor.context import JobContext
-from workbench.executor.timer import TimeLimit, limit_until
+from workbench.executor.timer import TimeLimit, limit_until, uninterrupted
 
 #: The file name the code is compiled under; tracebacks show it, with the code's own lines.
 FILENAME: Final = "<code>"
@@ -63,8 +63,10 @@ class _Capture(io.TextIOBase):
 
     Writing costs at most two slices of what is written, whatever its size, so code that prints without end
     uses no more memory than the one string it prints. Code may write from many threads at once: each write is
-    whole. The lock is reentrant, so a signal handler of the code's that prints while the thread it interrupted
-    is writing cannot deadlock it.
+    whole. Nothing that arrives by a signal splits one either. The code's time limit waits for the end of the
+    bookkeeping (:func:`~workbench.executor.timer.uninterrupted`). The lock is reentrant, so a signal handler of
+    the code's that prints while the thread it interrupted is writing cannot deadlock it, and what the handler
+    prints is taken on by the interrupted write once that is whole, after its own text.
 
     Attributes:
         encoding: The stream's encoding, for code that asks before it writes.
@@ -86,6 +88,8 @@ class _Capture(io.TextIOBase):
         self._head_size = 0
         self._tail: collections.deque[str] = collections.deque()
         self._tail_size = 0
+        self._writing = False
+        self._later: list[str] = []
         self.written = 0
 
     @override
@@ -115,8 +119,26 @@ class _Capture(io.TextIOBase):
             raise TypeError(f"write() argument must be str, not {type(s).__name__}")
         if self.closed:
             raise ValueError("I/O operation on closed file.")
-        size = len(s)
         with self._lock:
+            if self._writing:
+                self._later.append(s)  # a signal handler's: the write it interrupted takes it on
+            else:
+                self._writing = True
+                try:
+                    self._take(s)
+                finally:
+                    self._writing = False
+        return len(s)
+
+    @uninterrupted
+    def _take(self, s: str) -> None:
+        """Keep a text, then whatever a signal handler wrote meanwhile, within the head and the tail.
+
+        Args:
+            s: The text.
+        """
+        while True:
+            size = len(s)
             self.written += size
             start = 0
             room = self._keep - self._head_size
@@ -131,7 +153,9 @@ class _Capture(io.TextIOBase):
                 self._tail_size += len(piece)
                 while self._tail_size - len(self._tail[0]) >= self._keep:
                     self._tail_size -= len(self._tail.popleft())
-        return size
+            if not self._later:
+                return
+            s = self._later.pop(0)
 
     def parts(self) -> tuple[str, str, int]:
         """Tell what is kept.

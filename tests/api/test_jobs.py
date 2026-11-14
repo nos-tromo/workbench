@@ -8,6 +8,7 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, override
@@ -903,6 +904,47 @@ async def test_outputs_kept_before_a_failed_job_record_are_removed(
     assert store.files_in_chat(me) == []
     assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_a_cancel_while_outputs_are_registered_leaves_none_of_them(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller goes away after the first output is moved in: the registration ends, and what it moved goes again.
+
+    A cancelled caller records no event, so no file the job made may stay. The moves are not cut off half way (one
+    of them may already be in the chat folder when the cancel comes); they finish and are then undone.
+    """
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "b.txt": b"b"}
+    moved = threading.Event()
+    go_on = threading.Event()
+    real = store.register_output
+
+    def slow(p: Principal, staged: Path, name: str, job_id: str) -> FileRecord:
+        record = real(p, staged, name, job_id)
+        if not moved.is_set():
+            moved.set()
+            go_on.wait(10)
+        return record
+
+    monkeypatch.setattr(store, "register_output", slow)
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, []))
+    await until(moved.is_set)
+    running.cancel()
+    await asyncio.sleep(0.05)
+    go_on.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert store.files_in_chat(me) == []
+    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
+    assert store.get_job(me, executor.requests[0].job_id).status == "cancelled"
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+    assert queue.tracked_users == 0
 
 
 async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure(

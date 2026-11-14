@@ -38,7 +38,16 @@ from workbench.api.store import QuotaExceeded, StorageFull, Store, StoreError
 from workbench.config import Settings
 from workbench.models import FileRecord, JobRecord, Principal
 from workbench.paths import PathError, check_filename
-from workbench.protocol import MAX_INPUT_FILES, MAX_LINE, JobRequest, JobResult, Limits, decode_result, encode
+from workbench.protocol import (
+    MAX_INPUT_FILES,
+    MAX_LINE,
+    JobRequest,
+    JobResult,
+    Limits,
+    OutputFile,
+    decode_result,
+    encode,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -170,6 +179,26 @@ class _UserGate:
         self.running = asyncio.Semaphore(size)
         self.refs = 0
         self.waiting = 0
+
+
+async def _outlast[T](work: asyncio.Future[T]) -> T:
+    """Wait for work to end, whatever cancellation comes meanwhile; the caller has one on its way out already.
+
+    Args:
+        work: Work running on its own, such as a call in a thread.
+
+    Returns:
+        What the work returned.
+
+    Raises:
+        Exception: What the work raised.
+    """
+    while True:
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            if work.done():
+                return work.result()
 
 
 def _check_inputs(input_files: Sequence[str]) -> None:
@@ -389,7 +418,9 @@ class JobQueue:
                 raise
 
     def _discard(self, files: Sequence[FileRecord]) -> None:
-        """Remove the outputs of a job that could not be settled; a failure is logged and never raised.
+        """Remove outputs no event will record: the job could not be settled, or its caller went away.
+
+        A failure is logged and never raised.
 
         Args:
             files: The outputs already moved into the chat folder.
@@ -398,7 +429,7 @@ class JobQueue:
             try:
                 self._store.remove(rec)
             except Exception as exc:
-                _log.warning("could not remove an output of a job that was not settled (%s)", type(exc).__name__)
+                _log.warning("could not remove an output no event will record (%s)", type(exc).__name__)
 
     async def _settle(self, job_id: str, status: str, *, pending: bool) -> None:
         """Record the job's final status and remove its staging folder; the folder always goes.
@@ -451,8 +482,9 @@ class JobQueue:
     async def _keep(self, p: Principal, job_id: str, result: JobResult) -> tuple[JobResult, list[FileRecord]]:
         """Move the job's outputs into the chat folder.
 
-        The store trusts the path it is given, so only a file the executor staged for this job, under
-        ``staging/<job-id>/``, is handed to it. An output that cannot be kept does not stop the others.
+        The registration runs as one call in a thread. A cancellation does not cut it off half way: it finishes,
+        what it registered is removed again (the caller that is going away records no event for it), and then the
+        cancellation goes on.
 
         Args:
             p: The caller, user and chat the job ran for.
@@ -462,31 +494,62 @@ class JobQueue:
         Returns:
             The answer, its message extended by a note on outputs that could not be kept, and the new files.
         """
-        folder = self._staging / job_id
-        kept: list[FileRecord] = []
-        lost: dict[str, int] = {}
-        for output in result.outputs:
-            try:
-                staged = folder / check_filename(output.name)
-                if Path(output.staged_path) != staged:
-                    raise PathError("not the job's staging folder")
-                kept.append(await asyncio.to_thread(self._store.register_output, p, staged, output.name, job_id))
-            except QuotaExceeded:
-                why = "quota"
-            except StorageFull:
-                why = "storage full"
-            except PathError:
-                why = "invalid"
-            except (StoreError, OSError):
-                why = "failed"
-            else:
-                continue
-            lost[why] = lost.get(why, 0) + 1
+        registering = asyncio.ensure_future(asyncio.to_thread(self._register, p, job_id, result.outputs))
+        try:
+            kept, lost = await asyncio.shield(registering)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):  # a registration that failed has removed its files itself
+                kept, _ = await _outlast(registering)
+                await _outlast(asyncio.ensure_future(asyncio.to_thread(self._discard, kept)))
+            raise
         if lost:
             count = sum(lost.values())
             note = f"{count} {'output' if count == 1 else 'outputs'} could not be kept ({', '.join(lost)})"
             result = result.model_copy(update={"message": f"{result.message}; {note}" if result.message else note})
         return result, kept
+
+    def _register(
+        self, p: Principal, job_id: str, outputs: Sequence[OutputFile]
+    ) -> tuple[list[FileRecord], dict[str, int]]:
+        """Register each staged output of a job as a file of the chat.
+
+        The store trusts the path it is given, so only a file the executor staged for this job, under
+        ``staging/<job-id>/``, is handed to it. An output that cannot be kept does not stop the others; an
+        unexpected failure removes the files registered before it, then goes on up.
+
+        Args:
+            p: The caller, user and chat the job ran for.
+            job_id: The job's id.
+            outputs: The executor's staged outputs.
+
+        Returns:
+            The new files, and how many outputs could not be kept, by reason.
+        """
+        folder = self._staging / job_id
+        kept: list[FileRecord] = []
+        lost: dict[str, int] = {}
+        try:
+            for output in outputs:
+                try:
+                    staged = folder / check_filename(output.name)
+                    if Path(output.staged_path) != staged:
+                        raise PathError("not the job's staging folder")
+                    kept.append(self._store.register_output(p, staged, output.name, job_id))
+                except QuotaExceeded:
+                    why = "quota"
+                except StorageFull:
+                    why = "storage full"
+                except PathError:
+                    why = "invalid"
+                except (StoreError, OSError):
+                    why = "failed"
+                else:
+                    continue
+                lost[why] = lost.get(why, 0) + 1
+        except BaseException:
+            self._discard(kept)
+            raise
+        return kept, lost
 
     def _clear_staging(self, job_id: str) -> None:
         """Remove the job's staging folder, if there is one; a failure is logged and never raised.
