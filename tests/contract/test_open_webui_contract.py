@@ -155,8 +155,12 @@ def open_webui_audit_uris() -> list[str]:
 
 
 def open_webui_files(listing: Any) -> list[Any]:
-    """The files of Open WebUI's own ``GET /api/v1/files/``, a list or a page of one."""
-    return listing if isinstance(listing, list) else list(listing.get("items", listing.get("data", [])))
+    """The files of Open WebUI's own ``GET /api/v1/files/``: a list, or a page that holds one under ``items``."""
+    if isinstance(listing, dict):
+        assert "items" in listing, sorted(listing)
+        listing = listing["items"]
+    assert isinstance(listing, list), type(listing).__name__
+    return listing
 
 
 def stub_requests(chat: str) -> list[dict[str, Any]]:
