@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from tests.executor.conftest import SHARED_IPC_ONLY
 from workbench.executor import sandbox
 from workbench.executor.sandbox import Slot, clean_env, kill_slot_processes, preexec, run_in_slot
 from workbench.protocol import Limits
@@ -1288,6 +1289,7 @@ def _make_ipc_as(slot: Slot, tag: str, key: int) -> None:
     subprocess.run([sys.executable, "-I", "-c", MAKE_IPC, tag, str(key)], preexec_fn=drop, check=True, timeout=60)
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_a_slot_cleanup_removes_its_ipc_and_nothing_of_others() -> None:
     """Shared memory, queues and semaphores outlive their processes; the cleanup removes the slot's own only."""
@@ -1354,6 +1356,7 @@ pathlib.Path("note").write_text("synthetic note")
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_a_locked_folder_and_a_chain_deeper_than_path_max_are_cleared() -> None:
     """A job cannot keep its own leftovers out of reach: modes are reset and the walk needs no long paths."""
@@ -1368,6 +1371,7 @@ def test_as_root_a_locked_folder_and_a_chain_deeper_than_path_max_are_cleared() 
     assert _ipc_of(slot.uid) == []
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_the_ipc_helper_gives_up_past_its_entry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """The walk is bounded; a slot whose leftovers exceed it is not clear and must be retired."""
@@ -1540,6 +1544,7 @@ assert libc.shmctl(ident, 1, perm) == 0
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_a_full_dev_shm_and_another_slots_queues_do_not_fail_a_cleanup(
     monkeypatch: pytest.MonkeyPatch,
@@ -1578,6 +1583,7 @@ os.chmod("/dev/shm/wb-shared/mine", 0)
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_the_slots_entries_in_another_slots_shared_folder_are_cleared_and_nothing_else() -> None:
     """Under umask 077 the folder's owner cannot read the slot's file there, but the slot's next job could."""
@@ -1660,6 +1666,7 @@ while True:
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.parametrize("how", ["folder", "files"])
 @pytest.mark.parametrize("who", ["helper", "second look"])
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
@@ -1724,6 +1731,7 @@ pathlib.Path("/dev/shm/wb-mine").write_text("synthetic note of user a")
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not LINUX or os.geteuid() != 0, reason="switching uids needs root on Linux")
 def test_as_root_the_look_into_other_slots_folders_stops_at_its_budget_and_never_fails(
     monkeypatch: pytest.MonkeyPatch,

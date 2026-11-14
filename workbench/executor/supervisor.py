@@ -50,7 +50,7 @@ from workbench.executor.fs import (
     write_all,
 )
 from workbench.executor.prepare_volume import API_UID, JOBS, STAGING, WORKSPACES, Owners
-from workbench.executor.sandbox import IPC_ENTRY_LIMIT, Slot, run_in_slot
+from workbench.executor.sandbox import Slot, run_in_slot
 from workbench.paths import PathError, check_filename
 from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_request, encode
 
@@ -74,11 +74,12 @@ _PASSWD = Path("/etc/passwd")
 _MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
 _SYSCTLS = Path("/proc/sys/fs")
 _MOUNTINFO = Path("/proc/self/mountinfo")
-_SHM = "/dev/shm"
+_SHM = Path("/dev/shm")
+_QUEUES_MAX = Path("mqueue/queues_max")  # below /proc/sys/fs
 _CLOSE_GRACE_S = 5.0  # for the answer to the request that retired the last slot
 # Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
 # the api's database, which root would then stage. Symlinks: a link a job leaves in a sticky,
-# world-writable folder (/dev/shm, /dev/mqueue) is not followed by anyone else.
+# world-writable folder is not followed by anyone else.
 _LINK_PROTECTIONS = (
     ("protected_hardlinks", "so a job cannot link files it does not own"),
     ("protected_symlinks", "so no one follows a job's links in shared folders"),
@@ -183,7 +184,7 @@ def startup_problem(
     memory_max: Path = _MEMORY_MAX,
     sysctls: Path = _SYSCTLS,
     mountinfo: Path = _MOUNTINFO,
-    shm_files: int | None = None,
+    shm: Path = _SHM,
     euid: int | None = None,
 ) -> str | None:
     """Find a reason the supervisor must not start.
@@ -192,10 +193,10 @@ def startup_problem(
         settings: The executor's settings.
         passwd: The image's user list.
         memory_max: The container's cgroup memory limit, if it has one.
-        sysctls: The kernel's ``fs`` settings, ``/proc/sys/fs``.
+        sysctls: The kernel's ``fs`` settings, ``/proc/sys/fs``; ``mqueue/queues_max`` below it is
+            the IPC namespace's own.
         mountinfo: The process's mount table, ``/proc/self/mountinfo``.
-        shm_files: How many files ``/dev/shm`` can hold (``f_files`` of ``statvfs``, 0 for no
-            limit); read from ``/dev/shm`` by default.
+        shm: The folder of POSIX shared memory and semaphores, ``/dev/shm``.
         euid: The effective uid to judge; the process's own by default.
 
     Returns:
@@ -203,9 +204,14 @@ def startup_problem(
         every slot uid is a user of the image, the memory limit holds every slot's job memory,
         ``fs.protected_hardlinks`` and ``fs.protected_symlinks`` both read 1 (the host's kernel
         settings, which a container cannot change), ``/dev/mqueue`` is a mounted mqueue file
-        system (without it a job's queues can be neither listed nor removed), and ``/dev/shm``
-        holds at most ``IPC_ENTRY_LIMIT`` files (so no folder of a slot's there can hold more
-        than the slot cleanup clears per folder, and every look at it stays bounded).
+        system (without it a job's queues can be neither listed nor removed), ``shm`` is a folder
+        of root's that neither group nor others may write (``_root_only``), and
+        ``fs.mqueue.queues_max`` reads 0. Those two keep every slot from leaving anything in
+        either folder: a slot uid has no right to add a name to ``/dev/shm``, and without
+        ``CAP_SYS_RESOURCE`` it may not make a queue past that limit. The slot cleanup still
+        looks in both folders, as defence in depth; on its own it cannot be relied on there, since
+        another slot renaming and removing entries while a folder is listed can make the listing
+        skip entries nobody touched.
     """
     if (os.geteuid() if euid is None else euid) != 0:
         return "the supervisor must run as root"
@@ -232,14 +238,31 @@ def startup_problem(
             return f"fs.{name} must be 1, {why}"
     if not _mqueue_mounted(mountinfo):
         return "/dev/mqueue must be a mounted mqueue file system, so the slots' queues can be cleared"
-    if shm_files is None:
-        try:
-            shm_files = os.statvfs(_SHM).f_files
-        except OSError:
-            shm_files = 0
-    if not 0 < shm_files <= IPC_ENTRY_LIMIT:
-        return f"/dev/shm must hold at most {IPC_ENTRY_LIMIT} files (mount it with nr_inodes), so no job can fill it"
+    try:
+        shm_root_only = _root_only(os.lstat(shm))
+    except OSError:
+        shm_root_only = False
+    if not shm_root_only:
+        return "/dev/shm must be a folder of root's that no one else may write, so no job can leave anything there"
+    try:
+        queues_max = (sysctls / _QUEUES_MAX).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        queues_max = ""
+    if queues_max != "0":
+        return "fs.mqueue.queues_max must be 0, so no job can make a POSIX message queue"
     return None
+
+
+def _root_only(st: os.stat_result) -> bool:
+    """Tell from its ``lstat`` whether a folder is root's and no one else may add or remove a name in it.
+
+    Args:
+        st: The folder's ``lstat``; a link is judged as the link, never as its target.
+
+    Returns:
+        Whether it is a folder, owned by uid 0, with neither the group nor the others write bit.
+    """
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and st.st_mode & 0o022 == 0
 
 
 def _mqueue_mounted(mountinfo: Path) -> bool:

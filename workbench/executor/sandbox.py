@@ -84,15 +84,19 @@ except ProcessLookupError:
 # fails the helper (exit 5) if it still exists after IPC_RMID, so is attached elsewhere; one that
 # vanished on the way, or that IPC_RMID destroyed, is gone: IPC_STAT then fails with EINVAL (22) or
 # EIDRM (43).
-# Below the folders, the slot's own tree is cleared: its entries at the top, and every folder it
-# owns, entered by descriptor, never by path, so neither a mode the job set nor a depth past PATH_MAX
-# stops it. Each such folder gets 0700 through an O_PATH handle before it is listed, so nobody else
-# can change it from then on, and the walk climbs back through ".." of the folder it is in, which
-# nobody else can move, so it keeps one folder open at a time (from a folder of the slot's inside
-# another uid's folder, which that uid can make unreadable, it returns to the descriptor it kept
-# of that folder instead). The tree is held to the entry limit
-# per folder: the slot's own entries at the top, and the listing of each folder it owns. Past it the
-# helper fails (exit 4), which only the slot's own job can bring about.
+# Below the folders, the slot's own tree is cleared. That part is defence in depth (ruling R28): the
+# supervisor refuses to start unless /dev/shm is root's and no one else may write it, and
+# fs.mqueue.queues_max is 0, so no slot can leave anything in either folder; and in a folder slots
+# can write, the walk cannot be relied on, since another uid that renames and removes entries
+# while it is listed can make the listing skip entries nobody touched. The slot's own tree is its
+# entries at the top, and every folder it owns, entered by descriptor, never by path, so neither a
+# mode the job set nor a depth past PATH_MAX stops it. Each such folder gets 0700 through an O_PATH
+# handle before it is listed, so nobody else can change it from then on, and the walk climbs back
+# through ".." of the folder it is in, which nobody else can move, so it keeps one folder open at a
+# time (from a folder of the slot's inside another uid's folder, which that uid can make
+# unreadable, it returns to the descriptor it kept of that folder instead). The tree is held to the
+# entry limit per folder: the slot's own entries at the top, and the listing of each folder it
+# owns. Past it the helper fails (exit 4), which only the slot's own job can bring about.
 # Folders of other uids that the slot can list, met at the top or in a folder of the slot's, are
 # looked into as they are (no mode change, their parent held open to return to), and only the slot's
 # own entries in them are removed or entered; folders of other uids inside them are not entered.
@@ -254,18 +258,17 @@ if unemptied:
 """
 )
 # Where the kernel keeps IPC that outlives processes, as files: POSIX shared memory and semaphores,
-# and POSIX message queues where their file system is mounted.
+# and POSIX message queues where their file system is mounted. Under R28 no slot can write either:
+# the supervisor refuses to start unless /dev/shm is root's alone and fs.mqueue.queues_max is 0. The
+# cleanup still looks in both and clears what a slot left there, as defence in depth.
 _IPC_FOLDERS = ("/dev/shm", "/dev/mqueue")
 # Most entries of a slot's own tree the helper clears per folder: its own entries at the top of one
 # of those folders, and the listing of each folder it owns. Past it the slot is not clear. It is
 # also the budget, per top, for looking into other uids' folders, which is best effort: their owners
 # can rename and refill them while they are looked at (and a listing then meets moved entries
 # again), so nothing in them counts against a slot, and once the budget is spent no further entry of
-# theirs is looked at. The supervisor refuses to start unless /dev/shm can hold at most this many
-# files (tmpfs counts every name, hard links included, against its inode limit), and /dev/mqueue
-# holds at most fs.mqueue.queues_max queues, 256 by default, so no folder of a slot's ever reaches it.
-IPC_ENTRY_LIMIT = 100_000
-_IPC_ENTRY_LIMIT = IPC_ENTRY_LIMIT
+# theirs is looked at.
+_IPC_ENTRY_LIMIT = 100_000
 _SYSVIPC = Path("/proc/sysvipc")
 _SHM_DEST = 0o1000  # in the perms of /proc/sysvipc/shm: removed, but still attached somewhere
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
@@ -581,9 +584,13 @@ def _folder_holds(top: str, uid: int) -> bool:
 
     Whatever a slot leaves below such a folder starts with an entry of its own at the top, or in a
     folder of another uid the slot could write to, a file or a folder; the helper looks in the same
-    places, in the same order. Every entry at the top is looked at: no other uid can move or add an
-    entry of the slot's there. The look into other uids' folders is best effort, from a budget of
-    ``_IPC_ENTRY_LIMIT`` per top, as the helper's is (``_foreign_folder_holds``).
+    places, in the same order. The look is defence in depth (ruling R28): in production no slot can
+    write ``/dev/shm`` or make a POSIX queue, so it finds nothing there. Where slots can write the
+    folder, it does not see every entry at the top: another uid that renames entries onto existing
+    names and removes the one where a read of the listing ends, while the folder is listed, makes
+    later reads skip entries nobody touched, the slot's own among them. The look into other uids'
+    folders is best effort too, from a budget of ``_IPC_ENTRY_LIMIT`` per top, as the helper's is
+    (``_foreign_folder_holds``).
 
     Args:
         top: A folder, such as ``/dev/shm``, opened without following a link.
@@ -742,6 +749,10 @@ def kill_slot_processes(slot: Slot | None) -> None:
     made (``_slot_has_ipc``). If there is, a second helper, run like the first, removes it as the
     slot (``_DROP_AND_CLEAR``), and a second look must find nothing the uid made: objects by
     creator, entries by owner (``_slot_left_ipc``). That adds at most one more helper run of 30 s.
+    For the two folders this is defence in depth (ruling R28): the supervisor starts only where no
+    slot can write ``/dev/shm`` or make a POSIX queue, since a listing of a folder other slots
+    write can be made to skip entries. SysV IPC is not affected by that: each object is found in
+    ``/proc/sysvipc`` and removed by its id, with no folder listed.
 
     It blocks, so call it from a thread. Does nothing without a slot or off Linux.
 

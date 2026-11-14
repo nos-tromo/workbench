@@ -18,8 +18,9 @@ from typing import Any
 
 import pytest
 
+from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
 from workbench.config import Settings, load_settings
-from workbench.executor import sandbox, supervisor
+from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
 from workbench.executor.sandbox import Slot
 from workbench.executor.supervisor import MAX_OUTPUTS, NoUsableSlot, Supervisor, make_slots, startup_problem
@@ -820,8 +821,11 @@ def _memory_max(tmp_path: Path, value: str) -> Path:
 MOUNTINFO = (
     "105 92 0:51 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755\n"
     "109 105 0:54 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw\n"
-    "112 105 0:61 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,nr_inodes=4096\n"
+    "112 105 0:61 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,mode=755\n"
 )
+# A folder of root's that no one else may write, as /dev/shm must be: the file system's root is one
+# on every host the tests run on.
+ROOT_ONLY = Path("/")
 
 
 def _mountinfo(tmp_path: Path, content: str = MOUNTINFO) -> Path:
@@ -831,11 +835,18 @@ def _mountinfo(tmp_path: Path, content: str = MOUNTINFO) -> Path:
     return path
 
 
-def _sysctls(tmp_path: Path, hardlinks: str | None = "1", symlinks: str | None = "1") -> Path:
-    """A ``/proc/sys/fs`` with the two link protections set as given; ``None`` leaves one out."""
+def _sysctls(
+    tmp_path: Path, hardlinks: str | None = "1", symlinks: str | None = "1", queues_max: str | None = "0"
+) -> Path:
+    """A ``/proc/sys/fs`` with the link protections and ``mqueue/queues_max`` as given; ``None`` leaves one out."""
     folder = tmp_path / "fs"
-    folder.mkdir(exist_ok=True)
-    for name, value in (("protected_hardlinks", hardlinks), ("protected_symlinks", symlinks)):
+    (folder / "mqueue").mkdir(parents=True, exist_ok=True)
+    settings = (
+        ("protected_hardlinks", hardlinks),
+        ("protected_symlinks", symlinks),
+        ("mqueue/queues_max", queues_max),
+    )
+    for name, value in settings:
         if value is not None:
             (folder / name).write_text(value + "\n")
     return folder
@@ -853,7 +864,7 @@ def test_a_well_set_up_host_passes_the_start_up_checks(memory: str | None, tmp_p
         memory_max=memory_max,
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -870,7 +881,7 @@ def test_too_little_container_memory_refuses_to_start(tmp_path: Path) -> None:
         memory_max=_memory_max(tmp_path, str(4 * 1536 * MB - 1)),
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -887,7 +898,7 @@ def test_missing_slot_users_refuse_to_start(tmp_path: Path) -> None:
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -904,7 +915,7 @@ def test_a_pool_beyond_its_sixteen_uids_refuses_to_start(tmp_path: Path) -> None
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -920,7 +931,7 @@ def test_a_supervisor_that_is_not_root_refuses_to_start(tmp_path: Path) -> None:
         memory_max=tmp_path / "x",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=1000,
     )
 
@@ -946,7 +957,7 @@ def test_a_host_without_link_protection_refuses_to_start(
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path, hardlinks, symlinks),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -970,7 +981,7 @@ def test_a_dev_mqueue_that_is_not_a_mounted_mqueue_refuses_to_start(content: str
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path, content),
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
@@ -985,44 +996,127 @@ def test_unreadable_mount_information_refuses_to_start(tmp_path: Path) -> None:
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=tmp_path / "absent-mountinfo",
-        shm_files=4096,
+        shm=ROOT_ONLY,
         euid=0,
     )
 
     assert problem == "/dev/mqueue must be a mounted mqueue file system, so the slots' queues can be cleared"
 
 
-@pytest.mark.parametrize("files", [0, sandbox.IPC_ENTRY_LIMIT + 1, 1_529_122])
-def test_a_dev_shm_that_can_hold_more_files_than_the_cleanup_looks_at_refuses_to_start(
-    files: int, tmp_path: Path
-) -> None:
-    """A job could fill an unbounded ``/dev/shm`` past the cleanup's limit and so fail every other slot."""
+SHM_REFUSED = "/dev/shm must be a folder of root's that no one else may write, so no job can leave anything there"
+
+
+def _shm(tmp_path: Path, trap: str) -> Path:
+    """A ``/dev/shm`` set up as ``trap`` names; as root, made root's unless the trap is its owner."""
+    shm = tmp_path / "shm"
+    if trap == "missing":
+        return shm
+    if trap == "symlink":
+        shm.symlink_to(ROOT_ONLY)
+        return shm
+    if trap == "file":
+        shm.write_text("")
+        shm.chmod(0o644)
+        return shm
+    shm.mkdir()
+    shm.chmod({"world-writable": 0o1777, "group-writable": 0o775, "not-root-owned": 0o755}[trap])
+    if trap == "not-root-owned" and os.geteuid() == 0:
+        os.lchown(shm, 1000, 1000)
+    return shm
+
+
+@pytest.mark.parametrize("trap", ["world-writable", "group-writable", "not-root-owned", "symlink", "file", "missing"])
+def test_a_dev_shm_slots_could_write_refuses_to_start(trap: str, tmp_path: Path) -> None:
+    """Docker's default ``1777`` among them: a listing of a folder other slots write can be made to skip entries."""
     problem = startup_problem(
         _settings(tmp_path),
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=files,
+        shm=_shm(tmp_path, trap),
         euid=0,
     )
 
-    assert problem == "/dev/shm must hold at most 100000 files (mount it with nr_inodes), so no job can fill it"
+    assert problem == SHM_REFUSED
 
 
-def test_a_dev_shm_up_to_the_limit_passes(tmp_path: Path) -> None:
-    """The limit itself is allowed."""
+@pytest.mark.parametrize(
+    ("mode", "uid", "root_only"),
+    [
+        (stat.S_IFDIR | 0o755, 0, True),
+        (stat.S_IFDIR | 0o700, 0, True),
+        (stat.S_IFDIR | 0o1755, 0, True),
+        (stat.S_IFDIR | 0o1777, 0, False),
+        (stat.S_IFDIR | 0o775, 0, False),
+        (stat.S_IFDIR | 0o757, 0, False),
+        (stat.S_IFDIR | 0o755, 1000, False),
+        (stat.S_IFLNK | 0o777, 0, False),
+        (stat.S_IFREG | 0o644, 0, False),
+    ],
+    ids=["0755", "0700", "1755", "1777", "0775", "0757", "not-root-owned", "symlink", "file"],
+)
+def test_a_root_only_folder_is_roots_a_folder_and_writable_by_no_group_or_others(
+    mode: int, uid: int, root_only: bool
+) -> None:
+    """Judged on the ``lstat`` alone, so the mode is checked even where the tests cannot make a folder of root's."""
+    st = os.stat_result((mode, 1, 1, 2, uid, 0, 40, 0, 0, 0))
+
+    assert supervisor._root_only(st) is root_only
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="making a folder of root's needs root")
+def test_as_root_a_folder_of_roots_that_no_one_else_may_write_passes(tmp_path: Path) -> None:
+    """The production ``/dev/shm``: a tmpfs of root's, mode ``0755``."""
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    shm.chmod(0o755)
+
     problem = startup_problem(
         _settings(tmp_path),
         passwd=_passwd(tmp_path, range(20001, 20017)),
         memory_max=tmp_path / "absent",
         sysctls=_sysctls(tmp_path),
         mountinfo=_mountinfo(tmp_path),
-        shm_files=sandbox.IPC_ENTRY_LIMIT,
+        shm=shm,
         euid=0,
     )
 
     assert problem is None
+
+
+@pytest.mark.parametrize("queues_max", ["256", "1", "", "zero", None])
+def test_a_host_where_slots_could_make_posix_queues_refuses_to_start(queues_max: str | None, tmp_path: Path) -> None:
+    """``fs.mqueue.queues_max`` must be 0 (Docker's default is 256); unreadable counts as not 0."""
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path, queues_max=queues_max),
+        mountinfo=_mountinfo(tmp_path),
+        shm=ROOT_ONLY,
+        euid=0,
+    )
+
+    assert problem == "fs.mqueue.queues_max must be 0, so no job can make a POSIX message queue"
+
+
+@pytest.mark.skipif(IPC_SHAPE is None, reason="needs a Linux /dev/shm set up as in production or as Docker's default")
+def test_this_hosts_dev_shm_and_queue_limit_pass_only_in_the_production_shape(tmp_path: Path) -> None:
+    """The real ``/dev/shm`` and ``fs.mqueue.queues_max``: Docker's default (``1777``, 256 queues) is refused."""
+    queues_max = Path("/proc/sys/fs/mqueue/queues_max").read_text(encoding="ascii").strip()
+
+    problem = startup_problem(
+        _settings(tmp_path),
+        passwd=_passwd(tmp_path, range(20001, 20017)),
+        memory_max=tmp_path / "absent",
+        sysctls=_sysctls(tmp_path, queues_max=queues_max),
+        mountinfo=_mountinfo(tmp_path),
+        shm=Path("/dev/shm"),
+        euid=0,
+    )
+
+    assert problem == (None if IPC_SHAPE == "production" else SHM_REFUSED)
 
 
 def test_main_exits_with_one_short_line_when_no_slot_is_left(
@@ -1464,6 +1558,7 @@ result = {
 """
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
 async def test_as_root_the_next_job_in_a_slot_finds_nothing_of_the_last(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
@@ -1482,6 +1577,65 @@ async def test_as_root_the_next_job_in_a_slot_finds_nothing_of_the_last(
     assert first.result == {"uid": 20001, "made": [True] * 6}
     assert second.status == "ok", second
     assert second.result == {"uid": 20001, "files": [False, False], "sysv": [-1, -1, -1], "mq": -1, "mine": []}
+
+
+TRY_TO_LEAVE_IPC = """
+import ctypes, errno, multiprocessing
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmat.restype = ctypes.c_void_p
+made = {}
+for name, make in (
+    ("file", lambda: open("/dev/shm/wb-drop", "x")),
+    ("folder", lambda: os.mkdir("/dev/shm/wb-dir")),
+    ("semaphore", multiprocessing.Lock),
+):
+    try:
+        make()
+        made[name] = "made"
+    except OSError as exc:
+        made[name] = type(exc).__name__
+queue = libc.mq_open(b"/wb-q", os.O_CREAT | os.O_RDWR, 0o600, None)
+made["queue"] = "made" if queue >= 0 else errno.errorcode[ctypes.get_errno()]
+shm = libc.shmget(0x5745, 4096, 0o1000 | 0o600)
+at = libc.shmat(shm, None, 0)
+ctypes.memmove(at, b"user-a: sysv note\\0", 18)
+libc.shmdt(ctypes.c_void_p(at))
+result = {"uid": os.getuid(), "made": made, "sysv": shm >= 0}
+"""
+LOOK_FOR_ANY_IPC = """
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+result = {
+    "uid": os.getuid(),
+    "shm": os.listdir("/dev/shm"),
+    "mqueue": os.listdir("/dev/mqueue"),
+    "sysv": libc.shmget(0x5745, 0, 0),
+}
+"""
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+@pytest.mark.skipif(
+    IPC_SHAPE != "production",
+    reason="needs the production shape: /dev/shm root's alone (--tmpfs /dev/shm:size=1m,mode=0755) "
+    "and --sysctl fs.mqueue.queues_max=0",
+)
+async def test_as_root_in_the_production_shape_a_job_can_leave_nothing_in_dev_shm_or_dev_mqueue(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R28: a slot may add no name to ``/dev/shm`` nor make a POSIX queue; its SysV IPC is gone before the next job."""
+    _chat(root_volume)
+    (root_volume / "workspaces" / CALLER / "user-b" / CHAT).mkdir(parents=True)
+    sup = Supervisor(_settings(root_volume, WORKBENCH_EXECUTOR_SLOTS="1"))
+
+    _runner(monkeypatch, TRY_TO_LEAVE_IPC)
+    first = await sup.run_job(_request())
+    _runner(monkeypatch, LOOK_FOR_ANY_IPC)
+    second = await sup.run_job(_request(user_id="user-b"))
+
+    refused = dict.fromkeys(("file", "folder", "semaphore"), "PermissionError") | {"queue": "ENOSPC"}
+    assert (first.status, first.result) == ("ok", {"uid": 20001, "made": refused, "sysv": True})
+    assert (second.status, second.result) == ("ok", {"uid": 20001, "shm": [], "mqueue": [], "sysv": -1})
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
@@ -1600,6 +1754,7 @@ result = {"uid": os.getuid()}
 LOOK_FOR_TRAPS = 'result = {"uid": os.getuid(), "left": sorted(os.listdir("/dev/shm"))}'
 
 
+@SHARED_IPC_ONLY
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
 async def test_as_root_a_job_cannot_retire_its_own_slot_with_a_locked_or_deep_folder(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
