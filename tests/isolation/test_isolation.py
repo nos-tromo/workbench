@@ -223,6 +223,51 @@ def test_other_jobs_are_unreadable(api: httpx.Client) -> None:
     assert [stdout_of(answer) for answer in answers] == ["refused", "refused"]
 
 
+OPEN_UP_AND_LISTEN = """
+import os, pathlib, socket, time
+job = pathlib.Path.cwd().parents[1]
+os.chmod(job / "home", 0o777)
+os.chmod("out", 0o777)
+(job / "home" / "marker").write_text("synthetic")
+os.chmod(job / "home" / "marker", 0o666)
+outcomes = []
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM).bind(("127.0.0.1", 47000))
+    outcomes.append("listening")
+except PermissionError:
+    outcomes.append("no socket")
+mine = str(job).encode()
+others = set()
+deadline = time.monotonic() + 30
+while not others and time.monotonic() < deadline:
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            argv = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\\0")
+        except OSError:
+            continue
+        others |= {os.path.dirname(a).decode() for a in argv if a.endswith(b"/spec.json") and not a.startswith(mine)}
+    time.sleep(0.2)
+for folder in sorted(others):
+    other = pathlib.Path(folder)
+    for attempt in (lambda: (other / "home" / "marker").read_text(), lambda: os.listdir(other / "home")):
+        try:
+            attempt()
+            outcomes.append("reached")
+        except PermissionError:
+            outcomes.append("refused")
+print(",".join(outcomes))
+time.sleep(3)
+"""
+
+
+def test_a_job_that_opens_its_folders_to_all_opens_them_to_no_other_job(api: httpx.Client) -> None:
+    """R76: two jobs at once open their ``home/`` to everyone and try a loopback listener; neither reaches the other."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = list(pool.map(lambda user: run_python(api, OPEN_UP_AND_LISTEN, user=user), ["user-a", "user-b"]))
+
+    assert [stdout_of(answer) for answer in answers] == ["no socket,refused,refused"] * 2
+
+
 def test_inputs_are_read_only(api: httpx.Client) -> None:
     """The job's copy of an upload is root's; only ``out/`` takes writes."""
     upload = api.post(

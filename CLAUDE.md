@@ -128,9 +128,11 @@ key and allowed tools. Version 1 has `open-webui`; docint joins in version 2.
   (`workbench/paths.py:Workspaces`); another user's file is a 404.
 - **Files live only inside chat folders.** Nothing is ever a file directly
   under `/workspace`.
-- **No network** in the executor. A job sees copies of its own chat's files,
-  read-only, and writes only its `out/` and its private `tmp/`, both removed
-  with the job.
+- **No network** in the executor, and no socket in a job (a seccomp filter of
+  workbench's own). A job sees copies of its own chat's files, read-only, and
+  writes only its `out/` and its private `home/` (with its `tmp/`), both
+  removed with the job, inside a job folder no other slot can pass. A watchdog
+  holds each running job to its disk and memory.
 - **The agent deletes nothing.** No tool deletes or overwrites a file; the user
   (file browser) and retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error

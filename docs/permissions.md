@@ -26,7 +26,7 @@ Every tool that runs in the executor also leaves a job record (see
 | `display_file` | the name and type of one file, from the database | nothing | `disclose` / `file.display`, when the file exists | nothing; the browser then fetches the bytes with `/files/view` |
 | `read_document` | one file, as a copy in a job | nothing | `query` / `tool.read_document` | a job record |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
-| `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
+| `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
 | `inspect_template` | one template, as a copy in a job | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
@@ -117,10 +117,11 @@ actor of every event is the account id.
 ### No network
 
 The executor, where every file is opened, has no network at all
-(`network_mode: none` in `docker/compose.yaml`). A job sees only copies of its
-own chat's files, read-only, and can write only into its own `out/` folder and
-its private `tmp/`; both are removed with the job, and only what is in `out/`
-can become a file of the workspace (see [sandbox.md](sandbox.md)). The api calls no model and joins only
+(`network_mode: none` in `docker/compose.yaml`), and a job has no socket at all.
+A job sees only copies of its own chat's files, read-only, and can write only
+into its own `out/` folder and its private `home/` (with its `tmp/`); both are
+removed with the job, and only what is in `out/` can become a file of the
+workspace (see [sandbox.md](sandbox.md)). The api calls no model and joins only
 `workbench-net`.
 
 ### The agent deletes nothing
