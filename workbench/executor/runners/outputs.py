@@ -294,9 +294,13 @@ class _List:
 
 
 # python-docx internals this writer relies on, below the library's public api, to stay fast (a test names each, so an
-# upgrade that drops one fails clearly): ``Paragraph._p``, ``Document._body``, ``CT_Num.new``,
-# ``CT_Numbering._insert_num`` and ``num_having_numId``, ``CT_Tbl.new_tbl``, ``CT_Tbl.tblGrid``, ``CT_Tbl.add_tr``,
-# ``CT_Row.add_tc`` and ``docx.table._Cell``.
+# upgrade that drops one fails clearly): ``Paragraph._p``, ``Document._body``; a paragraph's ``CT_P.style`` and
+# ``get_or_add_pPr``, ``CT_PPr.numPr`` and ``get_or_add_numPr``, ``CT_NumPr.numId``, ``get_or_add_ilvl`` and
+# ``get_or_add_numId``, and a style's ``CT_Style.pPr``; the numbering's ``CT_Numbering.num_lst``, ``_insert_num`` and
+# ``num_having_numId``, ``CT_Num.new``, ``numId``, ``abstractNumId`` and ``add_lvlOverride``, and
+# ``CT_NumLvl.add_startOverride``; a table's ``CT_Tbl.new_tbl``, ``tblPr``, ``tblGrid`` and ``add_tr``,
+# ``CT_TblPr.style``, ``CT_TblGrid.gridCol_lst``, ``CT_TblGridCol.w``, ``CT_Row.add_tc``, ``CT_Tc.width`` and
+# ``docx.table._Cell``.
 class _Word:
     """Writes Markdown's tokens into a Word document.
 
@@ -554,9 +558,13 @@ class _Word:
                 self.lists.pop()
             elif kind == "list_item_open" and self.lists:
                 self.lists[-1].fresh = True
-                if tokens[index + 1].type != "paragraph_open":
+                ahead = index + 1
+                while tokens[ahead].type == "blockquote_open":  # a quote is its text; its close comes later
+                    ahead += 1
+                if tokens[ahead].type not in {"paragraph_open", "hr"}:
                     # An item that is empty or opens with a heading, code or a list gets its bullet or number first,
-                    # so what it holds reads as its own and the numbers after it hold.
+                    # so what it holds reads as its own and the numbers after it hold. A paragraph or a rule, quoted
+                    # or not, takes the bullet or number itself.
                     self.paragraph()
             elif kind == "hr":
                 self.run(self.paragraph(), THEMATIC_BREAK)

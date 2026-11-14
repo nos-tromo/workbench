@@ -33,11 +33,9 @@ from typing import Any, BinaryIO, Final, Literal, TypeGuard
 
 from workbench.models import VIRTUAL_ROOT, DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
+from workbench.utils.audit_event import MAX_IDS
 
 _log = logging.getLogger(__name__)
-
-#: The database's name in the data volume's root.
-DATABASE_NAME: Final = "workbench.db"
 
 _CHUNK = 1024 * 1024
 _PRIVATE_DIR = 0o700
@@ -51,9 +49,9 @@ _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
 
-#: Records the orphans of one chat folder before they go: called with the chat id, the file ids their names carry, and
-#: how many there are.
-OrphanRecord = Callable[[str, Sequence[str], int], object]
+#: Records orphans of one chat folder: called with the chat id, the file ids their names carry, how many there are, and
+#: the outcome, ``ok`` before they go or ``error`` for those that could not be removed.
+OrphanRecord = Callable[[str, Sequence[str], int, str], object]
 
 _OFFICE_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -166,6 +164,43 @@ def _lstat(path: Path) -> os.stat_result | None:
         return os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return None
+
+
+def _look(path: Path) -> os.stat_result | None:
+    """Look at an entry a sweep walks over, without following it; one that cannot be looked at is skipped.
+
+    Args:
+        path: The entry.
+
+    Returns:
+        Its ``lstat``, or ``None`` if it is gone or cannot be looked at; the latter is logged by the error's type.
+    """
+    try:
+        return _lstat(path)
+    except OSError as exc:
+        _log.warning("a sweep skipped an entry it could not look at (%s)", type(exc).__name__)
+        return None
+
+
+def _unlisted(exc: OSError) -> None:
+    """Note a folder a sweep could not list; the walk goes on without it.
+
+    Args:
+        exc: Why it could not be listed.
+    """
+    _log.warning("a sweep skipped a folder it could not list (%s)", type(exc).__name__)
+
+
+def _part_ids(paths: Sequence[Path]) -> list[str]:
+    """Take the file ids the names of orphans carry.
+
+    Args:
+        paths: The orphans.
+
+    Returns:
+        The id of each ``<id>.part``; the others carry none.
+    """
+    return [found.group(1) for path in paths if (found := _PART_NAME.fullmatch(path.name))]
 
 
 def _unlink(path: Path) -> None:
@@ -1021,13 +1056,15 @@ class Store:
         the ``<id>.part`` of an upload the api died during, or a file a kill left between its rename into place and
         its row's commit (``add_upload``, ``register_output``, ``move``). The look and the removal hold the store's
         lock, which every rename into place holds until its row is committed, so a file on its way in is never taken
-        for one. Each chat folder's orphans are recorded first, by ``record``, still under the lock; if it raises,
-        nothing more is removed and the error goes on.
+        for one. Each chat folder's orphans are recorded first, by ``record``, still under the lock, at most
+        ``MAX_IDS`` to a record so that no id is cut; those that could not be removed are recorded again as an error.
+        If ``record`` raises, nothing more is removed and the error goes on.
 
         Then every folder below the root, deepest first, the chat folders too, and the root itself go if they are
         empty and were last changed before ``untouched_before``. Their ages are taken before anything is removed, so
         an old tree of empty folders goes at once. Nothing is followed: links, anything but folders and regular files,
-        and anything of another device are left alone, and so is a folder in the root whose name is no chat id.
+        and anything of another device are left alone, and so is a folder in the root whose name is no chat id. An
+        entry that cannot be looked at, or a folder that cannot be listed, is skipped with a warning.
 
         Args:
             caller: The caller's folder's name.
@@ -1046,17 +1083,17 @@ class Store:
         p = Principal(caller, user_id, DEFAULT_CHAT)
         with self._lock:
             root = self._ws.resolve(p, VIRTUAL_ROOT)
-            root_st = _lstat(root)
+            root_st = _look(root)
             if not _is_folder(root_st, device):
                 return 0, 0
             folders: list[tuple[Path, os.stat_result]] = []
             candidates: dict[str, list[tuple[str, Path]]] = {}
-            for here, names, files in os.walk(root):
+            for here, names, files in os.walk(root, onerror=_unlisted):
                 where = Path(here)
                 below = where.relative_to(root).parts
                 kept: list[str] = []
                 for name in sorted(names):
-                    st = _lstat(where / name)
+                    st = _look(where / name)
                     if _is_folder(st, device) and (below or _is_chat_id(name)):
                         kept.append(name)
                         folders.append((where / name, st))
@@ -1064,7 +1101,7 @@ class Store:
                 if not below:
                     continue  # a file in the root is in no chat folder
                 for name in files:
-                    st = _lstat(where / name)
+                    st = _look(where / name)
                     if st is None or not stat.S_ISREG(st.st_mode) or st.st_dev != device:
                         continue
                     if st.st_mtime < untouched_before:
@@ -1077,18 +1114,22 @@ class Store:
                     ).fetchall()
                 known = {(chat, name) for chat, name in rows}
                 for chat in sorted(candidates):
-                    orphans = [(name, path) for name, path in candidates[chat] if (chat, name) not in known]
-                    if not orphans:
-                        continue
-                    ids = [found.group(1) for _, path in orphans if (found := _PART_NAME.fullmatch(path.name))]
-                    record(chat, ids, len(orphans))
-                    for _, path in orphans:
-                        try:
-                            _unlink(path)
-                        except OSError:
-                            failed += 1
-                        else:
-                            removed += 1
+                    orphans = [path for name, path in candidates[chat] if (chat, name) not in known]
+                    for start in range(0, len(orphans), MAX_IDS):
+                        batch = orphans[start : start + MAX_IDS]
+                        record(chat, _part_ids(batch), len(batch), "ok")
+                        stayed: list[Path] = []
+                        for path in batch:
+                            try:
+                                _unlink(path)
+                            except OSError as exc:
+                                _log.warning("could not remove a file that had no record (%s)", type(exc).__name__)
+                                stayed.append(path)
+                            else:
+                                removed += 1
+                        if stayed:
+                            record(chat, _part_ids(stayed), len(stayed), "error")
+                            failed += len(stayed)
             for folder, st in reversed(folders):  # a folder comes after every folder above it
                 if st.st_mtime < untouched_before:
                     _remove_empty(folder)

@@ -36,6 +36,7 @@ from typing import Any, Final, Literal, get_args
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, StorageFull, Store, StoreError
 from workbench.config import Settings
+from workbench.layout import STAGING
 from workbench.models import FileRecord, JobRecord, Principal
 from workbench.paths import PathError, check_filename
 from workbench.protocol import (
@@ -51,9 +52,6 @@ from workbench.protocol import (
 )
 
 _log = logging.getLogger(__name__)
-
-#: The staging folder's name on the data volume; the executor writes ``staging/<job-id>/<name>``.
-_STAGING: Final = "staging"
 
 #: Seconds the client waits for the answer beyond the job's wall time: the executor's cleanup of
 #: a killed job takes up to about 213 s before it answers.
@@ -182,7 +180,7 @@ class _UserGate:
         self.waiting = 0
 
 
-async def _outlast[T](work: asyncio.Future[T]) -> T:
+async def outlast[T](work: asyncio.Future[T]) -> T:
     """Wait for work to end, whatever cancellation comes meanwhile; the caller has one on its way out already.
 
     Args:
@@ -245,7 +243,7 @@ class JobQueue:
         self._gates: dict[tuple[str, str], _UserGate] = {}
         self._waiting = 0
         self._user_waiting_max = max(1, settings.queue_max // settings.executor_slots)
-        self._staging = settings.data_dir / _STAGING
+        self._staging = settings.data_dir / STAGING
         for reason in get_args(Reason):
             metrics.job_refusals_total.labels(reason)
 
@@ -502,8 +500,8 @@ class JobQueue:
             kept, lost = await asyncio.shield(registering)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):  # a registration that failed has removed its files itself
-                kept, _ = await _outlast(registering)
-                await _outlast(loop.run_in_executor(None, self._discard, kept))
+                kept, _ = await outlast(registering)
+                await outlast(loop.run_in_executor(None, self._discard, kept))
             raise
         if lost:
             count = sum(lost.values())

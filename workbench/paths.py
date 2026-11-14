@@ -13,6 +13,7 @@ import re
 import stat
 from pathlib import Path
 
+from workbench.layout import WORKSPACES
 from workbench.models import VIRTUAL_ROOT, Principal
 
 DEFAULT_CHAT = "default"
@@ -96,7 +97,7 @@ class Workspaces:
         Args:
             data_dir: Root of the ``workbench-data`` volume.
         """
-        self._base = data_dir / "workspaces"
+        self._base = data_dir / WORKSPACES
 
     def user_root(self, p: Principal) -> Path:
         """Return the folder holding everything one user owns.

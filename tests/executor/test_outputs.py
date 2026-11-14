@@ -362,6 +362,21 @@ def test_an_item_without_a_paragraph_keeps_its_number(job: Job) -> None:
     assert job.document("nested.docx", "- - inner\n  - more\n- c\n") == {}
     bullets = [(style, text) for style, text, _ in _numbered(job.output("nested.docx"))]
     assert bullets == [("List Bullet", ""), ("List Bullet 2", "inner"), ("List Bullet 2", "more"), ("List Bullet", "c")]
+    assert job.document("quoted-heading.docx", "1. > # Findings\n") == {}
+    found = _numbered(job.output("quoted-heading.docx"))
+    assert [(style, text) for style, text, _ in found] == [("List Number", ""), ("Heading 1", "Findings")]
+    assert found[0][2] is not None
+
+
+def test_an_item_that_opens_with_a_quote_or_a_rule_takes_its_bullet_itself(job: Job) -> None:
+    """A quoted paragraph or a thematic break is the item's first paragraph, as it was: no empty bullet before it."""
+    assert job.document("quote.docx", "- > quote\n- c\n") == {}
+    bullets = [(style, text) for style, text, _ in _numbered(job.output("quote.docx"))]
+    assert bullets == [("List Bullet", "quote"), ("List Bullet", "c")]
+    assert job.document("rule.docx", "1. ---\n2. c\n") == {}
+    found = _numbered(job.output("rule.docx"))
+    assert [(style, text) for style, text, _ in found] == [("List Number", "———"), ("List Number", "c")]
+    assert found[0][2] is not None and found[0][2] == found[1][2]
 
 
 def test_nested_numbered_lists_take_the_levels_numbering(job: Job) -> None:
@@ -420,21 +435,48 @@ def test_a_table_of_40000_rows_is_written_well_inside_the_budget(job: Job) -> No
 
 def test_the_python_docx_internals_the_writer_uses_are_there() -> None:
     """The writer reaches below python-docx's public api to stay fast; an upgrade that drops one fails here, by name."""
-    from docx.oxml.numbering import CT_Num, CT_Numbering
-    from docx.oxml.table import CT_Row, CT_Tbl
+    from docx.oxml.numbering import CT_Num, CT_Numbering, CT_NumLvl, CT_NumPr
+    from docx.oxml.styles import CT_Style
+    from docx.oxml.table import CT_Row, CT_Tbl, CT_TblGrid, CT_TblGridCol, CT_TblPr, CT_Tc
+    from docx.oxml.text.paragraph import CT_P
+    from docx.oxml.text.parfmt import CT_PPr
     from docx.table import _Cell
+
+    def has(cls: type, name: str) -> bool:
+        return isinstance(getattr(cls, name, None), property)
+
+    def can(cls: type, name: str) -> bool:
+        return callable(getattr(cls, name, None))
 
     document = Document()
     used = {
         "Paragraph._p": hasattr(document.add_paragraph(), "_p"),
         "Document._body": hasattr(document, "_body"),
-        "CT_Num.new": callable(getattr(CT_Num, "new", None)),
-        "CT_Numbering._insert_num": callable(getattr(CT_Numbering, "_insert_num", None)),
-        "CT_Numbering.num_having_numId": callable(getattr(CT_Numbering, "num_having_numId", None)),
-        "CT_Tbl.new_tbl": callable(getattr(CT_Tbl, "new_tbl", None)),
-        "CT_Tbl.tblGrid": isinstance(getattr(CT_Tbl, "tblGrid", None), property),
-        "CT_Tbl.add_tr": callable(getattr(CT_Tbl, "add_tr", None)),
-        "CT_Row.add_tc": callable(getattr(CT_Row, "add_tc", None)),
+        "CT_P.style": has(CT_P, "style"),
+        "CT_P.get_or_add_pPr": can(CT_P, "get_or_add_pPr"),
+        "CT_Style.pPr": has(CT_Style, "pPr"),
+        "CT_PPr.numPr": has(CT_PPr, "numPr"),
+        "CT_PPr.get_or_add_numPr": can(CT_PPr, "get_or_add_numPr"),
+        "CT_NumPr.numId": has(CT_NumPr, "numId"),
+        "CT_NumPr.get_or_add_ilvl": can(CT_NumPr, "get_or_add_ilvl"),
+        "CT_NumPr.get_or_add_numId": can(CT_NumPr, "get_or_add_numId"),
+        "CT_Num.new": can(CT_Num, "new"),
+        "CT_Num.numId": has(CT_Num, "numId"),
+        "CT_Num.abstractNumId": has(CT_Num, "abstractNumId"),
+        "CT_Num.add_lvlOverride": can(CT_Num, "add_lvlOverride"),
+        "CT_NumLvl.add_startOverride": can(CT_NumLvl, "add_startOverride"),
+        "CT_Numbering.num_lst": has(CT_Numbering, "num_lst"),
+        "CT_Numbering._insert_num": can(CT_Numbering, "_insert_num"),
+        "CT_Numbering.num_having_numId": can(CT_Numbering, "num_having_numId"),
+        "CT_Tbl.new_tbl": can(CT_Tbl, "new_tbl"),
+        "CT_Tbl.tblPr": has(CT_Tbl, "tblPr"),
+        "CT_Tbl.tblGrid": has(CT_Tbl, "tblGrid"),
+        "CT_Tbl.add_tr": can(CT_Tbl, "add_tr"),
+        "CT_TblPr.style": has(CT_TblPr, "style"),
+        "CT_TblGrid.gridCol_lst": has(CT_TblGrid, "gridCol_lst"),
+        "CT_TblGridCol.w": has(CT_TblGridCol, "w"),
+        "CT_Row.add_tc": can(CT_Row, "add_tc"),
+        "CT_Tc.width": has(CT_Tc, "width"),
         "_Cell": isinstance(_Cell, type),
     }
     assert [name for name, there in used.items() if not there] == []
@@ -509,8 +551,11 @@ def test_markdown_is_written_as_given(job: Job) -> None:
 
 
 def test_a_lone_surrogate_in_markdown_is_written_as_a_replacement_character(job: Job) -> None:
-    """Half of a pair cannot be UTF-8: it becomes U+FFFD, the hint says so, and a whole pair stays one character."""
-    answer = job.document("notes.md", "a\ud800b \U0001f600")
+    """Half of a pair cannot be UTF-8: it becomes U+FFFD, the hint says so, and a whole pair stays one character.
+
+    The pair comes as JSON's escapes bring it, two code points, which the runner joins into the one character.
+    """
+    answer = job.document("notes.md", "a\ud800b 😀")
     assert "1 character" in answer["hint"]
     assert job.output("notes.md").read_bytes() == "a�b \U0001f600".encode()
 

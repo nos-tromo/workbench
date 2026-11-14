@@ -31,7 +31,7 @@ from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
-from workbench.api.jobs import _outlast
+from workbench.api.jobs import outlast
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
 from workbench.api.store import Store
@@ -895,7 +895,7 @@ async def _to_the_end[T](step: Callable[[], T]) -> T:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
         with contextlib.suppress(Exception):  # the caller is gone; its cancellation is the answer
-            await _outlast(work)
+            await outlast(work)
         raise
 
 

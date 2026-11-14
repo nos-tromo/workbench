@@ -18,20 +18,26 @@ without a record is not.
 Every other regular file the sweep removes is recorded first too, on the same halt, once untouched for an hour:
 
 - an orphan, a file in a chat folder that has no row: the ``<id>.part`` of an upload the api died during, or a file a
-  kill left between its rename into place and its row's commit. One record per chat folder, with the chat as its
-  container, ``rule: orphan``, the ``caller``, the ``owner`` and the ``count``, and the file ids the ``.part`` names
-  carry; never a name. The store looks and removes under its lock (:meth:`~workbench.api.store.Store.sweep_user`),
-  which every rename into place holds until its row is committed, so a file on its way in is never taken for one;
+  kill left between its rename into place and its row's commit. One record per chat folder and at most 200 files,
+  with the chat as its container, ``rule: orphan``, the ``caller``, the ``owner`` and the ``count``, and the file ids
+  the ``.part`` names carry; never a name. The store looks and removes under its lock
+  (:meth:`~workbench.api.store.Store.sweep_user`), which every rename into place holds until its row is committed, so
+  a file on its way in is never taken for one;
 - the residue of ``staging/<job-id>``: outputs the api never registered (a client that went away, a crash before the
   job settled), made from the user's files. ``rule: staging``, the ``job``, the ``count`` of regular files, and the
   job's ``caller``, ``owner`` and chat while its record exists; then the folder goes.
+
+Here too what could not be removed is recorded again, ``outcome: error``: the orphans that stayed, by id where their
+names carry one, and the regular files a staging folder kept, by their count. An entry that cannot be looked at is
+skipped with a warning, and the sweep goes on with the next.
 
 Without a record, since they hold no content: job records older than the period are forgotten, and the folders the
 store finds empty go once untouched for an hour, under its lock (folders in chat folders, the chat folders and a user's
 root), so a file on its way into one never loses it. Nothing is followed: a link, anything but a folder or a regular
 file, or anything of another filesystem is left alone, and neither ``workspaces/`` nor a caller's folder ever goes. A
 sweep that deleted something ends with a ``TRUNCATE`` checkpoint, so the log's older pages, which hold file names, are
-copied over; then the metrics' gauges are measured again.
+copied over, even when the sweep fails after the deletions; a checkpoint the log was busy for is carried to the next
+sweep, whether or not that one deletes anything. Then the metrics' gauges are measured again.
 
 ``python -m workbench.api.retention dry-run [--days N]`` (``make retention-dry-run``) says what the period, or ``N``
 days, would delete now: counts and ages by kind, never a name, an id, a user or a chat. It reads the database
@@ -58,10 +64,11 @@ from pathlib import Path
 from typing import Final, TextIO
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import _STAGING, _outlast
+from workbench.api.jobs import outlast
 from workbench.api.metrics import Metrics
-from workbench.api.store import DATABASE_NAME, DueSummary, Store, summarize_due
+from workbench.api.store import DueSummary, Store, summarize_due
 from workbench.config import ConfigError, Settings, load_settings
+from workbench.layout import DATABASE, STAGING, WORKSPACES
 from workbench.models import FileRecord
 from workbench.paths import PathError
 from workbench.protocol import JOB_ID
@@ -80,8 +87,6 @@ FOLDER_GRACE_S: Final = 3600
 
 #: The kinds of file the dry run counts, in its order.
 KINDS: Final = ("upload", "output")
-
-_WORKSPACES: Final = "workspaces"
 
 
 @dataclass
@@ -234,9 +239,13 @@ class Sweeper:
         self._metrics = metrics
         self._clock = clock
         self._exit_process = exit_process
+        self._checkpoint_due = False
 
     def sweep_once(self, stop: threading.Event | None = None) -> SweepReport:
         """Delete what is due now, forget old job records, remove stale folders, and measure the volume again.
+
+        A sweep that deleted rows ends with a checkpoint, even when it fails after them; a checkpoint the log was too
+        busy for, or that failed, is carried by every later sweep until one empties the log.
 
         Args:
             stop: When set, the sweep ends before its next record or removal; files of a batch recorded but not yet
@@ -253,13 +262,17 @@ class Sweeper:
         now = self._clock()
         cutoff = cutoff_for(now, self._settings.retention_days)
         report = SweepReport(deleted=0, errors=0)
-        self._sweep_files(cutoff, stop, report)
         forgotten = 0
-        if not stop.is_set():
-            forgotten = self._forget_jobs(cutoff)
-            self._prune(now - FOLDER_GRACE_S)
-        if report.deleted or forgotten:
-            self._checkpoint()
+        try:
+            self._sweep_files(cutoff, stop, report)
+            if not stop.is_set():
+                forgotten = self._forget_jobs(cutoff)
+                self._prune(now - FOLDER_GRACE_S, stop)
+        finally:
+            if report.deleted or forgotten:
+                self._checkpoint_due = True
+            if self._checkpoint_due:
+                self._checkpoint_due = not self._checkpoint()
         self._metrics.refresh(files=self._store.count_files())
         if report.deleted or report.errors:
             _log.info("retention deleted %d files; %d could not be deleted", report.deleted, report.errors)
@@ -287,7 +300,7 @@ class Sweeper:
             except asyncio.CancelledError:
                 stop.set()
                 with contextlib.suppress(Exception):  # the api is going; its cancellation is the answer
-                    await _outlast(work)
+                    await outlast(work)
                 raise
             except AuditWriteError:
                 raise
@@ -402,15 +415,23 @@ class Sweeper:
                 stream.flush()
         self._exit_process(1)
 
-    def _checkpoint(self) -> None:
-        """Copy the database's log over, so the deleted rows' older pages leave it; a busy log is left to later."""
+    def _checkpoint(self) -> bool:
+        """Copy the database's log over, so the deleted rows' older pages leave it; a busy log is left to later.
+
+        Returns:
+            Whether the log was emptied; ``False`` when it was busy or the checkpoint failed, and the next sweep tries
+            again.
+        """
         try:
             emptied = self._store.checkpoint()
         except sqlite3.Error as exc:
-            _log.warning("retention could not checkpoint the database (%s)", type(exc).__name__)
-            return
+            _log.warning(
+                "retention could not checkpoint the database (%s); the next sweep tries again", type(exc).__name__
+            )
+            return False
         if not emptied:
-            _log.warning("the database's log was busy at the checkpoint; a later checkpoint carries it")
+            _log.warning("the database's log was busy at the checkpoint; the next sweep tries again")
+        return emptied
 
     # --- job records and folders ---------------------------------------------------------------------------------
 
@@ -428,11 +449,14 @@ class Sweeper:
             self._store.forget_jobs(ids)
         return len(ids)
 
-    def _prune(self, untouched_before: float) -> None:
+    def _prune(self, untouched_before: float, stop: threading.Event) -> None:
         """Remove the orphans and the empty folders of every user's root, then the leftover staging folders.
+
+        A user's root or a staging folder that cannot be looked at is skipped with a warning, and the prune goes on.
 
         Args:
             untouched_before: A file or folder last changed before this may go.
+            stop: Ends the prune before the next user's root or staging folder.
         """
         data = self._settings.data_dir
         try:
@@ -440,9 +464,11 @@ class Sweeper:
         except OSError as exc:
             _log.warning("retention could not look at the data volume (%s)", type(exc).__name__)
             return
-        if _folder(data / _WORKSPACES, device) is not None:
-            for caller, _ in _subfolders(data / _WORKSPACES, device):
+        if _folder(data / WORKSPACES, device) is not None:
+            for caller, _ in _subfolders(data / WORKSPACES, device):
                 for user, _ in _subfolders(caller, device):
+                    if stop.is_set():
+                        return
                     record = functools.partial(self._record_orphans, caller.name, user.name)
                     try:
                         _, failed = self._store.sweep_user(
@@ -450,15 +476,22 @@ class Sweeper:
                         )
                     except PathError:
                         continue  # not a folder the store made, or a link in its path: left alone
+                    except OSError as exc:
+                        _log.warning("retention skipped a user's folder it could not look at (%s)", type(exc).__name__)
+                        continue
                     if failed:
                         _log.warning("retention could not delete %d files that had no record", failed)
-        if _folder(data / _STAGING, device) is not None:
-            for job, job_st in _subfolders(data / _STAGING, device):
+        if _folder(data / STAGING, device) is not None:
+            for job, job_st in _subfolders(data / STAGING, device):
+                if stop.is_set():
+                    return
                 if JOB_ID.fullmatch(job.name) is not None and job_st.st_mtime < untouched_before:
                     self._clear_staging(job, device)
 
-    def _record_orphans(self, caller: str, user_id: str, chat_id: str, file_ids: Sequence[str], count: int) -> None:
-        """Record the orphans of one chat folder before the store removes them.
+    def _record_orphans(
+        self, caller: str, user_id: str, chat_id: str, file_ids: Sequence[str], count: int, outcome: str
+    ) -> None:
+        """Record orphans of one chat folder: before the store removes them, and again for those it could not.
 
         Args:
             caller: The caller.
@@ -466,35 +499,43 @@ class Sweeper:
             chat_id: The chat folder.
             file_ids: The ids their names carry.
             count: How many there are.
+            outcome: ``ok`` before they go, ``error`` for those that stayed.
 
         Raises:
             AuditWriteError: The event could not be written and ``exit_process`` returned.
         """
         criteria: dict[str, object] = {"rule": "orphan", "caller": caller, "owner": user_id, "count": count}
-        self._record(file_ids, criteria, count=count, container=f"chat:{chat_id}")
+        self._record(file_ids, criteria, outcome=outcome, count=count, container=f"chat:{chat_id}")
 
     def _clear_staging(self, job: Path, device: int) -> None:
         """Remove a job's leftover staging folder, its regular files recorded first.
+
+        The regular files a failed removal leaves are recorded again, by their count, as an error; the next sweep tries
+        again.
 
         Args:
             job: ``staging/<job-id>``, older than the grace.
             device: The data volume's device.
 
         Raises:
-            AuditWriteError: The event could not be written and ``exit_process`` returned; nothing was removed.
+            AuditWriteError: A record could not be written and ``exit_process`` returned; nothing was removed after it.
         """
         count = _regular_files(job, device)
+        criteria: dict[str, object] = {"rule": "staging", "job": job.name, "count": count}
+        container: str | None = None
         if count:
-            criteria: dict[str, object] = {"rule": "staging", "job": job.name, "count": count}
             owner = self._store.find_job(job.name)
             if owner is not None:
                 criteria |= {"caller": owner.caller, "owner": owner.user_id}
-            container = None if owner is None else f"chat:{owner.chat_id}"
+                container = f"chat:{owner.chat_id}"
             self._record((), criteria, count=count, container=container)
         try:
             shutil.rmtree(job)  # never follows a link inside
         except OSError as exc:
             _log.warning("retention could not remove a staging folder (%s)", type(exc).__name__)
+            left = _regular_files(job, device) if _folder(job, device) is not None else 0
+            if left:
+                self._record((), {**criteria, "count": left}, outcome="error", count=left, container=container)
 
 
 # --- the dry run --------------------------------------------------------------------------------------------------
@@ -513,13 +554,13 @@ def _days_old(now: float, created_at: float) -> str:
     return f"{(now - created_at) / DAY_S:.1f}"
 
 
-def dry_run(settings: Settings, out: TextIO, *, days: int, now: float | None = None) -> int:
+def dry_run(settings: Settings, out: TextIO, *, days: int | None = None, now: float | None = None) -> int:
     """Say what the period would delete now, by kind: counts and ages only; record, delete and change nothing.
 
     Args:
-        settings: Where the data volume is.
+        settings: Where the data volume is, and the configured period.
         out: Where the report goes.
-        days: The period to evaluate.
+        days: Another period to preview; the configured one by default. The header names both.
         now: The time of the report; the clock's by default.
 
     Returns:
@@ -527,8 +568,12 @@ def dry_run(settings: Settings, out: TextIO, *, days: int, now: float | None = N
     """
     moment = time.time() if now is None else now
     print("workbench retention, dry run: nothing is recorded, deleted or changed.", file=out)
-    print(f"Files are deleted {days} days after they were made.", file=out)
-    database = settings.data_dir / DATABASE_NAME
+    if days is None:
+        days = settings.retention_days
+        print(f"Files are deleted {days} days after they were made.", file=out)
+    else:
+        print(f"With a period of {days} days (preview; configured: {settings.retention_days}):", file=out)
+    database = settings.data_dir / DATABASE
     if not database.is_file():
         print("  no database: there is nothing to sweep", file=out)
         return 1
@@ -589,8 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"workbench retention: {exc}", file=sys.stderr)
         return 2
-    days: int = settings.retention_days if args.days is None else args.days
-    return dry_run(settings, sys.stdout, days=days)
+    return dry_run(settings, sys.stdout, days=args.days)
 
 
 if __name__ == "__main__":

@@ -23,14 +23,10 @@ from pathlib import Path
 
 from workbench.config import ConfigError, load_settings
 from workbench.executor.fs import CREATE_FLAGS, DIR_FLAGS, READ_FLAGS, closing, settle
+from workbench.layout import DATABASE, JOBS, STAGING, WORKSPACES
 
 API_UID = 10001
 API_GID = 10001
-
-WORKSPACES = "workspaces"
-STAGING = "staging"
-JOBS = "jobs"
-DATABASE = "workbench.db"
 
 _ROOT_MODE = 0o1771
 _FOLDERS = ((WORKSPACES, "api", 0o700), (STAGING, "api", 0o700), (JOBS, "root", 0o711))

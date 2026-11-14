@@ -21,9 +21,10 @@ from workbench.api.hardening import ViewHardening
 from workbench.api.jobs import ExecutorClient, JobQueue
 from workbench.api.metrics import Metrics
 from workbench.api.retention import Sweeper
-from workbench.api.store import DATABASE_NAME, Store
+from workbench.api.store import Store
 from workbench.api.upload_limit import UploadLimit, body_limit
 from workbench.config import Settings, load_settings
+from workbench.layout import DATABASE
 from workbench.paths import Workspaces
 
 
@@ -137,7 +138,7 @@ def app_factory() -> FastAPI:
         ConfigError: If the environment holds a value the api refuses to start with.
     """
     settings = load_settings(os.environ, role="api")
-    store = Store(settings.data_dir / DATABASE_NAME, Workspaces(settings.data_dir))
+    store = Store(settings.data_dir / DATABASE, Workspaces(settings.data_dir))
     metrics = Metrics(settings.data_dir)
     jobs = JobQueue(settings, ExecutorClient(settings.executor_socket), store, metrics)
     audit = AuditLog.open(settings, __version__)

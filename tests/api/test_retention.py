@@ -672,6 +672,169 @@ def test_staging_and_workspaces_that_are_links_are_not_followed(
         assert (outside / name / ("d" * 32) / "user-a" / "chat-1").is_dir()
 
 
+def test_an_orphan_that_cannot_be_removed_is_recorded_again_as_an_error(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As for a file with a row: the orphans that stay are named again, ``outcome: error``, by id where known."""
+    clock.now = time.time()
+    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    stuck, gone = (orphan(chat / f"{letter * 32}.part", clock.now) for letter in "ef")
+    loose = orphan(chat / "lost-report.docx", clock.now)
+    unlink = store_module._unlink
+
+    def failing(path: Path) -> None:
+        if path in (stuck, loose):
+            raise PermissionError("synthetic: busy")
+        unlink(path)
+
+    monkeypatch.setattr(store_module, "_unlink", failing)
+    sweeper.sweep_once()
+    assert stuck.exists() and loose.exists() and not gone.exists()
+    ok, error = sweeps(audit_lines)
+    assert (ok["outcome"], sorted(ok["target"]["ids"]), ok["target"]["count"]) == ("ok", ["e" * 32, "f" * 32], 3)
+    assert error["outcome"] == "error"
+    assert error["target"] == {"kind": "file", "ids": ["e" * 32], "count": 2, "container": "chat:chat-1"}
+    assert error["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 2}
+    assert "lost-report" not in json_text(audit_lines)
+
+
+def test_a_staging_folder_that_cannot_be_removed_is_recorded_again_as_an_error(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The files a failed removal left behind are named again by their count, ``outcome: error``."""
+    clock.now = time.time()
+    residue = settings.data_dir / "staging" / ("a" * 32)
+    for name in ("harbour-chart.png", "figures.csv"):
+        orphan(residue / name, clock.now)
+    age(residue, 2 * HOUR, clock.now)
+
+    def partly(path: Path, *_args: Any, **_kwargs: Any) -> None:
+        (path / "harbour-chart.png").unlink()
+        raise PermissionError("synthetic: busy")
+
+    monkeypatch.setattr(shutil, "rmtree", partly)
+    sweeper.sweep_once()
+    ok, error = sweeps(audit_lines)
+    assert (ok["outcome"], ok["criteria"]) == ("ok", {"rule": "staging", "job": "a" * 32, "count": 2})
+    assert (error["outcome"], error["criteria"]) == ("error", {"rule": "staging", "job": "a" * 32, "count": 1})
+    assert error["target"] == {"kind": "file", "count": 1}
+    assert (residue / "figures.csv").exists()
+
+
+def test_more_orphans_than_one_event_names_are_recorded_in_several(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """At most 200 ids an event: 201 ``.part`` orphans of one chat folder are two events, and no id is cut."""
+    clock.now = time.time()
+    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    ids = [f"{n:032x}" for n in range(201)]
+    for file_id in ids:
+        orphan(chat / f"{file_id}.part", clock.now)
+    sweeper.sweep_once()
+    events = sweeps(audit_lines)
+    assert sorted(event["target"]["count"] for event in events) == [1, 200]
+    for event in events:
+        assert "ids_truncated" not in event["target"]
+        assert event["criteria"]["count"] == event["target"]["count"] == len(event["target"]["ids"])
+    assert sorted(file_id for event in events for file_id in event["target"]["ids"]) == ids
+    assert list(chat.iterdir()) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root looks into a folder whatever its mode")
+def test_one_entry_that_cannot_be_looked_at_never_stops_the_prune(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    metrics: Metrics,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A chat subfolder of mode 0600 is skipped with a warning, by the error's type alone.
+
+    The other users, the staging residue, the checkpoint and the gauges still get their turn, every interval.
+    """
+    checkpoints: list[int] = []
+    monkeypatch.setattr(store, "checkpoint", lambda: checkpoints.append(1) or True)
+    clock.now = time.time() - 8 * DAY
+    put(store, "quarterly-figures.xlsx")
+    clock.now = time.time()
+    workspaces = settings.data_dir / "workspaces" / "open-webui"
+    sealed = workspaces / "user-a" / "chat-1" / "sealed"
+    orphan(sealed / "inside.txt", clock.now)
+    lost = orphan(workspaces / "user-b" / "chat-1" / "lost-report.docx", clock.now)
+    residue = orphan(settings.data_dir / "staging" / ("a" * 32) / "harbour-chart.png", clock.now)
+    age(residue.parent, 2 * HOUR, clock.now)
+    sealed.chmod(0o600)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    finally:
+        sealed.chmod(0o700)
+    assert not lost.exists() and not residue.parent.exists()
+    assert (sealed / "inside.txt").exists()
+    assert checkpoints == [1]
+    assert metrics.registry.get_sample_value("workbench_files_total") == 0
+    assert "PermissionError" in caplog.text
+    assert "sealed" not in caplog.text and "inside" not in caplog.text
+    rules = sorted(event["criteria"].get("rule", "period") for event in sweeps(audit_lines))
+    assert rules == ["orphan", "period", "staging"]
+
+
+def test_a_stop_during_the_prune_ends_it_before_the_next_user(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel asks the prune to stop: no user after the one in hand is swept, and no staging folder."""
+    clock.now = time.time()
+    workspaces = settings.data_dir / "workspaces" / "open-webui"
+    lost = [orphan(workspaces / user / "chat-1" / "lost-report.docx", clock.now) for user in ("user-a", "user-b")]
+    residue = orphan(settings.data_dir / "staging" / ("a" * 32) / "harbour-chart.png", clock.now)
+    age(residue.parent, 2 * HOUR, clock.now)
+    stop = threading.Event()
+    sweep_user = store.sweep_user
+
+    def then_stop(*args: Any, **kwargs: Any) -> tuple[int, int]:
+        try:
+            return sweep_user(*args, **kwargs)
+        finally:
+            stop.set()
+
+    monkeypatch.setattr(store, "sweep_user", then_stop)
+    sweeper.sweep_once(stop)
+    assert sorted(path.exists() for path in lost) == [False, True]
+    assert residue.exists()
+    assert len(sweeps(audit_lines)) == 1
+
+
+def test_a_stop_during_the_prune_ends_it_before_the_next_staging_folder(
+    sweeper: Sweeper, settings: Settings, clock: Clock, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The staging folders are looked at one by one; a stop between two leaves the second to the next sweep."""
+    clock.now = time.time()
+    residues = [orphan(settings.data_dir / "staging" / (c * 32) / "chart.png", clock.now) for c in "ab"]
+    for path in residues:
+        age(path.parent, 2 * HOUR, clock.now)
+    stop = threading.Event()
+    clear = sweeper._clear_staging
+
+    def then_stop(*args: Any) -> None:
+        try:
+            clear(*args)
+        finally:
+            stop.set()
+
+    monkeypatch.setattr(sweeper, "_clear_staging", then_stop)
+    sweeper.sweep_once(stop)
+    assert sorted(path.exists() for path in residues) == [False, True]
+    assert len(sweeps(audit_lines)) == 1
+
+
 # --- after a sweep ------------------------------------------------------------------------------------------------
 
 
@@ -704,6 +867,47 @@ def test_a_busy_checkpoint_is_left_to_a_later_sweep(
     with caplog.at_level(logging.WARNING):
         assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
     assert "checkpoint" in caplog.text
+
+
+@pytest.mark.parametrize("first", ["busy", "failed"])
+def test_a_checkpoint_left_undone_is_carried_by_the_next_sweep_even_one_that_deletes_nothing(
+    sweeper: Sweeper, store: Store, clock: Clock, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """A busy log, or a checkpoint that failed, is tried again at the next sweep, until one empties the log."""
+    checkpoints: list[str] = []
+
+    def checkpoint() -> bool:
+        checkpoints.append("busy" if not checkpoints else "emptied")
+        if checkpoints == ["busy"] and first == "failed":
+            raise sqlite3.OperationalError("synthetic: disk I/O error")
+        return checkpoints[-1] == "emptied"
+
+    monkeypatch.setattr(store, "checkpoint", checkpoint)
+    put(store, "a.txt")
+    clock.now = T0 + 8 * DAY
+    assert sweeper.sweep_once().deleted == 1
+    assert sweeper.sweep_once().deleted == 0
+    assert sweeper.sweep_once().deleted == 0
+    assert checkpoints == ["busy", "emptied"]
+
+
+def test_a_sweep_that_deleted_and_then_failed_still_checkpoints(
+    sweeper: Sweeper, store: Store, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log's old pages hold the names of the files it deleted: an error after the deletions never keeps them."""
+    checkpoints: list[int] = []
+    monkeypatch.setattr(store, "checkpoint", lambda: checkpoints.append(1) or True)
+
+    def broken(_cutoff: float) -> list[str]:
+        raise sqlite3.OperationalError("synthetic: database is locked")
+
+    monkeypatch.setattr(store, "due_jobs", broken)
+    put(store, "a.txt")
+    clock.now = T0 + 8 * DAY
+    with pytest.raises(sqlite3.OperationalError):
+        sweeper.sweep_once()
+    assert store.files_in_chat(ME) == []
+    assert checkpoints == [1]
 
 
 # --- the loop -----------------------------------------------------------------------------------------------------
@@ -922,9 +1126,10 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
     wal = volume / "workbench.db-wal"
     assert not wal.exists() or wal.stat().st_size == 0
     assert len(store.files_in_chat(who)) == 4
+    assert "preview" not in text
     assert main(["dry-run", "--days", "30"]) == 0
     text = capsys.readouterr().out
-    assert "30 days" in text
+    assert "With a period of 30 days (preview; configured: 7)" in text
     assert "upload: none due; 3 kept" in text
     assert "output: none due; 1 kept" in text
 

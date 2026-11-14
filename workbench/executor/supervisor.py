@@ -49,8 +49,9 @@ from workbench.executor.fs import (
     settle,
     write_all,
 )
-from workbench.executor.prepare_volume import API_UID, JOBS, STAGING, WORKSPACES, Owners
+from workbench.executor.prepare_volume import API_UID, Owners
 from workbench.executor.sandbox import Slot, run_in_slot
+from workbench.layout import JOBS, STAGING, WORKSPACES
 from workbench.paths import PathError, check_filename
 from workbench.protocol import (
     JOB_ID,
