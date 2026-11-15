@@ -24,8 +24,8 @@ the job's staging folder afterwards, whatever came of the job.
 
 No output becomes a file without its record. Once the executor has answered, the caller's
 :class:`Keeper` records the job by the ids the queue chose for its outputs, and only then are they
-moved into the chat folder; one that cannot be kept, or must go again and cannot, is recorded
-again as an error. A call without a keeper keeps no output at all.
+moved into the chat folder; one that cannot be kept, for any reason, or is removed again because
+the call failed, is recorded again as an error. A call without a keeper keeps no output at all.
 """
 
 import asyncio
@@ -92,7 +92,7 @@ class Keeper(Protocol):
         ...
 
     def again(self, ids: Sequence[str]) -> None:
-        """Record as ``error`` outputs the event named that did not end as it said: not kept, or kept and not removed.
+        """Record as ``error`` outputs the event named that did not end as it said: not kept, or kept and then removed.
 
         Args:
             ids: Their file ids.
@@ -328,8 +328,8 @@ class JobQueue:
                 or the executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
             Exception: What the keeper raised (no output is kept), or what the store raises, such as a failure to
-                settle the job's record. Files the job made are removed again first, and one that stays is recorded
-                again by the keeper.
+                settle the job's record. Files the job made are removed again first, and the keeper records each of
+                them again.
         """
         if tool not in TOOLS:
             raise ValueError("unknown tool")
@@ -471,25 +471,24 @@ class JobQueue:
     def _discard(self, files: Sequence[FileRecord], keeper: Keeper | None) -> None:
         """Remove outputs the model will not be told of: the job could not be settled, or its caller went away.
 
-        Their event, written before they were kept, covers their removal within the same call. One that cannot be
-        removed is named again, by an ``error`` event of the keeper. A failure is logged by its type and never raised.
+        Their event, written before they were kept, named them as kept; they did not end so, so each is named again by
+        an ``error`` event of the keeper, whether it was removed or could not be. A failure is logged by its type and
+        never raised.
 
         Args:
             files: The outputs already moved into the chat folder.
-            keeper: Records the outputs that stayed.
+            keeper: Records them again.
         """
-        left: list[str] = []
         for rec in files:
             try:
                 self._store.remove(rec)
             except Exception as exc:
                 _log.warning("could not remove an output the model will not be told of (%s)", type(exc).__name__)
-                left.append(rec.id)
-        if left and keeper is not None:
+        if files and keeper is not None:
             try:
-                keeper.again(left)
+                keeper.again([rec.id for rec in files])
             except Exception as exc:
-                _log.warning("could not record outputs that stayed (%s)", type(exc).__name__)
+                _log.warning("could not record outputs that were not kept (%s)", type(exc).__name__)
 
     async def _settle(self, job_id: str, status: str, *, pending: bool) -> None:
         """Record the job's final status and remove its staging folder; the folder always goes.
@@ -545,10 +544,10 @@ class JobQueue:
         """Record the job's answer, then move the outputs the keeper picked into the chat folder.
 
         The record and the registration run as one call in a thread. A cancellation does not cut it off half way: it
-        finishes, what it registered is removed again (the caller that is going away tells the model of none of it),
-        and then the cancellation goes on. Both calls are plain futures of the loop's executor, not tasks:
-        ``asyncio.run`` cancels every task as it shuts down, and a cancelled task would stop waiting while its thread
-        goes on moving files.
+        finishes, what it registered is removed again and recorded again (the caller that is going away tells the
+        model of none of it), and then the cancellation goes on. Both calls are plain futures of the loop's executor,
+        not tasks: ``asyncio.run`` cancels every task as it shuts down, and a cancelled task would stop waiting while
+        its thread goes on moving files.
 
         Args:
             p: The caller, user and chat the job ran for.
@@ -581,10 +580,10 @@ class JobQueue:
 
         Each staged output gets its file id before anything is recorded, so the keeper's event names every file that
         may become visible. The store trusts the path it is given, so only a file the executor staged for this job,
-        under ``staging/<job-id>/``, is handed to it. An output that cannot be kept (the user's quota, a full volume,
-        an invalid name) does not stop the others; those are recorded again as errors once all are through. An
-        unexpected failure, or an error record that cannot be written, removes the files registered before it, then
-        goes on up.
+        under ``staging/<job-id>/``, is handed to it. An output that cannot be kept, for whatever reason (the user's
+        quota, a full volume, an invalid name, or an error the store does not foresee, which is logged by its type),
+        does not stop the others; those are recorded again as errors once all are through. An error record that
+        cannot be written removes the files registered before it (``_discard``), then goes on up.
 
         Args:
             p: The caller, user and chat the job ran for.
@@ -621,6 +620,9 @@ class JobQueue:
                 except PathError:
                     why = "invalid"
                 except (StoreError, OSError):
+                    why = "failed"
+                except Exception as exc:  # the event named the output, so it is named again whatever the error
+                    _log.warning("could not keep an output (%s)", type(exc).__name__)
                     why = "failed"
                 else:
                     continue

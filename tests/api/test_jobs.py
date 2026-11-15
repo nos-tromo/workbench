@@ -146,6 +146,20 @@ class KeepAll:
 KEEP = KeepAll()
 
 
+class Exploding(KeepAll):
+    """A keeper whose record fails with a ``RuntimeError`` of the given text."""
+
+    def __init__(self, text: str) -> None:
+        """Fail with ``text``."""
+        super().__init__()
+        self.text = text
+
+    @override
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Fail."""
+        raise RuntimeError(self.text)
+
+
 @pytest.fixture
 def executor(settings: Settings) -> FakeClient:
     """A fake executor that answers at once."""
@@ -823,16 +837,15 @@ async def test_an_unexpected_failure_finishes_the_job_as_an_error(
     metrics: Metrics,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A store failure while registering is not hidden, and the job record does not stay ``running``."""
+    """A failure while the outputs are kept is not hidden, and the job record does not stay ``running``.
+
+    A single output that cannot be registered is recorded again instead (``test_an_output_whose_registration_fails_…``),
+    so the failure here is the keeper's own.
+    """
     executor.files = {"a.txt": b"a"}
-
-    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str, **_more: Any) -> FileRecord:
-        raise RuntimeError("synthetic store failure")
-
-    monkeypatch.setattr(store, "register_output", explode)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("synthetic keeper failure"))
     assert store.get_job(user("user-a"), executor.requests[0].job_id).status == "error"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
@@ -876,15 +889,10 @@ async def test_a_failed_job_record_does_not_hide_the_original_error(
 ) -> None:
     """The error that ended the job is the one raised, and the staging folder is cleared all the same."""
     executor.files = {"a.txt": b"a"}
-
-    def explode(_p: Principal, _staged: Path, _name: str, _job_id: str, **_more: Any) -> FileRecord:
-        raise RuntimeError("the original failure")
-
-    monkeypatch.setattr(store, "register_output", explode)
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError, match="the original failure"):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("the original failure"))
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
 
@@ -1088,31 +1096,73 @@ async def test_a_second_cancel_while_outputs_are_registered_still_leaves_none_of
     assert queue.tracked_users == 0
 
 
-async def test_an_unexpected_failure_of_the_registration_removes_what_it_moved_in(
+@pytest.mark.parametrize(
+    "failure",
+    [
+        sqlite3.OperationalError("synthetic: disk I/O error"),
+        RuntimeError("synthetic: an unexpected failure"),
+    ],
+    ids=["database", "unexpected"],
+)
+async def test_an_output_whose_registration_fails_in_any_way_is_recorded_again(
+    failure: Exception,
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R86 N4: the middle output fails as the store does not foresee; it is named again, the others are kept.
+
+    Its event named it ``ok`` before the move, so it is recorded again as ``error``, like an output past the quota. The
+    log names the error's type, never a file.
+    """
+    me = user("user-a")
+    executor.files = {"a.txt": b"a", "salaries-of-user-b.txt": b"b", "c.txt": b"c"}
+    real = store.register_output
+
+    def fail_the_second(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
+        if name.startswith("salaries"):
+            raise failure
+        return real(p, staged, name, job_id, **more)
+
+    monkeypatch.setattr(store, "register_output", fail_the_second)
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    with caplog.at_level(logging.DEBUG):
+        _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert sorted(rec.name for rec in files) == ["a.txt", "c.txt"]
+    assert keeper.again_ids == [[planned[1]]]
+    assert result.message == "1 output could not be kept (failed)"
+    assert sorted(path.name for path in _chat_folder(settings, me).glob("*")) == ["a.txt", "c.txt"]
+    assert store.get_job(me, executor.requests[0].job_id).status == "ok"
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+    assert type(failure).__name__ in caplog.text
+    assert "salaries" not in caplog.text
+
+
+async def test_outputs_removed_again_after_a_failed_job_record_are_recorded_again(
     settings: Settings,
     store: Store,
     executor: FakeClient,
     metrics: Metrics,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first output is moved in, the second fails in a way the queue does not expect: the first goes again."""
+    """R86 N4: the outputs the event named ``ok`` are kept, then removed when the job cannot be settled.
+
+    They did not end as the event said, so an ``error`` event names them again, whether or not they could be removed.
+    """
     me = user("user-a")
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
-    real = store.register_output
-
-    def fail_the_second(p: Principal, staged: Path, name: str, job_id: str, **more: Any) -> FileRecord:
-        if name == "b.txt":
-            raise RuntimeError("synthetic: an unexpected failure")
-        return real(p, staged, name, job_id, **more)
-
-    monkeypatch.setattr(store, "register_output", fail_the_second)
-    queue = queue_for(settings, executor, store, metrics)
-    with pytest.raises(RuntimeError):
-        await queue.submit(me, "run_python", ARGS, [], KEEP)
+    break_finish(store, monkeypatch)
+    keeper = KeepAll()
+    with pytest.raises(sqlite3.OperationalError):
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert keeper.again_ids == [planned]
     assert store.files_in_chat(me) == []
-    assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
-    assert store.get_job(me, executor.requests[0].job_id).status == "error"
-    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
 
 async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure(

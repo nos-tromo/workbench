@@ -22,9 +22,11 @@ goes, and before a new file becomes visible:
   (`workbench/api/jobs.py:JobQueue`, its `Keeper`).
 
 A new file whose event cannot be written is never stored. One that could not be
-stored after its event (a full disk, the user's quota, a failed commit) is
-recorded again with `outcome: error`. A process that ends between the two leaves
-a recorded `<id>.part`, which retention removes and records by that id.
+stored after its event, whatever the reason (a full disk, the user's quota, an
+invalid name, a failed commit or an error the store did not foresee), or that
+was stored and removed again because the call then failed, is recorded again
+with `outcome: error`. A process that ends between the two leaves a recorded
+`<id>.part`, which retention removes and records by that id.
 
 Every event a user's request causes has this shape (`workbench/api/audit.py:AuditLog.record`):
 
@@ -77,9 +79,9 @@ the answer is `audit unavailable`, never the refusal.
 
 A tool that makes files writes a second, `error` event, with `outputs` counting
 them, for new files its event named that did not end as it said: not stored
-after all (the user's quota, a full disk, an invalid name), or stored and then
-not removed when the call failed (`workbench/api/jobs.py:JobQueue`). Within the
-same call, the first event covers a new file that is removed again.
+after all (the user's quota, a full disk, an invalid name, any other error of
+the store), or stored and then removed again, or not removed, when the call
+failed or its caller went away (`workbench/api/jobs.py:JobQueue`).
 
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.

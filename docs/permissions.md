@@ -150,11 +150,12 @@ file browser, or by retention after the period
   Nothing of it reached the model, and the files it made are never kept
   (`workbench/api/jobs.py:JobQueue`). Its job record stays, until retention.
 - What a call makes and removes within the same request is covered by that
-  call's event: the job's folder in the executor, and a new file named in the
-  event that is removed again. A new file that could not be stored after its
-  event (the user's quota, a full disk, an invalid name), or that should have
-  gone again and could not, is recorded again with `outcome: error`. Only what
-  outlives its request otherwise gets an event of its own, from retention.
+  call's event: the job's folder in the executor. A new file named in the event
+  that could not be stored after it (the user's quota, a full disk, an invalid
+  name, any other error of the store), or that was stored and then had to go
+  again because the call failed, whether it went or not, is recorded again with
+  `outcome: error`. Only what outlives its request otherwise gets an event of
+  its own, from retention.
 - A new file whose event cannot be written is never stored, and the call fails
   (see [audit.md](audit.md#fail-closed)).
 

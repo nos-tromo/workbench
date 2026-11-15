@@ -477,7 +477,7 @@ class OutputKeeper:
         return keep
 
     def again(self, ids: Sequence[str]) -> None:
-        """Name outputs that did not end as the event said (not kept, or kept and not removed) in an ``error`` event.
+        """Name outputs that did not end as the event said (not kept, or kept and then removed) in an ``error`` event.
 
         Args:
             ids: Their file ids.
