@@ -12,6 +12,8 @@ name: workbench-test
 services:
   volume-permissions:
     image: workbench-executor:test
+    # The executor's image, which the executor service builds; never pulled.
+    pull_policy: never
 
   api:
     image: workbench-api:test

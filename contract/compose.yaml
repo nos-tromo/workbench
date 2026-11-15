@@ -101,6 +101,8 @@ services:
     # Test-only: the stand-in model Open WebUI calls (contract/stub_model.py), standard library only, in the api's
     # test image, so nothing is pulled. Hardened as the other services; on the test's network only, no port.
     image: workbench-api:test
+    # The api's image, which the api service builds; never pulled.
+    pull_policy: never
     command: ["python", "/stub/stub_model.py"]
     security_opt:
       - no-new-privileges:true

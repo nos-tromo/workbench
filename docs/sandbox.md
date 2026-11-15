@@ -349,8 +349,9 @@ Each of these is accepted. Each says what it would take.
   remains: SysV IPC while both run (a segment, a queue or a semaphore one job
   makes and hands to another uid; each is removed with its creator's job), the
   `/proc` entries of the other slot's processes (their command lines name a job
-  id, and their status), and CPU and timing. Nothing survives the end of a job:
-  each slot is cleared before its next one.
+  id, and their status), and CPU and timing. Nothing a job wrote survives its
+  end: each slot is cleared before its next one, and a segment another job
+  keeps attached is emptied first (below).
 - **What the watchdog cannot see between two of its measures.** It measures
   about twice a second. A job can write, between two measures, as much as the
   disk takes in half a second, and take as much memory as it can map in half a
@@ -368,9 +369,10 @@ Each of these is accepted. Each says what it would take.
 - **What the memory sum does not count.** The kernel's own memory that a job's
   processes cause (page tables, pipe and socket-pair buffers, the inodes of its
   files) and the page cache of the files it reads and writes are in no resident
-  set (a file it maps from its own folders counts as that file's disk). They are bounded by the job's other limits (processes, open files, file
-  size, its folders' disk and entries) and held, with the rest, by the
-  container's memory limit and the job's OOM score. A process's resident set
+  set (a file it maps from its own folders counts as that file's disk). They
+  are bounded by the job's other limits (processes, open files, file size, its
+  folders' disk and entries) and held, with the rest, by the container's memory
+  limit and the job's OOM score. A process's resident set
   counts pages it shares with its forked children once in each, which can stop
   a job early, never late.
 - **A SysV segment handed between two running jobs.** A segment counts against

@@ -585,11 +585,16 @@ def test_the_stack_tests_collect_their_own_folder_with_the_executors_libraries(t
 
 
 def test_the_test_stacks_images_are_built_and_never_pulled() -> None:
-    """No registry has the ``:test`` images; Compose would try one before building and print its refusal."""
+    """No registry has the ``:test`` images; Compose would try one before building and print its refusal.
+
+    The services that build them say ``build``; those that only reuse one (the volume's one-shot, the contract's stub
+    model) say ``never``, as their image is there once the build is.
+    """
     test = compose("compose.test.yaml")
-    assert {name: test["services"][name].get("pull_policy") for name in ("api", "executor")} == dict.fromkeys(
-        ("api", "executor"), "build"
-    )
+    policies = {name: service.get("pull_policy") for name, service in test["services"].items()}
+    assert policies == {"api": "build", "executor": "build", "volume-permissions": "never"}
+    stub = yaml.safe_load((ROOT / "contract" / "compose.yaml").read_text())["services"]["stub-model"]
+    assert (stub["image"], stub["pull_policy"]) == ("workbench-api:test", "never")
 
 
 def test_the_contract_makes_its_key_and_secret_for_each_run() -> None:
