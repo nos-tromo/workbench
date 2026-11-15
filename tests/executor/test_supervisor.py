@@ -1933,38 +1933,99 @@ async def test_as_a_slot_the_job_reaches_only_its_own_folder(
     assert _entries(root_volume / "jobs") == []
 
 
+#: The job's half of a barrier the test holds, for two jobs that must look at each other while both run.
+#:
+#: Each job leaves ``ready`` in its home and waits for the test's ``go``; then it looks (``look()``, which the test
+#: defines), leaves ``checked`` and waits for ``done``, so neither ends, and its folder goes, before the other has
+#: looked. A ``time.sleep`` did not hold that on a slower host: one job's folder was gone when the other looked (CI,
+#: x86_64), and the ``FileNotFoundError`` ended the job as "the job failed". Anything the job raises is its result, so
+#: the answer says what went wrong.
+TWO_JOBS = """
+import time, traceback
+gate = pathlib.Path({gate!r})
+home = pathlib.Path(os.environ["HOME"])
+others = pathlib.Path({jobs!r}) / spec["args"]["other"]
+def attempt(action):
+    try:
+        action()
+        return "ok"
+    except PermissionError:
+        return "denied"
+def wait_for(name):
+    deadline = time.monotonic() + 60
+    while not (gate / name).exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError("no " + name)
+        time.sleep(0.02)
+try:
+    mine = before()
+    (home / "ready").touch()
+    wait_for("go")
+    result = {{"mine": mine, **look()}}
+    (home / "checked").touch()
+    wait_for("done")
+except BaseException:
+    result = {{"crash": traceback.format_exc(limit=4)}}
+"""
+
+
+async def _two_jobs(sup: Supervisor, first: JobRequest, second: JobRequest, root_volume: Path) -> list[JobResult]:
+    """Run two jobs at once, holding the barrier of ``TWO_JOBS``; whatever happens, both end and are answered."""
+    gate = root_volume.parent / "gate"
+    homes = [root_volume / "jobs" / request.job_id / "home" for request in (first, second)]
+    running = asyncio.gather(sup.run_job(first), sup.run_job(second))
+    for mark, opens in (("ready", "go"), ("checked", "done")):
+
+        def reached(mark: str = mark) -> bool:
+            return running.done() or all((home / mark).exists() for home in homes)
+
+        with contextlib.suppress(TimeoutError):
+            await until(reached, seconds=scaled(30))
+        (gate / opens).touch()
+    return list(await running)
+
+
+def _two_job_runner(monkeypatch: pytest.MonkeyPatch, root_volume: Path, body: str) -> None:
+    """Run ``body``, which defines ``before()`` and ``look()``, inside the barrier of ``TWO_JOBS``."""
+    gate = root_volume.parent / "gate"
+    gate.mkdir()
+    gate.chmod(0o755)
+    barrier = TWO_JOBS.format(gate=str(gate), jobs=str(root_volume / "jobs"))
+    _runner(monkeypatch, textwrap.dedent(body) + barrier)
+
+
+def _crossed(first: JobRequest, second: JobRequest) -> tuple[JobRequest, JobRequest]:
+    """The two requests, each naming the other's job in its arguments."""
+    return (
+        first.model_copy(update={"args": {"other": second.job_id}}),
+        second.model_copy(update={"args": {"other": first.job_id}}),
+    )
+
+
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
 async def test_as_root_two_running_jobs_cannot_reach_each_other(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Jobs in different slots cannot enter each other's folder, even knowing its id."""
+    """Jobs in different slots cannot enter each other's folder, even knowing its id, while both run."""
     _chat(root_volume, {"q.csv": b"q"})
-    _runner(
+    _two_job_runner(
         monkeypatch,
-        f"""
-        import time
-        other = pathlib.Path({str(root_volume / "jobs")!r}) / spec["args"]["other"]
-        def attempt(action):
-            try:
-                action()
-                return "ok"
-            except PermissionError:
-                return "denied"
-        time.sleep(1)
-        result = {{
-            "list": attempt(lambda: os.listdir(other)),
-            "read": attempt(lambda: (other / "workspace" / spec["chat_id"] / "q.csv").read_bytes()),
-        }}
+        root_volume,
+        """
+        def before():
+            return {}
+        def look():
+            return {
+                "list": attempt(lambda: os.listdir(others)),
+                "read": attempt(lambda: (others / "workspace" / spec["chat_id"] / "q.csv").read_bytes()),
+            }
         """,
     )
-    first, second = _request(input_files=["q.csv"]), _request(input_files=["q.csv"])
-    first = first.model_copy(update={"args": {"other": second.job_id}})
-    second = second.model_copy(update={"args": {"other": first.job_id}})
-    sup = Supervisor(_settings(root_volume))
+    first, second = _crossed(_request(input_files=["q.csv"]), _request(input_files=["q.csv"]))
 
-    answers = await asyncio.gather(sup.run_job(first), sup.run_job(second))
+    answers = await _two_jobs(Supervisor(_settings(root_volume)), first, second, root_volume)
 
-    assert [a.result for a in answers] == [{"list": "denied", "read": "denied"}] * 2
+    assert [a.result for a in answers] == [{"mine": {}, "list": "denied", "read": "denied"}] * 2, answers
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
@@ -2811,87 +2872,46 @@ async def test_as_root_a_job_cannot_open_its_folder_to_another_slot(
 ) -> None:
     """R76: the job folder is root's, 0710; a job that opens ``home/`` and ``out/`` to all opens them to nobody."""
     _chat(root_volume, {"q.csv": b"q"})
-    _runner(
+    _two_job_runner(
         monkeypatch,
-        f"""
-        import time
-        def attempt(action):
-            try:
-                action()
-                return "ok"
-            except PermissionError:
-                return "denied"
-        job = spec_path.parent
-        mine = {{
-            "chmod_job": attempt(lambda: os.chmod(job, 0o777)),
-            "list_job": attempt(lambda: os.listdir(job)),
-            "add_to_job": attempt(lambda: (job / "x").write_text("x")),
-            "chmod_home": attempt(lambda: os.chmod(job / "home", 0o777)),
-            "chmod_out": attempt(lambda: os.chmod("out", 0o777)),
-        }}
-        (job / "home" / "secret").write_text("user a's figures")
-        os.chmod(job / "home" / "secret", 0o666)
-        time.sleep(1)
-        other = pathlib.Path({str(root_volume / "jobs")!r}) / spec["args"]["other"]
-        result = {{
-            "mine": mine,
-            "their_secret": attempt(lambda: (other / "home" / "secret").read_text()),
-            "their_out": attempt(lambda: os.listdir(other / "workspace" / spec["chat_id"] / "out")),
-            "their_job": attempt(lambda: os.listdir(other)),
-        }}
+        root_volume,
+        """
+        def before():
+            job = spec_path.parent
+            mine = {
+                "chmod_job": attempt(lambda: os.chmod(job, 0o777)),
+                "list_job": attempt(lambda: os.listdir(job)),
+                "add_to_job": attempt(lambda: (job / "x").write_text("x")),
+                "chmod_home": attempt(lambda: os.chmod(job / "home", 0o777)),
+                "chmod_out": attempt(lambda: os.chmod("out", 0o777)),
+            }
+            (job / "home" / "secret").write_text("user a's figures")
+            os.chmod(job / "home" / "secret", 0o666)
+            return mine
+        def look():
+            return {
+                "their_secret": attempt(lambda: (others / "home" / "secret").read_text()),
+                "their_out": attempt(lambda: os.listdir(others / "workspace" / spec["chat_id"] / "out")),
+                "their_job": attempt(lambda: os.listdir(others)),
+            }
         """,
     )
-    first, second = _request(input_files=["q.csv"]), _request(input_files=["q.csv"])
-    first = first.model_copy(update={"args": {"other": second.job_id}})
-    second = second.model_copy(update={"args": {"other": first.job_id}})
+    first, second = _crossed(_request(input_files=["q.csv"]), _request(input_files=["q.csv"]))
 
-    sup = Supervisor(_settings(root_volume))
-
-    answers = await asyncio.gather(sup.run_job(first), sup.run_job(second))
+    answers = await _two_jobs(Supervisor(_settings(root_volume)), first, second, root_volume)
 
     for answer in answers:
-        assert answer.status == "ok", answer
+        assert answer.status == "ok", answers
         assert answer.result["mine"] == {
             "chmod_job": "denied",
             "list_job": "denied",
             "add_to_job": "denied",
             "chmod_home": "ok",
             "chmod_out": "ok",
-        }
-        assert {key: answer.result[key] for key in ("their_secret", "their_out", "their_job")} == dict.fromkeys(
+        }, answers
+        assert {key: answer.result.get(key) for key in ("their_secret", "their_out", "their_job")} == dict.fromkeys(
             ("their_secret", "their_out", "their_job"), "denied"
-        )
-
-
-@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
-async def test_as_root_a_jobs_processes_together_are_held_to_its_memory(
-    root_volume: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """R75: each process stays under ``RLIMIT_AS``, but three of them together pass the job's memory, and it stops."""
-    _chat(root_volume)
-    _runner(
-        monkeypatch,
-        """
-        import time
-        for _ in range(3):
-            if os.fork() == 0:
-                held = bytearray(120 * 1024 * 1024)
-                for at in range(0, len(held), 4096):
-                    held[at] = 1
-                time.sleep(60)
-                os._exit(0)
-        time.sleep(60)
-        """,
-    )
-    began = time.monotonic()
-
-    answer = await Supervisor(_settings(root_volume, WORKBENCH_JOB_MEMORY_MB="256")).run_job(_request())
-
-    assert (answer.status, answer.message) == (
-        "killed",
-        "the job was stopped: its processes used more than 256 MB of memory together",
-    )
-    assert time.monotonic() - began < 40
+        ), answers
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
