@@ -7,8 +7,11 @@ import pytest
 from pydantic import ValidationError
 
 from workbench.protocol import (
+    MAX_INLINE_BYTES,
+    MAX_INLINE_FILES,
     MAX_INPUT_FILES,
     MAX_LINE,
+    InlineFile,
     JobRequest,
     JobResult,
     Limits,
@@ -220,3 +223,73 @@ def test_a_refused_request_line_is_a_value_error() -> None:
     line = json.dumps({**_fields(limits=LIMITS.model_dump()), "chat_id": "../x"}).encode()
     with pytest.raises(ValueError):
         decode_request(line)
+
+
+def _inline(**overrides: Any) -> dict[str, Any]:
+    """The fields of a request that carries its data inline: no input file is copied."""
+    return _fields(input_files=[], **overrides)
+
+
+PASSAGES = InlineFile(name="passages.json", content='[{"author": "user-a", "text": "Grüße aus dem Hafen"}]')
+
+
+def test_a_request_has_no_inline_inputs_by_default() -> None:
+    """A workspace request carries no data of its own."""
+    assert JobRequest(**_fields()).inline_inputs == []
+
+
+def test_a_request_with_inline_inputs_round_trips() -> None:
+    """The data comes back as it was sent, non-ASCII text included."""
+    request = JobRequest(**_inline(inline_inputs=[PASSAGES, InlineFile(name="counts.csv", content="a,b\n1,2\n")]))
+    assert decode_request(encode(request)) == request
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "out", "x\x00y"])
+def test_an_inline_name_is_one_plain_file_name_and_not_out(name: str) -> None:
+    """Each name becomes one file in the job's working folder, beside ``out/``, never below or above it."""
+    with pytest.raises(ValidationError):
+        InlineFile(name=name, content="x")
+    with pytest.raises(ValidationError):
+        JobRequest.model_validate(_inline(inline_inputs=[{"name": name, "content": "x"}]))
+
+
+def test_inline_names_are_unique() -> None:
+    """Two entries of one name would be one file."""
+    with pytest.raises(ValidationError, match="unique"):
+        JobRequest(**_inline(inline_inputs=[PASSAGES, InlineFile(name=PASSAGES.name, content="[]")]))
+
+
+def test_at_most_eight_inline_inputs() -> None:
+    """A request carries at most ``MAX_INLINE_FILES`` entries."""
+    files = [InlineFile(name=f"part-{n}.txt", content="x") for n in range(MAX_INLINE_FILES + 1)]
+    assert len(JobRequest(**_inline(inline_inputs=files[:-1])).inline_inputs) == MAX_INLINE_FILES == 8
+    with pytest.raises(ValidationError):
+        JobRequest(**_inline(inline_inputs=files))
+
+
+def test_inline_texts_together_stay_within_512_kib() -> None:
+    """The bound counts UTF-8 bytes of all the entries together, not characters."""
+    full = InlineFile(name="passages.json", content="é" * (256 * 1024))
+    assert MAX_INLINE_BYTES == 512 * 1024 == len(full.content.encode())
+    assert JobRequest(**_inline(inline_inputs=[full])).inline_inputs == [full]
+    with pytest.raises(ValidationError, match="512 KiB"):
+        JobRequest(**_inline(inline_inputs=[full, InlineFile(name="notes.txt", content="x")]))
+
+
+def test_inline_text_utf8_cannot_hold_is_refused() -> None:
+    """A lone surrogate could not be written to the job folder, so the request is refused before it gets there."""
+    with pytest.raises(ValidationError, match="UTF-8"):
+        JobRequest(**_inline(inline_inputs=[InlineFile(name="notes.txt", content="a\ud800b")]))
+
+
+def test_inline_text_stays_out_of_reprs() -> None:
+    """A request's repr, or an error that quotes one, never holds the data."""
+    request = JobRequest(**_inline(inline_inputs=[PASSAGES]))
+    assert PASSAGES.name in repr(request)
+    assert "Hafen" not in repr(request)
+
+
+def test_inline_inputs_never_come_with_input_files() -> None:
+    """No inline name can shadow a copied input: a request has one or the other."""
+    with pytest.raises(ValidationError, match="input_files"):
+        JobRequest(**_fields(inline_inputs=[PASSAGES]))

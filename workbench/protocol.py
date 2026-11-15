@@ -1,19 +1,25 @@
 """The job protocol between the api and the executor: pydantic models, one JSON line per message.
 
 The executor runs as root and builds paths from a request, so every request is checked here,
-before anything reads it: no field it does not declare, ids that are safe folder names, and
-input paths that stay below the chat folder.
+before anything reads it: no field it does not declare, ids that are safe folder names, input
+paths that stay below the chat folder, and inline inputs that are each one plain file name.
 """
 
 import re
-from typing import Any, Literal
+from typing import Any, Final, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from workbench.paths import check_filename, check_id
 
 MAX_LINE = 1_048_576
 MAX_INPUT_FILES = 1000
+#: Most entries a request carries inline.
+MAX_INLINE_FILES: Final = 8
+#: Most bytes, in UTF-8, the inline entries' texts hold together.
+MAX_INLINE_BYTES: Final = 512 * 1024
+#: The job's own output folder in its working folder: no input may take its name.
+_OUT: Final = "out"
 
 #: The message of a job the kernel stopped on one of its limits (memory, CPU time, file size, processes); a job the
 #: executor's watchdog stopped has a message that names the limit instead.
@@ -68,6 +74,37 @@ class Limits(_Message):
     nofile: int = Field(default=256, gt=0)
 
 
+class InlineFile(_Message):
+    """A text the request carries itself, written as one file into the job's working folder.
+
+    Attributes:
+        name: The file's name: one plain file name, not ``out``.
+        content: Its text, written as UTF-8.
+    """
+
+    name: str
+    content: str = Field(repr=False)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        """Accept one plain file name that is not the job's output folder.
+
+        Args:
+            value: The name.
+
+        Returns:
+            ``value``, unchanged.
+
+        Raises:
+            ValueError: It is not a valid file name (``workbench.paths.check_filename``), or it is ``out``.
+        """
+        check_filename(value)
+        if value == _OUT:
+            raise ValueError("an inline input cannot be named out")
+        return value
+
+
 class JobRequest(_Message):
     """One job the api hands to the executor.
 
@@ -82,6 +119,9 @@ class JobRequest(_Message):
         chat_id: Chat folder the job works on; a safe id.
         input_files: Paths relative to the chat folder, at most ``MAX_INPUT_FILES``; the
             executor copies only these.
+        inline_inputs: Texts the request carries itself, at most ``MAX_INLINE_FILES``, unique by
+            name and ``MAX_INLINE_BYTES`` in UTF-8 together; the executor writes each into the
+            working folder. Never together with ``input_files``.
         limits: Resource limits for this job.
         max_chars: Largest result the runner may return, in characters (``result_max_kb * 1024``).
     """
@@ -93,6 +133,7 @@ class JobRequest(_Message):
     user_id: str
     chat_id: str
     input_files: list[str] = Field(max_length=MAX_INPUT_FILES)
+    inline_inputs: list[InlineFile] = Field(default_factory=list, max_length=MAX_INLINE_FILES)
     limits: Limits
     max_chars: int = Field(gt=0)
 
@@ -148,6 +189,31 @@ class JobRequest(_Message):
         for path in value:
             check_input_path(path)
         return value
+
+    @model_validator(mode="after")
+    def _check_inline_inputs(self) -> Self:
+        """Accept inline inputs of distinct names, within their bound, in a request that copies no input.
+
+        Returns:
+            The request, unchanged.
+
+        Raises:
+            ValueError: A name is repeated; a text cannot be encoded as UTF-8; the texts together
+                are more than ``MAX_INLINE_BYTES`` in UTF-8; or the request also names
+                ``input_files``.
+        """
+        names = [entry.name for entry in self.inline_inputs]
+        if len(set(names)) != len(names):
+            raise ValueError("inline input names must be unique")
+        try:
+            size = sum(len(entry.content.encode("utf-8")) for entry in self.inline_inputs)
+        except UnicodeEncodeError as exc:
+            raise ValueError("inline inputs must be text UTF-8 can hold") from exc
+        if size > MAX_INLINE_BYTES:
+            raise ValueError(f"inline inputs hold more than {MAX_INLINE_BYTES // 1024} KiB together")
+        if self.inline_inputs and self.input_files:
+            raise ValueError("inline_inputs cannot come with input_files")
+        return self
 
 
 class OutputFile(_Message):

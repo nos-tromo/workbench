@@ -38,7 +38,7 @@ from workbench.executor.supervisor import (
     make_slots,
     startup_problem,
 )
-from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_result, encode
+from workbench.protocol import MAX_LINE, InlineFile, JobRequest, JobResult, Limits, OutputFile, decode_result, encode
 
 pytestmark = pytest.mark.anyio
 
@@ -502,6 +502,124 @@ async def test_limits_are_bounded_by_the_executors_own_settings(volume: Path, mo
     await sup.run_job(_request(limits=small))
 
     assert seen == [Limits(wall_s=30, cpu_s=30, memory_mb=512, file_mb=50, nproc=64, nofile=256), small]
+
+
+# --- inline inputs ---------------------------------------------------------------------------
+
+#: A marker of the data, which the spec must never hold.
+INLINE_MARKER = "harbour-ledger-7f3a"
+PASSAGES = InlineFile(name="passages.json", content=f'[{{"author": "user-a", "text": "Grüße {INLINE_MARKER}"}}]')
+
+
+def _inline_request(**overrides: Any) -> JobRequest:
+    """A job that carries its data inline, as docint's calls do: no input file, no chat folder."""
+    return _request(caller="docint", inline_inputs=[PASSAGES], **overrides)
+
+
+async def test_inline_inputs_are_written_into_the_working_folder_read_only(
+    volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each entry is a file in the working folder beside ``out/``, as sent, root's and ``0444`` like a copied input."""
+    _runner(
+        monkeypatch,
+        """
+        st = os.stat("passages.json", follow_symlinks=False)
+        result = {
+            "seen": sorted(os.listdir(".")),
+            "content": pathlib.Path("passages.json").read_bytes().decode("utf-8"),
+            "mode": oct(st.st_mode & 0o7777),
+            "owner": [st.st_uid, st.st_gid],
+        }
+        """,
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_inline_request())
+
+    assert answer.status == "ok", answer
+    assert answer.result == {
+        "seen": ["out", "passages.json"],
+        "content": PASSAGES.content,
+        "mode": "0o444",
+        "owner": list(ME),
+    }
+
+
+async def test_inline_data_never_reaches_the_spec(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``spec.json`` keeps its five keys: the data lives only in its own files."""
+    _runner(
+        monkeypatch,
+        f"""
+        text = spec_path.read_text()
+        result = {{"keys": sorted(spec), "marker": {INLINE_MARKER!r} in text}}
+        """,
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_inline_request())
+
+    assert answer.result == {"keys": sorted(["tool", "args", "chat_id", "max_chars", "file_mb"]), "marker": False}
+
+
+async def test_an_inline_job_opens_no_workspace(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no input file, no chat folder is opened or made: docint has no folder below ``workspaces/``."""
+    _runner(monkeypatch, "pass")
+    before = (volume / "workspaces" / "docint").exists()
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_inline_request())
+
+    assert answer.status == "ok", answer
+    assert (before, (volume / "workspaces" / "docint").exists()) == (False, False)
+
+
+@pytest.mark.parametrize(
+    ("ending", "body", "wall_s"),
+    [
+        ("ok", "pass", 60),
+        ("failing process", "sys.exit(3)", 60),
+        ("wall timeout", "import time\ntime.sleep(30)", 1),
+    ],
+    ids=["ok", "failing process", "wall timeout"],
+)
+async def test_inline_inputs_go_with_the_job_folder(
+    ending: str, body: str, wall_s: int, volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However the job ends, its folder goes, and the data with it; nothing of it is staged."""
+    _runner(monkeypatch, body)
+    request = _inline_request(limits=Limits(wall_s=wall_s, cpu_s=60, memory_mb=1024, file_mb=50))
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(request)
+
+    assert answer.status == {"ok": "ok", "failing process": "error", "wall timeout": "timeout"}[ending], answer
+    assert _entries(volume / "jobs") == []
+    assert _entries(volume / "staging") == []
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("..", "x"),
+        ("../../../escape.txt", "x"),
+        ("../../../../escape.txt", "x"),
+        ("out", "x"),
+        ("", "x"),
+        ("a/b", "x"),
+        ("notes.txt", "a\ud800b"),
+    ],
+)
+async def test_an_inline_input_built_without_validation_is_refused_where_it_is_written(
+    name: str, content: str, volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each entry is checked again where it becomes a file, whatever built the request: no other file, no lost slot."""
+    _runner(monkeypatch, "pass")
+    bad = InlineFile.model_construct(name=name, content=content)
+    request = _request(caller="docint").model_copy(update={"inline_inputs": [bad]})
+    before = sorted(str(p.relative_to(volume)) for p in volume.rglob("*"))
+    sup = Supervisor(_settings(volume, WORKBENCH_EXECUTOR_SLOTS="1"), use_slots=False)
+
+    answer = await sup.run_job(request)
+
+    assert (answer.status, answer.message) == ("error", "the job could not be set up")
+    assert sorted(str(p.relative_to(volume)) for p in volume.rglob("*")) == before
+    assert (await sup.run_job(_request())).status == "ok"
 
 
 # --- the job's result ------------------------------------------------------------------------
@@ -2044,6 +2162,86 @@ async def test_as_root_two_running_jobs_cannot_reach_each_other(
     answers = await _two_jobs(Supervisor(_settings(root_volume)), first, second, root_volume)
 
     assert [a.result for a in answers] == [{"mine": {}, "list": "denied", "read": "denied"}] * 2, answers
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_a_slot_inline_inputs_are_roots_and_unchangeable(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The job reads its data and can change none of it: not its content, its mode, its name or its place."""
+    _runner(
+        monkeypatch,
+        """
+        def owner(p):
+            st = os.stat(p, follow_symlinks=False)
+            return [st.st_uid, st.st_gid, oct(st.st_mode & 0o7777)]
+        def attempt(action):
+            try:
+                action()
+                return "ok"
+            except PermissionError:
+                return "denied"
+        result = {
+            "uid": os.getuid(),
+            "owner": owner("passages.json"),
+            "append": attempt(lambda: open("passages.json", "a").close()),
+            "chmod": attempt(lambda: os.chmod("passages.json", 0o666)),
+            "unlink": attempt(lambda: os.unlink("passages.json")),
+            "rename": attempt(lambda: os.rename("passages.json", "out/passages.json")),
+            "read": attempt(lambda: pathlib.Path("passages.json").read_bytes()),
+        }
+        """,
+    )
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_inline_request())
+
+    assert answer.status == "ok", answer
+    assert answer.result == {
+        "uid": 20001,
+        "owner": [0, 0, "0o444"],
+        "append": "denied",
+        "chmod": "denied",
+        "unlink": "denied",
+        "rename": "denied",
+        "read": "ok",
+    }
+    assert answer.outputs == []
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_one_jobs_inline_inputs_are_unreadable_to_another(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two jobs that run at once, each knowing the other's id, cannot open each other's data."""
+    _two_job_runner(
+        monkeypatch,
+        root_volume,
+        """
+        def before():
+            return {"own": attempt(lambda: pathlib.Path("passages.json").read_bytes())}
+        def look():
+            theirs = others / "workspace" / spec["chat_id"] / "passages.json"
+            return {"read": attempt(lambda: theirs.read_bytes())}
+        """,
+    )
+    first, second = _crossed(_inline_request(), _inline_request())
+
+    answers = await _two_jobs(Supervisor(_settings(root_volume)), first, second, root_volume)
+
+    assert [a.result for a in answers] == [{"mine": {"own": "ok"}, "read": "denied"}] * 2, answers
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_inline_inputs_are_gone_after_the_job(root_volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The data lives in the job folder alone, and goes with it."""
+    _runner(monkeypatch, 'result = {"seen": sorted(os.listdir("."))}')
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_inline_request())
+
+    assert (answer.status, answer.result) == ("ok", {"seen": ["out", "passages.json"]})
+    assert _entries(root_volume / "jobs") == []
+    assert _entries(root_volume / "staging") == []
+    assert not (root_volume / "workspaces" / "docint").exists()
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
