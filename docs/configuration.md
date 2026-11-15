@@ -34,9 +34,12 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 the same value on its terminal-server connection. Both `.env` files must hold
 it; change it in both and restart both stacks. It is not Open WebUI's
 forwarding secret and not the inference router's key. deploy's `make env`
-copies shared values between members once the key has its row in deploy's
-`env-sync.conf`; the `[shared: open-webui-service]` tag in `.env.example` comes
-with that row.
+copies it between the two files: the key has its row (`workbench-key`) in
+deploy's `env-sync.conf`, the `[shared: open-webui-service]` tag in
+`.env.example` names it, and `make env ENV_GENERATE=1` generates one where it
+is unset in both. From open-webui-service v0.14.0 the key also switches the
+connection on: its `ENABLE_TOOL_SERVERS` follows the key, so without it there
+Open WebUI runs without workbench.
 
 The key is compared in constant time (`workbench/api/auth.py`). It reaches only
 the api: the executor never reads it.
@@ -80,11 +83,13 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
 - The api waits for a job's answer up to the wall time plus 300 seconds
   (`workbench/api/jobs.py:_READ_GRACE_S`): the executor's cleanup of a killed
   job can take that long.
-- Open WebUI sets no timeout on a tool call by default. open-webui-service must
-  set one (`AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER`) when its workbench connection is
-  added. It must be longer than a call can take in workbench:
-  `WORKBENCH_QUEUE_WAIT_S` + `WORKBENCH_JOB_WALL_S` + 300 seconds, 480 seconds
-  with the defaults (60 + 120 + 300). With a shorter one, Open WebUI gives up on
+- Open WebUI sets no timeout on a tool call by default. From open-webui-service
+  v0.14.0 its `docker/compose.yaml` sets one,
+  `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER: "480"`. It must be longer than a call can
+  take in workbench: `WORKBENCH_QUEUE_WAIT_S` + `WORKBENCH_JOB_WALL_S` + 300
+  seconds, 480 seconds with the defaults (60 + 120 + 300). The 480 there is a
+  fixed value, not derived from workbench's settings: raising either of the two
+  here means raising it there too. With a shorter one, Open WebUI gives up on
   a call whose job is slow to be cleaned up before workbench answers it, and the
   model never gets the answer, although workbench may still finish the job,
   record it and keep its files.
@@ -160,6 +165,13 @@ The formulas, for other slot counts or job memory:
 |---|---|---|
 | `WORKBENCH_RETENTION_DAYS` | 7 | Days a workspace file or job record is kept after it was made. A changed value applies at once, with no notice ([retention.md](retention.md#a-changed-period-applies-at-once)). |
 | `WORKBENCH_RETENTION_INTERVAL_S` | 300 | Seconds between retention sweeps. |
+
+The period is shared with open-webui-service: from v0.14.0 a banner there tells
+every user how long workspace files are kept, and deploy's `make env` copies
+`WORKBENCH_RETENTION_DAYS` from workbench's `.env` to open-webui-service's
+(`[shared: open-webui-service]` in `.env.example`). Set it in workbench's `.env`:
+a value set only in open-webui-service's would be copied into workbench's, and
+workbench would delete by it, with no notice.
 
 `AUDIT_OUTPUT` is set by compose (`container`) and is not in `.env.example`
 ([audit.md](audit.md#settings)).

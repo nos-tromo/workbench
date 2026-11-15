@@ -161,8 +161,12 @@ with a SysV segment of the same size, read, as the control that both counters
 see). The same map opened for writing and filled by reads alone holds its
 pages: the watchdog's check below stops a job that does so
 (`::test_as_root_shared_memory_a_job_hides_where_dev_zero_stays_writable_stops_it`).
-Filled by writes, it adds 200 MB too, as measured by hand for the follow-up's
-report, not by a test.
+Filled by writes, it adds 200 MB too. That was measured by hand, not by a test,
+in the same set-up (the executor image, kernel 7.0.14-linuxkit on aarch64,
+compose's capabilities and `--memory 2g`, a forked child as slot 20001, 200 MB
+mapped `MAP_SHARED` with a writable `/dev/zero`, one access to each page): the
+container's `memory.stat` `shmem` and the process's `RssShmem` each rose by
+200 MB.
 Under Docker's usual set-up `/dev` is the container's own tmpfs and root owns
 the node, so the change needs no capability. Under a user-namespaced daemon
 (userns-remap, rootless Docker) the node is the host's, bind-mounted and owned
@@ -308,8 +312,11 @@ unless:
   api's;
 - every slot uid is a user of the image;
 - the container's cgroup memory limit (`memory.max`) holds every slot's job
-  memory. Without a cgroup v2 limit to read, this check passes; compose's
-  limit still applies;
+  memory. Where `memory.max` cannot be read (no cgroup v2), this check passes
+  on its own, but the executor then refuses to start anyway: the paragraph
+  after this list requires cgroup v2 and a cgroup namespace of its own. Where
+  it reads `max` (cgroup v2, no limit set), the check passes and the executor
+  starts; compose sets a limit, so that is a container run without it;
 - `fs.protected_hardlinks` and `fs.protected_symlinks` read 1. These are the
   host's kernel settings. The first keeps a job from giving `out/` a second name
   for a file it does not own, such as the database, which root would then copy
@@ -427,14 +434,21 @@ Each of these is accepted. Each says what it would take.
   files) and the page cache of the files it reads and writes are in no resident
   set (a file it maps from its own folders counts as that file's disk). They
   are bounded by the job's other limits (processes, open files, file size, its
-  folders' disk and entries) and by the container's memory limit, whose cgroup
-  counts page tables (`pagetables`) and the page cache (`file`). Socket-pair
-  buffers, up to about `net.core.wmem_default` (208 KiB) per socket end within
-  the job's descriptor limits, were measured as charged to the container's
-  cgroup, as `kernel` and not as `sock`: 333 MB queued in 1500 Unix socket
-  pairs raised `memory.current` by 348 MB (kernel 7.0.14, aarch64, by hand for
-  the follow-up's report). A kernel that does not charge them leaves them held
-  by no cgroup. The OOM score does not hold any of this to the job that caused
+  folders' disk and entries) and by the container's memory limit, as far as its
+  cgroup is charged for them. Its cgroup counts page tables (`pagetables`) and
+  the page cache (`file`). Socket-pair buffers, up to about `net.core.wmem_default`
+  (208 KiB) per socket end within the job's descriptor limits, were measured as
+  charged to it, as `kernel` and not as `sock`. That was by hand, not a test:
+  in a container started with `--memory 2g` (Docker Desktop's VM, kernel
+  7.0.14, aarch64), 1500 Unix socket pairs, each filled until a write failed
+  with `EAGAIN`, queued 333 MB, and the container's `memory.current` rose by
+  348 MB (`kernel` by 347 MB, `slab` by 37 MB, `sock` by 0). A kernel that does
+  not charge them leaves them held by no cgroup. Nothing was measured for pipe
+  buffers and the inodes of a job's files, and whether the cgroup is charged
+  for them on every kernel is not known here: the kernel may charge them as
+  `kernel` memory, as it did the socket-pair buffers, but this document does
+  not rely on it. Where the cgroup is not charged, only the job's other limits
+  hold them. The OOM score does not hold any of this to the job that caused
   it: when the container runs out, the kernel stops the score-1000 process with
   the most resident memory, which can be another user's job. That is a denial
   of service against concurrent jobs, the same class as the others here, and

@@ -115,6 +115,24 @@ test: with user forwarding on, Open WebUI signs a token naming the user
 proxied calls nor with the model's tool calls. workbench does not read it; the
 actor of every event is the account id.
 
+### What open-webui-service keeps in place
+
+From open-webui-service v0.14.0, workbench is the only terminal server Open
+WebUI offers. Its `docker/compose.yaml` sets the connection and turns Open
+WebUI's own tools, functions and code execution off, and its nginx guard in front
+of Open WebUI (`edge-guard`) refuses, for every account:
+
+- writes to the tool-server, terminal-server and OAuth-client configuration and
+  the configuration import, which would replace or add a connection;
+- writes to `/api/v1/configs/connections` and `/api/v1/configs/code_execution`,
+  which would switch on direct connections and direct tool-server integrations,
+  and code execution and the code interpreter inside Open WebUI;
+- every request under `/api/v1/tether`, through which a user could be offered a
+  terminal of their own, outside workbench's sandbox, audit and retention.
+
+`ENABLE_TOOL_SERVERS` follows the key: without `OPEN_WEBUI_WORKBENCH_KEY` there,
+no tool or terminal server is on (open-webui-service's `CLAUDE.md`, § Workbench).
+
 ### No network
 
 The executor, where every file is opened, has no network at all
