@@ -54,7 +54,7 @@ def _state(pid: int) -> str | None:
         if LINUX:
             return _stat_state(Path(f"/proc/{pid}/stat").read_bytes())
         ps = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False)
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return ps.stdout.strip()[:1] or None
 
