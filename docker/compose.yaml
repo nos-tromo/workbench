@@ -1,0 +1,236 @@
+### workbench compose — the federation's shared tool tier.
+###
+### Three services:
+###   volume-permissions  one-shot, as root: lays out the data volume
+###                       (workbench/executor/prepare_volume.py), then exits.
+###   api                 the tool API, uid 10001, on workbench-net as
+###                       `workbench-api` (port 8000, exposed, never published).
+###   executor            the job sandbox: no network, uid 0 with six
+###                       capabilities so it can run each job as a slot uid
+###                       (docs/sandbox.md). The api reaches it over the Unix
+###                       socket in workbench-run.
+###
+### State lives on the external `workbench-data` volume, so `docker compose
+### down -v` is safe; only `make nuke` removes it. `workbench-run` holds only
+### the executor's socket and is project-local.
+###
+### Production shape: no host ports. compose.override.yaml (make up-dev)
+### publishes the api; compose.test.yaml is the isolation tests' own stack.
+
+name: workbench
+
+##########################################################
+# Shared logging — the local driver rotates and compresses
+# per-container; tail with `docker compose logs -f <svc>`.
+##########################################################
+x-logging: &default-logging
+  driver: "local"
+  options:
+    max-size: "50m"
+    max-file: "5"
+    compress: "true"
+
+##########################################################
+# Shared hardening (deploy ADR 0001) — no privilege
+# escalation, no capabilities, read-only roots. The two
+# root services add back only what they need.
+##########################################################
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+##########################################################
+# The settings both roles read (workbench/config.py). The
+# executor bounds every job by its own copy, so api and
+# executor must see the same values.
+##########################################################
+x-settings: &settings
+  WORKBENCH_RETENTION_DAYS: ${WORKBENCH_RETENTION_DAYS:-7}
+  WORKBENCH_RETENTION_INTERVAL_S: ${WORKBENCH_RETENTION_INTERVAL_S:-300}
+  WORKBENCH_EXECUTOR_SLOTS: ${WORKBENCH_EXECUTOR_SLOTS:-4}
+  WORKBENCH_QUEUE_MAX: ${WORKBENCH_QUEUE_MAX:-16}
+  WORKBENCH_QUEUE_WAIT_S: ${WORKBENCH_QUEUE_WAIT_S:-60}
+  WORKBENCH_JOBS_PER_USER: ${WORKBENCH_JOBS_PER_USER:-1}
+  WORKBENCH_JOB_WALL_S: ${WORKBENCH_JOB_WALL_S:-120}
+  WORKBENCH_JOB_MEMORY_MB: ${WORKBENCH_JOB_MEMORY_MB:-1536}
+  WORKBENCH_RESULT_MAX_KB: ${WORKBENCH_RESULT_MAX_KB:-16}
+  WORKBENCH_UPLOAD_MAX_MB: ${WORKBENCH_UPLOAD_MAX_MB:-50}
+  WORKBENCH_WORKSPACE_MAX_MB: ${WORKBENCH_WORKSPACE_MAX_MB:-500}
+
+services:
+  volume-permissions:
+    # The executor's image, which holds prepare_volume. Root, with the three
+    # capabilities it needs to settle the layout: hand its parts over
+    # (CHOWN), set the modes of parts it does not own (FOWNER), and open the
+    # api's 0700 folders and 0600 database to do so, read-only
+    # (DAC_READ_SEARCH; it never writes through another's mode).
+    <<: *hardened
+    image: workbench-executor:${WORKBENCH_VERSION:-latest}
+    command: ["python", "-m", "workbench.executor.prepare_volume"]
+    user: "0:0"
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_READ_SEARCH
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    logging: *default-logging
+    volumes:
+      - workbench-data:/data
+    restart: "no"
+
+  api:
+    <<: *hardened
+    image: workbench-api:${WORKBENCH_VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    logging: *default-logging
+    read_only: true
+    tmpfs:
+      # Starlette spools uploads here; UploadLimit caps each request at the
+      # upload limit + 1 MiB. The audit chain's container lock lives here too.
+      - /tmp:size=512m
+    environment:
+      <<: *settings
+      # The bearer key Open WebUI presents; at least 32 characters, or the api
+      # refuses to start.
+      OPEN_WEBUI_WORKBENCH_KEY: ${OPEN_WEBUI_WORKBENCH_KEY:-}
+      # Data-protection audit log: the hash-chained events go to the
+      # container's main stdout under a container-wide lock (on the /tmp
+      # tmpfs); ops logs go to stderr.
+      AUDIT_OUTPUT: container
+    volumes:
+      - workbench-data:/data
+      - workbench-run:/run/workbench
+    networks:
+      workbench-net:
+        aliases:
+          - workbench-api
+    expose:
+      - "8000"
+    # One process and its /tmp tmpfs together: up to 512 MiB of uploads being
+    # spooled, and the rest for the process. A body past 2 MiB (an upload past
+    # its limit) is refused as it arrives, and only after the caller's key.
+    # Memory and swap together are the same limit.
+    mem_limit: ${WORKBENCH_API_MEM_LIMIT:-2g}
+    memswap_limit: ${WORKBENCH_API_MEM_LIMIT:-2g}
+    # Threads of the one process: 40 for the routes' blocking work, up to 32 for
+    # the queue's and the sweep's, and a few more.
+    pids_limit: ${WORKBENCH_API_PIDS_LIMIT:-128}
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+      # Its first jobs find the supervisor listening.
+      executor:
+        condition: service_healthy
+    healthcheck:
+      # /healthz needs no key and is not in the tool schema. urllib without
+      # proxies, so a proxy set for the container never sees the probe;
+      # start_interval marks it healthy ~5s after boot (Docker >=25).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://localhost:8000/healthz', timeout=4).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 3s
+    restart: unless-stopped
+
+  executor:
+    # docs/sandbox.md justifies each line. The supervisor refuses to start
+    # unless the container is set up this way: root, the slot users in the
+    # image, cgroup memory >= slots x job memory, /dev/shm and /tmp root's
+    # alone, fs.mqueue.queues_max 0, a mounted /dev/mqueue and a seccomp
+    # filter (Docker's default profile; never seccomp=unconfined), open files
+    # enough for its slots, and cgroup v2 with a cgroup namespace of its own
+    # (never cgroupns: host) whose memory.stat gives shmem. It closes
+    # /dev/zero to the slots where it can, which never stops it.
+    <<: *hardened
+    image: workbench-executor:${WORKBENCH_VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.executor
+    logging: *default-logging
+    network_mode: none
+    user: "0:0"
+    # Reaps the processes a job leaves when its slot is cleared.
+    init: true
+    # Switch to a slot's uid and gid (SETUID, SETGID); lay out and hand over
+    # job folders and staged outputs (CHOWN, FOWNER, DAC_OVERRIDE); stop every
+    # process of a slot after its job (KILL).
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - KILL
+    read_only: true
+    tmpfs:
+      # R30: jobs get a TMPDIR of their own; /tmp is root's alone.
+      - /tmp:size=16m,mode=0700
+      # R28: root's alone, so no slot can leave anything in POSIX shared
+      # memory or semaphores. Replaces Docker's 1777 /dev/shm; no shm_size.
+      - /dev/shm:size=1m,mode=0755
+    sysctls:
+      # R28: no slot can make a POSIX message queue (IPC namespace's own).
+      fs.mqueue.queues_max: 0
+      # A SysV segment is destroyed once no process is attached to it, so
+      # none outlives its job unattached.
+      kernel.shm_rmid_forced: 1
+    # R19: slots x 64 processes per job + 64 for the supervisor and its
+    # cleanup helpers.
+    pids_limit: ${WORKBENCH_EXECUTOR_PIDS_LIMIT:-320}
+    # Slots x WORKBENCH_JOB_MEMORY_MB + 512 MiB: 4 x 1536 + 512. Memory and
+    # swap together are the same limit, so no job swaps past it.
+    mem_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
+    memswap_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
+    # Docker refuses a limit above the host's CPUs (.env.example).
+    cpus: ${WORKBENCH_EXECUTOR_CPUS:-4}
+    environment:
+      <<: *settings
+    volumes:
+      - workbench-data:/data
+      - workbench-run:/run/workbench
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    healthcheck:
+      # Healthy once a socket listens on the supervisor's path: the kernel's
+      # /proc/net/unix lists it with the listening flag (__SO_ACCEPTCON,
+      # 00010000). The file alone is not enough, since it outlives a
+      # supervisor that was killed, in workbench-run. The probe never
+      # connects: a connection without a request line would be a malformed
+      # request to the supervisor. The image has no curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys; p = '/run/workbench/executor.sock'; sys.exit(not any(f[3] == '00010000' and f[7:] == [p] for f in map(str.split, open('/proc/net/unix').readlines()[1:])))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    # The supervisor exits non-zero once its last slot is retired; the
+    # restart brings fresh slots, a fresh IPC namespace and /dev/shm.
+    restart: unless-stopped
+
+volumes:
+  workbench-data:
+    external: true
+    name: workbench-data
+  workbench-run: {}
+
+networks:
+  workbench-net:
+    external: true
+    name: ${WORKBENCH_NET:-workbench-net}

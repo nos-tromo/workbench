@@ -1,0 +1,43 @@
+### The test stack: compose.yaml with this file on top, for the isolation tests
+### (make test-isolation) and later the contract and load tests.
+###
+### It is a project of its own (workbench-test) and keeps nothing of a
+### developer's: a project-local data volume and network in place of the
+### external ones, and images tagged :test. `down -v` removes all of it. The
+### executor's isolation is compose.yaml's, unchanged; this file sets only the
+### synthetic caller key, a shorter wall time and the published test port.
+
+name: workbench-test
+
+services:
+  volume-permissions:
+    image: workbench-executor:test
+    # The executor's image, which the executor service builds; never pulled.
+    pull_policy: never
+
+  api:
+    image: workbench-api:test
+    # Built here, never pulled: no registry has it (Compose would try one first and print the refusal).
+    pull_policy: build
+    ports:
+      - "127.0.0.1:18100:8000"
+    environment:
+      # Synthetic, test-only; never a real key.
+      OPEN_WEBUI_WORKBENCH_KEY: synthetic-isolation-test-key-not-a-secret
+      WORKBENCH_JOB_WALL_S: "20"
+
+  executor:
+    image: workbench-executor:test
+    pull_policy: build
+    environment:
+      WORKBENCH_JOB_WALL_S: "20"
+
+volumes:
+  workbench-data:
+    external: false
+    name: workbench-test-data
+
+networks:
+  workbench-net:
+    external: false
+    name: workbench-test-net

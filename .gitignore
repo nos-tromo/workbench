@@ -1,0 +1,51 @@
+# -----------------
+# Global
+# -----------------
+.DS_Store
+*.code-workspace
+*.env
+*.ipynb
+*.log
+*.pyc
+*.txt
+
+# -----------------
+# Backend (Python)
+# -----------------
+**/__pycache__/
+**/.claude/
+**/.idea/
+**/.log
+**/.venv/
+**/.vscode/
+**/*.egg-info/
+**/.pytest_cache/
+**/.ruff_cache/
+**/dist/
+**/build/
+
+# -----------------
+# Local tooling
+# -----------------
+.superpowers/
+
+# -----------------
+# Docker
+# -----------------
+*.pid
+*.sock
+.workbench-version
+docker-compose.override.yml
+
+# -----------------
+# Files
+# -----------------
+*.bundle
+*.sh
+*.tar.gz
+
+# -----------------
+# Exceptions
+# -----------------
+!scripts/bundle_images.sh
+!scripts/bundle-lib.sh

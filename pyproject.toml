@@ -1,0 +1,104 @@
+[project]
+name = "workbench"
+version = "0.1.0"
+description = "The federation's shared tool tier: a FastAPI tool API plus a sandboxed code and document executor"
+authors = [
+  { name = "nos-tromo" }
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "fastapi>=0.162.0",
+    "prometheus-client>=0.26.0",
+    "pydantic>=2.14.3",
+    "python-multipart>=0.0.33",
+    "uvicorn>=0.54.0",
+]
+
+[project.optional-dependencies]
+executor = [
+    "beautifulsoup4>=4.15.0",
+    "charset-normalizer>=3.5.2",
+    "cryptography>=50.0.2",
+    "docxtpl>=0.20.2",
+    "lxml>=6.1.3",
+    "markdown-it-py>=4.3.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "odfpy>=1.4.1",
+    "openpyxl>=3.1.5",
+    "pandas>=3.1.1",
+    "pypdf>=7.0.1",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "scipy>=1.18.1",
+    "xlsxwriter>=3.3.1",
+]
+
+[project.urls]
+Repository = "https://github.com/nos-tromo/workbench.git"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "httpx2>=2.16.0",
+    "pre-commit>=4.7.0",
+    "pyrefly==1.1.1",
+    "pytest>=9.2.0",
+    "pyyaml>=6.0.3",
+    "reportlab>=5.1.0",
+    "ruff==0.15.14",
+]
+
+[build-system]
+requires = ["setuptools>=84.2.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["workbench*"]
+
+[tool.setuptools.package-data]
+workbench = ["api/system_prompt.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "isolation: against the running test stack; make test-isolation brings it up",
+    "contract: against a real Open WebUI; make test-contract",
+    "load: the load test against the running test stack; make test-load",
+]
+addopts = "-m 'not isolation and not contract and not load'"
+
+[tool.ruff]
+# Mirrors nos-tromo/.github/configs/python-strict/ruff.toml. target-version
+# is the only key that may differ (workbench floors at py312). Drift fails CI.
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",
+    "I",
+    "B",
+    "D",
+    "ANN",
+    "UP",
+    "RUF",
+]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pyrefly]
+# Mirrors nos-tromo/.github/configs/python-strict/pyrefly.toml. Drift fails CI.
+preset = "strict"
+ignore-missing-imports = ["*"]
+
+[tool.uv]
+package = true
+# Security fixes are exempt from the 7-day cooldown. soupsieve comes with
+# beautifulsoup4: 4.1 fixes GHSA-f3mv-fm3p-593v, 4.1.1 GHSA-98qm-p6jx-5wj2.
+constraint-dependencies = ["soupsieve>=4.1.1"]

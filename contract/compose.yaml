@@ -1,0 +1,129 @@
+### The contract stack (make test-contract): workbench's test stack and the Open WebUI image open-webui-service
+### deploys, connected as one terminal server, for tests/contract.
+###
+### A project of its own (workbench-contract): workbench's services come from docker/compose.yaml with
+### docker/compose.test.yaml and contract/workbench.override.yaml on top, through `include`; the override names a data
+### volume and a network for this project, so neither a developer's stack nor the isolation stack is touched. This
+### file only adds services and redefines nothing it includes (Compose refuses that). Open WebUI keeps its state in a
+### tmpfs that dies with its container, and `down -v` removes the rest. The caller key and Open WebUI's forwarding
+### secret are made per run by make test-contract; the accounts the tests sign up are synthetic.
+###
+### Open WebUI runs without edge-guard, straight on the test's network, with the switches of its production
+### environment that bear on the contract (open-webui-service docker/compose.yaml). It reaches workbench by its
+### alias, workbench-api. Its one model is stub-model (contract/stub_model.py, test-only), so a chat can run its own
+### tool calls. This stack pulls the Open WebUI image: a test for CI and a developer's machine, never for the
+### airgapped host.
+
+name: workbench-contract
+
+include:
+  - path:
+      - ../docker/compose.yaml
+      - ../docker/compose.test.yaml
+      - workbench.override.yaml
+
+services:
+  open-webui:
+    # This repo pins the image here and nowhere else (its tests check only that it is a tag and a digest). It must
+    # stay what open-webui-service's docker/compose.yaml pins, which production runs. Dependabot bumps this copy on
+    # its own (.github/dependabot.yml, directory /contract): merge such a bump only with the same bump there. A bump
+    # that changes the terminal contract fails make test-contract.
+    image: ghcr.io/open-webui/open-webui:v0.13.3@sha256:46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      # Users, chats, the database and the session key, for this container's life only.
+      - /app/backend/data:size=256m,uid=10001,gid=10001,mode=0700
+    environment:
+      HOME: /tmp
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
+      # The terminal server: one bearer connection to workbench, chat attachments uploaded into it, every user.
+      ENABLE_TOOL_SERVERS: "true"
+      TERMINAL_SERVER_CONNECTIONS: >-
+        [{"id": "workbench", "name": "Workbench", "enabled": true,
+        "url": "http://workbench-api:8000", "path": "/openapi.json",
+        "key": "${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}", "auth_type": "bearer",
+        "config": {"chat_uploads": "filesystem",
+        "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}}]
+      # As in production: .env, not the admin UI, is the configuration.
+      ENABLE_PERSISTENT_CONFIG: "false"
+      # As in production: one audit record per request, GETs included, on stdout; the terminal proxy is left out
+      # (its URLs carry file names), and workbench records those accesses itself.
+      AUDIT_LOG_LEVEL: METADATA
+      ENABLE_AUDIT_STDOUT: "true"
+      ENABLE_AUDIT_LOGS_FILE: "false"
+      ENABLE_AUDIT_GET_REQUESTS: "true"
+      AUDIT_EXCLUDED_PATHS: /terminals
+      # As in production: no code runs inside Open WebUI. The terminal server must work with these off.
+      ENABLE_TOOLS: "false"
+      ENABLE_FUNCTIONS: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_CODE_EXECUTION: "false"
+      # As in production with its forwarding secret set: calls to model endpoints carry a signed user token.
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      FORWARD_USER_INFO_HEADER_JWT_SECRET: ${WORKBENCH_CONTRACT_JWT_SECRET:?make test-contract sets it}
+      # As in production: every account after the first (the admin) is active at once.
+      DEFAULT_USER_ROLE: user
+      # One provider, as in production: an OpenAI-compatible endpoint, here the stub model. Nothing is fetched: no
+      # second provider, no local model, no update check.
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://stub-model:9000/v1
+      OPENAI_API_KEY: synthetic-stub-key-not-a-secret
+      ENABLE_OLLAMA_API: "false"
+      RAG_EMBEDDING_ENGINE: openai
+      AUDIO_STT_ENGINE: openai
+      OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    networks:
+      - workbench-net
+    ports:
+      - "127.0.0.1:18180:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+      stub-model:
+        condition: service_healthy
+    healthcheck:
+      # The image's own probe (/health), tried every 3 s while it starts so that `up --wait` returns soon after.
+      start_period: 300s
+      start_interval: 3s
+    restart: "no"
+
+  stub-model:
+    # Test-only: the stand-in model Open WebUI calls (contract/stub_model.py), standard library only, in the api's
+    # test image, so nothing is pulled. Hardened as the other services; on the test's network only, no port.
+    image: workbench-api:test
+    # The api's image, which the api service builds; never pulled.
+    pull_policy: never
+    command: ["python", "/stub/stub_model.py"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m
+    volumes:
+      - ./stub_model.py:/stub/stub_model.py:ro
+    networks:
+      - workbench-net
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://localhost:9000/v1/models', timeout=4).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    restart: "no"
