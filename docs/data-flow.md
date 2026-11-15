@@ -20,6 +20,14 @@ record of processing and the impact assessment.
   `POST /files/upload`. With the connection's `chat_uploads: filesystem`, Open
   WebUI stores nothing of it and builds no vectors.
   workbench streams it to disk (`workbench/api/store.py:Store.add_upload`).
+  This is the path of a chat that has Workbench selected as its terminal. From
+  open-webui-service v0.14.0, an attachment in a chat without it goes to Open
+  WebUI's own file routes, which its edge-guard refuses with `403` for every
+  account. A temporary chat is the exception: there the browser extracts the
+  text of a PDF or text file itself, or keeps a pasted image as a data URL, and
+  sends it to the model inline with the message, like pasted text. It does not
+  pass workbench, which records nothing of it (see
+  open-webui-service's `CLAUDE.md`, § Workbench).
 - **Tool arguments the model writes** (`workbench/api/tools*.py`). They reach
   the executor in the job's request. What becomes of them:
   - paths, search queries and Python code end with the job: workbench keeps
@@ -126,18 +134,22 @@ operator's.
 - **Metrics.** `GET /metrics` gives queue lengths, waits, job durations,
   refusals by reason and disk use; no user id, chat id or file name
   (`workbench/api/metrics.py`).
-- **Open WebUI's own access log carries file names.** Open WebUI's server logs
-  every request it serves, the proxied terminal URLs with their query strings
-  among them (`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`).
-  So file names reach that container's standard output and, from there,
-  obs-plane, and obs-plane's log retention applies to those lines. Open WebUI's
-  audit records need not carry them: `AUDIT_EXCLUDED_PATHS=/terminals` keeps
-  the proxy out of them, and must be set in open-webui-service when its
-  workbench connection is added (its `main` sets it empty today). The contract
-  test runs its own Open WebUI with that setting and checks it
-  ([audit.md](audit.md#the-open-webui-side)). The access log is a current fact.
-  workbench cannot change it, since those paths are Open WebUI's protocol; the
-  fix belongs in open-webui-service or obs-plane.
+- **Open WebUI's logs and the file names.** Open WebUI proxies the file
+  browser's calls, and their URLs carry file names in their query strings
+  (`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`). From
+  open-webui-service v0.14.0 neither request log of Open WebUI prints them: its
+  audit records skip the terminal proxy (`AUDIT_EXCLUDED_PATHS: "/terminals"`),
+  and uvicorn's access log is off (`--no-access-log` together with
+  `AUDIT_UVICORN_LOGGER_NAMES: ""`, both needed;
+  [audit.md](audit.md#the-open-webui-side)). Still logging there: the audit
+  records of Open WebUI's other routes, its application log (the proxy's errors
+  name host and port, not the path), and the log of the edge-guard in front of
+  it, which writes the decoded path without the query. The contract test runs
+  its own Open WebUI with the audit setting and checks it; it does not check
+  open-webui-service's values. workbench cannot change any of this, since those
+  paths are Open WebUI's protocol; it belongs to open-webui-service. What the
+  gateway logs is edge-plane's: its access log cuts the query string from the
+  URI (`caddy/Caddyfile` there).
 
 workbench itself sends nothing outside the host: the executor has no network,
 and the api calls no model and no other service. What leaves the federation
@@ -166,7 +178,9 @@ in the files they upload or in the values the model writes.
   operator configured behind it: tool results enter the model's context. When
   that model is run by an outside provider, they leave the host and the
   federation to that provider. What Open WebUI does with an answer (the chat
-  history, the model call) is its own processing, recorded there;
+  history, the model call) is its own processing, recorded there. An attachment
+  in a temporary chat takes the same way to the model, inline with the message,
+  without passing workbench, which records nothing of it;
 - to obs-plane: the audit events (account id, chat id, file ids, times, counts)
   into its audit store, and the containers' log lines into its log store.
   Metrics hold no personal data.
@@ -210,5 +224,7 @@ retention.
   WebUI's chat history keeps tool results for longer;
 - whether the retention periods (workbench's, Open WebUI's, the audit store's)
   fit the rules that apply;
-- what to do about Open WebUI's access log carrying file names, until it is
-  changed.
+- whether temporary chats stay available in Open WebUI, where an attachment
+  goes to the model without passing workbench
+  (`USER_PERMISSIONS_CHAT_TEMPORARY`, which open-webui-service leaves at Open
+  WebUI's default, on).

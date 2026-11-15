@@ -196,16 +196,21 @@ URL. The file browser's URLs carry file names in their query strings
 (`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`).
 `AUDIT_EXCLUDED_PATHS=/terminals`, which Open WebUI matches as a prefix of
 `/api/v1/terminals`, keeps those URLs out of its audit records; workbench
-records those accesses itself, by file id. open-webui-service must set it when
-its workbench connection is added: its `main` sets the variable empty today, and
-without the setting Open WebUI's audit records would carry the file names. The
-contract test runs its own Open WebUI with the setting and checks that no record
-names an uploaded file
+records those accesses itself, by file id. From open-webui-service v0.14.0 its
+`docker/compose.yaml` sets `AUDIT_EXCLUDED_PATHS: "/terminals"`; without the
+setting, Open WebUI's audit records would carry the file names. The contract
+test runs its own Open WebUI with the setting and checks that no record names
+an uploaded file
 (`tests/contract/test_open_webui_contract.py:test_open_webui_audit_skips_the_terminal_proxy`);
 it does not check open-webui-service's value.
 
-Open WebUI's access log is a separate stream and still carries those URLs (see
-[data-flow.md](data-flow.md#what-leaves)).
+From the same version, uvicorn's access log, which would print those URLs with
+their query strings, is off as well: `--no-access-log` in compose's `command:`,
+together with `AUDIT_UVICORN_LOGGER_NAMES: ""`, which keeps Open WebUI from
+attaching a handler to uvicorn's access logger again at start-up. Each setting
+alone leaves the access lines, so both are needed (open-webui-service's
+`CLAUDE.md`, § Workbench). See [data-flow.md](data-flow.md#what-leaves) for what
+still logs there.
 
 ## Fail closed
 
