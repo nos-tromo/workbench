@@ -70,6 +70,10 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   (4 by default). A user past it gets `503` at once, and the other users are not
   affected: one user cannot fill every waiting place.
 - An executor with no free slot, or one the api cannot reach, is a `503` too.
+- So is a job the executor stopped because the container held more than
+  64 MiB of shared memory that no job's count showed (`hidden_memory`): it
+  stops every running job then, the innocent with the rest
+  ([sandbox.md](sandbox.md#limits)). Nothing was wrong with the call; retry.
 - A job's code gets 9/10 of `WORKBENCH_JOB_WALL_S` for `run_python` and 3/4 for
   the other tools, before the wall time stops it (see
   [sandbox.md](sandbox.md#limits)).
@@ -136,6 +140,11 @@ The formulas, for other slot counts or job memory:
   host's number of CPUs. On a host with fewer than 4 CPUs, set
   `WORKBENCH_EXECUTOR_CPUS` to the host's number or less. CI does so on small
   runners.
+- **cgroup v2:** the executor needs a cgroup namespace of its own and a
+  `memory.stat` that gives `shmem` (Docker's default on cgroup v2). A host on
+  cgroup v1, `cgroupns: host`, or a rootless daemon without the memory
+  controller delegated cannot run it: it refuses to start
+  ([sandbox.md](sandbox.md#what-the-supervisor-checks-before-it-starts)).
 - **Free space on the volume:** not a setting. The executor keeps 1 GiB free
   on the filesystem that holds `workbench-data`, or 5 % of that filesystem where
   that is more: below it, every running job is stopped and no job starts, and

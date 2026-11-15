@@ -155,8 +155,14 @@ writing is shared memory too, filled by reading its pages as much as by
 writing them; opened read-only, it holds nothing, however many pages are read.
 Measured in the executor image as slot 20001: a 200 MB read-only shared map,
 every page read, adds 0 bytes to the container's `shmem` (`memory.stat`) and
-to the process's `RssShmem`; the same map opened for writing adds 200 MB, read
-or written (`test_supervisor.py::test_as_root_a_read_only_shared_map_of_dev_zero_holds_no_memory`).
+to the process's `RssShmem`
+(`test_supervisor.py::test_as_root_a_read_only_shared_map_of_dev_zero_holds_no_memory`,
+with a SysV segment of the same size, read, as the control that both counters
+see). The same map opened for writing and filled by reads alone holds its
+pages: the watchdog's check below stops a job that does so
+(`::test_as_root_shared_memory_a_job_hides_where_dev_zero_stays_writable_stops_it`).
+Filled by writes, it adds 200 MB too, as measured by hand for the follow-up's
+report, not by a test.
 Under Docker's usual set-up `/dev` is the container's own tmpfs and root owns
 the node, so the change needs no capability. Under a user-namespaced daemon
 (userns-remap, rootless Docker) the node is the host's, bind-mounted and owned
@@ -227,9 +233,13 @@ neither `home/` nor `out/`, and the supervisor cannot see it without
 floor keeps that room for the api, its uploads and its database.
 
 With slots, each pass then asks the container's cgroup for its shared memory
-(`memory.stat` `shmem`, cgroup v2) and takes off what every tmpfs mount holds
-(`statvfs` of each: `/tmp`, `/dev/shm`, `/dev`) and every SysV segment, once
-(`sandbox.py:unattributed_shmem`). What is left is shared anonymous memory or a
+(`memory.stat` `shmem`, cgroup v2) and takes off what the executor's own tmpfs
+mounts hold (`statvfs` of `/tmp`, `/dev/shm` and `/dev`, which are root's, and
+of the data volume should it be a tmpfs) and every SysV segment, once
+(`sandbox.py:unattributed_shmem`). Any other tmpfs mount is not taken off: its
+files could be another container's. On a tmpfs data volume, a job's removed
+but mapped files there are taken off as the volume's, so only the free-space
+floor bounds them, as on a disk volume. What is left is shared anonymous memory or a
 shared map of `/dev/zero`, which no resident set need show: a process can fill
 one, leave it to a child and unmap it, or keep it mapped, where the job's own
 sum leaves it out (`VmRSS` minus `RssShmem`). The supervisor holds none: an
@@ -327,8 +337,14 @@ Then it makes two changes to its own container (`supervisor.py:prepare_host`):
 its soft limit of open files goes up to the hard one, which must hold
 slots × 258 + 256 descriptors, or it does not start; and `/dev/zero` is closed
 to others' writes (`0644`) where it can be, which never stops it (above). Last,
-the container's cgroup must give its shared memory (`memory.stat` `shmem`,
-cgroup v2), which the watchdog bounds.
+the supervisor must be in a cgroup namespace of its own (`/proc/self/cgroup`
+reads `0::/`), so that `/sys/fs/cgroup` is the container's cgroup and not the
+host's, and that cgroup must give its shared memory (`memory.stat` `shmem`),
+which the watchdog bounds. Both need cgroup v2, where Docker gives each
+container a cgroup namespace of its own by default. **A host on cgroup v1, a
+daemon run with `cgroupns: host`, or a rootless daemon without the memory
+controller delegated to it cannot run the executor**: it refuses to start
+there.
 
 Compose sets the container up this way. `seccomp=unconfined`, a missing
 `no-new-privileges` or Docker's default `/dev/shm` make it refuse.
@@ -412,12 +428,17 @@ Each of these is accepted. Each says what it would take.
   set (a file it maps from its own folders counts as that file's disk). They
   are bounded by the job's other limits (processes, open files, file size, its
   folders' disk and entries) and by the container's memory limit, whose cgroup
-  counts them (`memory.stat`: `pagetables`, `sock`, `kernel`, `file`). The OOM
-  score does not hold them to the job that caused them: when the container runs
-  out, the kernel stops the score-1000 process with the most resident memory,
-  which can be another user's job. That is a denial of service against
-  concurrent jobs, the same class as the others here, and it reaches no
-  user's files. A process's resident set
+  counts page tables (`pagetables`) and the page cache (`file`). Socket-pair
+  buffers, up to about `net.core.wmem_default` (208 KiB) per socket end within
+  the job's descriptor limits, were measured as charged to the container's
+  cgroup, as `kernel` and not as `sock`: 333 MB queued in 1500 Unix socket
+  pairs raised `memory.current` by 348 MB (kernel 7.0.14, aarch64, by hand for
+  the follow-up's report). A kernel that does not charge them leaves them held
+  by no cgroup. The OOM score does not hold any of this to the job that caused
+  it: when the container runs out, the kernel stops the score-1000 process with
+  the most resident memory, which can be another user's job. That is a denial
+  of service against concurrent jobs, the same class as the others here, and
+  it reaches no user's files. A process's resident set
   counts pages it shares with its forked children once in each, which can stop
   a job early, never late.
 - **A SysV segment handed between two running jobs.** A segment counts against

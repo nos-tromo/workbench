@@ -595,24 +595,37 @@ def _unescape(field: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
 
 
-def tmpfs_used(mountinfo: Path) -> int:
-    """Add up what every tmpfs mount of the process's mount namespace holds.
+#: The executor's own tmpfs mounts, root's alone (compose's ``/tmp`` and ``/dev/shm``, Docker's ``/dev``).
+ROOT_TMPFS = ("/tmp", "/dev/shm", "/dev")
+
+
+def tmpfs_used(mountinfo: Path, data_dir: Path | None = None) -> int:
+    """Add up what the executor's own tmpfs mounts hold: ``ROOT_TMPFS``, and the data volume where it is a tmpfs.
+
+    Any other tmpfs mount is left out: what it holds is no job's to subtract (another container's files on a shared
+    tmpfs are charged to that container), so it stays in what no job's count shows.
 
     Args:
         mountinfo: The process's mount table, ``/proc/self/mountinfo``.
+        data_dir: The data volume; its mount is known by its device, as ``stat`` gives it.
 
     Returns:
         Bytes in use (``statvfs``), files that are removed but still open included.
 
     Raises:
-        OSError: The table or a mount cannot be read.
+        OSError: The table, the volume or a mount cannot be read.
     """
+    volume = None if data_dir is None else os.stat(data_dir).st_dev
     total = 0
     for line in mountinfo.read_text(encoding="utf-8", errors="replace").splitlines():
         fields, _, rest = line.partition(" - ")
         mount = fields.split()
-        if len(mount) >= 5 and rest.split()[:1] == ["tmpfs"]:
-            st = os.statvfs(_unescape(mount[4]))
+        if len(mount) < 5 or rest.split()[:1] != ["tmpfs"]:
+            continue
+        point = _unescape(mount[4])
+        major, _, minor = mount[2].partition(":")
+        if point in ROOT_TMPFS or (volume is not None and os.makedev(int(major), int(minor)) == volume):
+            st = os.statvfs(point)
             total += (st.f_blocks - st.f_bfree) * st.f_frsize
     return total
 
@@ -660,12 +673,17 @@ def sysv_resident(proc: Path = Path("/proc")) -> int:
 
 
 def unattributed_shmem(
-    *, memory_stat: Path = MEMORY_STAT, mountinfo: Path = Path("/proc/self/mountinfo"), proc: Path = Path("/proc")
+    *,
+    data_dir: Path | None = None,
+    memory_stat: Path = MEMORY_STAT,
+    mountinfo: Path = Path("/proc/self/mountinfo"),
+    proc: Path = Path("/proc"),
 ) -> int:
     """Find the shared memory of the container that no job's count shows.
 
-    The container's shared memory (``shmem_charged``) less what the tmpfs mounts hold (``tmpfs_used``) and every SysV
-    segment (``sysv_resident``, which the slots' sums count by their maker). What is left is shared anonymous memory
+    The container's shared memory (``shmem_charged``) less what the executor's own tmpfs mounts hold (``tmpfs_used``:
+    ``/tmp``, ``/dev/shm``, ``/dev`` and a tmpfs data volume) and every SysV segment (``sysv_resident``, which the
+    slots' sums count by their maker). What is left is shared anonymous memory
     or a shared map of ``/dev/zero``, which no resident set need show: a process can fill one, leave it mapped in a
     child and unmap it itself. The jobs' seccomp filter refuses the first and the supervisor closes ``/dev/zero``
     where it can, so a job holds such memory only where they do not hold; the supervisor holds none. The cgroup is
@@ -673,6 +691,7 @@ def unattributed_shmem(
     left, and what comes is at worst missed for one pass.
 
     Args:
+        data_dir: The data volume, whose files, where it is a tmpfs, the folder walk and the floor bound instead.
         memory_stat: The cgroup's ``memory.stat``.
         mountinfo: The mount table.
         proc: The ``/proc`` to read.
@@ -686,7 +705,7 @@ def unattributed_shmem(
         ValueError: A part has an unexpected shape.
     """
     first = shmem_charged(memory_stat)
-    counted = tmpfs_used(mountinfo) + sysv_resident(proc)
+    counted = tmpfs_used(mountinfo, data_dir) + sysv_resident(proc)
     second = shmem_charged(memory_stat)
     return max(0, min(first, second) - counted)
 

@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import types
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -102,6 +103,17 @@ def _room_on_the_volume() -> Iterator[None]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(supervisor, "free_space_floor", lambda size: 0)
         yield
+
+
+#: A data volume no test of a watchdog's pass reads.
+NOWHERE = Path("/nowhere")
+
+
+def _own_cgroup(tmp_path: Path) -> Path:
+    """A ``/proc/self/cgroup`` of a process in a cgroup namespace of its own, cgroup v2."""
+    path = tmp_path / "own-cgroup"
+    path.write_text("0::/\n")
+    return path
 
 
 class _Above:
@@ -2601,10 +2613,10 @@ def test_one_pass_reads_proc_once_for_every_slot_and_hands_each_job_its_own_use(
         return {uid: SlotUse(memory=uid) for uid in uids}
 
     monkeypatch.setattr(supervisor, "slots_use", use_of)
-    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda: 0)
+    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda data_dir: 0)
     first, second, third = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB"), _Judged(2, None)
 
-    verdicts = supervisor._Watchdog(_Above()).check([first, second, third])  # type: ignore[list-item]
+    verdicts = supervisor._Watchdog(_Above(), NOWHERE).check([first, second, third])  # type: ignore[list-item]
 
     assert looks == [{20001, 20002}]
     assert (first.seen, second.seen, third.seen) == ([SlotUse(memory=20001)], [SlotUse(memory=20002)], [None])
@@ -2620,9 +2632,9 @@ def test_a_pass_that_cannot_read_proc_stops_every_job(
         raise _unexpected()
 
     one, two = _Judged(0, 20001), _Judged(1, 20002, error=_unexpected())
-    watchdog = supervisor._Watchdog(_Above())  # type: ignore[arg-type]
+    watchdog = supervisor._Watchdog(_Above(), NOWHERE)  # type: ignore[arg-type]
     monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
-    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda: 0)
+    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda data_dir: 0)
     with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
         assert watchdog.check([one, two]) == [(two, supervisor.UNMEASURED)]  # type: ignore[list-item]
         monkeypatch.setattr(supervisor, "slots_use", broken)
@@ -2679,6 +2691,41 @@ async def test_a_watchdog_that_dies_stops_its_jobs_and_the_next_job_is_watched_b
     assert len(passes) >= 2
 
 
+async def test_an_error_in_the_dying_watchdogs_handler_leaves_no_job_it_took_unwatched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R89: the stops go out before the log line, each on its own; neither a failing post nor log stops them."""
+    loop = asyncio.get_running_loop()
+
+    class ClosedLoop:
+        def call_soon_threadsafe(self, *args: Any) -> None:
+            raise ValueError("synthetic: this post fails")
+
+    first = types.SimpleNamespace(loop=ClosedLoop(), stop=loop.create_future())
+    second = types.SimpleNamespace(loop=loop, stop=loop.create_future())
+    watchdog = supervisor._Watchdog(_Above(), NOWHERE, interval_s=0.01)  # type: ignore[arg-type]
+    watchdog._watches = [first, second]  # type: ignore[list-item]
+
+    def dies(self: Any, watches: list[Any]) -> list[tuple[Any, str]]:
+        raise MemoryError
+
+    def no_log(*args: Any, **kwargs: Any) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(supervisor._Watchdog, "check", dies)
+    monkeypatch.setattr(supervisor._log, "error", no_log)
+    thread = threading.Thread(target=watchdog._run)
+    thread.start()
+    try:
+        await until(second.stop.done, seconds=scaled(5))
+    finally:
+        thread.join(scaled(5))
+
+    assert second.stop.result() == supervisor.UNMEASURED
+    assert not thread.is_alive()
+    assert (watchdog._thread, watchdog._watches) == (None, [])
+
+
 async def test_a_job_whose_watchdog_cannot_start_never_runs_and_the_next_job_starts_one(
     volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2723,14 +2770,15 @@ def test_shared_memory_outside_every_jobs_count_stops_every_job(
     hidden = {"bytes": supervisor.SHMEM_MARGIN + 1}
     looks: list[int] = []
 
-    def unattributed() -> int:
+    def unattributed(data_dir: Path) -> int:
+        assert data_dir == NOWHERE
         looks.append(hidden["bytes"])
         return hidden["bytes"]
 
     monkeypatch.setattr(supervisor, "unattributed_shmem", unattributed)
     monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
     one, two = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB")
-    watchdog = supervisor._Watchdog(_Above())  # type: ignore[arg-type]
+    watchdog = supervisor._Watchdog(_Above(), NOWHERE)  # type: ignore[arg-type]
 
     with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
         assert watchdog.check([one, two]) == [(one, supervisor.HIDDEN), (two, supervisor.HIDDEN)]  # type: ignore[list-item]
@@ -2767,13 +2815,45 @@ def test_a_container_whose_shared_memory_cannot_be_read_does_not_start(
     good, bad = tmp_path / "good.stat", tmp_path / "bad.stat"
     good.write_text("anon 1\nshmem 0\n")
     bad.write_text("anon 1\n")
+    own = _own_cgroup(tmp_path)
     settings = _settings(Path("/nowhere"))
 
-    assert supervisor.prepare_host(settings, memory_stat=good) is None
+    assert supervisor.prepare_host(settings, memory_stat=good, self_cgroup=own) is None
     for memory_stat in (bad, tmp_path / "absent"):
-        assert supervisor.prepare_host(settings, memory_stat=memory_stat) == (
+        assert supervisor.prepare_host(settings, memory_stat=memory_stat, self_cgroup=own) == (
             "the container's memory.stat (cgroup v2) must give its shared memory, so the watchdog can bound it"
         )
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["0::/system.slice/docker-0123.scope\n", "12:memory:/docker/0123\n0::/\n", ""],
+    ids=["host-namespace", "cgroup-v1", "empty"],
+)
+def test_a_supervisor_outside_a_cgroup_namespace_of_its_own_does_not_start(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R91: under ``cgroupns=host`` (or cgroup v1) ``/sys/fs/cgroup`` is not the container's: refused at start."""
+    limits = _Limits(8192, 8192)
+    monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
+    monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
+    monkeypatch.setattr(supervisor, "_close_dev_zero", lambda path: True)
+    good = tmp_path / "good.stat"
+    good.write_text("shmem 0\n")
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text(content)
+
+    for self_cgroup in (cgroup, tmp_path / "absent"):
+        assert supervisor.prepare_host(_settings(Path("/nowhere")), memory_stat=good, self_cgroup=self_cgroup) == (
+            "the supervisor must be in a cgroup namespace of its own (cgroup v2), so it reads the container's memory"
+        )
+
+
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own cgroup, as root")
+def test_as_root_the_container_has_a_cgroup_namespace_and_memory_stat_of_its_own() -> None:
+    """R91: what ``prepare_host`` requires holds in the container the root tests run in, as in compose's."""
+    assert Path("/proc/self/cgroup").read_text().strip() == "0::/"
+    assert supervisor.shmem_charged(supervisor.MEMORY_STAT) >= 0
 
 
 async def test_a_watch_judges_its_slots_memory_and_score_before_its_folders(tmp_path: Path) -> None:
@@ -3585,8 +3665,9 @@ def test_a_dev_zero_that_cannot_be_closed_never_stops_the_supervisor(
     monkeypatch.setattr(supervisor.os, "chmod", refuse)
     memory_stat = tmp_path / "memory.stat"
     memory_stat.write_text("shmem 0\n")
+    own = _own_cgroup(tmp_path)
 
-    assert supervisor.prepare_host(_settings(Path("/nowhere")), memory_stat=memory_stat) is None
+    assert supervisor.prepare_host(_settings(Path("/nowhere")), memory_stat=memory_stat, self_cgroup=own) is None
 
 
 @pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev, as root")

@@ -138,6 +138,7 @@ _SHM = Path("/dev/shm")
 _SHARED_TMP = Path("/tmp")
 _STATUS = Path("/proc/self/status")
 _DEV_ZERO = Path("/dev/zero")
+_SELF_CGROUP = Path("/proc/self/cgroup")
 _QUEUES_MAX = Path("mqueue/queues_max")  # below /proc/sys/fs
 _CLOSE_GRACE_S = 5.0  # for the answer to the request that retired the last slot
 # Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
@@ -777,14 +778,16 @@ class _Watchdog:
     thread runs while there are jobs to watch, and ends when there are none.
     """
 
-    def __init__(self, floor: _Floor, interval_s: float = WATCH_INTERVAL_S) -> None:
+    def __init__(self, floor: _Floor, data_dir: Path, interval_s: float = WATCH_INTERVAL_S) -> None:
         """Watch nothing yet.
 
         Args:
             floor: The data volume's free-space floor, asked first in every pass.
+            data_dir: The data volume; where it is a tmpfs, what it holds is no job's hidden memory.
             interval_s: Seconds between two passes.
         """
         self._floor = floor
+        self._data_dir = data_dir
         self._interval = interval_s
         self._lock = threading.Lock()
         self._watches: list[_Watch] = []
@@ -850,14 +853,16 @@ class _Watchdog:
                 watches = self._watches
                 self._watches = []
                 self._thread = None
-            _log.error(
-                "the watchdog stopped (%s); stopping the %d job%s it watched",
-                type(exc).__name__,
-                len(watches),
-                _s(len(watches)),
-            )
-            for watch in watches:
-                _post(watch, UNMEASURED)
+            for watch in watches:  # first, each on its own: no error here leaves a job it took unwatched
+                with contextlib.suppress(BaseException):
+                    _post(watch, UNMEASURED)
+            with contextlib.suppress(BaseException):
+                _log.error(
+                    "the watchdog stopped (%s); stopping the %d job%s it watched",
+                    type(exc).__name__,
+                    len(watches),
+                    _s(len(watches)),
+                )
 
     def check(self, watches: list[_Watch]) -> list[tuple[_Watch, str]]:
         """One pass: judge every job, failing closed.
@@ -880,7 +885,7 @@ class _Watchdog:
         uids = {watch.uid for watch in watches if watch.uid is not None}
         if uids:
             try:
-                hidden = unattributed_shmem()
+                hidden = unattributed_shmem(data_dir=self._data_dir)
             except Exception as exc:
                 _log.error("the watchdog could not read the container's shared memory (%s)", type(exc).__name__)
                 return [(watch, UNMEASURED) for watch in watches]
@@ -960,7 +965,7 @@ class Supervisor:
         self._cleanup_pool = ThreadPoolExecutor(max_workers=settings.executor_slots, thread_name_prefix="slot-cleanup")
         self._sockets = seccomp.for_this_machine()
         self._floor = _Floor(settings.data_dir)
-        self._watchdog = _Watchdog(self._floor)
+        self._watchdog = _Watchdog(self._floor, settings.data_dir)
         # Job folders whose removal failed; serve() tries them again every LEFTOVER_RETRY_S. Removals add to it in
         # worker threads while the retry reads it in another, so both hold the lock.
         self._leftovers: set[str] = set()
@@ -1791,17 +1796,22 @@ def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0, mountinfo: Path = 
     return True
 
 
-def prepare_host(settings: Settings, *, memory_stat: Path = MEMORY_STAT) -> str | None:
+def prepare_host(
+    settings: Settings, *, memory_stat: Path = MEMORY_STAT, self_cgroup: Path = _SELF_CGROUP
+) -> str | None:
     """Make the changes the supervisor needs in its container before it serves, and check what it cannot do without.
 
     ``/dev/zero`` is closed to others' writes where it can be (``_close_dev_zero``; best effort, never a reason to
     stop). The soft limit of open files goes up to the hard one, which must hold what the slots need
     (``_open_files_problem``). The cgroup's ``memory.stat`` must give its shared memory: the watchdog bounds what no
-    job's count shows by it, on every host (``unattributed_shmem``).
+    job's count shows by it, on every host (``unattributed_shmem``). And the supervisor must be in a cgroup namespace
+    of its own (``/proc/self/cgroup`` reads ``0::/``), so that ``/sys/fs/cgroup`` is the container's cgroup and not the
+    host's: cgroup v2, which Docker gives each container by default.
 
     Args:
         settings: The executor's settings.
         memory_stat: The container cgroup's ``memory.stat``.
+        self_cgroup: The process's ``/proc/self/cgroup``.
 
     Returns:
         A short reason it must not start, or ``None``.
@@ -1810,6 +1820,12 @@ def prepare_host(settings: Settings, *, memory_stat: Path = MEMORY_STAT) -> str 
     problem = _open_files_problem(settings.executor_slots)
     if problem is not None:
         return problem
+    try:
+        own = self_cgroup.read_text(encoding="ascii").strip() == "0::/"
+    except (OSError, UnicodeDecodeError):
+        own = False
+    if not own:
+        return "the supervisor must be in a cgroup namespace of its own (cgroup v2), so it reads the container's memory"
     try:
         shmem_charged(memory_stat)
     except (OSError, KeyError, ValueError):

@@ -149,7 +149,10 @@ services:
     # unless the container is set up this way: root, the slot users in the
     # image, cgroup memory >= slots x job memory, /dev/shm and /tmp root's
     # alone, fs.mqueue.queues_max 0, a mounted /dev/mqueue and a seccomp
-    # filter (Docker's default profile; never seccomp=unconfined).
+    # filter (Docker's default profile; never seccomp=unconfined), open files
+    # enough for its slots, and cgroup v2 with a cgroup namespace of its own
+    # (never cgroupns: host) whose memory.stat gives shmem. It closes
+    # /dev/zero to the slots where it can, which never stops it.
     <<: *hardened
     image: workbench-executor:${WORKBENCH_VERSION:-latest}
     build:

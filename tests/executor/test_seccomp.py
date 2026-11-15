@@ -368,15 +368,17 @@ def test_a_slot_process_below_the_jobs_oom_score_is_found(tmp_path: Path) -> Non
 MIB = 1024 * 1024
 
 
-def _mounts(tmp_path: Path) -> Path:
-    """A mount table of two tmpfs mounts (one with an escaped space) and two of other types."""
+def _mounts(tmp_path: Path, volume: Path) -> Path:
+    """A mount table: compose's two tmpfs mounts, the volume as a tmpfs by its device, another tmpfs, two others."""
+    device = os.stat(volume).st_dev
     table = tmp_path / "mountinfo"
     table.write_text(
         "20 1 0:20 / / ro - overlay overlay ro\n"
         "21 20 0:21 / /tmp rw,nosuid master:1 - tmpfs tmpfs rw,size=16m\n"
         "22 20 0:22 / /dev/shm rw - tmpfs shm rw,size=1m\n"
-        "23 20 0:23 / /scratch\\040space rw - tmpfs tmpfs rw\n"
-        "24 20 98:0 / /data rw - ext4 /dev/vdb rw\n"
+        f"23 20 {os.major(device)}:{os.minor(device)} / /scratch\\040space rw - tmpfs tmpfs rw\n"
+        "24 20 0:24 / /elsewhere rw - tmpfs tmpfs rw\n"
+        "25 20 98:0 / /data rw - ext4 /dev/vdb rw\n"
     )
     return table
 
@@ -391,11 +393,15 @@ def _stat(text: str, tmp_path: Path) -> Path:
 def test_the_shared_memory_no_job_count_shows_is_the_cgroups_less_tmpfs_and_segments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R90: ``shmem`` of ``memory.stat`` less what every tmpfs mount holds and every SysV segment, each once.
+    """R90: ``shmem`` of ``memory.stat`` less what the executor's own tmpfs mounts hold and every SysV segment, once.
 
-    The ext4 and overlay mounts are not looked at; the escaped mount point is read as the path it names.
+    Its own: compose's ``/tmp`` and ``/dev/shm``, and the data volume where it is a tmpfs, known by its device. Another
+    tmpfs (``/elsewhere``) is not taken off: its files could be another container's. The ext4 and overlay mounts are
+    not looked at; the escaped mount point is read as the path it names.
     """
-    used = {"/tmp": 10 * MIB, "/dev/shm": 0, "/scratch space": 50 * MIB}
+    volume = tmp_path / "data"
+    volume.mkdir()
+    used = {"/tmp": 10 * MIB, "/dev/shm": 0, "/scratch space": 50 * MIB, "/elsewhere": 30 * MIB}
     asked: list[str] = []
 
     def statvfs(path: str) -> os.statvfs_result:
@@ -406,11 +412,14 @@ def test_the_shared_memory_no_job_count_shows_is_the_cgroups_less_tmpfs_and_segm
     monkeypatch.setattr(sandbox.os, "statvfs", statvfs)
     proc = _proc(tmp_path, [], _shm_row(1, 1, 20001, 20001, 100 * MIB, 0) + _shm_row(2, 0, 20002, 20002, 4096, 0))
     memory_stat = _stat(f"anon 999\nfile 999\nshmem {300 * MIB}\nsock 0\n", tmp_path)
+    mounts = _mounts(tmp_path, volume)
 
-    hidden = sandbox.unattributed_shmem(memory_stat=memory_stat, mountinfo=_mounts(tmp_path), proc=proc)
+    hidden = sandbox.unattributed_shmem(data_dir=volume, memory_stat=memory_stat, mountinfo=mounts, proc=proc)
+    without_volume = sandbox.unattributed_shmem(memory_stat=memory_stat, mountinfo=mounts, proc=proc)
 
     assert hidden == 300 * MIB - 60 * MIB - (100 * MIB + 4096)
-    assert asked == ["/tmp", "/dev/shm", "/scratch space"]
+    assert without_volume == hidden + 50 * MIB
+    assert asked == ["/tmp", "/dev/shm", "/scratch space", "/tmp", "/dev/shm"]
 
 
 def test_what_goes_while_the_parts_are_read_is_not_counted_as_hidden(
@@ -419,7 +428,7 @@ def test_what_goes_while_the_parts_are_read_is_not_counted_as_hidden(
     """The cgroup is read before and after the parts; the smaller value is used, and the result is never below 0."""
     readings = iter([500 * MIB, 200 * MIB])
     monkeypatch.setattr(sandbox, "shmem_charged", lambda memory_stat: next(readings))
-    monkeypatch.setattr(sandbox, "tmpfs_used", lambda mountinfo: 0)
+    monkeypatch.setattr(sandbox, "tmpfs_used", lambda mountinfo, data_dir: 0)
     monkeypatch.setattr(sandbox, "sysv_resident", lambda proc: 300 * MIB)
 
     assert sandbox.unattributed_shmem() == 0

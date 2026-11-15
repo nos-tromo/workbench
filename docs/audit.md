@@ -71,9 +71,10 @@ Every tool job whose answer reached the api is recorded, whatever the answer
 job did not end in an answer the api sends on: it refused, ran out of time or
 memory, failed, or answered something that could not be read or used. A refusal
 adds `refused: <code>`, the runner's fixed word (`no_such_part`,
-`invalid_template`, `invalid_value`, `bad_regex`…, or the executor's
-`storage_full` when the data volume is below its free-space floor), never its
-message. The
+`invalid_template`, `invalid_value`, `bad_regex`…, or one of the executor's
+own: `storage_full` when the data volume is below its free-space floor,
+`hidden_memory` when the container held shared memory no job's count showed
+and every running job was stopped), never its message. The
 message goes to the model and can quote the file: a workbook's sheet names, a
 template's line, a drop-down's entries, a source's sheets and range. Since it
 discloses content, it is recorded like a read. If the event cannot be written,
