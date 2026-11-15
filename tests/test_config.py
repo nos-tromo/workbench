@@ -8,6 +8,7 @@ import pytest
 from workbench.config import ConfigError, Settings, load_settings
 
 KEY = "k" * 32
+D = "d" * 32
 
 
 def test_defaults_match_the_spec() -> None:
@@ -22,6 +23,9 @@ def test_defaults_match_the_spec() -> None:
     assert s.slot_uid_base == 20001
     assert s.open_webui_key == KEY
     assert s.audit_output is None
+    assert s.docint_key is None
+    assert (s.docint_tools, s.docint_wall_s, s.docint_slots) == (frozenset({"run_python"}), 60, 2)
+    assert s.require_purpose == frozenset()
 
 
 def test_every_variable_is_read_by_its_exact_name() -> None:
@@ -44,6 +48,11 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
             "WORKBENCH_EXECUTOR_SOCKET": "/run/other/exec.sock",
             "WORKBENCH_SLOT_UID_BASE": "30001",
             "AUDIT_OUTPUT": "container",
+            "DOCINT_WORKBENCH_KEY": D,
+            "DOCINT_WORKBENCH_TOOLS": "run_python,search_files",
+            "DOCINT_WORKBENCH_WALL_S": "9",
+            "DOCINT_WORKBENCH_SLOTS": "1",
+            "AUDIT_REQUIRE_PURPOSE": "query",
         },
         role="api",
     )
@@ -64,6 +73,11 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
         executor_socket=Path("/run/other/exec.sock"),
         slot_uid_base=30001,
         audit_output="container",
+        docint_key=D,
+        docint_tools=frozenset({"run_python", "search_files"}),
+        docint_wall_s=9,
+        docint_slots=1,
+        require_purpose=frozenset({"query"}),
     )
 
 
@@ -115,14 +129,16 @@ def test_settings_are_frozen() -> None:
         s.executor_slots = 1  # type: ignore[misc]
 
 
-def test_api_requires_a_long_key() -> None:
-    """The api role refuses a missing key, an empty one and one of 31 characters."""
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
-        load_settings({}, role="api")
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
-        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": ""}, role="api")
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
-        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "k" * 31}, role="api")
+@pytest.mark.parametrize(
+    ("name", "field"), [("OPEN_WEBUI_WORKBENCH_KEY", "open_webui_key"), ("DOCINT_WORKBENCH_KEY", "docint_key")]
+)
+def test_api_requires_a_long_key(name: str, field: str) -> None:
+    """Whichever caller's it is, a key that is set has at least 32 characters, and the error names its variable."""
+    with pytest.raises(ConfigError, match=f"^{name} must"):
+        load_settings({name: "k" * 31}, role="api")
+    with pytest.raises(ConfigError, match=f"^{name} must"):
+        load_settings({name: "k" * 31 + "\n"}, role="api")
+    assert getattr(load_settings({name: KEY + "\n"}, role="api"), field) == KEY
 
 
 def test_the_key_is_stripped_before_the_length_check() -> None:
@@ -145,6 +161,93 @@ def test_executor_needs_no_key() -> None:
     """The executor role has no caller key, even when one is in its environment."""
     assert load_settings({}, role="executor").open_webui_key is None
     assert load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="executor").open_webui_key is None
+
+
+def test_either_key_alone_starts_the_api() -> None:
+    """Open WebUI's key is optional now: the api starts with either caller's key, and the other is ``None``."""
+    assert load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="api").docint_key is None
+    assert load_settings({"DOCINT_WORKBENCH_KEY": D}, role="api").open_webui_key is None
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},
+        {"OPEN_WEBUI_WORKBENCH_KEY": "  "},
+        {"DOCINT_WORKBENCH_KEY": "d" * 31},
+        {"OPEN_WEBUI_WORKBENCH_KEY": "k" * 31, "DOCINT_WORKBENCH_KEY": D},
+    ],
+)
+def test_no_usable_key_stops_the_api(env: dict[str, str]) -> None:
+    """No key, a blank one or a short one beside a good one: the api does not start, and no key is in the error."""
+    with pytest.raises(ConfigError) as refused:
+        load_settings(env, role="api")
+    assert [value for value in env.values() if value.strip() and value.strip() in str(refused.value)] == []
+
+
+def test_the_docint_defaults() -> None:
+    """With only docint's key set, it may run Python, for 60 seconds, two jobs at once; no action needs a purpose."""
+    s = load_settings({"DOCINT_WORKBENCH_KEY": D}, role="api")
+    assert (s.docint_tools, s.docint_wall_s, s.docint_slots, s.require_purpose) == (
+        frozenset({"run_python"}),
+        60,
+        2,
+        frozenset(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "named"),
+    [
+        ("DOCINT_WORKBENCH_WALL_S", "121", "DOCINT_WORKBENCH_WALL_S"),
+        ("DOCINT_WORKBENCH_WALL_S", "4", "DOCINT_WORKBENCH_WALL_S"),
+        ("DOCINT_WORKBENCH_SLOTS", "4", "DOCINT_WORKBENCH_SLOTS"),
+        ("WORKBENCH_EXECUTOR_SLOTS", "2", "DOCINT_WORKBENCH_SLOTS"),
+    ],
+)
+def test_the_docint_rules_stop_the_api_never_the_executor(name: str, value: str, named: str) -> None:
+    """The wall cap of docint's jobs is from 5 to the job wall, and docint leaves a slot free; not for the executor."""
+    env = {"DOCINT_WORKBENCH_KEY": D, name: value}
+    with pytest.raises(ConfigError, match=named):
+        load_settings(env, role="api")
+    assert load_settings(env, role="executor").docint_key is None
+
+
+def test_the_docint_rules_wait_for_its_key() -> None:
+    """Without docint's key, a host with two slots or a short job wall still starts its api."""
+    assert (
+        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, "WORKBENCH_EXECUTOR_SLOTS": "2"}, role="api").docint_key is None
+    )
+    assert load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, "WORKBENCH_JOB_WALL_S": "30"}, role="api").job_wall_s == 30
+
+
+def test_the_docint_limits_take_their_bounds() -> None:
+    """The bounds themselves are allowed: a wall cap of 5 or of the job wall, and one slot fewer than the executor's."""
+    env = {"DOCINT_WORKBENCH_KEY": D, "WORKBENCH_EXECUTOR_SLOTS": "3"}
+    assert load_settings({**env, "DOCINT_WORKBENCH_WALL_S": "5"}, role="api").docint_wall_s == 5
+    assert load_settings({**env, "DOCINT_WORKBENCH_WALL_S": "120"}, role="api").docint_wall_s == 120
+    assert load_settings(env, role="api").docint_slots == 2
+
+
+def test_the_tool_list_is_a_comma_list() -> None:
+    """Entries are stripped and blank ones dropped; a blank list means ``run_python``."""
+    env = {"DOCINT_WORKBENCH_KEY": D}
+    assert load_settings({**env, "DOCINT_WORKBENCH_TOOLS": " run_python , ,"}, role="api").docint_tools == frozenset(
+        {"run_python"}
+    )
+    assert load_settings({**env, "DOCINT_WORKBENCH_TOOLS": ""}, role="api").docint_tools == frozenset({"run_python"})
+
+
+def test_require_purpose_is_parsed_and_checked() -> None:
+    """The listed actions, lower-cased; a misspelt one stops the api, and the executor reads none."""
+    env = {"OPEN_WEBUI_WORKBENCH_KEY": KEY}
+    s = load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "query, Disclose,combine"}, role="api")
+    assert s.require_purpose == frozenset({"query", "disclose", "combine"})
+    with pytest.raises(ConfigError, match="AUDIT_REQUIRE_PURPOSE"):
+        load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "quiery"}, role="api")
+    with pytest.raises(ConfigError, match="AUDIT_REQUIRE_PURPOSE"):
+        load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "lifecycle"}, role="api")
+    assert load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "quiery"}, role="executor").require_purpose == frozenset()
 
 
 @pytest.mark.parametrize("name", ["WORKBENCH_EXECUTOR_SLOTS", "WORKBENCH_RETENTION_DAYS", "WORKBENCH_JOB_WALL_S"])

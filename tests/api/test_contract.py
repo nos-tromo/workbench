@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import KEY, unrecorded
+from tests.api.conftest import DOCINT_KEY, KEY, unrecorded
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import ALL_TOOLS, CallerRegistry, KeyGate
@@ -215,7 +215,7 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     assert client.get("/api/config", headers=KEY_ONLY).status_code == 200
-    assert seen == [(KEY.encode(), KEY.encode())] * 2
+    assert seen == [(KEY.encode(), KEY.encode()), (KEY.encode(), DOCINT_KEY.encode())] * 2
 
 
 def test_the_key_is_checked_before_the_user(client: TestClient) -> None:
@@ -463,8 +463,8 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
 
 def test_the_registry_needs_a_key(settings: Settings) -> None:
     """The executor's settings carry no key, and the api refuses to build a registry from them."""
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
-        CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None))
+    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY"):
+        CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None, docint_key=None))
 
 
 @pytest.mark.parametrize(

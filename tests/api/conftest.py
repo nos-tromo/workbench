@@ -19,6 +19,8 @@ from workbench.paths import Workspaces
 from workbench.utils.audit_event import AuditEmitter
 
 KEY = "k" * 32
+DOCINT_KEY = "d" * 32
+HD = {"Authorization": f"Bearer {DOCINT_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 
 
 def unrecorded(*_: object) -> None:
@@ -27,9 +29,13 @@ def unrecorded(*_: object) -> None:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """Settings for the api with the synthetic caller key, on a throwaway data volume."""
+    """Settings for the api with both synthetic caller keys, on a throwaway data volume."""
     return load_settings(
-        {"OPEN_WEBUI_WORKBENCH_KEY": KEY, "WORKBENCH_DATA_DIR": str(tmp_path / "data")},
+        {
+            "OPEN_WEBUI_WORKBENCH_KEY": KEY,
+            "DOCINT_WORKBENCH_KEY": DOCINT_KEY,
+            "WORKBENCH_DATA_DIR": str(tmp_path / "data"),
+        },
         role="api",
     )
 
