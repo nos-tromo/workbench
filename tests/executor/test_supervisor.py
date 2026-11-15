@@ -43,6 +43,8 @@ pytestmark = pytest.mark.anyio
 
 LINUX = sys.platform == "linux"
 ROOT_ON_LINUX = LINUX and os.geteuid() == 0
+#: Root in the executor image (its ``/workspace`` link), never a bare host: the tests that change ``/dev/zero`` need it.
+IN_THE_IMAGE = ROOT_ON_LINUX and Path("/workspace").is_symlink()
 ME = (os.getuid(), os.getgid())
 CALLER, USER, CHAT = "open-webui", "user-a", "chat-1"
 MB = 1024 * 1024
@@ -3042,16 +3044,80 @@ async def test_as_root_a_job_that_lowers_its_oom_score_is_stopped(
 
 @pytest.fixture
 def dev_zero_closed() -> Iterator[None]:
-    """``/dev/zero`` as the supervisor leaves it at start (``prepare_host``), and as it was after the test."""
+    """``/dev/zero`` as the supervisor leaves it at start (``prepare_host``), and as it was after the test.
+
+    Only in the executor image (``IN_THE_IMAGE``): its ``/dev`` is the container's own, never a host's.
+    """
+    assert IN_THE_IMAGE
     before = stat.S_IMODE(os.lstat("/dev/zero").st_mode)
-    assert supervisor._close_dev_zero() is None
+    assert supervisor._close_dev_zero()
     try:
         yield
     finally:
         os.chmod("/dev/zero", before)
 
 
-@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev/zero, as root")
+async def test_as_root_a_read_only_shared_map_of_dev_zero_holds_no_memory(
+    root_volume: Path, dev_zero_closed: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R88: with ``/dev/zero`` closed, a slot gets only a read-only descriptor; its shared map holds nothing when read.
+
+    Measured in the container's cgroup (``memory.stat`` ``shmem``) and the process's ``RssShmem``, while the map is
+    held. The same job fills a SysV segment of the same size by reading it, which both counters see: a shared map of
+    ``/dev/zero`` opened for writing would do the same (shmem allocates a page on a read fault too).
+    """
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import ctypes, mmap
+        size, page = 200 * 1024 * 1024, mmap.PAGESIZE
+        def shmem():
+            for line in open("/sys/fs/cgroup/memory.stat"):
+                key, value = line.split()
+                if key == "shmem":
+                    return int(value)
+        def rss_shmem():
+            for line in open("/proc/self/status"):
+                if line.startswith("RssShmem:"):
+                    return int(line.split()[1]) * 1024
+        def read_all(view):
+            return sum(view[at] for at in range(0, size, page))
+        try:
+            os.open("/dev/zero", os.O_RDWR)
+            writable = "ok"
+        except PermissionError:
+            writable = "denied"
+        fd = os.open("/dev/zero", os.O_RDONLY)
+        before = shmem()
+        zero = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+        read = read_all(zero)
+        held = (shmem() - before, rss_shmem())
+        zero.close()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+        libc.shmat.restype = ctypes.c_void_p
+        libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        before = shmem()
+        at = libc.shmat(libc.shmget(0, size, 0o1600), None, 0)
+        read_all((ctypes.c_ubyte * size).from_address(at))
+        segment = (shmem() - before, rss_shmem())
+        result = {"writable": writable, "read": read, "zero": held, "segment": segment}
+        """,
+    )
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_request())
+
+    assert answer.status == "ok", answer
+    mb = 1024 * 1024
+    (zero_shmem, zero_rss), (segment_shmem, segment_rss) = answer.result["zero"], answer.result["segment"]
+    assert (answer.result["writable"], answer.result["read"]) == ("denied", 0)
+    assert zero_shmem < 16 * mb and zero_rss < 16 * mb, answer.result
+    assert segment_shmem > 180 * mb and segment_rss > 180 * mb, answer.result
+
+
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev/zero, as root")
 async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
     root_volume: Path, dev_zero_closed: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3213,9 +3279,18 @@ def test_a_supervisor_that_may_open_too_few_files_for_its_slots_refuses_to_start
     monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
     need = slots * (supervisor.MAX_JOB_DEPTH + 2) + supervisor.NOFILE_MARGIN
 
+    monkeypatch.setattr(supervisor, "_close_dev_zero", lambda path: True)
+
     problem = supervisor.prepare_host(_settings(Path("/nowhere"), WORKBENCH_EXECUTOR_SLOTS=str(slots)))
 
     assert problem == f"the supervisor may open {hard} files, fewer than the {need} its {slots} slots need"
+
+
+def _mountinfo_of(tmp_path: Path, *points: str) -> Path:
+    """A ``/proc/self/mountinfo`` whose mounts are at ``points``."""
+    path = tmp_path / "mountinfo-of"
+    path.write_text("".join(f"{n} 1 0:{n} / {point} rw - tmpfs tmpfs rw\n" for n, point in enumerate(points, 20)))
+    return path
 
 
 def test_dev_zero_is_closed_to_others_writes_at_start(tmp_path: Path) -> None:
@@ -3223,39 +3298,71 @@ def test_dev_zero_is_closed_to_others_writes_at_start(tmp_path: Path) -> None:
     node = tmp_path / "zero"
     node.write_bytes(b"")
     node.chmod(0o666)
+    mounts = _mountinfo_of(tmp_path, "/", "/dev")
 
-    assert supervisor._close_dev_zero(node, root=ME[0]) is None
+    assert supervisor._close_dev_zero(node, root=ME[0], mountinfo=mounts) is True
     assert _mode(node) == 0o644
-    assert supervisor._close_dev_zero(node, root=ME[0]) is None
-    assert supervisor._close_dev_zero(tmp_path / "absent", root=ME[0]) is None
+    assert supervisor._close_dev_zero(node, root=ME[0], mountinfo=mounts) is True
+    assert supervisor._close_dev_zero(tmp_path / "absent", root=ME[0], mountinfo=mounts) is True
 
 
-def test_a_dev_zero_that_cannot_be_closed_refuses_to_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """R85: a link, another owner, or a mode that cannot be changed: the supervisor does not start."""
-    reason = "/dev/zero must be root's and closed to others' writes, so no job can map shared memory through it"
+def test_a_dev_zero_that_cannot_be_closed_is_left_as_it_is_with_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R88: under userns-remap or rootless Docker the node is the host's, bind-mounted and not root's; never changed.
+
+    A link, another owner, a mount of its own (or a mount table that cannot be read), or a mode that cannot be
+    changed: the node stays as it is, a warning says why by a fixed text or a type, and nothing refuses to start.
+    """
     node = tmp_path / "zero"
     node.write_bytes(b"")
     node.chmod(0o666)
     link = tmp_path / "link"
     link.symlink_to(node)
 
-    assert supervisor._close_dev_zero(link, root=ME[0]) == reason
-    assert _mode(node) == 0o666  # a link is never followed
-    assert supervisor._close_dev_zero(node, root=ME[0] + 1) == reason
+    def refuse(path: Any, mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    with caplog.at_level(logging.WARNING, logger="workbench.executor"):
+        assert supervisor._close_dev_zero(link, root=ME[0], mountinfo=_mountinfo_of(tmp_path, "/")) is False
+        assert supervisor._close_dev_zero(node, root=ME[0] + 1, mountinfo=_mountinfo_of(tmp_path, "/")) is False
+        assert supervisor._close_dev_zero(node, root=ME[0], mountinfo=_mountinfo_of(tmp_path, "/", str(node))) is False
+        assert supervisor._close_dev_zero(node, root=ME[0], mountinfo=tmp_path / "unreadable") is False
+        monkeypatch.setattr(supervisor.os, "chmod", refuse)
+        assert supervisor._close_dev_zero(node, root=ME[0], mountinfo=_mountinfo_of(tmp_path, "/")) is False
+
+    assert _mode(node) == 0o666
+    open_route = "/dev/zero stays writable by the slots, who may map shared memory through it"
+    assert caplog.messages == [
+        f"{open_route}: it is not root's own node (a user-namespaced daemon?)",
+        f"{open_route}: it is not root's own node (a user-namespaced daemon?)",
+        f"{open_route}: it is a mount of its own, the host's node, which the supervisor leaves alone",
+        f"{open_route}: it is a mount of its own, the host's node, which the supervisor leaves alone",
+        f"{open_route}: its mode could not be changed (PermissionError)",
+    ]
+    assert str(tmp_path) not in caplog.text
+
+
+def test_a_dev_zero_that_cannot_be_closed_never_stops_the_supervisor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R88: the change is best effort. The chmod is refused here, so this host's node is never changed."""
+    limits = _Limits(8192, 8192)
+    monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
+    monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
 
     def refuse(path: Any, mode: int) -> None:
         raise PermissionError(1, "Operation not permitted")
 
-    node.chmod(0o666)
     monkeypatch.setattr(supervisor.os, "chmod", refuse)
-    assert supervisor._close_dev_zero(node, root=ME[0]) == reason
+
+    assert supervisor.prepare_host(_settings(Path("/nowhere"))) is None
 
 
-@pytest.mark.skipif(not ROOT_ON_LINUX, reason="the executor image's own /dev, as root")
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev, as root")
 def test_as_root_this_containers_dev_zero_can_be_closed(dev_zero_closed: None) -> None:
-    """R85: Docker's ``/dev`` is the container's tmpfs; root changes the node's mode without a capability."""
+    """R85: Docker's ``/dev`` is the container's tmpfs and the node its own (no mount of its own); root changes it."""
     st = os.lstat("/dev/zero")
     assert stat.S_ISCHR(st.st_mode) and (st.st_uid, stat.S_IMODE(st.st_mode)) == (0, 0o644)
+    assert "/dev/zero" not in (supervisor._mount_points(Path("/proc/self/mountinfo")) or {"/dev/zero"})
 
 
 def test_the_open_files_four_slots_need_pass_a_soft_limit_of_1024() -> None:

@@ -136,11 +136,14 @@ The formulas, for other slot counts or job memory:
   host's number of CPUs. On a host with fewer than 4 CPUs, set
   `WORKBENCH_EXECUTOR_CPUS` to the host's number or less. CI does so on small
   runners.
-- **Free space on the volume:** not a setting. The executor keeps 1 GiB of
-  `workbench-data` free, or 5 % of the volume where that is more: below it,
-  every running job is stopped and no job starts, and the tool answers `507`
-  ([sandbox.md](sandbox.md#limits)). Size the volume for the users' quotas and
-  that floor.
+- **Free space on the volume:** not a setting. The executor keeps 1 GiB free
+  on the filesystem that holds `workbench-data`, or 5 % of that filesystem where
+  that is more: below it, every running job is stopped and no job starts, and
+  the tool answers `507` ([sandbox.md](sandbox.md#limits)). For a local named
+  volume that filesystem is the disk of Docker's data root, which images,
+  containers' logs and other volumes share: their growth stops jobs too, and on
+  a large disk the floor is large (100 GB of a 2 TB disk). Size that disk for
+  the users' quotas, everything else on it, and the floor.
 
 ## Audit and retention
 

@@ -528,7 +528,8 @@ def slots_use(uids: Collection[int], *, proc: Path = Path("/proc")) -> dict[int,
     A process counts by its real uid, which a job cannot change. Its resident set counts without its shared memory
     (``RssShmem``): the only shared memory a job can map is a SysV segment, or a file of its own folders where the
     volume is a tmpfs, which counts as that file's disk (the jobs' seccomp filter refuses shared anonymous maps,
-    ``memfd_create`` and ``memfd_secret``, and the supervisor makes ``/dev/zero`` read-only to them). Each segment
+    ``memfd_create`` and ``memfd_secret``, and the supervisor makes ``/dev/zero`` read-only to them where the node
+    is the container's own; where it is not, a writable shared map of it is a residual, docs/sandbox.md). Each segment
     counts once instead, against the uid that made it, by the pages it holds, whether any process has it attached or
     not: a page a process touched and then left to a child it forked is in no resident set. A process that ends while
     it is read counts as gone.

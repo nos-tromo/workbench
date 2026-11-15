@@ -1641,43 +1641,74 @@ def _open_files_problem(slots: int) -> str | None:
     return None
 
 
-def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0) -> str | None:
-    """Take the write bits of group and others off ``/dev/zero``, so that no job can open it for writing.
+def _mount_points(mountinfo: Path) -> set[str] | None:
+    """Read the mount points of a mount table.
 
-    A shared map of ``/dev/zero`` opened for writing is shared anonymous memory, which a job can fill, leave to a child
-    and unmap itself, out of every resident set the watchdog counts (R85); the jobs' seccomp filter refuses the other
-    way there, ``mmap`` with ``MAP_SHARED | MAP_ANONYMOUS``. A shared map of it opened read-only is only readable, and
-    holds no memory. Docker makes ``/dev`` a tmpfs of the container's, root's, so the change lives as long as the
-    container and needs no capability: root owns the node. Nothing a job runs writes to ``/dev/zero``.
+    Args:
+        mountinfo: A ``/proc/<pid>/mountinfo`` file; the mount point is its fifth field.
+
+    Returns:
+        The mount points; ``None`` when the table cannot be read.
+    """
+    try:
+        lines = mountinfo.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    return {fields[4] for fields in (line.split() for line in lines) if len(fields) >= 5}
+
+
+def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0, mountinfo: Path = _MOUNTINFO) -> bool:
+    """Take the write bits of group and others off ``/dev/zero`` where the node is the container's own; best effort.
+
+    A shared map of ``/dev/zero`` opened for writing is shared memory, which a job can fill, by reading its pages as
+    much as by writing them, then leave to a child it forks and unmap itself, out of every resident set the watchdog
+    counts (R85); the jobs' seccomp filter refuses the other way there, ``mmap`` with ``MAP_SHARED | MAP_ANONYMOUS``. A
+    shared map opened read-only holds no memory, however many of its pages are read (measured, R88). Under Docker's
+    usual set-up ``/dev`` is a tmpfs of the container's and root owns the node, so the change needs no capability and
+    lives as long as the container. Under a user-namespaced daemon (userns-remap, rootless) the node is the host's,
+    bind-mounted and owned by an unmapped uid: it is left as it is, and so is any node that is not root's or is a mount
+    of its own. The supervisor starts all the same; the route stays open there (docs/sandbox.md, Residual risks).
 
     Args:
         path: ``/dev/zero``.
         root: The uid that must own it.
+        mountinfo: The process's mount table, to tell a bind-mounted node.
 
     Returns:
-        A short reason when it is there but stays writable by others or is not root's, else ``None``.
+        Whether ``/dev/zero`` is missing or closed to others' writes. When it is not, a warning names why, by a fixed
+        text or an error's type.
     """
+    open_route = "/dev/zero stays writable by the slots, who may map shared memory through it"
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        return None
-    except OSError:
-        st = None
-    if st is not None and not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022:
-        with contextlib.suppress(OSError):
-            os.chmod(path, stat.S_IMODE(st.st_mode) & ~0o022)
-        with contextlib.suppress(OSError):
-            st = os.lstat(path)
-    if st is None or stat.S_ISLNK(st.st_mode) or st.st_uid != root or st.st_mode & 0o022:
-        return "/dev/zero must be root's and closed to others' writes, so no job can map shared memory through it"
-    return None
+        return True
+    except OSError as exc:
+        _log.warning("%s: it could not be looked at (%s)", open_route, type(exc).__name__)
+        return False
+    if not st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode):
+        return True
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != root:
+        _log.warning("%s: it is not root's own node (a user-namespaced daemon?)", open_route)
+        return False
+    mounts = _mount_points(mountinfo)
+    if mounts is None or str(path) in mounts:
+        _log.warning("%s: it is a mount of its own, the host's node, which the supervisor leaves alone", open_route)
+        return False
+    try:
+        os.chmod(path, stat.S_IMODE(st.st_mode) & ~0o022)
+    except OSError as exc:
+        _log.warning("%s: its mode could not be changed (%s)", open_route, type(exc).__name__)
+        return False
+    return True
 
 
 def prepare_host(settings: Settings) -> str | None:
-    """Make the changes the supervisor needs in its container before it serves, and check that they hold.
+    """Make the changes the supervisor needs in its container before it serves, and check the one it cannot do without.
 
-    Its soft limit of open files goes up to the hard one (``_open_files_problem``), and ``/dev/zero`` is closed to
-    others' writes (``_close_dev_zero``).
+    ``/dev/zero`` is closed to others' writes where it can be (``_close_dev_zero``; best effort, never a reason to
+    stop). The soft limit of open files goes up to the hard one, which must hold what the slots need
+    (``_open_files_problem``).
 
     Args:
         settings: The executor's settings.
@@ -1685,7 +1716,8 @@ def prepare_host(settings: Settings) -> str | None:
     Returns:
         A short reason it must not start, or ``None``.
     """
-    return _open_files_problem(settings.executor_slots) or _close_dev_zero()
+    _close_dev_zero(_DEV_ZERO)
+    return _open_files_problem(settings.executor_slots)
 
 
 def main() -> int:
@@ -1702,11 +1734,13 @@ def main() -> int:
     except ConfigError as exc:
         print(f"workbench executor: {exc}", file=sys.stderr)
         return 1
-    problem = startup_problem(settings) or prepare_host(settings)
+    problem = startup_problem(settings)
+    if problem is None:
+        logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
+        problem = prepare_host(settings)
     if problem is not None:
         print(f"workbench executor: refusing to start: {problem}", file=sys.stderr)
         return 1
-    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
     try:
         asyncio.run(Supervisor(settings).serve())
     except NoUsableSlot as exc:

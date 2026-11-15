@@ -149,11 +149,21 @@ installed in `preexec`, while the child is still root and after
   a job's memory. A private anonymous map and a shared map of a file work.
 
 At start the supervisor also takes the write bits of group and others off
-`/dev/zero` (`supervisor.py:_close_dev_zero`; Docker's `/dev` is the
-container's own tmpfs, and root owns the node). A shared map of `/dev/zero`
-opened for writing is shared anonymous memory too; opened read-only, it can
-only be read and holds no memory. It refuses to start if the node stays
-writable by others.
+`/dev/zero`, where the node is the container's own
+(`supervisor.py:_close_dev_zero`). A shared map of `/dev/zero` opened for
+writing is shared memory too, filled by reading its pages as much as by
+writing them; opened read-only, it holds nothing, however many pages are read.
+Measured in the executor image as slot 20001: a 200 MB read-only shared map,
+every page read, adds 0 bytes to the container's `shmem` (`memory.stat`) and
+to the process's `RssShmem`; the same map opened for writing adds 200 MB, read
+or written (`test_supervisor.py::test_as_root_a_read_only_shared_map_of_dev_zero_holds_no_memory`).
+Under Docker's usual set-up `/dev` is the container's own tmpfs and root owns
+the node, so the change needs no capability. Under a user-namespaced daemon
+(userns-remap, rootless Docker) the node is the host's, bind-mounted and owned
+by an unmapped uid: the supervisor leaves it as it is, and so it does any node
+that is not root's, is a mount of its own, or cannot be changed. It logs a
+warning and starts all the same; the route stays open there
+([Residual risks](#residual-risks)).
 
 It knows x86_64 and aarch64, each with its own syscall numbers; a call of
 another architecture fails the same way, and the supervisor refuses to start on
@@ -182,7 +192,7 @@ supervisor caps whatever a request asks at its own settings
 | `RLIMIT_CPU` | `WORKBENCH_JOB_WALL_S` seconds of CPU |
 | `RLIMIT_FSIZE` | `WORKBENCH_UPLOAD_MAX_MB` (50 MB) per file written |
 | What the job writes | `WORKBENCH_WORKSPACE_MAX_MB` (500 MB) in `home/` and `out/` together, at most 10 000 files and folders, nested at most 256 deep, measured by the watchdog |
-| Free space on the volume | 1 GiB of `workbench-data`, or 5 % of it where that is more (`supervisor.py:free_space_floor`, a fixed rule, not a setting): below it every running job is stopped and no job starts |
+| Free space on the volume | 1 GiB, or 5 % of the filesystem that holds `workbench-data` where that is more (`supervisor.py:free_space_floor`, a fixed rule, not a setting): below it every running job is stopped and no job starts |
 | `RLIMIT_NPROC` | 64 processes of the slot's uid |
 | `RLIMIT_NOFILE` | 256 open files |
 | `RLIMIT_CORE` | 0 |
@@ -205,15 +215,20 @@ other. Per slot it counts:
 
 Before all that, each pass asks the data volume for its free space
 (`statvfs`, the space left to a process without privilege). Below its floor,
-1 GiB or 5 % of the volume, whichever is more, it stops every running job, and
-the supervisor starts no job until the volume is above the floor again; each
-such job is answered with the refusal `storage_full`, which the api answers
-`507` and records as a refusal ([audit.md](audit.md)). The log says when the
-volume crosses the floor and how many jobs were stopped. The floor catches
-what no folder holds: a file a job removed and keeps open is in neither
-`home/` nor `out/`, and the supervisor cannot see it without
+1 GiB or 5 % of the filesystem, whichever is more, it stops every running job,
+and the supervisor starts no job until the volume is above the floor again;
+each such job is answered with the refusal `storage_full`, which the api
+answers `507` and records as a refusal ([audit.md](audit.md)). The log says
+when the volume crosses the floor and how many jobs were stopped. The floor
+catches what no folder holds: a file a job removed and keeps open is in
+neither `home/` nor `out/`, and the supervisor cannot see it without
 `CAP_SYS_PTRACE`, which it does not get; but it takes room on the volume. The
 floor keeps that room for the api, its uploads and its database.
+
+`statvfs` sees the filesystem that holds the volume: for a local named volume,
+the disk of Docker's data root, which images, containers' logs and other
+volumes share. Other use of that disk therefore stops jobs too, and on a large
+disk the floor is large (100 GB of a 2 TB disk).
 
 Past a limit it stops the job: its process group is killed, the slot's cleanup
 kills the rest, and the answer names the limit ("the job was stopped: it wrote
@@ -287,10 +302,10 @@ unless:
   can neither open an Internet socket nor map shared anonymous memory, and can
   still make a Unix pair and a private anonymous map (`seccomp.py:problem`).
 
-Then it makes two changes to its own container and starts only if they hold
-(`supervisor.py:prepare_host`): its soft limit of open files goes up to the hard
-one, which must hold slots × 258 + 256 descriptors; and `/dev/zero` is closed
-to others' writes (`0644`).
+Then it makes two changes to its own container (`supervisor.py:prepare_host`):
+its soft limit of open files goes up to the hard one, which must hold
+slots × 258 + 256 descriptors, or it does not start; and `/dev/zero` is closed
+to others' writes (`0644`) where it can be, which never stops it (above).
 
 Compose sets the container up this way. `seccomp=unconfined`, a missing
 `no-new-privileges` or Docker's default `/dev/shm` make it refuse.
@@ -357,22 +372,29 @@ Each of these is accepted. Each says what it would take.
   disk takes in half a second, and take as much memory as it can map in half a
   second, or lower its OOM score for that long; the container's memory limit and
   the job's OOM score hold the memory.
-  A file a job has removed but keeps open is in no folder the watchdog walks:
-  each of its processes may hold 256 such files (`RLIMIT_NOFILE`) of 50 MB
-  each (`RLIMIT_FSIZE`), and a job may have 64 processes (`RLIMIT_NPROC`), so
-  64 × 256 × 50 MB, about 800 GB, a job. What bounds it is the volume's
+  A file a job has removed but keeps open, or mapped and then closed and
+  removed, is in no folder the watchdog walks. The open ones are 256 a process
+  (`RLIMIT_NOFILE`), but a mapping of one page keeps a whole file, so the
+  mapped ones are limited only by the kernel's `vm.max_map_count` (65 530 by
+  default) a process, each up to 50 MB (`RLIMIT_FSIZE`), across 64 processes
+  (`RLIMIT_NPROC`): no limit of the job bounds them. What does is the volume's
   free-space floor: the job is stopped once the volume falls below it, or at
-  its wall time if that comes first, and the files go when the job ends. Between
-  two measures it can still write what the disk takes in half a second past the
-  floor. A job that renames its folders while they are walked can be counted
-  short by one measure.
+  its wall time if that comes first, and the files go when the job ends;
+  between two measures it can still write what the disk takes in half a second
+  past the floor. A job that renames its folders while they are walked can be
+  counted short by one measure.
 - **What the memory sum does not count.** The kernel's own memory that a job's
   processes cause (page tables, pipe and socket-pair buffers, the inodes of its
   files) and the page cache of the files it reads and writes are in no resident
   set (a file it maps from its own folders counts as that file's disk). They
   are bounded by the job's other limits (processes, open files, file size, its
-  folders' disk and entries) and held, with the rest, by the container's memory
-  limit and the job's OOM score. A process's resident set
+  folders' disk and entries) and by the container's memory limit, whose cgroup
+  counts them (`memory.stat`: `pagetables`, `sock`, `kernel`, `file`). The OOM
+  score does not hold them to the job that caused them: when the container runs
+  out, the kernel stops the score-1000 process with the most resident memory,
+  which can be another user's job. That is a denial of service against
+  concurrent jobs, the same class as the others here, and it reaches no
+  user's files. A process's resident set
   counts pages it shares with its forked children once in each, which can stop
   a job early, never late.
 - **A SysV segment handed between two running jobs.** A segment counts against
@@ -381,9 +403,21 @@ Each of these is accepted. Each says what it would take.
   ended (the slot's cleanup empties and removes it, but the attached mapping
   stays). What the second job then writes into it counts against the first
   slot's next job, and against no job while that slot is idle, so it is held
-  only by the container's memory limit. It takes two jobs of two users that run
-  at once and cooperate, as the channel above does; it is a denial of service
-  against concurrent jobs, and it reaches no user's files.
+  only by the container's memory limit. It takes two jobs that run at once in
+  two slots and cooperate: two users' at the default
+  `WORKBENCH_JOBS_PER_USER=1`, or one user's two when that is higher. It is a
+  denial of service against concurrent jobs, and it reaches no user's files.
+- **`/dev/zero` where it cannot be closed.** On a host whose Docker daemon
+  remaps user namespaces (userns-remap, which deploy's ADR 0001 prescribes) or
+  runs rootless, `/dev/zero` is the host's node and stays writable by the
+  slots (above). A job can then open it for writing, fill a shared map of it,
+  leave the map to a child and unmap it, out of every resident set the
+  watchdog counts: up to `RLIMIT_AS` (1536 MB) per process, 64 processes,
+  held only by the container's memory limit, where the kernel's OOM killer
+  then stops the score-1000 process with the most resident memory, which can be
+  another user's job. A denial of service against concurrent jobs within the
+  user's own rate limits; it reaches no user's files. The supervisor logs a
+  warning at start where this holds.
 - **A job can have its own slot retired.** A job that leaves its folder so it
   cannot be removed (for example a tree deeper than the supervisor's open
   files allow) or wins the race against its slot's cleanup gets its slot
@@ -406,6 +440,8 @@ Each of these is accepted. Each says what it would take.
   that cooperate.
 - **userns-remap is untested.** The executor has not been run on a host whose
   Docker daemon remaps user namespaces (deploy `docs/runbooks/userns-remap.md`).
+  Nothing in its start-up refuses there for `/dev/zero` (above); the other
+  start-up checks have not been tried on such a host.
 
 ## gVisor
 
