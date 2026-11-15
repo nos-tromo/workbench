@@ -38,7 +38,7 @@ from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, Sto
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
 from workbench.models import Principal
-from workbench.protocol import KILLED, MAX_INPUT_FILES, JobResult
+from workbench.protocol import KILLED, MAX_INPUT_FILES, OUT_DIR, JobResult
 
 router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
@@ -822,9 +822,6 @@ async def search_files(
 #: The most characters of code one call runs.
 MAX_CODE: Final = 50_000
 
-#: The folder the code writes its outputs into; the executor gives the code no input below it.
-_OUT: Final = "out"
-
 
 class RunPythonRequest(BaseModel):
     """Body of ``run_python``.
@@ -1024,7 +1021,7 @@ async def run_python(
         What the code printed, the files it made and the job's id.
     """
     files = sorted(await run_in_threadpool(store.files_in_chat, p), key=lambda rec: (-rec.created_at, rec.name))
-    readable = [rec for rec in files if rec.name.split("/")[0] != _OUT]
+    readable = [rec for rec in files if rec.name.split("/")[0] != OUT_DIR]
     chosen = readable[:MAX_INPUT_FILES]
     args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
 

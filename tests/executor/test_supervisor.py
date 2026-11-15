@@ -573,7 +573,7 @@ async def test_an_inline_job_opens_no_workspace(volume: Path, monkeypatch: pytes
 @pytest.mark.parametrize(
     ("ending", "body", "wall_s"),
     [
-        ("ok", "pass", 60),
+        ("ok", 'pathlib.Path("out/counts.csv").write_text("author,posts\\nuser-a,12\\n")', 60),
         ("failing process", "sys.exit(3)", 60),
         ("wall timeout", "import time\ntime.sleep(30)", 1),
     ],
@@ -582,7 +582,7 @@ async def test_an_inline_job_opens_no_workspace(volume: Path, monkeypatch: pytes
 async def test_inline_inputs_go_with_the_job_folder(
     ending: str, body: str, wall_s: int, volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """However the job ends, its folder goes, and the data with it; nothing of it is staged."""
+    """However the job ends, its folder goes, and the data with it; only what the job wrote to ``out/`` is staged."""
     _runner(monkeypatch, body)
     request = _inline_request(limits=Limits(wall_s=wall_s, cpu_s=60, memory_mb=1024, file_mb=50))
 
@@ -590,7 +590,9 @@ async def test_inline_inputs_go_with_the_job_folder(
 
     assert answer.status == {"ok": "ok", "failing process": "error", "wall timeout": "timeout"}[ending], answer
     assert _entries(volume / "jobs") == []
-    assert _entries(volume / "staging") == []
+    staged = sorted(str(p.relative_to(volume / "staging")) for p in (volume / "staging").rglob("*"))
+    assert staged == ([request.job_id, f"{request.job_id}/counts.csv"] if ending == "ok" else [])
+    assert list(volume.rglob(PASSAGES.name)) == []
 
 
 @pytest.mark.parametrize(

@@ -82,6 +82,7 @@ from workbench.protocol import (
     JOB_ID,
     KILLED,
     MAX_LINE,
+    OUT_DIR,
     JobRequest,
     JobResult,
     Limits,
@@ -93,7 +94,6 @@ from workbench.protocol import (
 
 MB = 1024 * 1024
 MAX_OUTPUTS = 20
-OUT = "out"
 #: Most entries a running job's folders may hold, files and folders together.
 MAX_JOB_ENTRIES = 10_000
 #: Deepest a running job's folders may nest.
@@ -1216,7 +1216,7 @@ class Supervisor:
             opened.append(chat)
             self._copy_inputs(req, chat)
             self._write_inline(req, chat)
-            out = make_dir(OUT, chat, runner, 0o700)
+            out = make_dir(OUT_DIR, chat, runner, 0o700)
             opened.append(out)
             spec = {
                 "tool": req.tool,
@@ -1288,7 +1288,7 @@ class Supervisor:
         with closing(source):
             for path in dict.fromkeys(req.input_files):
                 parts = path.split("/")
-                if parts[0] == OUT:
+                if parts[0] == OUT_DIR:
                     continue
                 try:
                     fd = open_regular(source, parts)
@@ -1343,7 +1343,7 @@ class Supervisor:
                 data = entry.content.encode("utf-8")
             except ValueError as exc:  # PathError, UnicodeEncodeError
                 raise _SetupError("an inline input is not a plain file name with UTF-8 text") from exc
-            if entry.name == OUT:
+            if entry.name == OUT_DIR:
                 raise _SetupError("an inline input cannot be named out")
             with closing(os.open(entry.name, CREATE_FLAGS, 0o444, dir_fd=target)) as fd:
                 write_all(fd, data)

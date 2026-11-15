@@ -19,7 +19,7 @@ MAX_INLINE_FILES: Final = 8
 #: Most bytes, in UTF-8, the inline entries' texts hold together.
 MAX_INLINE_BYTES: Final = 512 * 1024
 #: The job's own output folder in its working folder: no input may take its name.
-_OUT: Final = "out"
+OUT_DIR: Final = "out"
 
 #: The message of a job the kernel stopped on one of its limits (memory, CPU time, file size, processes); a job the
 #: executor's watchdog stopped has a message that names the limit instead.
@@ -29,9 +29,9 @@ JOB_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class _Message(BaseModel):
-    """A protocol message: a field it does not declare is refused, not ignored."""
+    """A protocol message: a field it does not declare is refused, not ignored, and a refusal never quotes the input."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 def check_input_path(path: str) -> str:
@@ -100,7 +100,7 @@ class InlineFile(_Message):
             ValueError: It is not a valid file name (``workbench.paths.check_filename``), or it is ``out``.
         """
         check_filename(value)
-        if value == _OUT:
+        if value == OUT_DIR:
             raise ValueError("an inline input cannot be named out")
         return value
 

@@ -130,8 +130,9 @@ def test_a_request_names_the_user_root_its_chat_folder_lies_in() -> None:
         lambda: JobRequest.model_validate({**_fields(limits=LIMITS.model_dump()), "uid": 0}),
         lambda: OutputFile.model_validate({"name": "r.csv", "staged_path": "/data/staging/r.csv", "size": 1, "x": 1}),
         lambda: JobResult.model_validate({"job_id": JOB_ID, "status": "ok", "result": {}, "outputs": [], "x": 1}),
+        lambda: InlineFile.model_validate({"name": "notes.txt", "content": "x", "mode": 0o777}),
     ],
-    ids=["limits", "request", "output", "result"],
+    ids=["limits", "request", "output", "result", "inline"],
 )
 def test_unknown_fields_are_refused(model: Any) -> None:
     """Every message refuses a field it does not declare, so nothing unvetted reaches the executor."""
@@ -287,9 +288,13 @@ def test_inline_text_stays_out_of_reprs() -> None:
     request = JobRequest(**_inline(inline_inputs=[PASSAGES]))
     assert PASSAGES.name in repr(request)
     assert "Hafen" not in repr(request)
+    line = json.dumps({**_inline(limits=LIMITS.model_dump()), "inline_inputs": [PASSAGES.model_dump()] * 2}).encode()
+    with pytest.raises(ValueError, match="unique") as refused:
+        decode_request(line)
+    assert "Hafen" not in str(refused.value)
 
 
 def test_inline_inputs_never_come_with_input_files() -> None:
     """No inline name can shadow a copied input: a request has one or the other."""
-    with pytest.raises(ValidationError, match="input_files"):
+    with pytest.raises(ValidationError, match="cannot come with"):
         JobRequest(**_fields(inline_inputs=[PASSAGES]))
