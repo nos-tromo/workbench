@@ -284,7 +284,7 @@ open-webui-service's.
 
 ## Verification
 
-Before claiming a check is green, run the actual command and paste the output. `pre-commit run --all-files` (and so `make verify`) checks tracked files only, as `git ls-files` lists them: `git add` new files first. After opening a PR, confirm CI actually triggered on the latest push before declaring done.
+Before claiming a check is green, run the actual command and paste the output. `pre-commit run --all-files` (and so `make verify`) hands ruff the tracked files only, as `git ls-files` lists them, while pyrefly (`pass_filenames: false`) checks the whole tree: `git add` new files first. After opening a PR, confirm CI actually triggered on the latest push before declaring done.
 
 ## Communication Style
 

@@ -312,10 +312,11 @@ unless:
   api's;
 - every slot uid is a user of the image;
 - the container's cgroup memory limit (`memory.max`) holds every slot's job
-  memory. Where there is no cgroup v2 limit to read, this check passes on its
-  own (compose's limit still applies), but the executor then refuses to start
-  anyway: the paragraph after this list requires cgroup v2 and a cgroup
-  namespace of its own;
+  memory. Where `memory.max` cannot be read (no cgroup v2), this check passes
+  on its own, but the executor then refuses to start anyway: the paragraph
+  after this list requires cgroup v2 and a cgroup namespace of its own. Where
+  it reads `max` (cgroup v2, no limit set), the check passes and the executor
+  starts; compose sets a limit, so that is a container run without it;
 - `fs.protected_hardlinks` and `fs.protected_symlinks` read 1. These are the
   host's kernel settings. The first keeps a job from giving `out/` a second name
   for a file it does not own, such as the database, which root would then copy
@@ -434,8 +435,8 @@ Each of these is accepted. Each says what it would take.
   set (a file it maps from its own folders counts as that file's disk). They
   are bounded by the job's other limits (processes, open files, file size, its
   folders' disk and entries) and by the container's memory limit, as far as its
-  cgroup is charged for them. It counts page tables (`pagetables`) and the page
-  cache (`file`). Socket-pair buffers, up to about `net.core.wmem_default`
+  cgroup is charged for them. Its cgroup counts page tables (`pagetables`) and
+  the page cache (`file`). Socket-pair buffers, up to about `net.core.wmem_default`
   (208 KiB) per socket end within the job's descriptor limits, were measured as
   charged to it, as `kernel` and not as `sock`. That was by hand, not a test:
   in a container started with `--memory 2g` (Docker Desktop's VM, kernel

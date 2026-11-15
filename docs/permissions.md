@@ -124,6 +124,9 @@ of Open WebUI (`edge-guard`) refuses, for every account:
 
 - writes to the tool-server, terminal-server and OAuth-client configuration and
   the configuration import, which would replace or add a connection;
+- writes to `/api/v1/configs/connections` and `/api/v1/configs/code_execution`,
+  which would switch on direct connections and direct tool-server integrations,
+  and code execution and the code interpreter inside Open WebUI;
 - every request under `/api/v1/tether`, through which a user could be offered a
   terminal of their own, outside workbench's sandbox, audit and retention.
 

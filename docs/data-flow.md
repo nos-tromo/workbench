@@ -179,8 +179,9 @@ in the files they upload or in the values the model writes.
   that model is run by an outside provider, they leave the host and the
   federation to that provider. What Open WebUI does with an answer (the chat
   history, the model call) is its own processing, recorded there. An attachment
-  in a temporary chat takes the same way to the model, inline with the message,
-  without passing workbench, which records nothing of it;
+  in a temporary chat without Workbench selected takes the same way to the
+  model, inline with the message, without passing workbench, which records
+  nothing of it;
 - to obs-plane: the audit events (account id, chat id, file ids, times, counts)
   into its audit store, and the containers' log lines into its log store.
   Metrics hold no personal data.
@@ -224,7 +225,7 @@ retention.
   WebUI's chat history keeps tool results for longer;
 - whether the retention periods (workbench's, Open WebUI's, the audit store's)
   fit the rules that apply;
-- whether temporary chats stay available in Open WebUI, where an attachment
-  goes to the model without passing workbench
+- whether temporary chats stay available in Open WebUI, where an attachment in
+  a chat without Workbench selected goes to the model without passing workbench
   (`USER_PERMISSIONS_CHAT_TEMPORARY`, which open-webui-service leaves at Open
   WebUI's default, on).
