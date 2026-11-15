@@ -60,7 +60,8 @@ browser ── edge-plane :8443 ── Open WebUI ── agent loop (native tool
   the job queue and `/metrics`. It never parses a user file.
 - **`executor`** (`workbench/executor/`): a supervisor, root with six
   capabilities, that runs every job touching file content as a fresh process
-  under a slot uid (`20001`…`20016`), copy-in and copy-out, with limits. The
+  under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
+  default 4, run at once), copy-in and copy-out, with limits. The
   readers, the search, the templates, the writers and `run_python` all run
   there.
 - **`volume-permissions`**: a one-shot that lays out `workbench-data`
@@ -105,6 +106,12 @@ Adding a tool touches: its route; its runner and `jobs.TOOLS`, if it runs in
 the executor; `auth.ALL_TOOLS`; `audit.OPERATIONS`, if it is recorded;
 `docs/permissions.md` and `docs/audit.md` (`tests/test_docs.py` fails without
 them); and the contract test's `TOOLS`.
+
+Every router is built with `route_class=EncodableRoute`
+(`workbench/api/routing.py`: a JSON body read within a depth limit, lone
+surrogates replaced); a new one must be too. A request meets the middleware
+in this order (`workbench/api/main.py`): `ViewHardening`, `QuietErrors`,
+`KeyGate`, `BodyLimit`, then the route.
 
 **The terminal door** (`workbench/api/contract.py`) is what Open WebUI
 v0.13.3 calls besides the tools: `GET /api/v1/policies` must answer non-2xx (so
@@ -176,7 +183,7 @@ Python 3.12 (`requires-python = ">=3.12,<3.13"`), `uv`, run from the repo root.
 uv sync --group dev --extra executor   # dev tools + the executor's libraries
 make verify               # pre-commit: ruff + pyrefly (tracked files; git add new ones first)
 make test                 # pytest (no frontend/ here)
-uv run pytest tests/api/test_files.py -q   # one file
+uv run pytest tests/api/test_files.py -q -k <name>   # one file, or one test
 make test-executor-root   # executor tests as root in its image, in both /dev/shm shapes
 make test-isolation       # the sandbox on a real stack (project workbench-test)
 make test-load            # the 10-user load test on that stack (manual, not in CI)
@@ -193,6 +200,25 @@ make nuke                 # DESTROY workbench-data (type 'workbench' to confirm)
 
 `make/common.mk` and `scripts/bundle-lib.sh` are vendored verbatim from
 `nos-tromo/.github` like the audit modules; never edit them.
+
+How the tests are laid out:
+
+- `pyproject.toml`'s `addopts` deselects the `isolation`, `contract` and
+  `load` markers; those run only through their make targets, on a live stack.
+- The api tests (`tests/api/conftest.py`) run the real `create_app` on a
+  throwaway data folder, audit lines kept in a `StringIO`. The executor is a
+  `FakeClient` (`tests/api/test_jobs.py`); its subclass `Local`
+  (`tests/api/test_tools_templates.py`) runs the real `RUNNERS` in process, and
+  `Scripted` (`tests/api/test_tools_documents.py`) gives canned answers.
+- The executor tests that switch to slot uids skip unless they run as root on
+  Linux, so `make test` on a Mac passes without them; only
+  `make test-executor-root` (and CI) runs them.
+- Test documents are built at test time (`tests/fixtures/make_fixtures.py`,
+  `make_templates.py`), all text invented; no binary fixture is committed.
+- `WORKBENCH_TEST_TIME_SCALE` (default 1, CI 3) widens the tests' time bounds
+  on a slow host.
+- `tests/test_compose_defaults.py` reads compose, the Makefile and CI as files:
+  changing a value there can fail it.
 
 ## Configuration
 
@@ -244,6 +270,10 @@ open-webui-service's.
   the tag and digest open-webui-service deploys. Dependabot bumps it on its own;
   merge such a bump only with the same bump there. The static tests check its
   shape, not its value, so a bump reaches the contract job.
+- **`.gitignore` ignores `*.txt`, `*.sh`, `*.log` and `*.ipynb` everywhere.**
+  Only `scripts/bundle_images.sh` and `scripts/bundle-lib.sh` are excepted. A
+  new file of those types is silently untracked, so pre-commit and CI never see
+  it; check with `git check-ignore -v <path>`.
 
 ## Git & PR Workflow
 
@@ -254,7 +284,7 @@ open-webui-service's.
 
 ## Verification
 
-Before claiming a check is green, run the actual command and paste the output. `git ls-files` does not cover untracked files — use `pre-commit run --all-files`. After opening a PR, confirm CI actually triggered on the latest push before declaring done.
+Before claiming a check is green, run the actual command and paste the output. `pre-commit run --all-files` (and so `make verify`) checks tracked files only, as `git ls-files` lists them: `git add` new files first. After opening a PR, confirm CI actually triggered on the latest push before declaring done.
 
 ## Communication Style
 
