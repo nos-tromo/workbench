@@ -1,7 +1,7 @@
 """Environment-driven settings for the api and executor roles."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
 
@@ -39,7 +39,8 @@ class Settings:
 
     Attributes:
         data_dir: Root of the workbench-data volume.
-        open_webui_key: Bearer key Open WebUI presents; ``None`` when unset, and always for the executor role.
+        open_webui_key: Bearer key Open WebUI presents; ``None`` when unset, and always for the executor role. Like
+            ``docint_key``, it is left out of ``repr``, so no log line or traceback shows it.
         retention_days: Days a file or job record is kept after it was created.
         retention_interval_s: Seconds between retention sweeps.
         executor_slots: Jobs the executor runs at once; at most the uid pool.
@@ -62,7 +63,7 @@ class Settings:
     """
 
     data_dir: Path
-    open_webui_key: str | None
+    open_webui_key: str | None = field(repr=False)
     retention_days: int
     retention_interval_s: int
     executor_slots: int
@@ -77,7 +78,7 @@ class Settings:
     executor_socket: Path
     slot_uid_base: int
     audit_output: str | None
-    docint_key: str | None
+    docint_key: str | None = field(repr=False)
     docint_tools: frozenset[str]
     docint_wall_s: int
     docint_slots: int

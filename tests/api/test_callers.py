@@ -3,8 +3,11 @@
 import asyncio
 import dataclasses
 import hmac
+from urllib.parse import unquote
 
 import pytest
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
@@ -13,12 +16,14 @@ from tests.api.test_files import put
 from workbench.api import auth
 from workbench.api.auth import (
     ALL_TOOLS,
+    OPEN_PATHS,
     Caller,
     CallerRegistry,
     InvalidPrincipal,
     KeyGate,
     door_allows,
     principal_from_headers,
+    require_caller,
 )
 from workbench.api.store import Store
 from workbench.config import ConfigError, Settings
@@ -102,6 +107,106 @@ def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, 
     assert asked == (["app"] if passes else [])
     if not passes:
         assert sent[0]["status"] == 404
+
+
+def _passes_the_gate(callers: CallerRegistry, method: str, target: str, key: str) -> bool:
+    """Send one request through :class:`KeyGate` and say whether it reached the app behind it.
+
+    The scope is built from the request target as uvicorn builds it: ``path`` percent-decoded, the query apart.
+    """
+    reached: list[str] = []
+
+    async def inner(scope: Scope, _receive: Receive, _send: Send) -> None:
+        reached.append(scope["path"])
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: Message) -> None:
+        return None
+
+    raw_path, _, query = target.partition("?")
+    scope: Scope = {
+        "type": "http",
+        "method": method,
+        "path": unquote(raw_path),
+        "raw_path": raw_path.encode(),
+        "query_string": query.encode(),
+        "headers": [(b"authorization", f"Bearer {key}".encode())],
+    }
+    asyncio.run(KeyGate(inner, callers=callers)(scope, receive, send))
+    return bool(reached)
+
+
+@pytest.mark.parametrize(
+    ("method", "target", "docint", "open_webui"),
+    [
+        ("POST", "/MCP", False, True),
+        ("POST", "//mcp", False, True),
+        ("POST", "/%6Dcp", True, False),
+        ("POST", "/mcp?x=1", True, False),
+        ("POST", "/mcp/", False, True),
+        ("HEAD", "/mcp", True, False),
+        ("OPTIONS", "/mcp", True, False),
+        ("HEAD", "/files/list", False, True),
+        ("OPTIONS", "/files/list", False, True),
+    ],
+)
+def test_the_gate_judges_the_path_routing_will_see(
+    settings: Settings, method: str, target: str, docint: bool, open_webui: bool
+) -> None:
+    """Each form of a path reaches the app for the caller whose door it is, whatever the method, and for no other."""
+    callers = CallerRegistry.from_settings(settings)
+    assert _passes_the_gate(callers, method, target, DOCINT_KEY) is docint
+    assert _passes_the_gate(callers, method, target, KEY) is open_webui
+
+
+def test_the_routes_own_key_check_refuses_a_caller_off_the_terminal_door(app: FastAPI) -> None:
+    """The check every terminal route depends on answers docint's key with the gate's 404 and lets Open WebUI's by."""
+
+    def request(key: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/files/list",
+                "headers": [(b"authorization", f"Bearer {key}".encode())],
+                "app": app,
+            }
+        )
+
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(require_caller(request(DOCINT_KEY)))
+    assert (refused.value.status_code, refused.value.detail) == (404, "not found")
+    assert asyncio.run(require_caller(request(KEY))).name == "open-webui"
+
+
+def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) -> None:
+    """Were :class:`KeyGate` bypassed, every keyed route still refuses docint's key: file browser, handshake, tools."""
+    app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
+    routes = sorted(
+        (method, path)
+        for route in iter_route_contexts(app.routes)
+        if (path := route.path) is not None and path not in OPEN_PATHS
+        for method in route.methods or ()
+    )
+    assert ("POST", "/tools/run_python") in routes and ("GET", "/openapi.json") in routes
+    with TestClient(app) as client:
+        for method, path in routes:
+            r = client.request(method, path, headers=HD)
+            assert (r.status_code, r.json()) == NOT_FOUND, (method, path)
+
+
+@pytest.mark.parametrize("headers", [H, HD], ids=["open-webui", "docint"])
+@pytest.mark.parametrize(
+    ("method", "path"), [("GET", "/nowhere"), ("POST", "/tools/nothing"), ("GET", "/api/v1/policies")]
+)
+def test_an_unrouted_path_answers_one_404_body_with_either_key(
+    client: TestClient, headers: dict[str, str], method: str, path: str
+) -> None:
+    """A path no route serves is the door's 404 too, so the text does not tell ``/mcp`` apart from the others."""
+    r = client.request(method, path, headers=headers)
+    assert (r.status_code, r.json()) == NOT_FOUND
 
 
 def test_an_open_webui_user_id_with_docints_key_reaches_nothing(client: TestClient, store: Store) -> None:

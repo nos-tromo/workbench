@@ -237,7 +237,10 @@ def _is_id(value: str) -> bool:
 
 
 async def require_caller(request: Request) -> Caller:
-    """Authenticate the request by its bearer key.
+    """Authenticate the request by its bearer key, for a route of the terminal door.
+
+    Every route that depends on it is the terminal door's, so a caller of another door is refused here as
+    :class:`KeyGate` refuses it, should a request ever pass the gate.
 
     Args:
         request: The request.
@@ -246,14 +249,17 @@ async def require_caller(request: Request) -> Caller:
         The caller that holds the key.
 
     Raises:
-        HTTPException: 401 if the key is missing, malformed or not held by any caller.
-            The answer is the same for all three.
+        HTTPException: 401 if the key is missing, malformed or not held by any caller; the answer is the same for all
+            three. 404 with :data:`~workbench.api.errors.NOT_FOUND` if the caller does not come in through the terminal
+            door.
     """
     registry: CallerRegistry = request.app.state.callers
     token = _bearer_token(request.headers.get("authorization"))
     caller = registry.authenticate(token) if token is not None else None
     if caller is None:
         raise HTTPException(status_code=401, detail=UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
+    if caller.door != "terminal":
+        raise HTTPException(status_code=404, detail=NOT_FOUND)
     return caller
 
 

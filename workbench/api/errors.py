@@ -20,6 +20,9 @@ most :data:`MAX_ERRORS` are listed, the rest counted in ``more_errors``.
 Any other error is one no handler expected: :class:`QuietErrors` answers it as a 500 with one fixed text and logs it by
 the method, the route's template and the error's type, never its message or a traceback, which can name a path on the
 volume, a file name or a user id.
+
+A path no route serves answers 404 with :data:`NOT_FOUND`, as a path outside a caller's door does, so the text does not
+tell ``/mcp`` from a path that is not there.
 """
 
 import logging
@@ -180,11 +183,21 @@ class QuietErrors:
 
 
 def install(app: FastAPI) -> None:
-    """Register the handlers on ``app``.
+    """Register the handlers on ``app``, and its answer to a path no route serves.
 
     Args:
         app: The application.
     """
+    unrouted = app.router.default
+
+    async def not_found(scope: Scope, receive: Receive, send: Send) -> None:
+        """Answer an HTTP request no route serves with :data:`NOT_FOUND`; leave anything else to the router."""
+        if scope["type"] != "http":
+            await unrouted(scope, receive, send)
+            return
+        await JSONResponse({"detail": NOT_FOUND}, status_code=404)(scope, receive, send)
+
+    app.router.default = not_found
     app.add_exception_handler(PathError, _answer)
     app.add_exception_handler(StoreError, _answer)
     app.add_exception_handler(AuditWriteError, _answer)

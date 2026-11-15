@@ -157,6 +157,13 @@ def test_the_error_never_carries_the_key() -> None:
     assert short not in str(info.value)
 
 
+def test_neither_key_is_in_the_settings_repr() -> None:
+    """Settings shown in a log line or a traceback name neither caller's key."""
+    shown = repr(load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, "DOCINT_WORKBENCH_KEY": D}, role="api"))
+    assert KEY not in shown
+    assert D not in shown
+
+
 def test_executor_needs_no_key() -> None:
     """The executor role has no caller key, even when one is in its environment."""
     assert load_settings({}, role="executor").open_webui_key is None
