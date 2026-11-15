@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import io
 import logging
+import os
 import shutil
 import socket
 import sqlite3
@@ -17,13 +18,38 @@ from typing import Any, override
 import pytest
 
 from tests.api.conftest import unrecorded
-from workbench.api.jobs import Busy, ExecutorClient, ExecutorUnavailable, JobQueue, RequestTooLarge
+from tests.conftest import scaled
+from workbench.api.jobs import (
+    IMAGE_MAX,
+    MCP_QUEUE_WAIT_S,
+    PNG_SIGNATURE,
+    RETURN_MAX,
+    RETURN_TYPES,
+    TEXT_MAX,
+    Busy,
+    CallLimits,
+    ExecutorClient,
+    ExecutorUnavailable,
+    JobQueue,
+    RequestTooLarge,
+    TakenOutputs,
+)
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, Store
 from workbench.config import Settings
-from workbench.models import FileRecord, Principal
+from workbench.models import FileRecord, JobRecord, Principal
 from workbench.paths import PathError, Workspaces
-from workbench.protocol import JOB_ID, MAX_LINE, JobRequest, JobResult, OutputFile, decode_request, encode
+from workbench.protocol import (
+    JOB_ID,
+    MAX_INLINE_BYTES,
+    MAX_LINE,
+    InlineFile,
+    JobRequest,
+    JobResult,
+    OutputFile,
+    decode_request,
+    encode,
+)
 from workbench.utils.audit_event import AuditWriteError
 
 pytestmark = pytest.mark.anyio
@@ -1473,3 +1499,391 @@ async def test_a_failed_error_record_and_a_failed_removal_do_not_hide_the_audit_
     with caplog.at_level(logging.WARNING), pytest.raises(AuditWriteError):
         await queue.submit(me, "run_python", ARGS, [], NoAgain())
     assert "OSError" in caplog.text
+
+
+# --- version 2: inline jobs, outputs taken back, a cap per caller ------------------------------------------------
+
+#: docint's limits as the MCP door passes them: its wall cap, the MCP wait and its slots.
+DOCINT = CallLimits(wall_s=60, wait_s=5, slots=2)
+PASSAGES = InlineFile(name="passages.json", content='[{"author": "user-a", "text": "synthetic harbour notes"}]')
+PNG = PNG_SIGNATURE + b"\x00" * 16
+
+
+def docint_user(n: int) -> Principal:
+    """A synthetic docint user: a pseudonym of 64 hex digits, in the default session."""
+    return Principal("docint", f"{n:064x}", "default")
+
+
+class Takes:
+    """A taker that remembers what it was handed and what the job's staging folder held when it ran.
+
+    Attributes:
+        calls: Per call, the answer's status and the outputs taken.
+        seen: Per call, the names in the job's staging folder at that moment.
+        fail: Raised after remembering, if set.
+    """
+
+    def __init__(self, settings: Settings, fail: Exception | None = None) -> None:
+        """Look into the staging folder of ``settings``' volume; raise ``fail``, if given."""
+        self.staging = settings.data_dir / "staging"
+        self.fail = fail
+        self.calls: list[tuple[str, TakenOutputs]] = []
+        self.seen: list[list[str]] = []
+
+    def take(self, result: JobResult, taken: TakenOutputs) -> None:
+        """Remember, then fail if told to."""
+        folder = self.staging / result.job_id
+        self.seen.append(sorted(p.name for p in folder.iterdir()) if folder.is_dir() else [])
+        self.calls.append((result.status, taken))
+        if self.fail is not None:
+            raise self.fail
+
+
+async def run_inline(
+    queue: JobQueue, taker: Takes, p: Principal | None = None, call: CallLimits = DOCINT
+) -> tuple[JobRecord, JobResult, TakenOutputs]:
+    """``run_python`` on the passages for ``p``, docint's first user by default."""
+    return await queue.submit_inline(p or docint_user(1), "run_python", ARGS, [PASSAGES], taker, call)
+
+
+async def take_back(
+    files: dict[str, bytes], settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> TakenOutputs:
+    """What one inline job whose ``out/`` holds ``files`` takes back."""
+    executor.files = files
+    _, _, taken = await run_inline(queue_for(settings, executor, store, metrics), Takes(settings))
+    return taken
+
+
+def returned(taken: TakenOutputs) -> list[str]:
+    """The names that come back, in order."""
+    return [f.name for f in taken.files]
+
+
+def skipped(taken: TakenOutputs) -> set[tuple[str, str]]:
+    """The names that do not come back, each with its reason."""
+    return {(s.name, s.reason) for s in taken.skipped}
+
+
+def test_mcp_callers_wait_five_seconds() -> None:
+    """An MCP call waits at most five seconds for its turn (§3.5)."""
+    assert MCP_QUEUE_WAIT_S == 5
+
+
+async def test_a_capped_caller_runs_at_most_its_slots_and_leaves_room_for_others(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Four docint users, two slots of its own: two run, two wait without a global slot, and Open WebUI still runs."""
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(4)}
+    queue = queue_for(settings, executor, store, metrics)
+    calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(4)]
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 2)
+    async with asyncio.timeout(scaled(2)):
+        _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [])
+    assert result.status == "ok"
+    assert executor.running == 2
+    assert [r.caller for r in executor.requests] == ["docint", "docint", "open-webui"]
+    executor.gate.set()
+    await asyncio.gather(*calls)
+    assert len(executor.requests) == 5
+    assert sample(metrics, "workbench_queue_length") == 0
+
+
+async def test_the_callers_waiting_calls_are_capped_across_many_users(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Docint's users are pseudonyms each: 2 run, 8 wait (2 * 16 // 4), the 11th is refused, and places come back."""
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)} | {"open-webui/user-a"}
+    queue = queue_for(settings, executor, store, metrics)
+    calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(10)]
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 8)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await run_inline(queue, Takes(settings), docint_user(10))
+    assert refused.value.reason == "queue_full"
+    assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
+    other = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    await until(lambda: executor.running == 3)
+    executor.gate.set()
+    await asyncio.gather(*calls, other)
+    assert len(executor.requests) == 11
+    assert sample(metrics, "workbench_queue_length") == 0
+    executor.gate.clear()
+    again = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(10)]
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 8)
+    executor.gate.set()
+    await asyncio.gather(*again)
+
+
+async def test_a_per_call_wait_replaces_the_queue_wait(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The queue waits 60 s, the call 1 s: it is refused after its own wait, and gives the caller's slot back."""
+    executor.hold = {"open-webui/user-a", "open-webui/user-b"}
+    queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_wait_s=60)
+    held = [asyncio.create_task(queue.submit(user(name), "run_python", ARGS, [])) for name in ("user-a", "user-b")]
+    await until(lambda: executor.running == 2)
+    async with asyncio.timeout(scaled(3)):
+        with pytest.raises(Busy) as refused:
+            await run_inline(queue, Takes(settings), call=dataclasses.replace(DOCINT, wait_s=1))
+    assert refused.value.reason == "wait_timeout"
+    executor.gate.set()
+    await asyncio.gather(*held)
+    executor.gate.clear()
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(2)}
+    both = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(2)]
+    await until(lambda: executor.running == 2)
+    executor.gate.set()
+    await asyncio.gather(*both)
+
+
+@pytest.mark.parametrize(("wall", "job_wall", "expected"), [(30, 120, 30), (200, 120, 120)])
+async def test_the_wall_is_the_least_of_the_call_and_the_setting(
+    wall: int, job_wall: int, expected: int, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The job gets the smaller wall as its wall and CPU time; the client waits that plus the cleanup's 300 s."""
+    queue = queue_for(settings, executor, store, metrics, job_wall_s=job_wall)
+    await run_inline(queue, Takes(settings), call=dataclasses.replace(DOCINT, wall_s=wall))
+    (req,) = executor.requests
+    assert req.limits.wall_s == req.limits.cpu_s == expected
+    assert executor.timeouts[-1] == expected + 300
+
+
+async def test_a_workspace_call_with_limits_takes_them_too(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """``submit`` with ``call`` applies its wall, its wait and its slots, as ``submit_inline`` does."""
+    executor.hold = {"docint/user-a", "docint/user-b"}
+    queue = queue_for(settings, executor, store, metrics, job_wall_s=120)
+    limits = CallLimits(wall_s=30, wait_s=1, slots=1)
+    first = asyncio.create_task(
+        queue.submit(Principal("docint", "user-a", "chat-1"), "run_python", ARGS, [], call=limits)
+    )
+    await until(lambda: executor.running == 1)
+    async with asyncio.timeout(scaled(3)):
+        with pytest.raises(Busy) as refused:
+            await queue.submit(Principal("docint", "user-b", "chat-1"), "run_python", ARGS, [], call=limits)
+    assert refused.value.reason == "wait_timeout"
+    executor.gate.set()
+    await first
+    assert (executor.requests[0].limits.wall_s, executor.timeouts[0]) == (30, 330)
+
+
+async def test_inline_inputs_reach_the_request_and_nothing_the_workspace(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The data travels in the request; no input file is named, no folder made below ``workspaces/``, no file kept."""
+    executor.files = {"counts.csv": b"author,posts\nuser-a,12\n"}
+    p = docint_user(1)
+    job, result, taken = await run_inline(queue_for(settings, executor, store, metrics), Takes(settings), p)
+    (req,) = executor.requests
+    assert (req.inline_inputs, req.input_files, req.caller) == ([PASSAGES], [], "docint")
+    assert (job.caller, job.user_id, job.status, result.status, result.outputs) == ("docint", p.user_id, "ok", "ok", [])
+    assert returned(taken) == ["counts.csv"]
+    assert not (settings.data_dir / "workspaces" / "docint").exists()
+    assert store.files_in_chat(p) == []
+
+
+async def test_outputs_come_back_png_then_csv_then_the_rest_by_name(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Only the five types come back, charts first, then tables, then the rest; any other type is skipped."""
+    names = ["z.txt", "b.csv", "a.png", "c.json", "n.md", "x.xlsx", "y.html"]
+    taken = await take_back(
+        {name: PNG if name.endswith(".png") else b"x" for name in names}, settings, store, executor, metrics
+    )
+    assert returned(taken) == ["a.png", "b.csv", "c.json", "n.md", "z.txt"]
+    assert skipped(taken) == {("x.xlsx", "type"), ("y.html", "type")}
+    assert [f.mime for f in taken.files] == [RETURN_TYPES[Path(f.name).suffix] for f in taken.files]
+    assert [f.data for f in taken.files] == [PNG, b"x", b"x", b"x", b"x"]
+
+
+async def test_upper_case_suffixes_come_back(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A model writes ``Chart.PNG`` as often as ``chart.png``: the suffix counts lower-cased, the name stays as is."""
+    taken = await take_back({"Chart.PNG": PNG, "Counts.CSV": b"a,b\n"}, settings, store, executor, metrics)
+    assert [(f.name, f.mime) for f in taken.files] == [("Chart.PNG", "image/png"), ("Counts.CSV", "text/csv")]
+    assert taken.skipped == ()
+
+
+async def test_a_png_needs_its_signature_and_text_must_be_strict_utf8(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A GIF named ``.png`` and a Latin-1 table are skipped; a UTF-8 table with a byte-order mark comes back as is."""
+    files = {
+        "fake.png": b"GIF89a\x01\x00\x01\x00",
+        "t.csv": "Müller\n".encode("latin-1"),
+        "bom.csv": b"\xef\xbb\xbfa,b\n",
+    }
+    taken = await take_back(files, settings, store, executor, metrics)
+    assert [(f.name, f.data) for f in taken.files] == [("bom.csv", b"\xef\xbb\xbfa,b\n")]
+    assert skipped(taken) == {("fake.png", "signature"), ("t.csv", "encoding")}
+
+
+async def test_the_return_caps(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
+    """At most 8 files, an image up to 512 KiB, a text up to 256 KiB, 1 MiB in all; past the total the next is tried."""
+    files = {f"{c}.csv": b"a,b\n" for c in "abcdefghi"} | {"0.csv": "Müller\n".encode("latin-1"), "x.xlsx": b"x"}
+    many = await take_back(files, settings, store, executor, metrics)
+    assert returned(many) == [f"{c}.csv" for c in "abcdefgh"]
+    assert skipped(many) == {("0.csv", "encoding"), ("i.csv", "count"), ("x.xlsx", "type")}
+
+    big = PNG_SIGNATURE + b"\x00" * (IMAGE_MAX + 1 - len(PNG_SIGNATURE))
+    large = await take_back({"big.png": big, "long.txt": b"x" * (TEXT_MAX + 1)}, settings, store, executor, metrics)
+    assert large.files == ()
+    assert {(s.name, s.size, s.reason) for s in large.skipped} == {
+        ("big.png", IMAGE_MAX + 1, "size"),
+        ("long.txt", TEXT_MAX + 1, "size"),
+    }
+
+    full = PNG_SIGNATURE + b"\x00" * (IMAGE_MAX - len(PNG_SIGNATURE))
+    total = await take_back({"a.png": full, "b.png": full, "c.csv": b"a,b\n"}, settings, store, executor, metrics)
+    assert returned(total) == ["a.png", "b.png"]
+    assert sum(len(f.data) for f in total.files) == RETURN_MAX
+    assert skipped(total) == {("c.csv", "total")}
+
+    part = PNG_SIGNATURE + b"\x00" * (400 * 1024)
+    files = {"a.png": full, "b.png": part, "c.csv": b"x" * (200 * 1024), "d.json": b"[]"}
+    tried = await take_back(files, settings, store, executor, metrics)
+    assert returned(tried) == ["a.png", "b.png", "d.json"]
+    assert skipped(tried) == {("c.csv", "total")}
+
+
+async def test_only_the_jobs_own_staged_regular_files_are_read(
+    settings: Settings, store: Store, metrics: Metrics
+) -> None:
+    """A path outside ``staging/<job-id>/``, a symlink, a folder and a FIFO in a staged file's place are not read."""
+    secret = settings.data_dir / "elsewhere.csv"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_bytes(b"not an output\n")
+
+    class Planted(FakeClient):
+        @override
+        async def run(self, req: JobRequest, timeout_s: float) -> JobResult:
+            self.requests.append(req)
+            folder = self.staged(req.job_id, "")
+            folder.mkdir(parents=True)
+            (folder / "own.csv").write_bytes(b"a,b\n")
+            (folder / "link.csv").symlink_to(secret)
+            (folder / "folder.csv").mkdir()
+            os.mkfifo(folder / "fifo.csv")
+            outputs = [
+                OutputFile(name=name, staged_path=str(folder / name), size=4)
+                for name in ("own.csv", "link.csv", "folder.csv", "fifo.csv")
+            ]
+            outputs += [
+                OutputFile(name="elsewhere.csv", staged_path=str(secret), size=14),
+                OutputFile(name="../elsewhere.csv", staged_path=str(folder / "../elsewhere.csv"), size=14),
+            ]
+            return sample_result(req.job_id, outputs)
+
+    queue = queue_for(settings, Planted(settings.data_dir), store, metrics)
+    async with asyncio.timeout(scaled(5)):
+        _, _, taken = await run_inline(queue, Takes(settings))
+    assert [(f.name, f.data) for f in taken.files] == [("own.csv", b"a,b\n")]
+    assert skipped(taken) == {
+        (name, "unreadable") for name in ("link.csv", "folder.csv", "fifo.csv", "elsewhere.csv", "../elsewhere.csv")
+    }
+    assert secret.read_bytes() == b"not an output\n"
+
+
+async def test_the_taker_records_before_anything_returns_and_its_failure_sends_nothing(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The taker runs while the outputs are still staged; when it cannot record, its error is the answer."""
+    executor.files = {"counts.csv": b"a,b\n", "chart.png": PNG}
+    taker = Takes(settings, fail=AuditWriteError("x"))
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(AuditWriteError):
+        await run_inline(queue, taker)
+    job_id = executor.requests[0].job_id
+    assert taker.seen == [["chart.png", "counts.csv"]]
+    ((status, taken),) = taker.calls
+    assert (status, returned(taken)) == ("ok", ["chart.png", "counts.csv"])
+    assert not (settings.data_dir / "staging" / job_id).exists()
+    assert store.get_job(docint_user(1), job_id).status == "error"
+    assert queue.tracked_users == 0
+
+
+@pytest.mark.parametrize("ending", ["ok", "error", "cancelled"])
+async def test_staging_is_removed_on_success_error_and_cancellation(
+    ending: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """However the call ends, nothing of the job's outputs stays, and its record says how it ended."""
+    p = docint_user(1)
+    executor.files = {"counts.csv": b"a,b\n"}
+    if ending == "error":
+        executor.status = "error"
+    if ending == "cancelled":
+        executor.hold = {f"docint/{p.user_id}"}
+    queue = queue_for(settings, executor, store, metrics)
+    call = asyncio.create_task(run_inline(queue, Takes(settings), p))
+    await until(lambda: len(executor.requests) == 1)
+    job_id = executor.requests[0].job_id
+    if ending == "cancelled":
+        executor.staged(job_id, "left.csv").parent.mkdir(parents=True)
+        executor.staged(job_id, "left.csv").write_bytes(b"x")
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+    else:
+        await call
+    assert not (settings.data_dir / "staging" / job_id).exists()
+    assert store.get_job(p, job_id).status == ending
+    assert queue.tracked_users == 0
+
+
+async def test_a_failed_job_takes_no_output_but_is_still_handed_to_the_taker(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A job that timed out is recorded like any other the executor answered; what it staged does not come back."""
+    executor.files = {"counts.csv": b"a,b\n"}
+    executor.status = "timeout"
+    taker = Takes(settings)
+    _, result, taken = await run_inline(queue_for(settings, executor, store, metrics), taker)
+    assert (result.status, taken) == ("timeout", TakenOutputs())
+    assert taker.calls == [("timeout", TakenOutputs())]
+    assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
+
+
+async def test_a_refused_call_is_not_handed_to_the_taker(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """An executor with no free slot answered no job: ``Busy``, and nothing for the taker to record."""
+    executor.status = "busy"
+    taker = Takes(settings)
+    with pytest.raises(Busy) as refused:
+        await run_inline(queue_for(settings, executor, store, metrics), taker)
+    assert refused.value.reason == "executor_busy"
+    assert taker.calls == []
+
+
+async def test_inline_data_past_the_line_is_too_large_and_not_sent(
+    settings: Settings, store: Store, metrics: Metrics, sock_dir: Path
+) -> None:
+    """512 KiB of quotes passes the protocol's bound but doubles on the line: the client's own error, nothing taken."""
+    quotes = InlineFile(name="passages.json", content='"' * MAX_INLINE_BYTES)
+    queue = JobQueue(settings, ExecutorClient(sock_dir / "none.sock"), store, metrics)
+    taker = Takes(settings)
+    with pytest.raises(RequestTooLarge):
+        await queue.submit_inline(docint_user(1), "run_python", ARGS, [quotes], taker, DOCINT)
+    assert taker.calls == []
+    assert sample(metrics, "workbench_job_refusals_total", reason="executor_busy") == 0
+    assert queue.tracked_users == 0
+
+
+async def test_open_webui_is_never_capped(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Docint's gate holds docint alone: four Open WebUI users run at once while docint's calls wait for a slot."""
+    queue = queue_for(settings, executor, store, metrics)
+    await run_inline(queue, Takes(settings))
+    executor.hold = {f"open-webui/user-{n}" for n in range(4)}
+    others = [asyncio.create_task(queue.submit(user(f"user-{n}"), "run_python", ARGS, [])) for n in range(4)]
+    await until(lambda: executor.running == 4)
+    waiting = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in (2, 3)]
+    await until(lambda: sample(metrics, "workbench_queue_length") == 2)
+    executor.gate.set()
+    await asyncio.gather(*others, *waiting)
+    assert executor.peak == 4
+    assert len(executor.requests) == 7

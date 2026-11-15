@@ -26,7 +26,7 @@ from tests.api.test_files import CHAT, ME, AuditLines, H, put, tick
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue, Keeper
+from workbench.api.jobs import CallLimits, JobQueue, Keeper
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.openapi import TOOL_TAG
@@ -420,9 +420,11 @@ class CancelledOnReturn(JobQueue):
         args: dict[str, Any],
         input_files: Sequence[str],
         keeper: Keeper | None = None,
+        *,
+        call: CallLimits | None = None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
-        answer = await super().submit(p, tool, args, input_files, keeper)
+        answer = await super().submit(p, tool, args, input_files, keeper, call=call)
         caller = asyncio.current_task()
         assert caller is not None
         caller.cancel()
