@@ -1029,7 +1029,9 @@ def test_a_part_of_millions_of_elements_is_counted_without_building_them(tmp_pat
     seconds, megabytes = (float(x) for x in numbers.split())
     assert verdict == "refused the workbook holds too many strings"
     assert seconds < scaled(8)
-    assert megabytes < 400
+    # The bound tells the two passes apart, not a tight budget: the counting pass peaked at 49 MB (macOS), 76 MB
+    # (the aarch64 image) and 415 MB (an x86_64 CI runner, run 3); the tree-keeping pass at 2.6 GB.
+    assert megabytes < 1024
 
 
 def test_the_timer_interrupts_a_workbook_that_is_slow_to_load(tmp_path: Path) -> None:
