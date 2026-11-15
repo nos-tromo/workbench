@@ -20,7 +20,9 @@ The job folder, ``<data_dir>/jobs/<job-id>/``:
 ``out/`` and ``home/`` are all the job can write. While it runs, a watchdog measures them, and
 the memory and OOM scores of the slot's processes, about twice a second, and stops the job past
 its limits. One thread of its own measures every running job (``_Watchdog``); the wall clock is
-kept on the event loop, so neither waits on the other.
+kept on the event loop, so neither waits on the other. Below a floor of free space on the data
+volume, every running job is stopped and no job starts (``below_floor``): a file a job removed
+and keeps open is in no folder the watchdog walks, but it takes room on the volume.
 
 The api owns the workspaces and the staging folder, and the job owns ``out/`` and ``home/``, so
 neither is trusted: everything below ``data_dir`` is opened relative to a folder already open,
@@ -91,6 +93,13 @@ LEFTOVER_RETRY_S = 300
 #: Descriptors the supervisor keeps beyond the walks of the job folders: its socket and connections, each job's process
 #: and its watch, and the cleanup helpers, with room to spare.
 NOFILE_MARGIN = 256
+#: The least free space the data volume keeps for the api and the database (R84): 1 GiB, or a share of the volume where
+#: that is more. Below it every running job is stopped and none starts. A fixed rule, not a setting.
+FREE_FLOOR_MIN = 1 << 30
+#: That share: one part in 20, 5 %.
+FREE_FLOOR_PARTS = 20
+#: The refusal of a job the floor stops or keeps from starting: a runner's ``code: text``, which the api answers 507.
+STORAGE_FULL = "storage_full: storage is full"
 
 _WORKSPACE = "workspace"
 _HOME = "home"
@@ -183,6 +192,38 @@ def make_slots(settings: Settings) -> tuple[Slot, ...]:
     if base <= API_UID <= last:
         raise ValueError(f"the slot uids must not include the api's uid {API_UID}")
     return slots
+
+
+def free_space_floor(size: int) -> int:
+    """Give the free space below which the data volume takes no job.
+
+    Args:
+        size: The volume's size in bytes.
+
+    Returns:
+        ``FREE_FLOOR_MIN``, or one ``FREE_FLOOR_PARTS``-th of ``size`` where that is more.
+    """
+    return max(FREE_FLOOR_MIN, size // FREE_FLOOR_PARTS)
+
+
+def below_floor(data_dir: Path) -> bool:
+    """Tell whether the data volume's free space is below its floor (``free_space_floor``).
+
+    The free space is what a process without privilege may still use (``f_bavail``), as the api and the jobs are. It
+    counts every file still open, named or not: a job can remove a file and keep writing it, out of every folder the
+    watchdog walks, but not out of the volume's free space.
+
+    Args:
+        data_dir: The data volume.
+
+    Returns:
+        Whether it is below.
+
+    Raises:
+        OSError: The volume cannot be asked.
+    """
+    st = os.statvfs(data_dir)
+    return st.f_bavail * st.f_frsize < free_space_floor(st.f_blocks * st.f_frsize)
 
 
 def _passwd_uids(passwd: Path) -> set[int]:
@@ -492,6 +533,18 @@ def _dropped(count: int) -> str:
     return f"dropped {count} output{'' if count == 1 else 's'}: not the job's own file"
 
 
+def _full(job_id: str) -> JobResult:
+    """Refuse a job because the data volume is below its free-space floor.
+
+    Args:
+        job_id: The request's id.
+
+    Returns:
+        An ``error`` whose result is the refusal ``STORAGE_FULL``, as a runner's refusal reads.
+    """
+    return _answer(job_id, "error", "the data volume is full", {"error": STORAGE_FULL})
+
+
 def _answer(job_id: str, status: Status, message: str = "", result: dict[str, Any] | None = None) -> JobResult:
     """Build an answer without outputs.
 
@@ -554,6 +607,40 @@ class _Job:
 UNMEASURED = "its use of memory and disk could not be measured"
 #: What it says when a process of the job's slot runs below the OOM score jobs get.
 LOWERED = "one of its processes lowered its OOM score"
+#: What it says when the data volume is below its free-space floor; the job is refused as ``STORAGE_FULL``.
+FULL = "the data volume is below its free-space floor"
+
+
+class _Floor:
+    """Whether the data volume is below its free-space floor, as last asked; each crossing is logged, without names."""
+
+    def __init__(self, data_dir: Path) -> None:
+        """Start above the floor.
+
+        Args:
+            data_dir: The data volume.
+        """
+        self._data_dir = data_dir
+        self._lock = threading.Lock()
+        self._below = False
+
+    def below(self) -> bool:
+        """Ask the volume (``below_floor``) and log when the answer changed.
+
+        Returns:
+            Whether it is below its floor.
+
+        Raises:
+            OSError: The volume cannot be asked.
+        """
+        below = below_floor(self._data_dir)
+        with self._lock:
+            crossed, self._below = below != self._below, below
+        if crossed and below:
+            _log.warning("the data volume is below its free-space floor: running jobs stop and no job starts")
+        elif crossed:
+            _log.info("the data volume is above its free-space floor again: jobs start")
+        return below
 
 
 class _Watch:
@@ -652,19 +739,22 @@ def _settle(stop: asyncio.Future[str], verdict: str) -> None:
 class _Watchdog:
     """Measures every running job about twice a second, in one thread of its own, and stops those past a limit.
 
-    One pass looks at ``/proc`` and the SysV table once for every slot (``slots_use``), then measures each job's
-    folders, one job after the other, so the supervisor holds one walk's descriptors at a time. A verdict reaches the
+    One pass asks the data volume for its free space: below its floor, every job stops (``FULL``). Then it looks at
+    ``/proc`` and the SysV table once for every slot (``slots_use``), and measures each job's folders, one job after
+    the other, so the supervisor holds one walk's descriptors at a time. A verdict reaches the
     job's loop as the result of its stop; the wall clock never waits on a pass, nor a pass on the loop's own pool.
     What cannot be measured stops the job: ``UNMEASURED``, logged by its type alone, and the slot is retired. The
     thread runs while there are jobs to watch, and ends when there are none.
     """
 
-    def __init__(self, interval_s: float = WATCH_INTERVAL_S) -> None:
+    def __init__(self, floor: _Floor, interval_s: float = WATCH_INTERVAL_S) -> None:
         """Watch nothing yet.
 
         Args:
+            floor: The data volume's free-space floor, asked first in every pass.
             interval_s: Seconds between two passes.
         """
+        self._floor = floor
         self._interval = interval_s
         self._lock = threading.Lock()
         self._watches: list[_Watch] = []
@@ -719,6 +809,15 @@ class _Watchdog:
         Returns:
             Each job that broke a limit, with the limit.
         """
+        try:
+            full = self._floor.below()
+        except OSError as exc:
+            _log.error("the watchdog could not ask the data volume for its free space (%s)", type(exc).__name__)
+            return [(watch, UNMEASURED) for watch in watches]
+        if full:
+            count = len(watches)
+            _log.warning("stopped %d running job%s: the data volume is below its free-space floor", count, _s(count))
+            return [(watch, FULL) for watch in watches]
         uids = {watch.uid for watch in watches if watch.uid is not None}
         try:
             use = slots_use(uids)
@@ -735,6 +834,18 @@ class _Watchdog:
             if verdict is not None:
                 verdicts.append((watch, verdict))
         return verdicts
+
+
+def _s(count: int) -> str:
+    """The plural ending of a count.
+
+    Args:
+        count: How many.
+
+    Returns:
+        ``"s"``, or nothing for one.
+    """
+    return "" if count == 1 else "s"
 
 
 def _verdict(stop: asyncio.Future[str] | None) -> str | None:
@@ -774,7 +885,8 @@ class Supervisor:
         self._exhausted = asyncio.Event()
         self._cleanup_pool = ThreadPoolExecutor(max_workers=settings.executor_slots, thread_name_prefix="slot-cleanup")
         self._sockets = seccomp.for_this_machine()
-        self._watchdog = _Watchdog()
+        self._floor = _Floor(settings.data_dir)
+        self._watchdog = _Watchdog(self._floor)
         # Job folders whose removal failed; serve() tries them again every LEFTOVER_RETRY_S.
         self._leftovers: set[str] = set()
         self._jobs = settings.data_dir / JOBS
@@ -826,17 +938,26 @@ class Supervisor:
             req: The job.
 
         Returns:
-            The answer. ``busy`` when no slot is free (``no usable slot`` once every slot is
-            retired); ``timeout`` or ``killed`` when the job was stopped; ``error`` when it could
-            not be set up, its slot could not be cleared, it failed, its runner raised (the
-            result keeps the runner's ``{"error": ...}``), it left no readable result, or its
-            outputs broke a limit; else ``ok`` with the staged outputs, its message counting
-            outputs dropped as not the job's own file (``_own_file``). A slot whose job folder
-            could not be removed is retired.
+            The answer. ``error`` with the refusal ``STORAGE_FULL`` when the data volume is below
+            its free-space floor, before the job or while it runs (``below_floor``); ``busy`` when
+            no slot is free (``no usable slot`` once every slot is retired); ``timeout`` or
+            ``killed`` when the job was stopped; ``error`` when it could not be set up, its slot
+            could not be cleared, it failed, its runner raised (the result keeps the runner's
+            ``{"error": ...}``), it left no readable result, or its outputs broke a limit; else
+            ``ok`` with the staged outputs, its message counting outputs dropped as not the job's
+            own file (``_own_file``). A slot whose job folder could not be removed, or whose job
+            could not be measured, is retired.
 
         Raises:
             asyncio.CancelledError: The job was cancelled; its slot is retired.
         """
+        try:
+            full = self._floor.below()
+        except OSError as exc:
+            _log.error("the data volume's free space could not be read (%s)", type(exc).__name__)
+            return _answer(req.job_id, "error", "the job could not be set up")
+        if full:
+            return _full(req.job_id)
         if not self._free:
             message = "no usable slot" if not self._slots_left() else "every slot is busy"
             return _answer(req.job_id, "busy", message)
@@ -1148,6 +1269,8 @@ class Supervisor:
         """
         if outcome == "timeout":
             return _answer(req.job_id, "timeout", f"the job ran past its wall time of {limits.wall_s} s")
+        if outcome == "killed" and broken == FULL:
+            return _full(req.job_id)
         if outcome == "killed":
             return _answer(req.job_id, "killed", KILLED if broken is None else f"the job was stopped: {broken}")
         if outcome != "ok":

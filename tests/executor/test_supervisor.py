@@ -84,6 +84,28 @@ def _settings(data: Path, **env: str) -> Settings:
     return load_settings(values, role="executor")
 
 
+#: The real floor, for the tests of the floor itself.
+FREE_SPACE_FLOOR = supervisor.free_space_floor
+
+
+@pytest.fixture(autouse=True)
+def _room_on_the_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A floor of 0 bytes: a test's volume is a folder on the developer's disk, whose free space is not the test's.
+
+    The supervisor still asks the volume before each job and in every pass; the tests of the floor put the real one
+    back and stub what the volume answers.
+    """
+    monkeypatch.setattr(supervisor, "free_space_floor", lambda size: 0)
+
+
+class _Above:
+    """A floor the volume is always above, for the tests of a watchdog's pass."""
+
+    def below(self) -> bool:
+        """Never below."""
+        return False
+
+
 @pytest.fixture
 def volume(tmp_path: Path) -> Path:
     """A prepared volume owned by the test runner, as the supervisor without slots expects it."""
@@ -2514,7 +2536,7 @@ def test_one_pass_reads_proc_once_for_every_slot_and_hands_each_job_its_own_use(
     monkeypatch.setattr(supervisor, "slots_use", use_of)
     first, second, third = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB"), _Judged(2, None)
 
-    verdicts = supervisor._Watchdog().check([first, second, third])  # type: ignore[list-item]
+    verdicts = supervisor._Watchdog(_Above()).check([first, second, third])  # type: ignore[list-item]
 
     assert looks == [{20001, 20002}]
     assert (first.seen, second.seen, third.seen) == ([SlotUse(memory=20001)], [SlotUse(memory=20002)], [None])
@@ -2530,7 +2552,7 @@ def test_a_pass_that_cannot_read_proc_stops_every_job(
         raise _unexpected()
 
     one, two = _Judged(0, 20001), _Judged(1, 20002, error=_unexpected())
-    watchdog = supervisor._Watchdog()
+    watchdog = supervisor._Watchdog(_Above())  # type: ignore[arg-type]
     monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
     with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
         assert watchdog.check([one, two]) == [(two, supervisor.UNMEASURED)]  # type: ignore[list-item]
@@ -2566,6 +2588,122 @@ async def test_a_watch_judges_its_slots_memory_and_score_before_its_folders(tmp_
         for fd in fds:
             os.close(fd)
     assert watch.judge(SlotUse(lowered=True)) is None
+
+
+GIB = 1024 * MB
+
+
+def _space(free: int, size: int = 100 * GIB) -> os.statvfs_result:
+    """What ``statvfs`` says of a volume of ``size`` bytes with ``free`` of them free to anyone, in 4 KiB blocks."""
+    return os.statvfs_result((4096, 4096, size // 4096, free // 4096, free // 4096, 1000, 500, 500, 0, 255))
+
+
+def test_the_floor_is_a_gibibyte_or_a_twentieth_of_the_volume_whichever_is_more() -> None:
+    """R84: a fixed rule, not a setting: 1 GiB on a volume of up to 20 GiB, 5 % on a larger one."""
+    assert [FREE_SPACE_FLOOR(size * GIB) for size in (1, 10, 20, 100, 2000)] == [GIB, GIB, GIB, 5 * GIB, 100 * GIB]
+
+
+class _Volume:
+    """A stand-in for ``os.statvfs`` whose answer the test sets, counting the calls."""
+
+    def __init__(self, free: int) -> None:
+        """Answer ``free`` bytes free of 100 GiB."""
+        self.free = free
+        self.asked = 0
+
+    def __call__(self, path: Any) -> os.statvfs_result:
+        """The volume's space now."""
+        self.asked += 1
+        return _space(self.free)
+
+
+async def test_below_the_free_space_floor_no_job_starts(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R84: the refusal is the runner's ``storage_full`` code, which the api answers 507; nothing of the job is made."""
+    monkeypatch.setattr(supervisor, "free_space_floor", FREE_SPACE_FLOOR)
+    space = _Volume(free=4 * GIB)  # below 5 GiB, the floor of 100 GiB
+    monkeypatch.setattr(supervisor.os, "statvfs", space)
+    _chat(volume, {"q.csv": b"q"})
+    _runner(monkeypatch, "result = {'ran': True}")
+    sup = Supervisor(_settings(volume), use_slots=False)
+    request = _request(input_files=["q.csv"])
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        first = await sup.run_job(request)
+        second = await sup.run_job(_request())
+
+    for answer in (first, second):
+        assert (answer.status, answer.result, answer.message) == (
+            "error",
+            {"error": "storage_full: storage is full"},
+            "the data volume is full",
+        )
+    assert _entries(volume / "jobs") == []
+    assert (sup._free, sup._retired) == ([0, 1], set())
+    assert caplog.messages == ["the data volume is below its free-space floor: running jobs stop and no job starts"]
+
+    space.free = 6 * GIB
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        again = await sup.run_job(request)
+    assert (again.status, again.result) == ("ok", {"ran": True})
+    assert caplog.messages[-1] == "the data volume is above its free-space floor again: jobs start"
+    assert request.job_id not in caplog.text
+
+
+async def test_a_running_job_stops_when_the_volume_falls_below_its_floor(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R84: the watchdog asks the volume in every pass; below the floor it stops every running job, by count in the log.
+
+    A job can fill the volume with a file it removed and keeps open: no folder the watchdog walks holds it, but the
+    volume's free space counts it.
+    """
+    monkeypatch.setattr(supervisor, "free_space_floor", FREE_SPACE_FLOOR)
+    space = _Volume(free=50 * GIB)
+    monkeypatch.setattr(supervisor.os, "statvfs", space)
+    _chat(volume)
+    started = volume.parent / "started"
+    started.mkdir()
+    _runner(
+        monkeypatch, f"import time\n(pathlib.Path({str(started)!r}) / spec_path.parent.name).touch()\ntime.sleep(60)\n"
+    )
+    sup = Supervisor(_settings(volume), use_slots=False)
+    limits = Limits(wall_s=30, cpu_s=30, memory_mb=1024, file_mb=50)
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        running = [asyncio.create_task(sup.run_job(_request(limits=limits))) for _ in range(2)]
+        await until(lambda: len(_entries(started)) == 2, seconds=scaled(10))
+        began = time.monotonic()
+        space.free = GIB
+        answers = await asyncio.gather(*running)
+
+    assert time.monotonic() - began < scaled(4)
+    for answer in answers:
+        assert (answer.status, answer.result) == ("error", {"error": "storage_full: storage is full"})
+    assert "stopped 2 running jobs: the data volume is below its free-space floor" in caplog.messages
+    assert _entries(volume / "jobs") == []
+    assert sorted(sup._free) == [0, 1]
+
+
+async def test_a_volume_that_cannot_be_asked_for_its_free_space_runs_no_job(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail closed: the job is not set up, and the log names the error's type alone."""
+
+    def broken(path: Any) -> os.statvfs_result:
+        raise _unexpected()
+
+    monkeypatch.setattr(supervisor.os, "statvfs", broken)
+    _chat(volume)
+    _runner(monkeypatch, "result = {'ran': True}")
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
+
+    assert (answer.status, answer.message) == ("error", "the job could not be set up")
+    assert "the data volume's free space could not be read (PermissionError)" in caplog.text
+    assert not _holds_a_secret(caplog.text)
 
 
 async def test_a_failed_run_removes_the_job_folder_off_the_event_loop(
@@ -2752,6 +2890,56 @@ async def test_as_root_segments_a_job_filled_and_left_to_its_children_count_agai
         "the job was stopped: its processes used more than 256 MB of memory together",
     )
     assert time.monotonic() - began < scaled(20)
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+@pytest.mark.parametrize(
+    ("room_mb", "pause_s", "status"),
+    [(64, 0.0, "error"), (None, 0.5, "timeout")],
+    ids=["the-floor-first", "the-wall-time-first"],
+)
+async def test_as_root_a_job_that_writes_files_it_removed_ends_by_the_floor_or_its_wall_time(
+    room_mb: int | None, pause_s: float, status: str, root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R84: files a job removes and keeps open are in no folder the watchdog walks, but they fill the volume.
+
+    Each of its processes may hold 256 such files of 50 MB, 64 processes a job. The floor is set 64 MB below what the
+    volume has free now, so the job reaches it fast; or out of reach, with a job that writes slowly, which ends at its
+    wall time instead.
+    """
+    st = os.statvfs(root_volume)
+    if room_mb is None:
+        floor = 0
+    else:
+        floor = st.f_bavail * st.f_frsize - room_mb * MB
+    monkeypatch.setattr(supervisor, "free_space_floor", lambda size: floor)
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        f"""
+        import time
+        chunk = os.urandom(4 * 1024 * 1024)
+        held = []
+        while True:
+            name = pathlib.Path(os.environ["TMPDIR"], f"gone{{len(held)}}")
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT, 0o600)
+            os.unlink(name)
+            held.append(fd)
+            for _ in range(12):
+                os.write(fd, chunk)
+                time.sleep({pause_s})
+        """,
+    )
+    limits = Limits(wall_s=5, cpu_s=30, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_request(limits=limits))
+
+    assert answer.status == status, answer
+    if status == "error":
+        assert answer.result == {"error": "storage_full: storage is full"}
+        assert time.monotonic() - began < scaled(4)
+    assert _entries(root_volume / "jobs") == []
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")

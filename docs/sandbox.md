@@ -181,6 +181,7 @@ supervisor caps whatever a request asks at its own settings
 | `RLIMIT_CPU` | `WORKBENCH_JOB_WALL_S` seconds of CPU |
 | `RLIMIT_FSIZE` | `WORKBENCH_UPLOAD_MAX_MB` (50 MB) per file written |
 | What the job writes | `WORKBENCH_WORKSPACE_MAX_MB` (500 MB) in `home/` and `out/` together, at most 10 000 files and folders, nested at most 256 deep, measured by the watchdog |
+| Free space on the volume | 1 GiB of `workbench-data`, or 5 % of it where that is more (`supervisor.py:free_space_floor`, a fixed rule, not a setting): below it every running job is stopped and no job starts |
 | `RLIMIT_NPROC` | 64 processes of the slot's uid |
 | `RLIMIT_NOFILE` | 256 open files |
 | `RLIMIT_CORE` | 0 |
@@ -200,6 +201,18 @@ other. Per slot it counts:
 - whether a process of the uid runs with an `oom_score_adj` below 1000
   (`/proc/<pid>/oom_score_adj` is world-readable);
 - the disk, entries and depth of `home/` and `out/`.
+
+Before all that, each pass asks the data volume for its free space
+(`statvfs`, the space left to a process without privilege). Below its floor,
+1 GiB or 5 % of the volume, whichever is more, it stops every running job, and
+the supervisor starts no job until the volume is above the floor again; each
+such job is answered with the refusal `storage_full`, which the api answers
+`507` and records as a refusal ([audit.md](audit.md)). The log says when the
+volume crosses the floor and how many jobs were stopped. The floor catches
+what no folder holds: a file a job removed and keeps open is in neither
+`home/` nor `out/`, and the supervisor cannot see it without
+`CAP_SYS_PTRACE`, which it does not get; but it takes room on the volume. The
+floor keeps that room for the api, its uploads and its database.
 
 Past a limit it stops the job: its process group is killed, the slot's cleanup
 kills the rest, and the answer names the limit ("the job was stopped: it wrote
@@ -342,10 +355,15 @@ Each of these is accepted. Each says what it would take.
   disk takes in half a second, and take as much memory as it can map in half a
   second, or lower its OOM score for that long; the container's memory limit and
   the job's OOM score hold the memory.
-  A file a job has removed but keeps open is in no folder the watchdog walks: up
-  to 256 such files (`RLIMIT_NOFILE`) of 50 MB each (`RLIMIT_FSIZE`), freed
-  when the job ends. A job that renames its folders while they are walked can
-  be counted short by one measure.
+  A file a job has removed but keeps open is in no folder the watchdog walks:
+  each of its processes may hold 256 such files (`RLIMIT_NOFILE`) of 50 MB
+  each (`RLIMIT_FSIZE`), and a job may have 64 processes (`RLIMIT_NPROC`), so
+  64 × 256 × 50 MB, about 800 GB, a job. What bounds it is the volume's
+  free-space floor: the job is stopped once the volume falls below it, or at
+  its wall time if that comes first, and the files go when the job ends. Between
+  two measures it can still write what the disk takes in half a second past the
+  floor. A job that renames its folders while they are walked can be counted
+  short by one measure.
 - **What the memory sum does not count.** The kernel's own memory that a job's
   processes cause (page tables, pipe and socket-pair buffers, the inodes of its
   files) and the page cache of the files it reads and writes are in no resident

@@ -136,6 +136,11 @@ The formulas, for other slot counts or job memory:
   host's number of CPUs. On a host with fewer than 4 CPUs, set
   `WORKBENCH_EXECUTOR_CPUS` to the host's number or less. CI does so on small
   runners.
+- **Free space on the volume:** not a setting. The executor keeps 1 GiB of
+  `workbench-data` free, or 5 % of the volume where that is more: below it,
+  every running job is stopped and no job starts, and the tool answers `507`
+  ([sandbox.md](sandbox.md#limits)). Size the volume for the users' quotas and
+  that floor.
 
 ## Audit and retention
 

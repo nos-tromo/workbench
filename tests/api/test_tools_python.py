@@ -597,6 +597,20 @@ def test_a_run_python_refusal_is_recorded_as_an_error_by_its_code_alone(
     assert "salaries" not in json.dumps(audit_lines())
 
 
+def test_a_job_the_executor_refused_for_a_full_volume_is_a_507_and_recorded_as_a_refusal(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """R84: the executor's free-space floor stops or refuses the job; the api answers as for a full volume, 507."""
+    a = put(store, "q.csv")
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "storage_full: storage is full"}
+    r = run(client)
+    assert (r.status_code, r.json()) == (507, {"detail": "storage_full: storage is full"})
+    (event,) = events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [a.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "storage_full"}
+
+
 def test_a_run_python_refusal_whose_record_cannot_be_written_never_reaches_the_model(
     client: TestClient, fake_executor: Scripted, broken_audit: None
 ) -> None:

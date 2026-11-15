@@ -437,6 +437,21 @@ def test_a_runner_refusal_is_its_422(client: TestClient, fake_executor: Local) -
     assert document(client).status_code == 422
 
 
+def test_a_full_volume_in_the_executor_is_a_507_and_recorded_as_a_refusal(
+    client: TestClient, fake_executor: Local, audit_lines: AuditLines
+) -> None:
+    """R84: below the executor's free-space floor no file is written; the answer is a full volume's, 507."""
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "storage_full: storage is full"}
+    r = table(client)
+    assert (r.status_code, r.json()) == (507, {"detail": "storage_full: storage is full"})
+    assert document(client).status_code == 507
+    for tool in ("write_table", "write_document"):
+        (event,) = events(audit_lines, tool)
+        assert event["outcome"] == "error"
+        assert (event["criteria"]["outputs"], event["criteria"]["refused"]) == (0, "storage_full")
+
+
 def test_a_busy_executor_is_a_503(client: TestClient, fake_executor: Local) -> None:
     """Nothing ran; retry later."""
     fake_executor.status = "busy"
