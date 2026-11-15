@@ -2633,6 +2633,84 @@ def test_a_pass_that_cannot_read_proc_stops_every_job(
     assert not _holds_a_secret(caplog.text)
 
 
+async def test_a_watchdog_that_dies_stops_its_jobs_and_the_next_job_is_watched_by_a_new_one(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R89: an error that escapes the watchdog's loop fails closed: its jobs stop unmeasured, their slots are retired.
+
+    The next job starts a new thread, which watches it: past its disk limit, it is stopped.
+    """
+    _chat(volume)
+    _runner(monkeypatch, "import time\ntime.sleep(60)\n")
+    real = supervisor._Watchdog.check
+    passes: list[int] = []
+
+    def dies_once(self: Any, watches: list[Any]) -> list[tuple[Any, str]]:
+        passes.append(len(watches))
+        if len(passes) == 1:
+            raise MemoryError
+        return real(self, watches)
+
+    monkeypatch.setattr(supervisor._Watchdog, "check", dies_once)
+    sup = Supervisor(_settings(volume, WORKBENCH_WORKSPACE_MAX_MB="1"), use_slots=False)
+    limits = Limits(wall_s=20, cpu_s=20, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        first = await sup.run_job(_request(limits=limits))
+
+    assert (first.status, first.message) == (
+        "killed",
+        "the job was stopped: its use of memory and disk could not be measured",
+    )
+    assert time.monotonic() - began < scaled(5)
+    assert sup._retired == {0}
+    assert "the watchdog stopped (MemoryError); stopping the 1 job it watched" in caplog.messages
+
+    _runner(
+        monkeypatch,
+        "pathlib.Path(os.environ['TMPDIR'], 'big').write_bytes(os.urandom(3 * 1024 * 1024))\n"
+        "import time\ntime.sleep(60)\n",
+    )
+    second = await sup.run_job(_request(limits=limits))
+    assert (second.status, second.message) == ("killed", "the job was stopped: it wrote more than 1 MB")
+    assert len(passes) >= 2
+
+
+async def test_a_job_whose_watchdog_cannot_start_never_runs_and_the_next_job_starts_one(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R89, c5d75fb: a thread that cannot start leaves the watchdog able to start the next; the answer says the truth.
+
+    Nothing ran, so the answer is not "the job's processes could not be stopped"; the job's folder goes and its slot
+    stays free.
+    """
+    _chat(volume)
+    ran = volume.parent / "ran"
+    _runner(monkeypatch, f"pathlib.Path({str(ran)!r}).touch()\nresult = {{'ran': True}}\n")
+    real = supervisor._Watchdog._new_thread
+
+    class NoThread:
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(supervisor._Watchdog, "_new_thread", lambda self: NoThread())
+    sup = Supervisor(_settings(volume), use_slots=False)
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        refused = await sup.run_job(_request())
+
+    assert (refused.status, refused.message) == ("error", "the job could not be watched, so it did not run")
+    assert not ran.exists()
+    assert _entries(volume / "jobs") == []
+    assert (sorted(sup._free), sup._retired) == ([0, 1], set())
+    assert "a job could not be watched and did not run (RuntimeError)" in caplog.messages
+
+    monkeypatch.setattr(supervisor._Watchdog, "_new_thread", real)
+    again = await sup.run_job(_request())
+    assert (again.status, again.result) == ("ok", {"ran": True})
+
+
 async def test_a_watch_judges_its_slots_memory_and_score_before_its_folders(tmp_path: Path) -> None:
     """R86 N7: a lowered OOM score is a broken limit; memory past the job's share is too."""
     home, out = tmp_path / "home", tmp_path / "out"

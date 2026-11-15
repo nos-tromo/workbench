@@ -725,6 +725,17 @@ class _Watch:
             self._folders = ()
 
 
+def _post(watch: _Watch, verdict: str) -> None:
+    """Hand a verdict to a job's loop, from the watchdog's thread; a closed loop means that job is over.
+
+    Args:
+        watch: The job's watch.
+        verdict: The limit it broke.
+    """
+    with contextlib.suppress(RuntimeError):
+        watch.loop.call_soon_threadsafe(_settle, watch.stop, verdict)
+
+
 def _settle(stop: asyncio.Future[str], verdict: str) -> None:
     """Complete a job's stop with the watchdog's verdict, on its loop; one already done or cancelled stays as it is.
 
@@ -771,11 +782,19 @@ class _Watchdog:
         """
         with self._lock:
             if self._thread is None:
-                thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
+                thread = self._new_thread()
                 thread.start()
                 self._thread = thread
             self._watches.append(watch)
         watch.stop.add_done_callback(lambda _: self._discard(watch))
+
+    def _new_thread(self) -> threading.Thread:
+        """Make the watchdog's thread, not yet started.
+
+        Returns:
+            The thread.
+        """
+        return threading.Thread(target=self._run, name="watchdog", daemon=True)
 
     def _discard(self, watch: _Watch) -> None:
         """Watch a job no more.
@@ -788,21 +807,38 @@ class _Watchdog:
                 self._watches.remove(watch)
 
     def _run(self) -> None:
-        """Pass every ``interval_s`` while there are jobs; end when there are none.
+        """Pass every ``interval_s`` while there are jobs; end when there are none; fail closed if anything escapes.
 
         The thread blocks every signal, so the kernel hands the process's signals to the threads that expect them.
+        Should its loop end by an error (``check`` catches what it calls, so it would be something like a
+        ``MemoryError``), the error is logged by its type, every job it watched is stopped as ``UNMEASURED`` (killed,
+        answered, its slot retired), and the watchdog counts as stopped: the next job starts a new thread, or is
+        refused if none starts.
         """
-        signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
-        while True:
-            time.sleep(self._interval)
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+            while True:
+                time.sleep(self._interval)
+                with self._lock:
+                    watches = list(self._watches)
+                    if not watches:
+                        self._thread = None
+                        return
+                for watch, verdict in self.check(watches):
+                    _post(watch, verdict)
+        except BaseException as exc:
             with self._lock:
-                watches = list(self._watches)
-                if not watches:
-                    self._thread = None
-                    return
-            for watch, verdict in self.check(watches):
-                with contextlib.suppress(RuntimeError):  # the loop is closed: that job is over
-                    watch.loop.call_soon_threadsafe(_settle, watch.stop, verdict)
+                watches = self._watches
+                self._watches = []
+                self._thread = None
+            _log.error(
+                "the watchdog stopped (%s); stopping the %d job%s it watched",
+                type(exc).__name__,
+                len(watches),
+                _s(len(watches)),
+            )
+            for watch in watches:
+                _post(watch, UNMEASURED)
 
     def check(self, watches: list[_Watch]) -> list[tuple[_Watch, str]]:
         """One pass: judge every job, failing closed.
@@ -982,6 +1018,21 @@ class Supervisor:
         try:
             watch = _Watch(job, index, slot, limits, self._settings.workspace_max_mb)
             self._watchdog.add(watch)
+        except Exception as exc:  # nothing ran: the folder goes, and the slot with it if that fails
+            _log.error("a job could not be watched and did not run (%s)", type(exc).__name__)
+            if watch is not None and not watch.stop.done():
+                watch.stop.cancel()
+            removed = False
+            with contextlib.suppress(asyncio.CancelledError):
+                removed = await asyncio.shield(
+                    asyncio.get_running_loop().run_in_executor(None, self._remove, job, watch)
+                )
+            if removed:
+                self._free.append(index)
+            else:
+                self._retire(index)  # the folder may still be going, or stayed
+            return _answer(req.job_id, "error", "the job could not be watched, so it did not run")
+        try:
             outcome, _ = await run_in_slot(
                 job_argv(job.path / _SPEC, job.path / _HOME / _RESULT),
                 job.cwd,
@@ -994,7 +1045,7 @@ class Supervisor:
                 stop=watch.stop,
             )
         except BaseException as exc:
-            if watch is not None and not watch.stop.done():
+            if not watch.stop.done():
                 watch.stop.cancel()
             self._retire(index)
             # The removal runs in a thread, off the loop; a second cancellation stops only the wait for it.
