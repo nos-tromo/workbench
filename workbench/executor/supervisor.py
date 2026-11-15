@@ -765,12 +765,16 @@ class _Watchdog:
 
         Args:
             watch: The job's watch.
+
+        Raises:
+            RuntimeError: The watchdog's thread could not be started; the job is not watched, and must not run.
         """
         with self._lock:
-            self._watches.append(watch)
             if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
-                self._thread.start()
+                thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
+                thread.start()
+                self._thread = thread
+            self._watches.append(watch)
         watch.stop.add_done_callback(lambda _: self._discard(watch))
 
     def _discard(self, watch: _Watch) -> None:

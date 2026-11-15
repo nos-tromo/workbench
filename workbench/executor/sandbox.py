@@ -525,8 +525,9 @@ class SlotUse:
 def slots_use(uids: Collection[int], *, proc: Path = Path("/proc")) -> dict[int, SlotUse]:
     """Look once through ``/proc`` and the SysV table for the memory and OOM scores of the slots' processes.
 
-    A process counts by its real uid, which a job cannot change. Its resident set counts without its shared memory:
-    the only shared memory a job can hold is a SysV segment (the jobs' seccomp filter refuses shared anonymous maps,
+    A process counts by its real uid, which a job cannot change. Its resident set counts without its shared memory
+    (``RssShmem``): the only shared memory a job can map is a SysV segment, or a file of its own folders where the
+    volume is a tmpfs, which counts as that file's disk (the jobs' seccomp filter refuses shared anonymous maps,
     ``memfd_create`` and ``memfd_secret``, and the supervisor makes ``/dev/zero`` read-only to them). Each segment
     counts once instead, against the uid that made it, by the pages it holds, whether any process has it attached or
     not: a page a process touched and then left to a child it forked is in no resident set. A process that ends while

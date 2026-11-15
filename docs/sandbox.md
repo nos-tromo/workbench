@@ -161,8 +161,9 @@ another machine. pandas, numpy, matplotlib, openpyxl, python-docx, threads,
 asyncio and ctypes callbacks work under it
 (`tests/executor/test_supervisor.py::test_as_root_a_job_has_no_socket_and_its_libraries_still_work`).
 Nothing needs a socket or shared anonymous memory in a job: the executor has no
-network, and multiprocessing, the one user of shared anonymous memory among the
-image's libraries, does not work there anyway.
+network, and multiprocessing, the only Python code in the image that maps
+shared anonymous memory (`multiprocessing.heap`, `shared_memory`), does not work
+there anyway.
 The files of the user's other chats are never copied in. A file below a folder
 named `out` is never copied in either: `out/` is where a job writes.
 
@@ -226,10 +227,10 @@ every slot's folder may walk at once, so the supervisor raises its own soft
 limit of open files to the hard one at start and refuses to start below
 slots × 258 + 256 (the jobs keep theirs).
 
-What the memory limit holds: a job's processes together, and every SysV
-segment it made, within its share of the container, between two measures.
-The shared memory no resident set counts is closed to a job (above), so what
-it holds is counted. What it does not count is in
+At each measure, then, the memory limit holds the resident memory of a job's
+processes together and every SysV segment it made. The shared memory that no
+resident set counts is closed to a job (above). What a job can add between two
+measures, and what the sum does not count, are in
 [Residual risks](#residual-risks).
 
 For the container (`docker/compose.yaml`, see
@@ -367,7 +368,7 @@ Each of these is accepted. Each says what it would take.
 - **What the memory sum does not count.** The kernel's own memory that a job's
   processes cause (page tables, pipe and socket-pair buffers, the inodes of its
   files) and the page cache of the files it reads and writes are in no resident
-  set. They are bounded by the job's other limits (processes, open files, file
+  set (a file it maps from its own folders counts as that file's disk). They are bounded by the job's other limits (processes, open files, file
   size, its folders' disk and entries) and held, with the rest, by the
   container's memory limit and the job's OOM score. A process's resident set
   counts pages it shares with its forked children once in each, which can stop
