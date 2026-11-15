@@ -1,11 +1,13 @@
 """The job's one timer: nested limits on a single real-time timer, which never clobber each other."""
 
+import gc
 import os
 import random
 import signal
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from types import CodeType, FrameType
@@ -331,6 +333,107 @@ def test_a_limit_is_not_raised_inside_a_finalizer_where_it_would_be_lost(monkeyp
     monkeypatch.undo()
     assert dropped == []
     assert 0.29 < time.monotonic() - began < 3.0
+    assert timer._limits == []
+
+
+def _drop_in_a_weakref_callback() -> None:
+    """Run a weakref callback past the deadline; Python drops an exception raised in one."""
+
+    class Thing:
+        pass
+
+    doomed = Thing()
+    ref = weakref.ref(doomed, lambda _ref: spin(0.3))
+    del doomed
+    assert ref() is None
+
+
+def _drop_in_a_closed_generator() -> None:
+    """Run the ``finally`` of a generator that is closed as it is freed past the deadline; Python drops that too."""
+
+    def parts() -> Iterator[int]:
+        try:
+            yield 1
+        finally:
+            spin(0.3)
+
+    abandoned = parts()
+    next(abandoned)
+    del abandoned
+
+
+@pytest.mark.parametrize("drop", [_drop_in_a_weakref_callback, _drop_in_a_closed_generator])
+def test_a_limit_python_dropped_is_raised_again_in_the_code_that_runs_on(
+    monkeypatch: pytest.MonkeyPatch, drop: Callable[[], None]
+) -> None:
+    """A deadline raised where Python prints and drops an exception is raised again a moment later.
+
+    A weakref callback or a generator closed as it is freed runs any Python, and its frame does not tell it, as a
+    ``__del__``'s does. A test run with warnings as errors failed on such a drop now and then (a ``WeakSet``
+    callback inside a reader's deadline), and the code that was to be stopped ran on.
+    """
+    dropped: list[object] = []
+
+    def hook(unraisable: "sys.UnraisableHookArgs") -> None:
+        dropped.append(unraisable.exc_value)
+
+    monkeypatch.setattr("sys.unraisablehook", hook)
+    began = time.monotonic()
+    with pytest.raises(Inner):
+        with limit_until(began + 0.1, Inner):
+            drop()
+            spin()
+    assert sys.unraisablehook is hook
+    monkeypatch.undo()
+    assert dropped == []
+    assert time.monotonic() - began < 3.0
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert timer._limits == []
+
+
+def test_a_limit_does_not_keep_the_error_it_raised_alive() -> None:
+    """The error, and every frame in its traceback, is freed once the code that caught it lets go, with no collector.
+
+    The limit knows its error again only by a weak reference: the traceback holds the frame that holds the limit,
+    and a strong one made a cycle that kept a block suspended in one of those frames listed until the collector ran.
+    """
+    gc.disable()
+    try:
+        with pytest.raises(Inner) as caught:
+            with limit_until(time.monotonic() + 0.05, Inner):
+                spin()
+        error = weakref.ref(caught.value)
+        del caught
+        assert error() is None
+    finally:
+        gc.enable()
+    assert timer._limits == []
+
+
+def test_an_error_of_the_code_s_own_that_python_drops_reaches_the_hook_that_was_there(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside a limit, a dropped error that is no limit's goes on to the hook there was before, as it would without."""
+    dropped: list[object] = []
+
+    def hook(unraisable: "sys.UnraisableHookArgs") -> None:
+        dropped.append(unraisable.exc_value)
+
+    def fail(_ref: object) -> None:
+        raise ValueError("a callback of the code's own")
+
+    class Thing:
+        pass
+
+    monkeypatch.setattr("sys.unraisablehook", hook)
+    with limit_until(time.monotonic() + 5, Inner):
+        doomed = Thing()
+        ref = weakref.ref(doomed, fail)
+        del doomed
+        assert ref() is None
+    assert sys.unraisablehook is hook
+    monkeypatch.undo()
+    assert [type(error) for error in dropped] == [ValueError]
     assert timer._limits == []
 
 

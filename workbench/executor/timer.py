@@ -20,11 +20,14 @@ Limits nest and share the one real-time interval timer of the process:
   deadline has passed raises at once, in the code that enters or leaves a block, instead of being armed again
   (a timer re-armed from "now" for a deadline that is a few microseconds away would never go off in a loop of
   short blocks).
-- The earliest deadline that has passed decides which error is raised, and each limit raises at most once. When
+- The earliest deadline that has passed decides which error is raised, and each limit raises once. When
   another limit is due as well, the timer is armed to go off at once after the first error, so that the second
   is raised even if the code that got the first swallows it. A signal that comes while a ``__del__`` is running
   is put off for a moment: an exception raised in a finalizer is printed and dropped, and the code that was to be
-  stopped would run on.
+  stopped would run on. Python drops an exception in the same way where the frame does not tell it, in a weakref
+  callback or in a generator closed as it is freed; there the error is caught on its way to
+  ``sys.unraisablehook`` and raised again a moment later, in the code that runs on, before any other. This
+  module's hook is in place while a limit is in force, and passes every other error on to the one it replaced.
 - Every meter that is running is stopped, charged up to that moment, before the error of a limit that falls due
   while it is in force is raised, by the handler or as a block is entered or left: the error ends the work the
   meter times, and it can land in the very code that would stop the meter. A block whose own limit is due already
@@ -49,8 +52,10 @@ The errors are :class:`BaseException` subclasses, like ``KeyboardInterrupt``: a 
 
 import math
 import signal
+import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -64,7 +69,7 @@ _EARLY = 1e-3
 #: The smallest interval armed; ``setitimer`` with zero would disarm.
 _SOONEST = 1e-6
 
-#: How long to wait before trying again to raise an error that was due inside a finalizer.
+#: How long to wait before trying again to raise an error that was due inside a finalizer, or that Python dropped.
 _RETRY = 1e-3
 
 #: While a meter is stopped, the timer looks at it again after the time it has left, but not sooner than this; a
@@ -138,13 +143,20 @@ class _Limit:
         error: The error to raise when it is due.
         deadline: A :func:`time.monotonic` time, for a limit with no meter.
         meter: The budget, for a limit that is due when its meter has run out.
-        fired: Whether the error was raised already, or the limit is being left; it raises once.
+        fired: Whether the error was raised already, or the limit is being left; it raises once, and again only
+            when Python dropped it.
+        raised: The error as it was last raised, to know it by if Python drops it; a weak reference, since the
+            error's traceback holds the frame that holds the limit, and a cycle would keep every frame of it alive
+            (and the blocks suspended in them listed) until the collector came.
+        dropped: Whether Python dropped that error (:func:`_recover`): the limit is due again, before all others.
     """
 
     error: type[TimeLimit]
     deadline: float = math.inf
     meter: Meter | None = None
     fired: bool = False
+    raised: weakref.ref[TimeLimit] | None = None
+    dropped: bool = False
 
     def soonest(self, now: float) -> float:
         """Tell the earliest moment the limit can be due, as far as can be told now.
@@ -154,8 +166,11 @@ class _Limit:
 
         Returns:
             The deadline; for a meter, when it runs out if it runs from now on, or infinity when it is spent and
-            stopped (it cannot run again: the code that starts it looks at :attr:`Meter.spent` first).
+            stopped (it cannot run again: the code that starts it looks at :attr:`Meter.spent` first). Minus
+            infinity once its error was dropped.
         """
+        if self.dropped:
+            return -math.inf
         meter = self.meter
         if meter is None:
             return self.deadline
@@ -170,8 +185,11 @@ class _Limit:
             now: The time.
 
         Returns:
-            The moment it became due, or ``None`` if it is not due; a meter is due only while it runs.
+            The moment it became due, or ``None`` if it is not due; a meter is due only while it runs. Minus
+            infinity once its error was dropped.
         """
+        if self.dropped:
+            return -math.inf
         at = self.deadline if self.meter is None else self.meter.until
         return at if at is not None and at <= now + _EARLY else None
 
@@ -183,6 +201,9 @@ _firing = False
 
 #: The code of the functions marked :func:`uninterrupted`.
 _UNINTERRUPTED: set[CodeType] = set()
+
+#: The ``sys.unraisablehook`` that :func:`_recover` replaced while limits are in force, and passes other errors to.
+_unraisable_before: "Callable[[sys.UnraisableHookArgs], object]" = sys.__unraisablehook__
 
 
 def uninterrupted[**P, R](function: Callable[P, R]) -> Callable[P, R]:
@@ -263,7 +284,8 @@ def _must_wait(frame: FrameType | None) -> bool:
 
     One is inside a ``__del__``: Python prints and drops an exception raised in a finalizer, so a timeout raised
     there would be lost and the code that ought to have been stopped would run on. The other is inside a function
-    marked :func:`uninterrupted`, which would be left half done.
+    marked :func:`uninterrupted`, which would be left half done. (A weakref callback or a generator closed as it is
+    freed loses the error too, but its frame does not tell it; :func:`_recover` takes the error back there.)
 
     Args:
         frame: The frame the signal interrupted.
@@ -279,7 +301,7 @@ def _must_wait(frame: FrameType | None) -> bool:
     return False
 
 
-def _spend(limit: _Limit) -> type[TimeLimit]:
+def _spend(limit: _Limit) -> TimeLimit:
     """Mark a limit as fired and its meter as run out, and stop every meter that is running, charged up to now.
 
     The error is about to be raised in the code that is running, and a meter runs only around work that the error
@@ -291,18 +313,44 @@ def _spend(limit: _Limit) -> type[TimeLimit]:
         limit: A limit that is due.
 
     Returns:
-        Its error, to raise.
+        Its error, to raise; the limit keeps a weak reference to it, to know it by if Python drops it.
     """
     for each in _limits:
         running = each.meter
         if running is not None:
             running.stop()
     limit.fired = True
+    limit.dropped = False
     meter = limit.meter
     if meter is not None:
         meter.left = 0.0
         meter.until = None
-    return limit.error
+    error = limit.error()
+    limit.raised = weakref.ref(error)
+    return error
+
+
+def _recover(unraisable: "sys.UnraisableHookArgs") -> None:
+    """Take back a limit's error that Python dropped, to be raised again in a moment; pass any other error on.
+
+    Python prints and drops an exception that has nowhere to go: one raised in a weakref callback, in a generator
+    closed as it is freed, in a callback of the collector. The handler cannot tell those from the frame it
+    interrupts, as it tells a ``__del__``, and its error would be lost while the code it was to stop ran on. This
+    hook runs before that code goes on, so the limit is still listed: it is made due again, before every other, and
+    the timer comes back in a moment (where it waits again, inside a finalizer, as any due limit does).
+
+    Args:
+        unraisable: What Python dropped.
+    """
+    error = unraisable.exc_value
+    if error is not None:
+        for limit in _limits:
+            if limit.raised is not None and limit.raised() is error:
+                limit.fired = False
+                limit.dropped = True
+                signal.setitimer(signal.ITIMER_REAL, _RETRY)
+                return
+    _unraisable_before(unraisable)
 
 
 def _rearm() -> None:
@@ -339,13 +387,18 @@ def _fire(_signum: int, _frame: FrameType | None) -> None:
             return
         error = _spend(min(due, key=lambda pair: pair[0])[1])
         _rearm()
-        raise error
+        try:
+            raise error
+        finally:
+            del error  # its traceback holds this frame
     finally:
         _firing = False
 
 
 def _enter(limit: _Limit) -> None:
     """List a limit and arm the timer for it, with ``SIGALRM`` blocked, installing the handler if it is not.
+
+    The first limit also puts :func:`_recover` in as ``sys.unraisablehook``, keeping the hook it replaces.
 
     A signal that came while blocked is delivered when the mask is restored at the end, and raises in the caller,
     which is inside the ``try`` that removes the limit.
@@ -356,10 +409,14 @@ def _enter(limit: _Limit) -> None:
     Raises:
         TimeLimit: The error of a limit, this one or another, that is due.
     """
+    global _unraisable_before
     before = _block()
     try:
-        if not _limits and signal.getsignal(signal.SIGALRM) is not _fire:
-            signal.signal(signal.SIGALRM, _fire)
+        if not _limits:
+            if signal.getsignal(signal.SIGALRM) is not _fire:
+                signal.signal(signal.SIGALRM, _fire)
+            if sys.unraisablehook is not _recover:
+                _unraisable_before, sys.unraisablehook = sys.unraisablehook, _recover
         _limits.append(limit)
         due = _arm()
     finally:
@@ -370,6 +427,9 @@ def _enter(limit: _Limit) -> None:
 
 def _leave(limit: _Limit) -> None:
     """Take a limit out and arm the timer for the rest, or disarm it when there are none.
+
+    The last limit puts back the ``sys.unraisablehook`` that :func:`_recover` replaced, unless another has been put
+    in since; with no limit in force there is no error of one to take back.
 
     It may be run again after a :class:`TimeLimit` that landed in it before it had blocked the signal; running it
     again does what is left to do.
@@ -385,6 +445,8 @@ def _leave(limit: _Limit) -> None:
     try:
         if limit in _limits:
             _limits.remove(limit)
+        if not _limits and sys.unraisablehook is _recover:
+            sys.unraisablehook = _unraisable_before
         due = _arm()
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, before)
