@@ -6,6 +6,7 @@ file name, a path or a user id.
 
 import asyncio
 import dataclasses
+import errno
 import io
 import itertools
 import json
@@ -663,17 +664,35 @@ def test_a_failed_audit_write_logs_nothing_with_a_name(
 
 
 def test_an_unrecorded_upload_answers_the_audit_failure_even_if_nothing_could_be_removed(
-    client: TestClient, broken_audit: None, store: Store, monkeypatch: pytest.MonkeyPatch
+    client: TestClient,
+    broken_audit: None,
+    store: Store,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """No removal's error can replace the audit failure: the upload is never stored, so nothing has to be taken out."""
+    """The ``.part`` cannot be removed after the audit failure: that error is logged by its type, never the answer."""
+    real = store_module._unlink
+    tried: list[str] = []
 
-    def refuse(_record: FileRecord) -> None:
-        raise OSError("synthetic: read-only file system")
+    def refuse_the_part(path: Path) -> None:
+        if path.name.endswith(".part"):
+            tried.append(path.name)
+            raise OSError(errno.EROFS, "synthetic: read-only file system", str(path))
+        real(path)
 
-    monkeypatch.setattr(store, "remove", refuse)
-    r = upload(client, "q.csv", b"data")
+    monkeypatch.setattr(store_module, "_unlink", refuse_the_part)
+    with caplog.at_level(logging.DEBUG):
+        r = upload(client, "salaries-of-user-b.csv", b"data")
     assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    assert len(tried) == 1
     assert store.files_in_chat(ME) == []
+    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    assert [path.name for path in chat.iterdir()] == tried
+    assert "OSError" in caplog.text
+    assert "salaries" not in caplog.text
+    assert tried[0] not in caplog.text
+    assert [record for record in server_log(caplog) if record.exc_info] == []
 
 
 def test_an_upload_is_recorded_by_its_id_before_it_is_a_file_of_the_chat(

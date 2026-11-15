@@ -625,8 +625,9 @@ class Store:
         ``record`` writes the upload's event by that id, and only then is the file renamed into place and its row
         committed. A record that cannot be written leaves nothing stored. A rename or commit that fails after the record
         takes the file back out and records the upload again as ``error``; the store's error is what is raised, even if
-        that second record fails too (it is logged by its type). A process that ends between the two leaves a recorded
-        ``<id>.part``, which retention removes and records by that id.
+        that second record fails too (it is logged by its type). A ``.part`` that cannot be removed after any failure
+        never replaces that failure either: it is logged by its type, and retention removes it later. A process that
+        ends between the two leaves a recorded ``<id>.part``, which retention removes and records by that id.
 
         Args:
             p: The caller and user; the chat comes from ``directory``.
@@ -680,7 +681,10 @@ class Store:
                 )
                 self._place(part, folder / name, rec, again=lambda: record(segments[0], file_id, "error"))
         except BaseException:
-            _unlink(part)
+            try:
+                _unlink(part)
+            except OSError as exc:  # the first error is the answer; this one is only logged
+                _log.warning("could not remove an upload that was not stored (%s)", type(exc).__name__)
             raise
         return rec
 
