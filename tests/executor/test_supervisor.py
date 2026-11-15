@@ -89,13 +89,17 @@ FREE_SPACE_FLOOR = supervisor.free_space_floor
 
 
 @pytest.fixture(autouse=True)
-def _room_on_the_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+def _room_on_the_volume() -> Iterator[None]:
     """A floor of 0 bytes: a test's volume is a folder on the developer's disk, whose free space is not the test's.
 
     The supervisor still asks the volume before each job and in every pass; the tests of the floor put the real one
-    back and stub what the volume answers.
+    back and stub what the volume answers. Its own patch, not the test's ``monkeypatch``: requested here, that would be
+    set up before every other fixture and undone after them, and a test's patch of ``shutil`` would then outlive
+    ``public_tmp``'s removal.
     """
-    monkeypatch.setattr(supervisor, "free_space_floor", lambda size: 0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(supervisor, "free_space_floor", lambda size: 0)
+        yield
 
 
 class _Above:
