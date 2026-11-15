@@ -15,6 +15,8 @@ services:
 
   api:
     image: workbench-api:test
+    # Built here, never pulled: no registry has it (Compose would try one first and print the refusal).
+    pull_policy: build
     ports:
       - "127.0.0.1:18100:8000"
     environment:
@@ -24,6 +26,7 @@ services:
 
   executor:
     image: workbench-executor:test
+    pull_policy: build
     environment:
       WORKBENCH_JOB_WALL_S: "20"
 

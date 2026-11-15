@@ -121,7 +121,10 @@ test-executor-root:
 ### included, whatever the tests did: the EXIT trap runs on success, on failure
 ### and, through the INT/TERM/HUP trap, on Ctrl-C or a cancelled CI job. It
 ### names the test project alone. test-isolation and test-load both run on it,
-### each with its own pytest marker (isolation, load).
+### each with its own pytest marker (isolation, load), and each collects only its
+### own folder (tests/isolation, tests/load): the other modules need nothing of
+### the stack. The stack's tests build their files with openpyxl and python-docx,
+### so uv syncs the executor extra (a runner has only the dev group otherwise).
 TEST_PROJECT := workbench-test
 TEST_COMPOSE := docker compose -p $(TEST_PROJECT) -f $(COMPOSE_FILE) -f docker/compose.test.yaml
 
@@ -131,7 +134,8 @@ test-isolation test-load:
 	status=0; \
 	$(BUILD_ENV) $(TEST_COMPOSE) up -d --build --wait --wait-timeout 300 || status=$$?; \
 	if [ $$status -eq 0 ]; then \
-		WORKBENCH_TEST_PROJECT=$(TEST_PROJECT) uv run --locked pytest -m $(@:test-%=%) -q -rfEsxX || status=$$?; \
+		WORKBENCH_TEST_PROJECT=$(TEST_PROJECT) uv run --locked --extra executor \
+			pytest tests/$(@:test-%=%) -m $(@:test-%=%) -q -rfEsxX || status=$$?; \
 	else \
 		$(TEST_COMPOSE) ps --all; $(TEST_COMPOSE) logs --tail=30; \
 	fi; \
@@ -143,7 +147,8 @@ test-isolation test-load:
 ### airgapped host). The caller key and Open WebUI's forwarding secret are made
 ### for each run and live only in this shell. Torn down, volumes included, on
 ### every way out, as the test stack is; the trap names the contract project
-### alone.
+### alone. It collects tests/contract only, with the executor extra, as the
+### test stack does.
 CONTRACT_PROJECT := workbench-contract
 CONTRACT_COMPOSE := docker compose -p $(CONTRACT_PROJECT) -f contract/compose.yaml
 
@@ -154,7 +159,8 @@ test-contract:
 	status=0; \
 	$(BUILD_ENV) $(CONTRACT_COMPOSE) up -d --build --wait --wait-timeout 600 || status=$$?; \
 	if [ $$status -eq 0 ]; then \
-		WORKBENCH_CONTRACT_PROJECT=$(CONTRACT_PROJECT) uv run --locked pytest -m contract -q -rfEsxX || status=$$?; \
+		WORKBENCH_CONTRACT_PROJECT=$(CONTRACT_PROJECT) uv run --locked --extra executor \
+			pytest tests/contract -m contract -q -rfEsxX || status=$$?; \
 	else \
 		$(CONTRACT_COMPOSE) ps --all; $(CONTRACT_COMPOSE) logs --tail=30; \
 	fi; \

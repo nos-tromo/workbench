@@ -570,7 +570,26 @@ def test_the_load_and_contract_stacks_are_torn_down_on_every_way_out(target: str
     downs = re.findall(r"docker compose ([^;']*?) down -v", planned)
     assert downs and all(f"-p {project} " in down for down in downs)
     assert "--env-file" not in planned
-    assert f"pytest -m {target.removeprefix('test-')} " in planned
+
+
+@pytest.mark.parametrize("target", ["test-isolation", "test-load", "test-contract"])
+def test_the_stack_tests_collect_their_own_folder_with_the_executors_libraries(target: str) -> None:
+    """CI run 1: a runner's environment has the dev group only; collecting every module failed on openpyxl and docx.
+
+    Each target collects its own folder, whose modules build their files with openpyxl and python-docx, and syncs the
+    executor extra for them.
+    """
+    name = target.removeprefix("test-")
+    planned = " ".join(_make("-n", target).stdout.replace("\\\n", " ").split())
+    assert f"uv run --locked --extra executor pytest tests/{name} -m {name} " in planned
+
+
+def test_the_test_stacks_images_are_built_and_never_pulled() -> None:
+    """No registry has the ``:test`` images; Compose would try one before building and print its refusal."""
+    test = compose("compose.test.yaml")
+    assert {name: test["services"][name].get("pull_policy") for name in ("api", "executor")} == dict.fromkeys(
+        ("api", "executor"), "build"
+    )
 
 
 def test_the_contract_makes_its_key_and_secret_for_each_run() -> None:
