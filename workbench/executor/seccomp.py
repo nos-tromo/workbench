@@ -1,9 +1,10 @@
-"""A seccomp filter that takes sockets away from jobs: no channel to another job's process through the kernel's net.
+"""A seccomp filter that takes sockets and unseen shared memory away from jobs.
 
 The executor has no network, but its loopback, its abstract Unix socket names and its netlink families are shared by
 every slot. Two jobs that run at once, of two users, could pass a user's files from one to the other through them. The
-filter closes every way to such a socket; it is installed in each job's process, between ``fork`` and ``exec``, before
-the uid drop, and every process the job starts inherits it:
+filter closes every way to such a socket, and every way to memory the supervisor's watchdog could not count against
+the job; it is installed in each job's process, between ``fork`` and ``exec``, before the uid drop, and every process
+the job starts inherits it:
 
 - ``socket()`` fails with ``EACCES``, whatever the family: Internet, Unix, netlink (``NETLINK_USERSOCK`` lets any
   process of the namespace send to any other) and the rest;
@@ -13,8 +14,10 @@ the uid drop, and every process the job starts inherits it:
   that sends or connects names itself with an abstract address (autobind), which another job could reach;
 - ``io_uring_setup()`` fails: an io_uring can make and bind sockets past the filter (Docker's default profile refuses it
   too, since Docker 25);
-- ``memfd_create()`` fails: memory held in such a file is in no process's resident set, where the supervisor's
-  watchdog sums a job's memory.
+- ``memfd_create()`` and ``memfd_secret()`` fail, and so does ``mmap()`` with both ``MAP_SHARED`` and
+  ``MAP_ANONYMOUS`` in its flags: a process can fill such memory, leave it mapped in a child it forks and unmap it
+  itself, and then it is in no process's resident set, where the watchdog sums a job's memory (``fork`` copies no
+  page of a shared mapping into the child's). A private anonymous map, and a shared map of a file, still work.
 
 A connected pair from ``socketpair()`` reaches only the process that made it and its children. The one way to unpair a
 datagram end (its peer closes) leaves it nameless, and nobody can send to a nameless socket.
@@ -39,6 +42,7 @@ from typing import Final
 _LD_W_ABS: Final = 0x20  # BPF_LD | BPF_W | BPF_ABS
 _JEQ_K: Final = 0x15  # BPF_JMP | BPF_JEQ | BPF_K
 _JGE_K: Final = 0x35  # BPF_JMP | BPF_JGE | BPF_K
+_AND_K: Final = 0x54  # BPF_ALU | BPF_AND | BPF_K
 _RET_K: Final = 0x06  # BPF_RET | BPF_K
 
 # Seccomp (linux/seccomp.h) and prctl (linux/prctl.h).
@@ -49,7 +53,8 @@ _PR_SET_SECCOMP: Final = 22
 _SECCOMP_MODE_FILTER: Final = 2
 
 # struct seccomp_data: nr (u32) at 0, arch (u32) at 4, args (u64 each) from 16; the low word comes first on both
-# architectures, which are little-endian. Every argument checked here is an int, so its low word is all of it.
+# architectures, which are little-endian. Every argument checked here is an int, whose low word is all of it, or
+# mmap's flags, whose two bits checked here are in the low word.
 _NR: Final = 0
 _ARCH: Final = 4
 
@@ -63,6 +68,9 @@ _AF_UNIX: Final = 1
 _SOL_SOCKET: Final = 1
 #: SO_PASSCRED, SO_PASSPIDFD, SO_PASSPIDFD_THREAD (asm-generic/socket.h, the same on both architectures).
 _AUTOBINDS: Final = (16, 76, 86)
+#: MAP_SHARED | MAP_ANONYMOUS (asm-generic/mman-common.h, which both architectures' asm/mman.h include). The bit of
+#: MAP_SHARED is in MAP_SHARED_VALIDATE (0x03) too; the flags are an unsigned long, and both bits are in its low word.
+_SHARED_ANONYMOUS: Final = 0x01 | 0x20
 #: x32 calls on x86_64 carry this bit in their number.
 _X32_BIT: Final = 0x40000000
 
@@ -83,6 +91,8 @@ class _Arch:
         setsockopt: ``setsockopt``.
         io_uring_setup: ``io_uring_setup``.
         memfd_create: ``memfd_create``.
+        memfd_secret: ``memfd_secret``.
+        mmap: ``mmap``.
     """
 
     audit: int
@@ -93,13 +103,15 @@ class _Arch:
     setsockopt: int
     io_uring_setup: int
     memfd_create: int
+    memfd_secret: int
+    mmap: int
 
 
 #: The architectures the executor runs on, by ``platform.machine()``: arch/x86/entry/syscalls/syscall_64.tbl and
 #: include/uapi/asm-generic/unistd.h; AUDIT_ARCH_* = EM_* | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
 ARCHES: Final = {
-    "x86_64": _Arch(0xC000003E, True, 41, 53, 49, 54, 425, 319),
-    "aarch64": _Arch(0xC00000B7, False, 198, 199, 200, 208, 425, 279),
+    "x86_64": _Arch(0xC000003E, True, 41, 53, 49, 54, 425, 319, 447, 9),
+    "aarch64": _Arch(0xC00000B7, False, 198, 199, 200, 208, 425, 279, 447, 222),
 }
 
 
@@ -122,10 +134,11 @@ def program(arch: _Arch) -> bytes:
     add(_LD_W_ABS, _NR)
     if arch.x32:
         add(_JGE_K, _X32_BIT, "deny", 0)
-    for refused in (arch.socket, arch.bind, arch.io_uring_setup, arch.memfd_create):
+    for refused in (arch.socket, arch.bind, arch.io_uring_setup, arch.memfd_create, arch.memfd_secret):
         add(_JEQ_K, refused, "deny", 0)
     add(_JEQ_K, arch.socketpair, "pair", 0)
     add(_JEQ_K, arch.setsockopt, "option", 0)
+    add(_JEQ_K, arch.mmap, "map", 0)
     add(_RET_K, _RET_ALLOW)
     labels = {"pair": len(code)}
     add(_LD_W_ABS, _arg(0))
@@ -138,6 +151,11 @@ def program(arch: _Arch) -> bytes:
     for option in _AUTOBINDS:
         add(_JEQ_K, option, "deny", 0)
     labels["other_option"] = len(code)
+    add(_RET_K, _RET_ALLOW)
+    labels["map"] = len(code)
+    add(_LD_W_ABS, _arg(3))
+    add(_AND_K, _SHARED_ANONYMOUS)
+    add(_JEQ_K, _SHARED_ANONYMOUS, "deny", 0)
     add(_RET_K, _RET_ALLOW)
     labels["deny"] = len(code)
     add(_RET_K, _RET_ERRNO | REFUSED)
@@ -212,9 +230,10 @@ def for_this_machine(machine: str | None = None) -> Filter | None:
     return None if arch is None else Filter(arch)
 
 
-#: The probe: under the filter, an Internet socket must be refused with EACCES, and a Unix pair must still be made.
+#: The probe: under the filter, an Internet socket and a shared anonymous map must be refused with EACCES, and a Unix
+#: pair and a private anonymous map must still be made.
 _PROBE = """\
-import _socket, sys
+import _socket, mmap, sys
 try:
     _socket.socket(2, 1)
 except OSError as exc:
@@ -223,7 +242,22 @@ except OSError as exc:
 else:
     sys.exit(3)
 a, b = _socket.socketpair(1, 1)
+try:
+    mmap.mmap(-1, 4096)
+except OSError as exc:
+    if exc.errno != 13:
+        sys.exit(6)
+else:
+    sys.exit(5)
+mmap.mmap(-1, 4096, flags=mmap.MAP_PRIVATE)
 """
+#: What a probe's exit code says.
+_PROBE_FAILURES: Final = {
+    3: "the seccomp filter does not keep a process from opening an Internet socket",
+    4: "the seccomp filter does not keep a process from opening an Internet socket",
+    5: "the seccomp filter does not keep a process from mapping shared anonymous memory",
+    6: "the seccomp filter does not keep a process from mapping shared anonymous memory",
+}
 
 
 def problem(make: Callable[[], Filter | None] = for_this_machine) -> str | None:
@@ -233,8 +267,8 @@ def problem(make: Callable[[], Filter | None] = for_this_machine) -> str | None:
         make: Builds the filter.
 
     Returns:
-        A short reason, or ``None`` when a child under the filter cannot open an ``AF_INET`` socket (it gets
-        ``EACCES``) and can still make a Unix socket pair.
+        A short reason, or ``None`` when a child under the filter can neither open an ``AF_INET`` socket nor map shared
+        anonymous memory (it gets ``EACCES``), and can still make a Unix socket pair and a private anonymous map.
     """
     built = make()
     if built is None:
@@ -253,5 +287,5 @@ def problem(make: Callable[[], Filter | None] = for_this_machine) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return "the seccomp filter that keeps jobs from sockets could not be installed"
     if done.returncode != 0:
-        return "the seccomp filter does not keep a process from opening an Internet socket"
+        return _PROBE_FAILURES.get(done.returncode, "the seccomp filter breaks what every job needs")
     return None

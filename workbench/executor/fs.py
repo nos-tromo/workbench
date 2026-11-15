@@ -183,6 +183,9 @@ def measure(tops: Iterable[int], *, max_entries: int, max_depth: int) -> Use:
 
     Returns:
         What was found.
+
+    Raises:
+        OSError: A folder given in ``tops`` cannot be listed; every descriptor the walk opened is closed again.
     """
     use = Use()
 
@@ -205,7 +208,13 @@ def measure(tops: Iterable[int], *, max_entries: int, max_depth: int) -> Use:
     for top in tops:
         frames: list[tuple[int, Iterator[str]]] = []
         try:
-            frames.append((os.dup(top), listed(top)))
+            here = os.dup(top)
+            try:
+                found = listed(here)
+            except BaseException:
+                os.close(here)
+                raise
+            frames.append((here, found))
             while frames and use.entries <= max_entries:
                 fd, names = frames[-1]
                 name = next(names, None)

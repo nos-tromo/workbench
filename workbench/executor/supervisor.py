@@ -18,7 +18,9 @@ The job folder, ``<data_dir>/jobs/<job-id>/``:
   ``home/tmp/``, the slot's, ``0700``, its ``TMPDIR``.
 
 ``out/`` and ``home/`` are all the job can write. While it runs, a watchdog measures them, and
-the memory of the slot's processes, about twice a second, and stops the job past its limits.
+the memory and OOM scores of the slot's processes, about twice a second, and stops the job past
+its limits. One thread of its own measures every running job (``_Watchdog``); the wall clock is
+kept on the event loop, so neither waits on the other.
 
 The api owns the workspaces and the staging folder, and the job owns ``out/`` and ``home/``, so
 neither is trusted: everything below ``data_dir`` is opened relative to a folder already open,
@@ -33,10 +35,12 @@ import logging
 import os
 import resource
 import shutil
+import signal
 import socket
 import stat
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -59,7 +63,7 @@ from workbench.executor.fs import (
     write_all,
 )
 from workbench.executor.prepare_volume import API_UID, Owners
-from workbench.executor.sandbox import Slot, run_in_slot, slot_memory
+from workbench.executor.sandbox import WATCH_INTERVAL_S, Slot, SlotUse, run_in_slot, slots_use
 from workbench.layout import JOBS, STAGING, WORKSPACES
 from workbench.paths import PathError, check_filename
 from workbench.protocol import (
@@ -84,6 +88,9 @@ MAX_JOB_ENTRIES = 10_000
 MAX_JOB_DEPTH = 256
 #: Seconds between two tries to remove the job folders a failed removal left.
 LEFTOVER_RETRY_S = 300
+#: Descriptors the supervisor keeps beyond the walks of the job folders: its socket and connections, each job's process
+#: and its watch, and the cleanup helpers, with room to spare.
+NOFILE_MARGIN = 256
 
 _WORKSPACE = "workspace"
 _HOME = "home"
@@ -106,6 +113,7 @@ _MOUNTINFO = Path("/proc/self/mountinfo")
 _SHM = Path("/dev/shm")
 _SHARED_TMP = Path("/tmp")
 _STATUS = Path("/proc/self/status")
+_DEV_ZERO = Path("/dev/zero")
 _QUEUES_MAX = Path("mqueue/queues_max")  # below /proc/sys/fs
 _CLOSE_GRACE_S = 5.0  # for the answer to the request that retired the last slot
 # Each must read 1. Hard links: a job cannot give out/ a name for a file it does not own, such as
@@ -542,58 +550,85 @@ class _Job:
     runner: int
 
 
-class _Watch:
-    """Measures a running job against its limits; the supervisor's watchdog, run in a thread by ``run_in_slot``.
+#: What the watchdog says when it cannot measure a job: the job is stopped and its slot retired (fail closed).
+UNMEASURED = "its use of memory and disk could not be measured"
+#: What it says when a process of the job's slot runs below the OOM score jobs get.
+LOWERED = "one of its processes lowered its OOM score"
 
-    It holds descriptors of its own of the job's ``home/`` and ``out/``, and a lock: a measure still running in its
-    thread when the job is over keeps them until it ends, and ``close`` waits for it, so it never measures a
+
+class _Watch:
+    """One running job in the watchdog: descriptors of its ``home/`` and ``out/``, its slot and limits, and its stop.
+
+    It holds descriptors of its own of the job's ``home/`` and ``out/``, and a lock: a measure still running in the
+    watchdog's thread when the job is over keeps them until it ends, and ``close`` waits for it, so it never measures a
     descriptor that meanwhile names another folder.
 
     Attributes:
-        broken: The limit the job broke, as its answer says it, once it broke one.
+        index: The slot's index, for the log.
+        uid: The slot's uid, whose processes are summed; ``None`` without a slot (tests, dev), whose job shares the
+            supervisor's uid.
+        stop: Completes with the limit the job broke; ``run_in_slot`` waits on it.
+        loop: The loop ``stop`` belongs to.
     """
 
-    def __init__(self, job: _Job, slot: Slot | None, limits: Limits, disk_mb: int) -> None:
-        """Measure ``job``'s ``home/`` and ``out/`` and, with a slot, the memory of the slot's processes.
+    def __init__(self, job: _Job, index: int, slot: Slot | None, limits: Limits, disk_mb: int) -> None:
+        """Watch ``job`` against its limits.
 
         Args:
             job: The job's folders.
-            slot: Its slot; without one (tests, dev) the memory is not summed, since the job shares the uid.
+            index: Its slot's index.
+            slot: Its slot; without one the memory is not summed.
             limits: The limits it runs with; ``memory_mb`` bounds its processes together.
             disk_mb: The most its folders may hold, ``WORKBENCH_WORKSPACE_MAX_MB``.
+
+        Raises:
+            OSError: The folders' descriptors could not be duplicated.
+            RuntimeError: There is no running event loop.
         """
         self._lock = threading.Lock()
-        self._folders: tuple[int, ...] = (os.dup(job.home), os.dup(job.out))
-        self._uid = None if slot is None else slot.uid
+        self._folders: tuple[int, ...] = ()
+        self.loop = asyncio.get_running_loop()
+        home = os.dup(job.home)
+        try:
+            self._folders = (home, os.dup(job.out))
+        except BaseException:
+            os.close(home)
+            raise
+        self.index = index
+        self.uid = None if slot is None else slot.uid
         self._memory = limits.memory_mb * MB
         self._memory_mb = limits.memory_mb
         self._disk = disk_mb * MB
         self._disk_mb = disk_mb
-        self.broken: str | None = None
+        self.stop: asyncio.Future[str] = self.loop.create_future()
 
-    def __call__(self) -> str | None:
-        """Measure once.
+    def judge(self, use: SlotUse | None) -> str | None:
+        """Judge the job by its slot's use, from the watchdog's look at ``/proc``, and by a measure of its folders.
+
+        Args:
+            use: What the slot's processes hold; ``None`` without a slot.
 
         Returns:
-            The limit the job broke, or ``None``.
+            The limit the job broke, as its answer says it, or ``None``.
 
         Raises:
-            OSError: ``/proc`` or a folder could not be read; ``run_in_slot`` counts that as nothing broken.
+            OSError: A folder could not be measured.
         """
         with self._lock:
             if not self._folders:
                 return None
-            if self._uid is not None and slot_memory(self._uid) > self._memory:
-                self.broken = f"its processes used more than {self._memory_mb} MB of memory together"
-                return self.broken
-            use = measure(self._folders, max_entries=MAX_JOB_ENTRIES, max_depth=MAX_JOB_DEPTH)
-            if use.entries > MAX_JOB_ENTRIES:
-                self.broken = f"it wrote more than {MAX_JOB_ENTRIES:,} files and folders".replace(",", " ")
-            elif use.depth > MAX_JOB_DEPTH:
-                self.broken = f"its folders nest more than {MAX_JOB_DEPTH} deep"
-            elif use.bytes > self._disk:
-                self.broken = f"it wrote more than {self._disk_mb} MB"
-            return self.broken
+            if use is not None and use.lowered:
+                return LOWERED
+            if use is not None and use.memory > self._memory:
+                return f"its processes used more than {self._memory_mb} MB of memory together"
+            found = measure(self._folders, max_entries=MAX_JOB_ENTRIES, max_depth=MAX_JOB_DEPTH)
+            if found.entries > MAX_JOB_ENTRIES:
+                return f"it wrote more than {MAX_JOB_ENTRIES:,} files and folders".replace(",", " ")
+            if found.depth > MAX_JOB_DEPTH:
+                return f"its folders nest more than {MAX_JOB_DEPTH} deep"
+            if found.bytes > self._disk:
+                return f"it wrote more than {self._disk_mb} MB"
+            return None
 
     def close(self) -> None:
         """Close its descriptors, once a measure in hand has ended; later measures find nothing."""
@@ -601,6 +636,119 @@ class _Watch:
             for fd in self._folders:
                 os.close(fd)
             self._folders = ()
+
+
+def _settle(stop: asyncio.Future[str], verdict: str) -> None:
+    """Complete a job's stop with the watchdog's verdict, on its loop; one already done or cancelled stays as it is.
+
+    Args:
+        stop: The job's stop.
+        verdict: The limit it broke.
+    """
+    if not stop.done():
+        stop.set_result(verdict)
+
+
+class _Watchdog:
+    """Measures every running job about twice a second, in one thread of its own, and stops those past a limit.
+
+    One pass looks at ``/proc`` and the SysV table once for every slot (``slots_use``), then measures each job's
+    folders, one job after the other, so the supervisor holds one walk's descriptors at a time. A verdict reaches the
+    job's loop as the result of its stop; the wall clock never waits on a pass, nor a pass on the loop's own pool.
+    What cannot be measured stops the job: ``UNMEASURED``, logged by its type alone, and the slot is retired. The
+    thread runs while there are jobs to watch, and ends when there are none.
+    """
+
+    def __init__(self, interval_s: float = WATCH_INTERVAL_S) -> None:
+        """Watch nothing yet.
+
+        Args:
+            interval_s: Seconds between two passes.
+        """
+        self._interval = interval_s
+        self._lock = threading.Lock()
+        self._watches: list[_Watch] = []
+        self._thread: threading.Thread | None = None
+
+    def add(self, watch: _Watch) -> None:
+        """Watch a job until its stop is done: stopped, or cancelled by ``run_in_slot`` when the job ended otherwise.
+
+        Args:
+            watch: The job's watch.
+        """
+        with self._lock:
+            self._watches.append(watch)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="watchdog", daemon=True)
+                self._thread.start()
+        watch.stop.add_done_callback(lambda _: self._discard(watch))
+
+    def _discard(self, watch: _Watch) -> None:
+        """Watch a job no more.
+
+        Args:
+            watch: The job's watch.
+        """
+        with self._lock:
+            with contextlib.suppress(ValueError):
+                self._watches.remove(watch)
+
+    def _run(self) -> None:
+        """Pass every ``interval_s`` while there are jobs; end when there are none.
+
+        The thread blocks every signal, so the kernel hands the process's signals to the threads that expect them.
+        """
+        signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        while True:
+            time.sleep(self._interval)
+            with self._lock:
+                watches = list(self._watches)
+                if not watches:
+                    self._thread = None
+                    return
+            for watch, verdict in self.check(watches):
+                with contextlib.suppress(RuntimeError):  # the loop is closed: that job is over
+                    watch.loop.call_soon_threadsafe(_settle, watch.stop, verdict)
+
+    def check(self, watches: list[_Watch]) -> list[tuple[_Watch, str]]:
+        """One pass: judge every job, failing closed.
+
+        Args:
+            watches: The jobs to judge.
+
+        Returns:
+            Each job that broke a limit, with the limit.
+        """
+        uids = {watch.uid for watch in watches if watch.uid is not None}
+        try:
+            use = slots_use(uids)
+        except Exception as exc:
+            _log.error("the watchdog could not read the slots' processes (%s)", type(exc).__name__)
+            return [(watch, UNMEASURED) for watch in watches]
+        verdicts: list[tuple[_Watch, str]] = []
+        for watch in watches:
+            try:
+                verdict = watch.judge(None if watch.uid is None else use[watch.uid])
+            except Exception as exc:
+                _log.error("the watchdog could not measure the job of slot %d (%s)", watch.index, type(exc).__name__)
+                verdict = UNMEASURED
+            if verdict is not None:
+                verdicts.append((watch, verdict))
+        return verdicts
+
+
+def _verdict(stop: asyncio.Future[str] | None) -> str | None:
+    """Read the watchdog's verdict on a job that has ended.
+
+    Args:
+        stop: The job's stop.
+
+    Returns:
+        The limit it was stopped on; ``None`` when the watchdog did not stop it (its stop was cancelled).
+    """
+    if stop is None or not stop.done() or stop.cancelled():
+        return None
+    return stop.result()
 
 
 class Supervisor:
@@ -626,6 +774,7 @@ class Supervisor:
         self._exhausted = asyncio.Event()
         self._cleanup_pool = ThreadPoolExecutor(max_workers=settings.executor_slots, thread_name_prefix="slot-cleanup")
         self._sockets = seccomp.for_this_machine()
+        self._watchdog = _Watchdog()
         # Job folders whose removal failed; serve() tries them again every LEFTOVER_RETRY_S.
         self._leftovers: set[str] = set()
         self._jobs = settings.data_dir / JOBS
@@ -704,7 +853,8 @@ class Supervisor:
             raise
         watch: _Watch | None = None
         try:
-            watch = _Watch(job, slot, limits, self._settings.workspace_max_mb)
+            watch = _Watch(job, index, slot, limits, self._settings.workspace_max_mb)
+            self._watchdog.add(watch)
             outcome, _ = await run_in_slot(
                 job_argv(job.path / _SPEC, job.path / _HOME / _RESULT),
                 job.cwd,
@@ -714,9 +864,11 @@ class Supervisor:
                 home=job.path / _HOME,
                 cleanup_pool=self._cleanup_pool,
                 sockets=self._sockets,
-                watch=watch,
+                stop=watch.stop,
             )
         except BaseException as exc:
+            if watch is not None and not watch.stop.done():
+                watch.stop.cancel()
             self._retire(index)
             # The removal runs in a thread, off the loop; a second cancellation stops only the wait for it.
             with contextlib.suppress(asyncio.CancelledError):
@@ -724,15 +876,19 @@ class Supervisor:
             if not isinstance(exc, Exception):
                 raise
             return _answer(req.job_id, "error", "the job's processes could not be stopped")
+        if not watch.stop.done():  # run_in_slot cancels it; this holds for any run, so no watch outlives its job
+            watch.stop.cancel()
+        broken = _verdict(watch.stop)
         try:
-            answer, removed = await asyncio.to_thread(self._finish, req, job, outcome, limits, watch)
+            answer, removed = await asyncio.to_thread(self._finish, req, job, outcome, limits, watch, broken)
         except BaseException:
             self._retire(index)  # the folder may still be being read
             raise
-        if removed:
+        if removed and broken != UNMEASURED:
             self._free.append(index)
         else:
-            self._retire(index)  # what is left holds a user's files, under a folder the slot owned
+            # What is left holds a user's files, under a folder the slot owned; or the job ran unmeasured.
+            self._retire(index)
         return answer
 
     def _slots_left(self) -> int:
@@ -948,7 +1104,13 @@ class Supervisor:
                 os.close(folder)
 
     def _finish(
-        self, req: JobRequest, job: _Job, outcome: str, limits: Limits, watch: _Watch | None = None
+        self,
+        req: JobRequest,
+        job: _Job,
+        outcome: str,
+        limits: Limits,
+        watch: _Watch | None = None,
+        broken: str | None = None,
     ) -> tuple[JobResult, bool]:
         """Answer a job whose slot is clear, then remove its folder.
 
@@ -957,13 +1119,14 @@ class Supervisor:
             job: Its folder.
             outcome: How the process ended (``run_in_slot``).
             limits: The limits it ran with.
-            watch: Its watchdog, which names the limit it stopped the job on, if it did.
+            watch: Its watch, closed before the folder goes.
+            broken: The limit the watchdog stopped it on, if it did.
 
         Returns:
             The answer, and whether the job folder is gone.
         """
         try:
-            answer = self._answer_job(req, job, outcome, limits, None if watch is None else watch.broken)
+            answer = self._answer_job(req, job, outcome, limits, broken)
         finally:
             removed = self._remove(job, watch)
         return answer, removed
@@ -1089,7 +1252,7 @@ class Supervisor:
 
         Args:
             job: The folder.
-            watch: Its watchdog, closed first.
+            watch: Its watch, closed first.
 
         Returns:
             Whether it is gone.
@@ -1308,16 +1471,89 @@ class Supervisor:
             return _answer(req.job_id, "error", "the executor failed")
 
 
-def _open_files_up_to_the_hard_limit() -> None:
-    """Raise the supervisor's soft limit of open files to its hard one, which needs no capability.
+def open_files_needed(slots: int) -> int:
+    """Count the descriptors the supervisor may hold at once.
 
-    The watchdog holds a descriptor per level of a job's folders while it measures them, up to ``MAX_JOB_DEPTH`` + 1 for
-    each running job, and a host may start the container with a soft limit of 1024. The jobs keep their own limit.
+    A job folder is walked one descriptor per level, ``MAX_JOB_DEPTH`` + 2 at most with the walk's own: by the watchdog,
+    one job at a time, and by its removal, which may run for every slot at once.
+
+    Args:
+        slots: ``WORKBENCH_EXECUTOR_SLOTS``.
+
+    Returns:
+        Slots times a walk, and ``NOFILE_MARGIN`` for the rest.
+    """
+    return slots * (MAX_JOB_DEPTH + 2) + NOFILE_MARGIN
+
+
+def _open_files_problem(slots: int) -> str | None:
+    """Raise the supervisor's soft limit of open files to its hard one, and check it covers what the slots need.
+
+    Raising it needs no capability. A host may start the container with a soft limit of 1024, which four slots' walks
+    already pass. The jobs keep their own limit (``preexec``).
+
+    Args:
+        slots: ``WORKBENCH_EXECUTOR_SLOTS``.
+
+    Returns:
+        A short reason when the limit stays below ``open_files_needed``, else ``None``.
     """
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft != hard:
         with contextlib.suppress(ValueError, OSError):
             resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    need = open_files_needed(slots)
+    if soft != resource.RLIM_INFINITY and soft < need:
+        return f"the supervisor may open {soft} files, fewer than the {need} its {slots} slots need"
+    return None
+
+
+def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0) -> str | None:
+    """Take the write bits of group and others off ``/dev/zero``, so that no job can open it for writing.
+
+    A shared map of ``/dev/zero`` opened for writing is shared anonymous memory, which a job can fill, leave to a child
+    and unmap itself, out of every resident set the watchdog counts (R85); the jobs' seccomp filter refuses the other
+    way there, ``mmap`` with ``MAP_SHARED | MAP_ANONYMOUS``. A shared map of it opened read-only is only readable, and
+    holds no memory. Docker makes ``/dev`` a tmpfs of the container's, root's, so the change lives as long as the
+    container and needs no capability: root owns the node. Nothing a job runs writes to ``/dev/zero``.
+
+    Args:
+        path: ``/dev/zero``.
+        root: The uid that must own it.
+
+    Returns:
+        A short reason when it is there but stays writable by others or is not root's, else ``None``.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        st = None
+    if st is not None and not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022:
+        with contextlib.suppress(OSError):
+            os.chmod(path, stat.S_IMODE(st.st_mode) & ~0o022)
+        with contextlib.suppress(OSError):
+            st = os.lstat(path)
+    if st is None or stat.S_ISLNK(st.st_mode) or st.st_uid != root or st.st_mode & 0o022:
+        return "/dev/zero must be root's and closed to others' writes, so no job can map shared memory through it"
+    return None
+
+
+def prepare_host(settings: Settings) -> str | None:
+    """Make the changes the supervisor needs in its container before it serves, and check that they hold.
+
+    Its soft limit of open files goes up to the hard one (``_open_files_problem``), and ``/dev/zero`` is closed to
+    others' writes (``_close_dev_zero``).
+
+    Args:
+        settings: The executor's settings.
+
+    Returns:
+        A short reason it must not start, or ``None``.
+    """
+    return _open_files_problem(settings.executor_slots) or _close_dev_zero()
 
 
 def main() -> int:
@@ -1334,12 +1570,11 @@ def main() -> int:
     except ConfigError as exc:
         print(f"workbench executor: {exc}", file=sys.stderr)
         return 1
-    problem = startup_problem(settings)
+    problem = startup_problem(settings) or prepare_host(settings)
     if problem is not None:
         print(f"workbench executor: refusing to start: {problem}", file=sys.stderr)
         return 1
     logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="workbench executor: %(message)s")
-    _open_files_up_to_the_hard_limit()
     try:
         asyncio.run(Supervisor(settings).serve())
     except NoUsableSlot as exc:

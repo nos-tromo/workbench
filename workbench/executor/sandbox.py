@@ -9,12 +9,12 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Any, Literal
 
 from workbench.executor.fs import DIR_FLAGS, closing
 from workbench.executor.seccomp import Filter
@@ -469,42 +469,84 @@ def _slot_has_live_processes(uid: int) -> bool:
     return False
 
 
+_STATUS_FIELDS = (b"Uid", b"VmRSS", b"RssShmem")
+
+
 def _status_fields(status: bytes) -> dict[bytes, list[bytes]]:
-    """Read the ``Uid`` and ``VmRSS`` lines of the bytes of ``/proc/<pid>/status``, never decoding the name.
+    """Read the ``Uid``, ``VmRSS`` and ``RssShmem`` lines of the bytes of a ``/proc/<pid>/status``, never its name.
 
     Args:
         status: The file's contents.
 
     Returns:
-        Each of the two lines that is there, split into its words.
+        Each of the lines that is there, split into its words.
     """
     fields: dict[bytes, list[bytes]] = {}
     for line in status.split(b"\n"):
         key, _, value = line.partition(b":")
-        if key in (b"Uid", b"VmRSS"):
+        if key in _STATUS_FIELDS:
             fields[key] = value.split()
     return fields
 
 
-def slot_memory(uid: int, *, proc: Path = Path("/proc")) -> int:
-    """Add up the memory a slot's job holds: the resident memory of every process of the uid, and its SysV segments.
-
-    A process counts by its real uid, which a job cannot change. A SysV shared memory segment the uid made and nobody
-    has attached is in no process's resident set, so its resident and swapped bytes are added; an attached one is in
-    the resident set of each process that has it. ``memfd_create``, the other way to hold memory outside every
-    resident set, the jobs' seccomp filter refuses. A process that ends while it is read counts as gone.
+def _kilobytes(fields: dict[bytes, list[bytes]], key: bytes) -> int:
+    """Read one ``… kB`` line of a status, in bytes.
 
     Args:
-        uid: The slot's user id.
+        fields: The status's lines (``_status_fields``).
+        key: The line's name.
+
+    Returns:
+        Its value in bytes; 0 when the line is not there, as for a kernel thread or a zombie.
+
+    Raises:
+        ValueError: The line holds no number.
+    """
+    words = fields.get(key)
+    if not words:
+        return 0
+    return int(words[0]) * 1024
+
+
+@dataclass
+class SlotUse:
+    """What the processes of one slot's uid hold, as one look at ``/proc`` found it.
+
+    Attributes:
+        memory: Bytes: each process's resident memory without its shared memory (``VmRSS`` minus ``RssShmem``), and
+            the resident and swapped bytes of every SysV shared memory segment the uid made, attached or not.
+        lowered: Whether a process of the uid runs with an ``oom_score_adj`` below ``JOB_OOM_SCORE_ADJ``.
+    """
+
+    memory: int = 0
+    lowered: bool = False
+
+
+def slots_use(uids: Collection[int], *, proc: Path = Path("/proc")) -> dict[int, SlotUse]:
+    """Look once through ``/proc`` and the SysV table for the memory and OOM scores of the slots' processes.
+
+    A process counts by its real uid, which a job cannot change. Its resident set counts without its shared memory:
+    the only shared memory a job can hold is a SysV segment (the jobs' seccomp filter refuses shared anonymous maps,
+    ``memfd_create`` and ``memfd_secret``, and the supervisor makes ``/dev/zero`` read-only to them). Each segment
+    counts once instead, against the uid that made it, by the pages it holds, whether any process has it attached or
+    not: a page a process touched and then left to a child it forked is in no resident set. A process that ends while
+    it is read counts as gone.
+
+    Args:
+        uids: The slots' user ids.
         proc: The ``/proc`` to read.
 
     Returns:
-        Bytes.
+        Each uid's use.
 
     Raises:
         OSError: ``/proc`` cannot be listed, or the SysV table cannot be read.
+        ValueError: A value of a process of a slot, or of the SysV table, is not a number.
+        KeyError: The SysV table lacks a column.
     """
-    total = 0
+    use = {uid: SlotUse() for uid in uids}
+    if not use:
+        return use
     with os.scandir(proc) as entries:
         pids = [entry.name for entry in entries if entry.name.isdigit()]
     for pid in pids:
@@ -513,18 +555,27 @@ def slot_memory(uid: int, *, proc: Path = Path("/proc")) -> int:
         except (FileNotFoundError, ProcessLookupError):
             continue
         try:
-            if int(fields[b"Uid"][0]) == uid and b"VmRSS" in fields:
-                total += int(fields[b"VmRSS"][0]) * 1024
+            found = use.get(int(fields[b"Uid"][0]))
         except (KeyError, IndexError, ValueError):
             continue
+        if found is None:
+            continue
+        found.memory += max(0, _kilobytes(fields, b"VmRSS") - _kilobytes(fields, b"RssShmem"))
+        try:
+            score = int((proc / pid / "oom_score_adj").read_bytes())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if score < JOB_OOM_SCORE_ADJ:
+            found.lowered = True
     try:
         table = (proc / "sysvipc" / "shm").read_bytes()
     except FileNotFoundError:
-        return total
+        return use
     for row in _sysv_rows(table):
-        if row.get(b"cuid") == uid and row.get(b"nattch") == 0:
-            total += row.get(b"rss", row.get(b"size", 0)) + row.get(b"swap", 0)
-    return total
+        maker = use.get(row[b"cuid"])
+        if maker is not None:
+            maker.memory += row.get(b"rss", row[b"size"]) + row.get(b"swap", 0)
+    return use
 
 
 def _run_as_slot(program: str, slot: Slot, extra: list[str], failure: str) -> None:
@@ -911,8 +962,7 @@ async def run_in_slot(
     home: Path | None = None,
     cleanup_pool: Executor | None = None,
     sockets: Filter | None = None,
-    watch: Callable[[], str | None] | None = None,
-    watch_interval_s: float = WATCH_INTERVAL_S,
+    stop: asyncio.Future[str] | None = None,
 ) -> tuple[Literal["ok", "error", "timeout", "killed"], int]:
     """Run ``argv`` as a fresh process in ``cwd`` under the slot's ids and the limits.
 
@@ -922,8 +972,13 @@ async def run_in_slot(
     is killed with it. With a slot, every other process of the slot's uid is killed too, including
     those that left the group; that also happens when the child could not become the slot.
 
-    The watchdog, when given, runs in a thread every ``watch_interval_s`` while the job runs; when
-    it names a limit the job broke, the job's group is killed and the job ends ``killed``.
+    The wall clock is kept here, on the loop, waiting on the process and ``stop`` together; nothing
+    of it waits on a thread. ``stop`` is the watchdog's (``supervisor._Watchdog``), which measures
+    the job in a thread of its own: when it completes first, or together with the process, the
+    job's group is killed and the job ends ``killed``. Whichever way the job ends otherwise,
+    ``stop`` is cancelled before the slot is cleared, so the slot's cleanup helpers are never
+    judged, and a verdict that comes later is never taken: ``stop`` holds a result only if it
+    stopped the job.
 
     Args:
         argv: The command line; ``argv[0]`` should be an absolute path since ``PATH`` is fixed.
@@ -936,9 +991,7 @@ async def run_in_slot(
             30 s, so the supervisor gives one of its own, a thread per slot; ``None`` is the
             loop's default pool.
         sockets: The seccomp filter the job runs under (``preexec``).
-        watch: Measures the running job; returns what limit it broke, or ``None``. An error in it
-            counts as nothing broken.
-        watch_interval_s: Seconds between two measures.
+        stop: Completes, with the limit the job broke, when the watchdog stops it.
 
     Returns:
         The outcome and the exit code (negative for death by a signal). ``timeout`` means the
@@ -965,45 +1018,41 @@ async def run_in_slot(
             umask=0o077,
         )
     except subprocess.SubprocessError:
+        _drop(stop)
         await _clear(slot, cleanup_pool)
         return "error", SPAWN_FAILED
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + limits.wall_s
+    except BaseException:
+        _drop(stop)
+        raise
     waiting = asyncio.ensure_future(process.wait())
     returncode: int | None = None
-    broken = False
+    stopped = False
     try:
-        while (left := deadline - loop.time()) > 0:
-            done, _ = await asyncio.wait({waiting}, timeout=left if watch is None else min(left, watch_interval_s))
-            if done:
-                returncode = waiting.result()
-                break
-            if watch is not None and await _measure(watch):
-                broken = True
-                break
+        watched: set[asyncio.Future[Any]] = {waiting} if stop is None else {waiting, stop}
+        done, _ = await asyncio.wait(watched, timeout=limits.wall_s, return_when=asyncio.FIRST_COMPLETED)
+        if stop is not None and stop in done:
+            stopped = True
+        elif waiting in done:
+            returncode = waiting.result()
     finally:
+        _drop(stop)
         _kill_group(process.pid)
         reaped = await process.wait()
         if not waiting.done():
             waiting.cancel()
         await _clear(slot, cleanup_pool)
-    if broken:
+    if stopped:
         return "killed", reaped
     if returncode is None:
         return "timeout", reaped
     return _outcome(returncode), returncode
 
 
-async def _measure(watch: Callable[[], str | None]) -> bool:
-    """Run the watchdog once, in a thread of the loop's default pool.
+def _drop(stop: asyncio.Future[str] | None) -> None:
+    """Cancel the watchdog's future unless it already stopped the job, so that no later verdict lands on it.
 
     Args:
-        watch: The watchdog.
-
-    Returns:
-        Whether it named a limit the job broke; an error in it is not one.
+        stop: The future, or ``None``.
     """
-    try:
-        return await asyncio.to_thread(watch) is not None
-    except Exception:
-        return False
+    if stop is not None and not stop.done():
+        stop.cancel()

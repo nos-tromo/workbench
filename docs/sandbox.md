@@ -80,7 +80,8 @@ One job runs in a slot at a time:
    environment (`sandbox.py:CLEAN_ENV`, with `HOME` and `TMPDIR` in the job's
    own `home/`) and a `077` umask; its stdin, stdout and stderr are
    `/dev/null`. Before it drops to the slot's uid it raises its OOM score and
-   installs the seccomp filter that keeps it from sockets (below).
+   installs the seccomp filter that keeps it from sockets and from memory the
+   watchdog could not count (below).
 3. While it runs, a watchdog measures it about twice a second (below). When
    the job ends, by itself, on the wall clock, on the watchdog or because the
    request was cancelled, its process group is killed. Then every process of the slot's uid
@@ -125,7 +126,7 @@ they stay out of reach all the same, behind the job folder only its slot can
 pass. A job cannot reach the users' files, the staging folder, the database,
 the socket or another job's folder: each is another uid's and closed to others.
 
-### No sockets
+### No sockets, no unseen shared memory
 
 Every job runs under a seccomp filter of workbench's own
 (`workbench/executor/seccomp.py`), on top of Docker's default profile. It is
@@ -139,15 +140,29 @@ installed in `preexec`, while the child is still root and after
 - `bind()` fails, and so does `setsockopt` with `SO_PASSCRED`, `SO_PASSPIDFD`
   or `SO_PASSPIDFD_THREAD`, which would make a Unix socket name itself: no
   socket of a job ever has a name another job could reach;
-- `io_uring_setup()` fails (an io_uring can make sockets past the filter), and
-  so does `memfd_create()` (memory in such a file is in no process's resident
-  set, where the watchdog counts it).
+- `io_uring_setup()` fails (an io_uring can make sockets past the filter);
+- `memfd_create()`, `memfd_secret()` and `mmap()` with both `MAP_SHARED` and
+  `MAP_ANONYMOUS` in its flags fail. Shared anonymous memory can be filled,
+  left mapped in a child the process forks and unmapped by the process itself:
+  `fork` copies no page of a shared mapping into the child's page tables, so
+  those pages are then in no process's resident set, where the watchdog counts
+  a job's memory. A private anonymous map and a shared map of a file work.
+
+At start the supervisor also takes the write bits of group and others off
+`/dev/zero` (`supervisor.py:_close_dev_zero`; Docker's `/dev` is the
+container's own tmpfs, and root owns the node). A shared map of `/dev/zero`
+opened for writing is shared anonymous memory too; opened read-only, it can
+only be read and holds no memory. It refuses to start if the node stays
+writable by others.
 
 It knows x86_64 and aarch64, each with its own syscall numbers; a call of
 another architecture fails the same way, and the supervisor refuses to start on
-another machine. pandas, numpy, matplotlib, openpyxl, python-docx, threads and
-asyncio work under it. Nothing needs a socket in a job: the executor has no
-network, and multiprocessing does not work there anyway.
+another machine. pandas, numpy, matplotlib, openpyxl, python-docx, threads,
+asyncio and ctypes callbacks work under it
+(`tests/executor/test_supervisor.py::test_as_root_a_job_has_no_socket_and_its_libraries_still_work`).
+Nothing needs a socket or shared anonymous memory in a job: the executor has no
+network, and multiprocessing, the one user of shared anonymous memory among the
+image's libraries, does not work there anyway.
 The files of the user's other chats are never copied in. A file below a folder
 named `out` is never copied in either: `out/` is where a job writes.
 
@@ -162,7 +177,7 @@ supervisor caps whatever a request asks at its own settings
 | Wall time | `WORKBENCH_JOB_WALL_S` (120 s); then the group is killed and the answer is a timeout |
 | The code's own time | 9/10 of the wall time for `run_python`, 3/4 for every other tool, stopped by `SIGALRM` inside the job (`workbench/executor/timer.py`); the wall time is the backstop |
 | `RLIMIT_AS` | `WORKBENCH_JOB_MEMORY_MB` (1536 MB) of address space, per process |
-| Memory of the job | `WORKBENCH_JOB_MEMORY_MB` for all its processes together, measured by the watchdog (below) |
+| Memory of the job | `WORKBENCH_JOB_MEMORY_MB` for all its processes and its SysV segments together, measured by the watchdog (below) |
 | `RLIMIT_CPU` | `WORKBENCH_JOB_WALL_S` seconds of CPU |
 | `RLIMIT_FSIZE` | `WORKBENCH_UPLOAD_MAX_MB` (50 MB) per file written |
 | What the job writes | `WORKBENCH_WORKSPACE_MAX_MB` (500 MB) in `home/` and `out/` together, at most 10 000 files and folders, nested at most 256 deep, measured by the watchdog |
@@ -170,19 +185,39 @@ supervisor caps whatever a request asks at its own settings
 | `RLIMIT_NOFILE` | 256 open files |
 | `RLIMIT_CORE` | 0 |
 | Priority | niceness 10 or more, which a job cannot lower again (`sandbox.py:JOB_NICENESS`) |
-| OOM score | `oom_score_adj` 1000 (`sandbox.py:JOB_OOM_SCORE_ADJ`): the kernel's OOM killer picks a job's process first |
+| OOM score | `oom_score_adj` 1000 (`sandbox.py:JOB_OOM_SCORE_ADJ`): the kernel's OOM killer picks a job's process first; a process of the slot below it is a broken limit (below) |
 
-The watchdog (`supervisor.py:_Watch`, run by `sandbox.py:run_in_slot`)
-measures a running job about twice a second, in a thread: the resident memory
-of every process of the slot's uid, read from `/proc`, plus the SysV shared
-memory segments the uid made that nobody has attached; and the disk, entries and
-depth of `home/` and `out/`, walked by descriptor without following a link.
-It holds one descriptor per level of a folder it walks, so the supervisor
-raises its own soft limit of open files to the hard one at start (the jobs keep
-theirs). Past a limit it kills the job's process group, the slot's cleanup
-kills the rest, and the answer names the limit ("the job was stopped: it wrote more than
-500 MB"). The memory limit thus holds per job, not only per process, and no
-job's processes together can take the container's memory from another slot.
+The watchdog (`supervisor.py:_Watchdog`) measures every running job about
+twice a second, in one thread of its own. Each pass looks once at `/proc` and
+the SysV table for all slots (`sandbox.py:slots_use`), then walks each job's
+`home/` and `out/` by descriptor without following a link, one job after the
+other. Per slot it counts:
+
+- the resident memory of every process of the slot's uid, without its shared
+  memory (`VmRSS` minus `RssShmem`);
+- every SysV shared memory segment the uid made, once, by the pages it holds
+  (its resident and swapped bytes), whether a process has it attached or not;
+- whether a process of the uid runs with an `oom_score_adj` below 1000
+  (`/proc/<pid>/oom_score_adj` is world-readable);
+- the disk, entries and depth of `home/` and `out/`.
+
+Past a limit it stops the job: its process group is killed, the slot's cleanup
+kills the rest, and the answer names the limit ("the job was stopped: it wrote
+more than 500 MB", "…: one of its processes lowered its OOM score"). The wall
+clock is kept on the event loop and waits on no thread, and a pass never waits
+on the loop's own pool, which copies the inputs and stages the outputs. A
+measure that fails stops the job and retires its slot ("the job was stopped:
+its use of memory and disk could not be measured"); the log names the error's
+type and the slot. A walk holds one descriptor per level, and the removal of
+every slot's folder may walk at once, so the supervisor raises its own soft
+limit of open files to the hard one at start and refuses to start below
+slots × 258 + 256 (the jobs keep theirs).
+
+What the memory limit holds: a job's processes together, and every SysV
+segment it made, within its share of the container, between two measures.
+The shared memory no resident set counts is closed to a job (above), so what
+it holds is counted. What it does not count is in
+[Residual risks](#residual-risks).
 
 For the container (`docker/compose.yaml`, see
 [configuration.md](configuration.md#the-executor-container)):
@@ -194,8 +229,9 @@ For the container (`docker/compose.yaml`, see
   `WORKBENCH_EXECUTOR_MEM_LIMIT` (6656 MiB): every slot's job memory plus
   512 MiB for the supervisor. Memory and swap together are that one limit, so
   no job swaps past it. The watchdog holds each job to its share; what a job
-  takes between two of its measures is held by this limit, and the OOM score
-  makes a job's process the one the kernel stops.
+  takes between two of its measures, and the kernel memory no measure counts
+  (below), is held by this limit, and the OOM score makes a job's process the
+  one the kernel stops.
 
 Documents get guards of their own before a library parses them: an Office file
 may unpack to at most 20 times the upload limit, with at most 10 000 members
@@ -233,9 +269,14 @@ unless:
   (`docker/Dockerfile.executor` strips the bits);
 - the cgroup's process limit (`pids.max`), when there is one, holds every
   slot's 64 processes and 64 more for the supervisor and its helpers;
-- the machine is x86_64 or aarch64, and a child under the jobs' socket filter
-  cannot open an Internet socket and can still make a Unix pair
-  (`seccomp.py:problem`).
+- the machine is x86_64 or aarch64, and a child under the jobs' seccomp filter
+  can neither open an Internet socket nor map shared anonymous memory, and can
+  still make a Unix pair and a private anonymous map (`seccomp.py:problem`).
+
+Then it makes two changes to its own container and starts only if they hold
+(`supervisor.py:prepare_host`): its soft limit of open files goes up to the hard
+one, which must hold slots × 258 + 256 descriptors; and `/dev/zero` is closed
+to others' writes (`0644`).
 
 Compose sets the container up this way. `seccomp=unconfined`, a missing
 `no-new-privileges` or Docker's default `/dev/shm` make it refuse.
@@ -299,16 +340,29 @@ Each of these is accepted. Each says what it would take.
 - **What the watchdog cannot see between two of its measures.** It measures
   about twice a second. A job can write, between two measures, as much as the
   disk takes in half a second, and take as much memory as it can map in half a
-  second; the container's memory limit and the job's OOM score hold the latter.
+  second, or lower its OOM score for that long; the container's memory limit and
+  the job's OOM score hold the memory.
   A file a job has removed but keeps open is in no folder the watchdog walks: up
   to 256 such files (`RLIMIT_NOFILE`) of 50 MB each (`RLIMIT_FSIZE`), freed
   when the job ends. A job that renames its folders while they are walked can
   be counted short by one measure.
-- **A job's OOM score can come down.** A job runs at `oom_score_adj` 1000, but
-  the kernel lets a process lower its own score to the floor its parents had,
-  the container's own (0 under Docker's default), without a capability. A job
-  that does so is no longer picked first; the watchdog's memory limit still
-  holds it.
+- **What the memory sum does not count.** The kernel's own memory that a job's
+  processes cause (page tables, pipe and socket-pair buffers, the inodes of its
+  files) and the page cache of the files it reads and writes are in no resident
+  set. They are bounded by the job's other limits (processes, open files, file
+  size, its folders' disk and entries) and held, with the rest, by the
+  container's memory limit and the job's OOM score. A process's resident set
+  counts pages it shares with its forked children once in each, which can stop
+  a job early, never late.
+- **A SysV segment handed between two running jobs.** A segment counts against
+  the slot that made it. A job can open one it made to every uid; another job
+  that runs at once can attach it and keep it attached after the first job
+  ended (the slot's cleanup empties and removes it, but the attached mapping
+  stays). What the second job then writes into it counts against the first
+  slot's next job, and against no job while that slot is idle, so it is held
+  only by the container's memory limit. It takes two jobs of two users that run
+  at once and cooperate, as the channel above does; it is a denial of service
+  against concurrent jobs, and it reaches no user's files.
 - **A job can have its own slot retired.** A job that leaves its folder so it
   cannot be removed (for example a tree deeper than the supervisor's open
   files allow) or wins the race against its slot's cleanup gets its slot

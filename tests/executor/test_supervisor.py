@@ -23,11 +23,12 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.conftest import scaled
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
 from workbench.config import Settings, load_settings
 from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
-from workbench.executor.sandbox import Slot
+from workbench.executor.sandbox import Slot, SlotUse
 from workbench.executor.supervisor import (
     MAX_OUTPUTS,
     NoUsableSlot,
@@ -1393,6 +1394,7 @@ def test_main_exits_with_one_short_line_when_no_slot_is_left(
 
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "prepare_host", lambda settings: None)
     monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
     monkeypatch.setattr(Supervisor, "serve", exhausted)
 
@@ -1426,6 +1428,7 @@ def test_main_reports_a_socket_it_may_not_bind_in_one_short_line(
 
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "prepare_host", lambda settings: None)
     monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
     monkeypatch.setattr(Supervisor, "serve", refuse)
 
@@ -1472,6 +1475,7 @@ def test_main_reports_an_unexpected_error_by_its_type_alone(
 
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(supervisor, "startup_problem", lambda settings: None)
+    monkeypatch.setattr(supervisor, "prepare_host", lambda settings: None)
     monkeypatch.setattr(supervisor, "make_slots", lambda settings: ())
     monkeypatch.setattr(Supervisor, "serve", fail)
 
@@ -2404,6 +2408,166 @@ async def test_a_job_within_its_limits_is_not_stopped(volume: Path, monkeypatch:
     assert (answer.status, answer.result) == ("ok", {"done": True})
 
 
+async def test_a_job_ends_at_its_wall_time_while_every_worker_of_the_loops_pool_is_held(
+    volume: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R86 N2: the wall clock is kept on the loop; the watchdog has a thread of its own. Neither waits on that pool.
+
+    The pool runs the set-up, the staging and the removals of every slot; once the job runs, both its workers are held.
+    The job beats into a file; once its wall time has passed, it beats no more, while the pool is still held.
+    """
+    _chat(volume)
+    beats = tmp_path / "beats"
+    _runner(
+        monkeypatch,
+        f"""
+        import time
+        while True:
+            pathlib.Path({str(beats)!r}).write_text(repr(time.time()))
+            time.sleep(0.05)
+        """,
+    )
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    release = threading.Event()
+    real = Supervisor._set_up
+
+    def set_up_then_hold_the_pool(self: Supervisor, *args: Any) -> Any:
+        job = real(self, *args)
+        for _ in range(2):  # both workers, once this one is back
+            loop.call_soon_threadsafe(loop.run_in_executor, None, release.wait, 60)
+        return job
+
+    monkeypatch.setattr(Supervisor, "_set_up", set_up_then_hold_the_pool)
+    limits = Limits(wall_s=2, cpu_s=60, memory_mb=1024, file_mb=50)
+    running = asyncio.create_task(Supervisor(_settings(volume), use_slots=False).run_job(_request(limits=limits)))
+    try:
+        await until(beats.exists, seconds=scaled(10))
+        await asyncio.sleep(2 + scaled(2))
+        last = beats.read_text()
+        await asyncio.sleep(1)
+        assert beats.read_text() == last, "the job still ran past its wall time"
+        assert not running.done()  # the staging that follows waits for the pool
+    finally:
+        release.set()
+    answer = await running
+    assert (answer.status, answer.message) == ("timeout", "the job ran past its wall time of 2 s")
+
+
+async def test_a_job_the_watchdog_cannot_measure_is_stopped_and_its_slot_retired(
+    volume: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R86 N3: a measure that fails stops the job (fail closed) and retires its slot; the log has the type alone."""
+    _chat(volume)
+    _runner(monkeypatch, "import time\ntime.sleep(60)\n")
+
+    def unreadable(tops: Any, **bounds: Any) -> Any:
+        raise _unexpected()
+
+    monkeypatch.setattr(supervisor, "measure", unreadable)
+    sup = Supervisor(_settings(volume), use_slots=False)
+    limits = Limits(wall_s=5, cpu_s=60, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        answer = await sup.run_job(_request(limits=limits))
+
+    assert (answer.status, answer.message) == (
+        "killed",
+        "the job was stopped: its use of memory and disk could not be measured",
+    )
+    assert time.monotonic() - began < scaled(4)
+    assert sup._retired == {0}
+    assert sup._free == [1]
+    assert "the watchdog could not measure the job of slot 0 (PermissionError)" in caplog.text
+    assert not _holds_a_secret(caplog.text)
+    assert _entries(volume / "jobs") == []
+
+
+class _Judged:
+    """A stand-in for a job's watch: its slot's uid and what judging it does."""
+
+    def __init__(self, index: int, uid: int | None, verdict: str | None = None, error: Exception | None = None) -> None:
+        """Judge to ``verdict``, or raise ``error``."""
+        self.index, self.uid = index, uid
+        self.verdict, self.error = verdict, error
+        self.seen: list[SlotUse | None] = []
+
+    def judge(self, use: SlotUse | None) -> str | None:
+        """Remember the use, then judge."""
+        self.seen.append(use)
+        if self.error is not None:
+            raise self.error
+        return self.verdict
+
+
+def test_one_pass_reads_proc_once_for_every_slot_and_hands_each_job_its_own_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R86 N6: one look at ``/proc`` for all slots per pass, not one per slot; the per-slot sums stay apart."""
+    looks: list[set[int]] = []
+
+    def use_of(uids: set[int]) -> dict[int, SlotUse]:
+        looks.append(set(uids))
+        return {uid: SlotUse(memory=uid) for uid in uids}
+
+    monkeypatch.setattr(supervisor, "slots_use", use_of)
+    first, second, third = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB"), _Judged(2, None)
+
+    verdicts = supervisor._Watchdog().check([first, second, third])  # type: ignore[list-item]
+
+    assert looks == [{20001, 20002}]
+    assert (first.seen, second.seen, third.seen) == ([SlotUse(memory=20001)], [SlotUse(memory=20002)], [None])
+    assert verdicts == [(second, "it wrote more than 1 MB")]
+
+
+def test_a_pass_that_cannot_read_proc_stops_every_job(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R86 N3: fail closed for every job when the shared look fails, and for one job when its own measure does."""
+
+    def broken(uids: set[int]) -> dict[int, SlotUse]:
+        raise _unexpected()
+
+    one, two = _Judged(0, 20001), _Judged(1, 20002, error=_unexpected())
+    watchdog = supervisor._Watchdog()
+    monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        assert watchdog.check([one, two]) == [(two, supervisor.UNMEASURED)]  # type: ignore[list-item]
+        monkeypatch.setattr(supervisor, "slots_use", broken)
+        assert watchdog.check([one, two]) == [  # type: ignore[list-item]
+            (one, supervisor.UNMEASURED),
+            (two, supervisor.UNMEASURED),
+        ]
+    assert "the watchdog could not measure the job of slot 1 (PermissionError)" in caplog.text
+    assert "the watchdog could not read the slots' processes (PermissionError)" in caplog.text
+    assert not _holds_a_secret(caplog.text)
+
+
+async def test_a_watch_judges_its_slots_memory_and_score_before_its_folders(tmp_path: Path) -> None:
+    """R86 N7: a lowered OOM score is a broken limit; memory past the job's share is too."""
+    home, out = tmp_path / "home", tmp_path / "out"
+    home.mkdir()
+    out.mkdir()
+    fds = [os.open(folder, os.O_RDONLY | os.O_DIRECTORY) for folder in (home, out)]
+    job = supervisor._Job(
+        name="0" * 32, jobs=-1, folder=-1, out=fds[1], home=fds[0], path=tmp_path, cwd=tmp_path, runner=ME[0]
+    )
+    limits = Limits(wall_s=5, cpu_s=5, memory_mb=256, file_mb=1)
+    watch = supervisor._Watch(job, 0, Slot(0, 20001, 20001), limits, disk_mb=1)
+    try:
+        assert watch.judge(SlotUse(memory=256 * MB)) is None
+        assert watch.judge(SlotUse(memory=256 * MB + 1)) == "its processes used more than 256 MB of memory together"
+        assert watch.judge(SlotUse(memory=0, lowered=True)) == "one of its processes lowered its OOM score"
+        (home / "big").write_bytes(os.urandom(2 * MB))
+        assert watch.judge(SlotUse()) == "it wrote more than 1 MB"
+    finally:
+        watch.close()
+        for fd in fds:
+            os.close(fd)
+    assert watch.judge(SlotUse(lowered=True)) is None
+
+
 async def test_a_failed_run_removes_the_job_folder_off_the_event_loop(
     volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2548,15 +2712,103 @@ async def test_as_root_a_jobs_processes_together_are_held_to_its_memory(
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
-async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
+async def test_as_root_segments_a_job_filled_and_left_to_its_children_count_against_it(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R76: no Internet, Unix or netlink socket, no abstract name; a Unix pair, asyncio, pandas and the OOM score do."""
+    """R85: each child keeps a SysV segment its parent filled and then detached; no resident set holds those pages.
+
+    Each segment is attached (``nattch`` 1, the child's), and before R85 the watchdog left attached segments out. Each
+    process stays under ``RLIMIT_AS``; the three segments together pass the job's memory, and it stops.
+    """
     _chat(root_volume)
     _runner(
         monkeypatch,
         """
-        import asyncio, errno, socket
+        import ctypes, time
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+        libc.shmat.restype = ctypes.c_void_p
+        libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        libc.shmdt.argtypes = [ctypes.c_void_p]
+        size = 100 * 1024 * 1024
+        for _ in range(3):
+            ident = libc.shmget(0, size, 0o1600)
+            at = libc.shmat(ident, None, 0)
+            ctypes.memset(at, 1, size)
+            if os.fork() == 0:
+                time.sleep(60)
+                os._exit(0)
+            libc.shmdt(at)
+        time.sleep(60)
+        """,
+    )
+    limits = Limits(wall_s=30, cpu_s=30, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume, WORKBENCH_JOB_MEMORY_MB="256")).run_job(_request(limits=limits))
+
+    assert (answer.status, answer.message) == (
+        "killed",
+        "the job was stopped: its processes used more than 256 MB of memory together",
+    )
+    assert time.monotonic() - began < scaled(20)
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_that_lowers_its_oom_score_is_stopped(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R86 N7: a job may lower its score from 1000 to the container's floor; the watchdog then stops it."""
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import time
+        if os.fork() == 0:
+            pathlib.Path("/proc/self/oom_score_adj").write_text("0")
+            time.sleep(60)
+            os._exit(0)
+        time.sleep(60)
+        """,
+    )
+    limits = Limits(wall_s=30, cpu_s=30, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_request(limits=limits))
+
+    assert (answer.status, answer.message) == (
+        "killed",
+        "the job was stopped: one of its processes lowered its OOM score",
+    )
+    assert time.monotonic() - began < scaled(20)
+
+
+@pytest.fixture
+def dev_zero_closed() -> Iterator[None]:
+    """``/dev/zero`` as the supervisor leaves it at start (``prepare_host``), and as it was after the test."""
+    before = stat.S_IMODE(os.lstat("/dev/zero").st_mode)
+    assert supervisor._close_dev_zero() is None
+    try:
+        yield
+    finally:
+        os.chmod("/dev/zero", before)
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
+    root_volume: Path, dev_zero_closed: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R76, R81, R85: no socket, no shared anonymous memory; the image's libraries, threads, asyncio and ctypes work.
+
+    No Internet, Unix or netlink socket, no abstract name, no memfd, no shared anonymous map, and ``/dev/zero`` cannot
+    be opened for writing. A Unix pair, a private anonymous map, a read-only shared map of ``/dev/zero``, pandas,
+    numpy, matplotlib, openpyxl, python-docx, threads, asyncio and a ctypes callback all work; the OOM score is 1000.
+    """
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import asyncio, ctypes, errno, io, mmap, socket, threading
         def attempt(action):
             try:
                 action()
@@ -2569,9 +2821,35 @@ async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
         def passcred():
             one, two = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
             one.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        libc = ctypes.CDLL(None, use_errno=True)
+        def secret():
+            if libc.syscall(447, 0) < 0:
+                raise OSError(ctypes.get_errno(), "memfd_secret")
+        def zero_shared(prot):
+            fd = os.open("/dev/zero", os.O_RDONLY)
+            try:
+                mmap.mmap(fd, 4096, mmap.MAP_SHARED, prot)
+            finally:
+                os.close(fd)
         async def nothing():
             return "ok"
-        import pandas
+        import numpy, pandas, matplotlib.pyplot as plt, openpyxl, docx
+        figure = io.BytesIO()
+        plt.plot([1, 2, 3])
+        plt.savefig(figure, format="png")
+        book = openpyxl.Workbook()
+        book.active["A1"] = 3
+        sheet = io.BytesIO()
+        book.save(sheet)
+        letter = docx.Document()
+        letter.add_paragraph("harbour report")
+        page = io.BytesIO()
+        letter.save(page)
+        callback = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)(lambda x: x * 2)
+        done = []
+        worker = threading.Thread(target=lambda: done.append(int(numpy.linalg.inv(numpy.eye(3) * 2).trace() * 4)))
+        worker.start()
+        worker.join()
         result = {
             "inet": attempt(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM)),
             "inet6": attempt(lambda: socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)),
@@ -2580,9 +2858,18 @@ async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
             "abstract": attempt(abstract),
             "passcred": attempt(passcred),
             "memfd": attempt(lambda: os.memfd_create("x")),
+            "memfd_secret": attempt(secret),
+            "shared_anonymous": attempt(lambda: mmap.mmap(-1, 4096)),
+            "dev_zero_for_writing": attempt(lambda: os.close(os.open("/dev/zero", os.O_RDWR))),
+            "dev_zero_shared_writable": attempt(lambda: zero_shared(mmap.PROT_READ | mmap.PROT_WRITE)),
             "pair": attempt(lambda: socket.socketpair()),
+            "private_anonymous": attempt(lambda: mmap.mmap(-1, 4096, flags=mmap.MAP_PRIVATE)),
+            "dev_zero_shared_readable": attempt(lambda: zero_shared(mmap.PROT_READ)),
             "asyncio": asyncio.run(nothing()),
             "pandas": int(pandas.DataFrame({"a": [1, 2, 3]})["a"].sum()),
+            "libraries": [figure.getvalue()[1:4].decode(), sheet.getvalue()[:2].decode(), page.getvalue()[:2].decode()],
+            "thread_numpy": done,
+            "callback": callback(21),
             "oom_score_adj": pathlib.Path("/proc/self/oom_score_adj").read_text().strip(),
         }
         """,
@@ -2591,12 +2878,29 @@ async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
     answer = await Supervisor(_settings(root_volume)).run_job(_request())
 
     assert answer.status == "ok", answer
-    refused = ("inet", "inet6", "unix", "netlink", "abstract", "passcred", "memfd")
+    refused = (
+        "inet",
+        "inet6",
+        "unix",
+        "netlink",
+        "abstract",
+        "passcred",
+        "memfd",
+        "memfd_secret",
+        "shared_anonymous",
+        "dev_zero_for_writing",
+        "dev_zero_shared_writable",
+    )
     assert {key: answer.result[key] for key in refused} == dict.fromkeys(refused, "EACCES")
-    assert {key: answer.result[key] for key in ("pair", "asyncio", "pandas", "oom_score_adj")} == {
-        "pair": "ok",
-        "asyncio": "ok",
+    works = ("pair", "private_anonymous", "dev_zero_shared_readable", "asyncio")
+    assert {key: answer.result[key] for key in works} == dict.fromkeys(works, "ok")
+    assert {
+        key: answer.result[key] for key in ("pandas", "libraries", "thread_numpy", "callback", "oom_score_adj")
+    } == {
         "pandas": 6,
+        "libraries": ["PNG", "PK", "PK"],
+        "thread_numpy": [6],
+        "callback": 42,
         "oom_score_adj": "1000",
     }
 
@@ -2613,12 +2917,90 @@ def test_the_executor_image_has_no_setuid_or_setgid_program() -> None:
     assert not Path("/app/contract").exists() and not Path("/app/docs").exists()  # R1 M-10: .dockerignore
 
 
+class _Limits:
+    """A stand-in for ``getrlimit`` and ``setrlimit`` of open files, starting at ``soft`` and ``hard``."""
+
+    def __init__(self, soft: int, hard: int) -> None:
+        """Start at the given limits."""
+        self.soft, self.hard = soft, hard
+        self.calls: list[tuple[int, tuple[int, int]]] = []
+
+    def get(self, which: int) -> tuple[int, int]:
+        """The limits now."""
+        return self.soft, self.hard
+
+    def set(self, which: int, limits: tuple[int, int]) -> None:
+        """Take the new limits, as the kernel does up to the hard one."""
+        self.calls.append((which, limits))
+        self.soft = limits[0]
+
+
 def test_the_supervisor_raises_its_soft_limit_of_open_files_to_the_hard_one(monkeypatch: pytest.MonkeyPatch) -> None:
     """The watchdog holds a descriptor per level of a running job's folders; a host may start containers at 1024."""
-    calls: list[tuple[int, tuple[int, int]]] = []
-    monkeypatch.setattr(supervisor.resource, "getrlimit", lambda which: (1024, 524288))
-    monkeypatch.setattr(supervisor.resource, "setrlimit", lambda which, limits: calls.append((which, limits)))
+    limits = _Limits(1024, 524288)
+    monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
+    monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
 
-    supervisor._open_files_up_to_the_hard_limit()
+    assert supervisor._open_files_problem(4) is None
 
-    assert calls == [(supervisor.resource.RLIMIT_NOFILE, (524288, 524288))]
+    assert limits.calls == [(supervisor.resource.RLIMIT_NOFILE, (524288, 524288))]
+
+
+@pytest.mark.parametrize(("slots", "hard"), [(4, 1024), (16, 4096)])
+def test_a_supervisor_that_may_open_too_few_files_for_its_slots_refuses_to_start(
+    slots: int, hard: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R86 N3: every slot's walk of its job folder, one descriptor per level, and a margin must fit the hard limit."""
+    limits = _Limits(hard, hard)
+    monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
+    monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
+    need = slots * (supervisor.MAX_JOB_DEPTH + 2) + supervisor.NOFILE_MARGIN
+
+    problem = supervisor.prepare_host(_settings(Path("/nowhere"), WORKBENCH_EXECUTOR_SLOTS=str(slots)))
+
+    assert problem == f"the supervisor may open {hard} files, fewer than the {need} its {slots} slots need"
+
+
+def test_dev_zero_is_closed_to_others_writes_at_start(tmp_path: Path) -> None:
+    """R85: a node writable by all becomes ``0644``; one that already is stays; a missing one is no route at all."""
+    node = tmp_path / "zero"
+    node.write_bytes(b"")
+    node.chmod(0o666)
+
+    assert supervisor._close_dev_zero(node, root=ME[0]) is None
+    assert _mode(node) == 0o644
+    assert supervisor._close_dev_zero(node, root=ME[0]) is None
+    assert supervisor._close_dev_zero(tmp_path / "absent", root=ME[0]) is None
+
+
+def test_a_dev_zero_that_cannot_be_closed_refuses_to_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R85: a link, another owner, or a mode that cannot be changed: the supervisor does not start."""
+    reason = "/dev/zero must be root's and closed to others' writes, so no job can map shared memory through it"
+    node = tmp_path / "zero"
+    node.write_bytes(b"")
+    node.chmod(0o666)
+    link = tmp_path / "link"
+    link.symlink_to(node)
+
+    assert supervisor._close_dev_zero(link, root=ME[0]) == reason
+    assert _mode(node) == 0o666  # a link is never followed
+    assert supervisor._close_dev_zero(node, root=ME[0] + 1) == reason
+
+    def refuse(path: Any, mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    node.chmod(0o666)
+    monkeypatch.setattr(supervisor.os, "chmod", refuse)
+    assert supervisor._close_dev_zero(node, root=ME[0]) == reason
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="the executor image's own /dev, as root")
+def test_as_root_this_containers_dev_zero_can_be_closed(dev_zero_closed: None) -> None:
+    """R85: Docker's ``/dev`` is the container's tmpfs; root changes the node's mode without a capability."""
+    st = os.lstat("/dev/zero")
+    assert stat.S_ISCHR(st.st_mode) and (st.st_uid, stat.S_IMODE(st.st_mode)) == (0, 0o644)
+
+
+def test_the_open_files_four_slots_need_pass_a_soft_limit_of_1024() -> None:
+    """Why the soft limit is raised at all: four slots at 256 levels already need more than many hosts give."""
+    assert supervisor.open_files_needed(4) > 1024
