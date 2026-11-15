@@ -1,17 +1,18 @@
 """One tool core: the specs of each form, the start check of each caller's list, and the answers both doors give."""
 
 import dataclasses
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 
 from tests.api.conftest import DOCINT_KEY, KEY
-from workbench.api.auth import Caller, CallerRegistry
+from workbench.api.auth import Caller, CallerRegistry, require_tool
 from workbench.api.errors import MAX_ERRORS, compact, describe
 from workbench.api.files import DisplayedFile
 from workbench.api.jobs import Busy, RequestTooLarge
-from workbench.api.registry import WORKSPACE_TOOLS, Registry, ToolSpec, workspace_specs
+from workbench.api.openapi import TOOL_TAG
+from workbench.api.registry import FORM_TOOLS, INLINE_TOOLS, WORKSPACE_TOOLS, Files, Registry, ToolSpec, workspace_specs
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StoreError
 from workbench.api.tools import FileList, PythonRun, RunPythonRequest
 from workbench.config import ConfigError, Settings
@@ -36,7 +37,7 @@ def test_the_registry_equals_the_tool_routes(app: FastAPI) -> None:
     assert [s.name for s in registry.for_caller(open_webui)] == sorted(WORKSPACE_TOOLS)
 
 
-def _spec(name: str, form: Literal["workspace", "inline"]) -> ToolSpec:
+def _spec(name: str, form: Files) -> ToolSpec:
     """A synthetic spec named ``name``, of the form ``form``."""
     return ToolSpec(name=name, title=name, description=f"tool {name}", input_model=None, output_model=None, form=form)
 
@@ -59,9 +60,45 @@ def test_a_caller_sees_the_tools_of_its_form_in_name_order() -> None:
 
 @pytest.mark.parametrize("tools", [frozenset({"list_files"}), frozenset({"run_python", "nowhere"})])
 def test_a_tool_without_the_callers_form_stops_the_start(settings: Settings, tools: frozenset[str]) -> None:
-    """Docint brings its data with each call: a workspace tool, or a name no tool has, on its list stops the start."""
-    with pytest.raises(ConfigError, match="DOCINT_WORKBENCH_TOOLS"):
+    """Docint brings its data with each call: a workspace tool, or a name no tool has, on its list stops the start.
+
+    The message names the variable and the tools it may list, never a name the variable was set to.
+    """
+    with pytest.raises(ConfigError, match="DOCINT_WORKBENCH_TOOLS") as refused:
         CallerRegistry.from_settings(dataclasses.replace(settings, docint_tools=tools))
+    assert [name for name in tools - INLINE_TOOLS if name in str(refused.value)] == []
+
+
+def test_the_tools_of_each_form_are_read_only() -> None:
+    """The start check's sets cannot be changed while the api runs."""
+    with pytest.raises(TypeError):
+        cast(dict[str, frozenset[str]], FORM_TOOLS)["inline"] = WORKSPACE_TOOLS
+
+
+def _write_table() -> dict[str, str]:
+    """A synthetic tool route's endpoint."""
+    return {}
+
+
+@pytest.mark.parametrize(("guard", "starts"), [(None, False), ("write_document", False), ("write_table", True)])
+def test_a_tool_route_without_its_own_guard_stops_the_start(guard: str | None, starts: bool) -> None:
+    """A tool route must enforce the caller's list under its own name: no guard, or another tool's, stops the start."""
+    app = FastAPI()
+    app.add_api_route(
+        "/tools/write_table",
+        _write_table,
+        methods=["POST"],
+        tags=[TOOL_TAG],
+        operation_id="write_table",
+        summary="Write a table",
+        description="Write a table into a new file of this conversation.",
+        dependencies=[] if guard is None else [Depends(require_tool(guard))],
+    )
+    if starts:
+        assert [spec.name for spec in workspace_specs(app)] == ["write_table"]
+        return
+    with pytest.raises(ValueError, match="write_table"):
+        workspace_specs(app)
 
 
 # --- the answers ----------------------------------------------------------------------------------------------------

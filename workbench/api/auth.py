@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.api.errors import NOT_FOUND
-from workbench.api.registry import FORM_TOOLS, WORKSPACE_TOOLS
+from workbench.api.registry import FORM_TOOLS, WORKSPACE_TOOLS, Files, ToolGuard
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
@@ -52,9 +52,6 @@ INVALID_SESSION: Final = "invalid session"
 
 #: How a caller comes in: Open WebUI's terminal-server HTTP, or the MCP door.
 Door = Literal["terminal", "mcp"]
-
-#: Where a caller's files live: in its users' workspaces, or only inside the call that brings them.
-Files = Literal["workspace", "inline"]
 
 
 @dataclass(frozen=True)
@@ -269,22 +266,11 @@ async def require_caller(request: Request) -> Caller:
     return caller
 
 
-def require_tool(name: str) -> Callable[..., Awaitable[Caller]]:
-    """Make the dependency of the tool route ``name``.
+class _ToolOnList(ToolGuard):
+    """The guard :func:`require_tool` makes: the caller's key, its door, and the tool on its list."""
 
-    Like :func:`require_caller`, it reads the request itself and declares no parameter, so the route's
-    OpenAPI operation gains none.
-
-    Args:
-        name: The tool's ``operationId``.
-
-    Returns:
-        A dependency that gives the caller :func:`require_caller` authenticated, and answers 404 with
-        :data:`~workbench.api.errors.NOT_FOUND` when ``name`` is not on that caller's list.
-    """
-
-    async def tool_on_list(caller: Annotated[Caller, Depends(require_caller)]) -> Caller:
-        """Let the caller through if ``name`` is on its list.
+    async def __call__(self, caller: Annotated[Caller, Depends(require_caller)]) -> Caller:
+        """Let the caller through if the guarded tool is on its list.
 
         Args:
             caller: The authenticated caller of the terminal door.
@@ -295,11 +281,26 @@ def require_tool(name: str) -> Callable[..., Awaitable[Caller]]:
         Raises:
             HTTPException: 404 with :data:`~workbench.api.errors.NOT_FOUND` if the tool is not on the caller's list.
         """
-        if name not in caller.tools:
+        if self.tool not in caller.tools:
             raise HTTPException(status_code=404, detail=NOT_FOUND)
         return caller
 
-    return tool_on_list
+
+def require_tool(name: str) -> Callable[..., Awaitable[Caller]]:
+    """Make the dependency of the tool route ``name``.
+
+    Like :func:`require_caller`, it reads the request itself and declares no parameter, so the route's
+    OpenAPI operation gains none. It is a :class:`~workbench.api.registry.ToolGuard` tagged with ``name``, which
+    :func:`~workbench.api.registry.workspace_specs` looks for on the route of that name.
+
+    Args:
+        name: The tool's ``operationId``.
+
+    Returns:
+        A dependency that gives the caller :func:`require_caller` authenticated, and answers 404 with
+        :data:`~workbench.api.errors.NOT_FOUND` when ``name`` is not on that caller's list.
+    """
+    return _ToolOnList(name)
 
 
 class KeyGate:

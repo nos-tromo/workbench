@@ -5,16 +5,19 @@ a user keeps in a chat folder, an ``inline`` tool on data that comes with the ca
 workspace tools are the terminal door's routes tagged :data:`~workbench.api.openapi.TOOL_TAG`, described as specs when
 the app is made (:func:`workspace_specs`); they are not served on the MCP door in version 2. A caller finds the tools of
 its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other
-(:data:`FORM_TOOLS`).
+(:data:`FORM_TOOLS`). Each workspace tool route must also enforce that list itself, through a :class:`ToolGuard` named
+after it, or the api does not start either.
 
 ``Caller`` is imported for type checking only, since :mod:`workbench.api.auth` imports this module.
 """
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from fastapi import FastAPI
+from fastapi.dependencies.models import Dependant
 from pydantic import BaseModel
 
 from workbench.api.audit import AuditLog
@@ -27,6 +30,10 @@ from workbench.utils.audit_event import Purpose
 
 if TYPE_CHECKING:
     from workbench.api.auth import Caller
+
+#: Where a caller's files live, and so the form of the tools it may use: in its users' workspaces, or only inside the
+#: call that brings them.
+Files = Literal["workspace", "inline"]
 
 #: Every workspace tool, by ``operationId``: the terminal door's tool routes.
 WORKSPACE_TOOLS: Final = frozenset(
@@ -46,8 +53,10 @@ WORKSPACE_TOOLS: Final = frozenset(
 #: Every inline tool, by name.
 INLINE_TOOLS: Final = frozenset({"run_python"})
 
-#: The tools of each file form. A caller's list must lie within its own form's.
-FORM_TOOLS: Final[Mapping[str, frozenset[str]]] = {"workspace": WORKSPACE_TOOLS, "inline": INLINE_TOOLS}
+#: The tools of each file form, read-only. A caller's list must lie within its own form's.
+FORM_TOOLS: Final[Mapping[Files, frozenset[str]]] = MappingProxyType(
+    {"workspace": WORKSPACE_TOOLS, "inline": INLINE_TOOLS}
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,25 @@ class PurposeRequired(Exception):
     """A purpose the call had to state was not stated; the ``denied`` event is already written."""
 
 
+class ToolGuard:
+    """The dependency a workspace tool route enforces the caller's list with, tagged with the tool it guards.
+
+    :func:`~workbench.api.auth.require_tool` makes it; :func:`workspace_specs` refuses a tool route without one named
+    after the route.
+
+    Attributes:
+        tool: The ``operationId`` of the tool it guards.
+    """
+
+    def __init__(self, tool: str) -> None:
+        """Tag the guard.
+
+        Args:
+            tool: The ``operationId`` of the tool it guards.
+        """
+        self.tool = tool
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """A tool, whichever door serves it.
@@ -114,7 +142,7 @@ class ToolSpec:
     description: str
     input_model: type[BaseModel] | None
     output_model: type[BaseModel] | None
-    form: Literal["workspace", "inline"]
+    form: Files
     run: Callable[[Any, ToolEnv], Awaitable[ToolOutcome]] | None = None
     input_schema: Callable[["Caller"], dict[str, Any]] | None = None
 
@@ -131,6 +159,23 @@ def _model(candidate: object) -> type[BaseModel] | None:
     return candidate if isinstance(candidate, type) and issubclass(candidate, BaseModel) else None
 
 
+def _guarded(dependant: Dependant) -> set[str]:
+    """Name the tools the guards in a dependency tree guard.
+
+    Args:
+        dependant: A route's dependencies, or one of them.
+
+    Returns:
+        The ``tool`` of every :class:`ToolGuard` in the tree.
+    """
+    names: set[str] = set()
+    for sub in dependant.dependencies:
+        if isinstance(sub.call, ToolGuard):
+            names.add(sub.call.tool)
+        names |= _guarded(sub)
+    return names
+
+
 def workspace_specs(app: FastAPI) -> tuple[ToolSpec, ...]:
     """Describe each tool route of ``app`` as a workspace spec.
 
@@ -142,13 +187,16 @@ def workspace_specs(app: FastAPI) -> tuple[ToolSpec, ...]:
         ``description``, its body model or ``None``, and its ``response_model`` or ``None``.
 
     Raises:
-        ValueError: If a tool route has no ``operation_id``, ``summary`` or ``description``.
+        ValueError: If a tool route has no ``operation_id``, ``summary`` or ``description``, or its guards are not
+            exactly one tool's, its own: without that, it would serve a caller whose list does not name it.
     """
     specs: list[ToolSpec] = []
     for route in tool_routes(app):
         name, title, description = route.operation_id, route.summary, route.description
         if not (name and title and description):
             raise ValueError(f"the tool route {route.path} needs an operation_id, a summary and a description")
+        if _guarded(route.dependant) != {name}:
+            raise ValueError(f"the tool route {route.path} needs require_tool({name!r}) and no other tool's guard")
         body = route.body_field
         specs.append(
             ToolSpec(

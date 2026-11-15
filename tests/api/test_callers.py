@@ -26,7 +26,7 @@ from workbench.api.auth import (
     require_caller,
 )
 from workbench.api.main import create_app
-from workbench.api.openapi import tool_openapi
+from workbench.api.openapi import tool_openapi, tool_routes
 from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
 from workbench.config import ConfigError, Settings
@@ -332,23 +332,33 @@ def test_principal_from_headers_names_the_caller_and_defaults_the_chat() -> None
 # --- the tool list -------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("full", [False, True], ids=["reduced", "full"])
+@pytest.mark.parametrize("tool", sorted(WORKSPACE_TOOLS))
 def test_a_reduced_list_is_refused_by_require_tool(
-    settings: Settings, store: Store, audit: AuditLog, monkeypatch: pytest.MonkeyPatch
+    settings: Settings, store: Store, audit: AuditLog, monkeypatch: pytest.MonkeyPatch, tool: str, full: bool
 ) -> None:
-    """A tool off the caller's list is the door's 404 and is not in its document; the rest of the list still works."""
+    """Each tool route answers the door's 404 to a list without it, never to one with it; the document follows."""
+    listed = WORKSPACE_TOOLS if full else WORKSPACE_TOOLS - {tool}
 
-    def reduced(_settings: Settings) -> CallerRegistry:
-        return CallerRegistry([Caller("open-webui", KEY, WORKSPACE_TOOLS - {"read_document"})])
+    def registry(_settings: Settings) -> CallerRegistry:
+        return CallerRegistry([Caller("open-webui", KEY, listed)])
 
-    monkeypatch.setattr(CallerRegistry, "from_settings", reduced)
-    with TestClient(create_app(settings, store=store, audit=audit)) as client:
-        r = client.post("/tools/read_document", json={"path": f"{CHAT}/q.csv"}, headers=H)
-        assert (r.status_code, r.json()) == NOT_FOUND
+    monkeypatch.setattr(CallerRegistry, "from_settings", registry)
+    app = create_app(settings, store=store, audit=audit)
+    ((method, path),) = [
+        (method, route.path or "")
+        for route in tool_routes(app)
+        if route.operation_id == tool
+        for method in route.methods or ()
+    ]
+    with TestClient(app) as client:
+        r = client.request(method, path, headers=H, json={} if method == "POST" else None)
+        if full:
+            assert r.status_code != 404, r.json()
+        else:
+            assert (r.status_code, r.json()) == NOT_FOUND
         doc = client.get("/openapi.json", headers=H).json()
-        assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == WORKSPACE_TOOLS - {
-            "read_document"
-        }
-        assert client.post("/tools/list_files", headers=H).status_code == 200
+        assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == listed
 
 
 def test_each_caller_gets_its_own_document(app: FastAPI) -> None:
