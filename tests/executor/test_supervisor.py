@@ -2999,6 +2999,41 @@ async def test_as_root_a_job_cannot_open_its_folder_to_another_slot(
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_jobs_processes_together_are_held_to_its_memory(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R75: each process stays under ``RLIMIT_AS``, but three of them together pass the job's memory, and it stops.
+
+    Private memory on a real kernel: each child's own pages are in its resident set, and the sum of the slot's
+    processes passes the job's share.
+    """
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import time
+        for _ in range(3):
+            if os.fork() == 0:
+                held = bytearray(120 * 1024 * 1024)
+                for at in range(0, len(held), 4096):
+                    held[at] = 1
+                time.sleep(60)
+                os._exit(0)
+        time.sleep(60)
+        """,
+    )
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume, WORKBENCH_JOB_MEMORY_MB="256")).run_job(_request())
+
+    assert (answer.status, answer.message) == (
+        "killed",
+        "the job was stopped: its processes used more than 256 MB of memory together",
+    )
+    assert time.monotonic() - began < scaled(40)
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
 async def test_as_root_segments_a_job_filled_and_left_to_its_children_count_against_it(
     root_volume: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
