@@ -314,6 +314,21 @@ def test_fork_bomb_is_contained(api: httpx.Client) -> None:
     assert stdout_of(run_python(api, 'print("still here")')) == "still here"
 
 
+#: Run inside the executor's container: what it holds now, and the shared memory no job's count shows.
+SHMEM_NOW = (
+    "from workbench.executor import sandbox, supervisor; "
+    "print(sandbox.unattributed_shmem(), sandbox.shmem_charged(sandbox.MEMORY_STAT), supervisor.SHMEM_MARGIN)"
+)
+
+
+def test_the_running_executor_holds_no_shared_memory_outside_any_jobs_count(executor: str, api: httpx.Client) -> None:
+    """R90: the baseline the watchdog bounds, on the real stack: none idle, and none after a job that used numpy."""
+    for _ in range(2):
+        hidden, charged, margin = (int(word) for word in docker("exec", executor, "python", "-c", SHMEM_NOW).split())
+        assert hidden < margin // 4, (hidden, charged)
+        assert stdout_of(run_python(api, "import numpy\nprint(int(numpy.ones(10).sum()))")) == "10"
+
+
 def test_memory_hog_is_killed_with_a_clear_message(api: httpx.Client) -> None:
     """More than the job's memory ends the job, and the answer says it was memory."""
     hog = run_python(api, "blob = bytearray(8 * 1024 ** 3)\nprint(len(blob))")

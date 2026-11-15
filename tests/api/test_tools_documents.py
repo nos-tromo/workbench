@@ -209,6 +209,7 @@ def test_a_folder_is_not_a_document(client: TestClient, store: Store, executor: 
         ("read_timeout", 422, "reading the file took longer than 90 s; it is too large or too complex"),
         ("file_not_found", 404, "is not in this conversation's workspace"),
         ("storage_full", 507, "storage is full"),
+        ("hidden_memory", 503, "memory outside any job's count"),
     ],
 )
 def test_the_runners_failures_are_answered_with_their_code_and_message(

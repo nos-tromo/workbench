@@ -2601,6 +2601,7 @@ def test_one_pass_reads_proc_once_for_every_slot_and_hands_each_job_its_own_use(
         return {uid: SlotUse(memory=uid) for uid in uids}
 
     monkeypatch.setattr(supervisor, "slots_use", use_of)
+    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda: 0)
     first, second, third = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB"), _Judged(2, None)
 
     verdicts = supervisor._Watchdog(_Above()).check([first, second, third])  # type: ignore[list-item]
@@ -2621,6 +2622,7 @@ def test_a_pass_that_cannot_read_proc_stops_every_job(
     one, two = _Judged(0, 20001), _Judged(1, 20002, error=_unexpected())
     watchdog = supervisor._Watchdog(_Above())  # type: ignore[arg-type]
     monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
+    monkeypatch.setattr(supervisor, "unattributed_shmem", lambda: 0)
     with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
         assert watchdog.check([one, two]) == [(two, supervisor.UNMEASURED)]  # type: ignore[list-item]
         monkeypatch.setattr(supervisor, "slots_use", broken)
@@ -2709,6 +2711,69 @@ async def test_a_job_whose_watchdog_cannot_start_never_runs_and_the_next_job_sta
     monkeypatch.setattr(supervisor._Watchdog, "_new_thread", real)
     again = await sup.run_job(_request())
     assert (again.status, again.result) == ("ok", {"ran": True})
+
+
+def test_shared_memory_outside_every_jobs_count_stops_every_job(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R90: past the margin, every running job stops, the innocent with the rest; the log has counts alone.
+
+    Without a slot (tests, dev) the container's shared memory is not asked: such jobs share the supervisor's uid.
+    """
+    hidden = {"bytes": supervisor.SHMEM_MARGIN + 1}
+    looks: list[int] = []
+
+    def unattributed() -> int:
+        looks.append(hidden["bytes"])
+        return hidden["bytes"]
+
+    monkeypatch.setattr(supervisor, "unattributed_shmem", unattributed)
+    monkeypatch.setattr(supervisor, "slots_use", lambda uids: {uid: SlotUse() for uid in uids})
+    one, two = _Judged(0, 20001), _Judged(1, 20002, "it wrote more than 1 MB")
+    watchdog = supervisor._Watchdog(_Above())  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.DEBUG, logger="workbench.executor"):
+        assert watchdog.check([one, two]) == [(one, supervisor.HIDDEN), (two, supervisor.HIDDEN)]  # type: ignore[list-item]
+        hidden["bytes"] = supervisor.SHMEM_MARGIN
+        assert watchdog.check([one, two]) == [(two, "it wrote more than 1 MB")]  # type: ignore[list-item]
+        assert watchdog.check([_Judged(2, None)]) == []  # type: ignore[list-item]
+
+    assert looks == [supervisor.SHMEM_MARGIN + 1, supervisor.SHMEM_MARGIN]
+    assert caplog.messages == ["stopped 2 running jobs: 64 MiB of shared memory is outside any job's count"]
+
+
+def test_a_job_stopped_for_hidden_shared_memory_is_refused_with_its_code(volume: Path) -> None:
+    """R90: the answer is a refusal the api answers 503 and records as ``refused: hidden_memory``."""
+    sup = Supervisor(_settings(volume), use_slots=False)
+    limits = Limits(wall_s=5, cpu_s=5, memory_mb=256, file_mb=1)
+
+    answer = sup._answer_job(_request(), None, "killed", limits, supervisor.HIDDEN)  # type: ignore[arg-type]
+
+    assert (answer.status, answer.result, answer.message) == (
+        "error",
+        {"error": "hidden_memory: memory outside any job's count"},
+        "the job was stopped: shared memory outside any job's count",
+    )
+
+
+def test_a_container_whose_shared_memory_cannot_be_read_does_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R90: the bound needs cgroup v2's ``memory.stat``; without its ``shmem`` the supervisor refuses to start."""
+    limits = _Limits(8192, 8192)
+    monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
+    monkeypatch.setattr(supervisor.resource, "setrlimit", limits.set)
+    monkeypatch.setattr(supervisor, "_close_dev_zero", lambda path: True)
+    good, bad = tmp_path / "good.stat", tmp_path / "bad.stat"
+    good.write_text("anon 1\nshmem 0\n")
+    bad.write_text("anon 1\n")
+    settings = _settings(Path("/nowhere"))
+
+    assert supervisor.prepare_host(settings, memory_stat=good) is None
+    for memory_stat in (bad, tmp_path / "absent"):
+        assert supervisor.prepare_host(settings, memory_stat=memory_stat) == (
+            "the container's memory.stat (cgroup v2) must give its shared memory, so the watchdog can bound it"
+        )
 
 
 async def test_a_watch_judges_its_slots_memory_and_score_before_its_folders(tmp_path: Path) -> None:
@@ -3230,6 +3295,56 @@ async def test_as_root_a_read_only_shared_map_of_dev_zero_holds_no_memory(
     assert segment_shmem > 180 * mb and segment_rss > 180 * mb, answer.result
 
 
+@pytest.fixture
+def dev_zero_open() -> Iterator[None]:
+    """``/dev/zero`` writable by all, as on a host where the supervisor cannot close it (userns-remap, rootless)."""
+    assert IN_THE_IMAGE
+    before = stat.S_IMODE(os.lstat("/dev/zero").st_mode)
+    os.chmod("/dev/zero", 0o666)
+    try:
+        yield
+    finally:
+        os.chmod("/dev/zero", before)
+
+
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev/zero, as root")
+async def test_as_root_shared_memory_a_job_hides_where_dev_zero_stays_writable_stops_it(
+    root_volume: Path, dev_zero_open: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R90: the job fills a writable shared map of ``/dev/zero``, leaves it to a child and unmaps it: no count shows it.
+
+    The container's ``shmem`` does, past the margin: the job stops within a pass or two, refused ``hidden_memory``.
+    Before it, the idle container is far below the margin (its baseline is 0 bytes).
+    """
+    idle = supervisor.unattributed_shmem()
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        """
+        import mmap, time
+        size = 200 * 1024 * 1024
+        fd = os.open("/dev/zero", os.O_RDWR)
+        zero = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        sum(zero[at] for at in range(0, size, mmap.PAGESIZE))
+        if os.fork() == 0:
+            time.sleep(60)
+            os._exit(0)
+        zero.close()
+        os.close(fd)
+        time.sleep(60)
+        """,
+    )
+    limits = Limits(wall_s=30, cpu_s=30, memory_mb=1024, file_mb=50)
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(_request(limits=limits))
+
+    assert idle < supervisor.SHMEM_MARGIN // 4, idle
+    assert (answer.status, answer.result) == ("error", {"error": "hidden_memory: memory outside any job's count"})
+    assert time.monotonic() - began < scaled(10)
+    assert supervisor.unattributed_shmem() < supervisor.SHMEM_MARGIN // 4  # the slot's cleanup freed it
+
+
 @pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev/zero, as root")
 async def test_as_root_a_job_has_no_socket_and_its_libraries_still_work(
     root_volume: Path, dev_zero_closed: None, monkeypatch: pytest.MonkeyPatch
@@ -3456,7 +3571,9 @@ def test_a_dev_zero_that_cannot_be_closed_is_left_as_it_is_with_a_warning(
     assert str(tmp_path) not in caplog.text
 
 
-def test_a_dev_zero_that_cannot_be_closed_never_stops_the_supervisor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_dev_zero_that_cannot_be_closed_never_stops_the_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """R88: the change is best effort. The chmod is refused here, so this host's node is never changed."""
     limits = _Limits(8192, 8192)
     monkeypatch.setattr(supervisor.resource, "getrlimit", limits.get)
@@ -3466,8 +3583,10 @@ def test_a_dev_zero_that_cannot_be_closed_never_stops_the_supervisor(monkeypatch
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(supervisor.os, "chmod", refuse)
+    memory_stat = tmp_path / "memory.stat"
+    memory_stat.write_text("shmem 0\n")
 
-    assert supervisor.prepare_host(_settings(Path("/nowhere"))) is None
+    assert supervisor.prepare_host(_settings(Path("/nowhere")), memory_stat=memory_stat) is None
 
 
 @pytest.mark.skipif(not IN_THE_IMAGE, reason="the executor image's own /dev, as root")

@@ -162,8 +162,9 @@ the node, so the change needs no capability. Under a user-namespaced daemon
 (userns-remap, rootless Docker) the node is the host's, bind-mounted and owned
 by an unmapped uid: the supervisor leaves it as it is, and so it does any node
 that is not root's, is a mount of its own, or cannot be changed. It logs a
-warning and starts all the same; the route stays open there
-([Residual risks](#residual-risks)).
+warning and starts all the same. The chmod is one layer; what bounds this route
+on every host, and any shared anonymous memory the filter might miss, is the
+watchdog's look at the container's shared memory (below).
 
 It knows x86_64 and aarch64, each with its own syscall numbers; a call of
 another architecture fails the same way, and the supervisor refuses to start on
@@ -225,6 +226,26 @@ neither `home/` nor `out/`, and the supervisor cannot see it without
 `CAP_SYS_PTRACE`, which it does not get; but it takes room on the volume. The
 floor keeps that room for the api, its uploads and its database.
 
+With slots, each pass then asks the container's cgroup for its shared memory
+(`memory.stat` `shmem`, cgroup v2) and takes off what every tmpfs mount holds
+(`statvfs` of each: `/tmp`, `/dev/shm`, `/dev`) and every SysV segment, once
+(`sandbox.py:unattributed_shmem`). What is left is shared anonymous memory or a
+shared map of `/dev/zero`, which no resident set need show: a process can fill
+one, leave it to a child and unmap it, or keep it mapped, where the job's own
+sum leaves it out (`VmRSS` minus `RssShmem`). The supervisor holds none: an
+idle executor shows 0 bytes in the image, and the isolation tests hold the
+running test stack under 16 MiB, idle and after a job.
+Past a fixed margin of 64 MiB (`supervisor.py:SHMEM_MARGIN`) the watchdog stops
+every running job, the innocent with the one that hid the memory, which it
+cannot tell apart; each is answered with the refusal `hidden_memory`, which the
+api answers `503` and records as a refusal. The log says how many jobs were
+stopped and how many MiB were left. The slots' cleanup then frees the memory
+with the processes that held it. The cgroup is read before and after the parts,
+and the smaller value is used, so memory that goes while a pass reads is never
+counted as left. The supervisor refuses to start without a `memory.stat` that
+gives `shmem`. Between two passes a job can still hide what it can fill in
+half a second, and up to the margin for as long as it likes.
+
 `statvfs` sees the filesystem that holds the volume: for a local named volume,
 the disk of Docker's data root, which images, containers' logs and other
 volumes share. Other use of that disk therefore stops jobs too, and on a large
@@ -243,9 +264,9 @@ limit of open files to the hard one at start and refuses to start below
 slots × 258 + 256 (the jobs keep theirs).
 
 At each measure, then, the memory limit holds the resident memory of a job's
-processes together and every SysV segment it made. The shared memory that no
-resident set counts is closed to a job (above). What a job can add between two
-measures, and what the sum does not count, are in
+processes together and every SysV segment it made; and the container holds at
+most 64 MiB of shared memory that no job's sum shows, for all jobs together.
+What a job can add between two measures, and what neither counts, are in
 [Residual risks](#residual-risks).
 
 For the container (`docker/compose.yaml`, see
@@ -305,7 +326,9 @@ unless:
 Then it makes two changes to its own container (`supervisor.py:prepare_host`):
 its soft limit of open files goes up to the hard one, which must hold
 slots × 258 + 256 descriptors, or it does not start; and `/dev/zero` is closed
-to others' writes (`0644`) where it can be, which never stops it (above).
+to others' writes (`0644`) where it can be, which never stops it (above). Last,
+the container's cgroup must give its shared memory (`memory.stat` `shmem`,
+cgroup v2), which the watchdog bounds.
 
 Compose sets the container up this way. `seccomp=unconfined`, a missing
 `no-new-privileges` or Docker's default `/dev/shm` make it refuse.
@@ -407,17 +430,13 @@ Each of these is accepted. Each says what it would take.
   two slots and cooperate: two users' at the default
   `WORKBENCH_JOBS_PER_USER=1`, or one user's two when that is higher. It is a
   denial of service against concurrent jobs, and it reaches no user's files.
-- **`/dev/zero` where it cannot be closed.** On a host whose Docker daemon
-  remaps user namespaces (userns-remap, which deploy's ADR 0001 prescribes) or
-  runs rootless, `/dev/zero` is the host's node and stays writable by the
-  slots (above). A job can then open it for writing, fill a shared map of it,
-  leave the map to a child and unmap it, out of every resident set the
-  watchdog counts: up to `RLIMIT_AS` (1536 MB) per process, 64 processes,
-  held only by the container's memory limit, where the kernel's OOM killer
-  then stops the score-1000 process with the most resident memory, which can be
-  another user's job. A denial of service against concurrent jobs within the
-  user's own rate limits; it reaches no user's files. The supervisor logs a
-  warning at start where this holds.
+- **Shared memory no job's sum shows ends every running job.** Where
+  `/dev/zero` stays writable (a user-namespaced daemon, above), a job can hide
+  shared memory past the margin; the watchdog then stops every running job, of
+  every user, within half a second. That bounds the memory, not the harm to the
+  other jobs: one job can end its concurrent jobs this way, again and again, a
+  denial of service within its user's own rate limits. It reaches no user's
+  files.
 - **A job can have its own slot retired.** A job that leaves its folder so it
   cannot be removed (for example a tree deeper than the supervisor's open
   files allow) or wins the race against its slot's cleanup gets its slot

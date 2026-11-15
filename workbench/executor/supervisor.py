@@ -65,7 +65,16 @@ from workbench.executor.fs import (
     write_all,
 )
 from workbench.executor.prepare_volume import API_UID, Owners
-from workbench.executor.sandbox import WATCH_INTERVAL_S, Slot, SlotUse, run_in_slot, slots_use
+from workbench.executor.sandbox import (
+    MEMORY_STAT,
+    WATCH_INTERVAL_S,
+    Slot,
+    SlotUse,
+    run_in_slot,
+    shmem_charged,
+    slots_use,
+    unattributed_shmem,
+)
 from workbench.layout import JOBS, STAGING, WORKSPACES
 from workbench.paths import PathError, check_filename
 from workbench.protocol import (
@@ -100,6 +109,12 @@ FREE_FLOOR_MIN = 1 << 30
 FREE_FLOOR_PARTS = 20
 #: The refusal of a job the floor stops or keeps from starting: a runner's ``code: text``, which the api answers 507.
 STORAGE_FULL = "storage_full: storage is full"
+#: Shared memory of the container that no job's count shows, past which every running job stops (R90). Idle, the
+#: executor has none (measured, 0 bytes); the margin keeps a pass from tripping on a mount or segment that changes
+#: while it is read.
+SHMEM_MARGIN = 64 * MB
+#: The refusal of a job stopped for it: a runner's ``code: text``, which the api answers 503.
+HIDDEN_MEMORY = "hidden_memory: memory outside any job's count"
 
 _WORKSPACE = "workspace"
 _HOME = "home"
@@ -609,6 +624,8 @@ UNMEASURED = "its use of memory and disk could not be measured"
 LOWERED = "one of its processes lowered its OOM score"
 #: What it says when the data volume is below its free-space floor; the job is refused as ``STORAGE_FULL``.
 FULL = "the data volume is below its free-space floor"
+#: What it says when the container holds shared memory no job's count shows; the job is refused as ``HIDDEN_MEMORY``.
+HIDDEN = "shared memory outside any job's count"
 
 
 class _Floor:
@@ -750,7 +767,9 @@ def _settle(stop: asyncio.Future[str], verdict: str) -> None:
 class _Watchdog:
     """Measures every running job about twice a second, in one thread of its own, and stops those past a limit.
 
-    One pass asks the data volume for its free space: below its floor, every job stops (``FULL``). Then it looks at
+    One pass asks the data volume for its free space: below its floor, every job stops (``FULL``). With slots, it then
+    asks the container's cgroup for the shared memory no job's count shows (``unattributed_shmem``): past
+    ``SHMEM_MARGIN`` every job stops too (``HIDDEN``), the innocent with the one that hid it. Then it looks at
     ``/proc`` and the SysV table once for every slot (``slots_use``), and measures each job's folders, one job after
     the other, so the supervisor holds one walk's descriptors at a time. A verdict reaches the
     job's loop as the result of its stop; the wall clock never waits on a pass, nor a pass on the loop's own pool.
@@ -859,6 +878,21 @@ class _Watchdog:
             _log.warning("stopped %d running job%s: the data volume is below its free-space floor", count, _s(count))
             return [(watch, FULL) for watch in watches]
         uids = {watch.uid for watch in watches if watch.uid is not None}
+        if uids:
+            try:
+                hidden = unattributed_shmem()
+            except Exception as exc:
+                _log.error("the watchdog could not read the container's shared memory (%s)", type(exc).__name__)
+                return [(watch, UNMEASURED) for watch in watches]
+            if hidden > SHMEM_MARGIN:
+                count = len(watches)
+                _log.warning(
+                    "stopped %d running job%s: %d MiB of shared memory is outside any job's count",
+                    count,
+                    _s(count),
+                    hidden // MB,
+                )
+                return [(watch, HIDDEN) for watch in watches]
         try:
             use = slots_use(uids)
         except Exception as exc:
@@ -1328,6 +1362,8 @@ class Supervisor:
             return _answer(req.job_id, "timeout", f"the job ran past its wall time of {limits.wall_s} s")
         if outcome == "killed" and broken == FULL:
             return _full(req.job_id)
+        if outcome == "killed" and broken == HIDDEN:
+            return _answer(req.job_id, "error", f"the job was stopped: {HIDDEN}", {"error": HIDDEN_MEMORY})
         if outcome == "killed":
             return _answer(req.job_id, "killed", KILLED if broken is None else f"the job was stopped: {broken}")
         if outcome != "ok":
@@ -1718,7 +1754,8 @@ def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0, mountinfo: Path = 
     usual set-up ``/dev`` is a tmpfs of the container's and root owns the node, so the change needs no capability and
     lives as long as the container. Under a user-namespaced daemon (userns-remap, rootless) the node is the host's,
     bind-mounted and owned by an unmapped uid: it is left as it is, and so is any node that is not root's or is a mount
-    of its own. The supervisor starts all the same; the route stays open there (docs/sandbox.md, Residual risks).
+    of its own. The supervisor starts all the same: the watchdog's look at the container's shared memory
+    (``unattributed_shmem``) bounds the route there, as it does everywhere.
 
     Args:
         path: ``/dev/zero``.
@@ -1754,21 +1791,30 @@ def _close_dev_zero(path: Path = _DEV_ZERO, *, root: int = 0, mountinfo: Path = 
     return True
 
 
-def prepare_host(settings: Settings) -> str | None:
-    """Make the changes the supervisor needs in its container before it serves, and check the one it cannot do without.
+def prepare_host(settings: Settings, *, memory_stat: Path = MEMORY_STAT) -> str | None:
+    """Make the changes the supervisor needs in its container before it serves, and check what it cannot do without.
 
     ``/dev/zero`` is closed to others' writes where it can be (``_close_dev_zero``; best effort, never a reason to
     stop). The soft limit of open files goes up to the hard one, which must hold what the slots need
-    (``_open_files_problem``).
+    (``_open_files_problem``). The cgroup's ``memory.stat`` must give its shared memory: the watchdog bounds what no
+    job's count shows by it, on every host (``unattributed_shmem``).
 
     Args:
         settings: The executor's settings.
+        memory_stat: The container cgroup's ``memory.stat``.
 
     Returns:
         A short reason it must not start, or ``None``.
     """
     _close_dev_zero(_DEV_ZERO)
-    return _open_files_problem(settings.executor_slots)
+    problem = _open_files_problem(settings.executor_slots)
+    if problem is not None:
+        return problem
+    try:
+        shmem_charged(memory_stat)
+    except (OSError, KeyError, ValueError):
+        return "the container's memory.stat (cgroup v2) must give its shared memory, so the watchdog can bound it"
+    return None
 
 
 def main() -> int:

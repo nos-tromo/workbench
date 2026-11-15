@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import os
+import re
 import resource
 import signal
 import stat
@@ -276,6 +277,8 @@ _IPC_FOLDERS = ("/dev/shm", "/dev/mqueue")
 # theirs is looked at.
 _IPC_ENTRY_LIMIT = 100_000
 _SYSVIPC = Path("/proc/sysvipc")
+#: The container cgroup's memory figures (cgroup v2).
+MEMORY_STAT = Path("/sys/fs/cgroup/memory.stat")
 _SHM_DEST = 0o1000  # in the perms of /proc/sysvipc/shm: removed, but still attached somewhere
 _GONE_STATES = frozenset({"Z", "X"})  # zombie (waiting to be reaped) and dead: no longer running
 
@@ -529,7 +532,7 @@ def slots_use(uids: Collection[int], *, proc: Path = Path("/proc")) -> dict[int,
     (``RssShmem``): the only shared memory a job can map is a SysV segment, or a file of its own folders where the
     volume is a tmpfs, which counts as that file's disk (the jobs' seccomp filter refuses shared anonymous maps,
     ``memfd_create`` and ``memfd_secret``, and the supervisor makes ``/dev/zero`` read-only to them where the node
-    is the container's own; where it is not, a writable shared map of it is a residual, docs/sandbox.md). Each segment
+    is the container's own; where it is not, ``unattributed_shmem`` bounds a writable shared map of it). Each segment
     counts once instead, against the uid that made it, by the pages it holds, whether any process has it attached or
     not: a page a process touched and then left to a child it forked is in no resident set. A process that ends while
     it is read counts as gone.
@@ -578,6 +581,114 @@ def slots_use(uids: Collection[int], *, proc: Path = Path("/proc")) -> dict[int,
         if maker is not None:
             maker.memory += row.get(b"rss", row[b"size"]) + row.get(b"swap", 0)
     return use
+
+
+def _unescape(field: str) -> str:
+    """Undo the octal escapes of a ``mountinfo`` field, such as a space written as a backslash and ``040``.
+
+    Args:
+        field: The field.
+
+    Returns:
+        The path it names.
+    """
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
+
+
+def tmpfs_used(mountinfo: Path) -> int:
+    """Add up what every tmpfs mount of the process's mount namespace holds.
+
+    Args:
+        mountinfo: The process's mount table, ``/proc/self/mountinfo``.
+
+    Returns:
+        Bytes in use (``statvfs``), files that are removed but still open included.
+
+    Raises:
+        OSError: The table or a mount cannot be read.
+    """
+    total = 0
+    for line in mountinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields, _, rest = line.partition(" - ")
+        mount = fields.split()
+        if len(mount) >= 5 and rest.split()[:1] == ["tmpfs"]:
+            st = os.statvfs(_unescape(mount[4]))
+            total += (st.f_blocks - st.f_bfree) * st.f_frsize
+    return total
+
+
+def shmem_charged(memory_stat: Path) -> int:
+    """Read the shared memory the container's cgroup holds: ``shmem`` of its ``memory.stat`` (cgroup v2).
+
+    Args:
+        memory_stat: The cgroup's ``memory.stat``.
+
+    Returns:
+        Bytes: tmpfs files, SysV segments and every shared map of anonymous memory or ``/dev/zero``.
+
+    Raises:
+        OSError: It cannot be read.
+        KeyError: It has no ``shmem`` line.
+        ValueError: The line holds no number.
+    """
+    for line in memory_stat.read_text(encoding="ascii").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "shmem":
+            return int(value)
+    raise KeyError("shmem")
+
+
+def sysv_resident(proc: Path = Path("/proc")) -> int:
+    """Add up the resident bytes of every SysV shared memory segment, each once.
+
+    Args:
+        proc: The ``/proc`` to read.
+
+    Returns:
+        Bytes; 0 without a SysV table.
+
+    Raises:
+        OSError: The table cannot be read.
+        ValueError: The table has an unexpected shape.
+        KeyError: The table lacks its ``size`` column.
+    """
+    try:
+        table = (proc / "sysvipc" / "shm").read_bytes()
+    except FileNotFoundError:
+        return 0
+    return sum(row.get(b"rss", row[b"size"]) for row in _sysv_rows(table))
+
+
+def unattributed_shmem(
+    *, memory_stat: Path = MEMORY_STAT, mountinfo: Path = Path("/proc/self/mountinfo"), proc: Path = Path("/proc")
+) -> int:
+    """Find the shared memory of the container that no job's count shows.
+
+    The container's shared memory (``shmem_charged``) less what the tmpfs mounts hold (``tmpfs_used``) and every SysV
+    segment (``sysv_resident``, which the slots' sums count by their maker). What is left is shared anonymous memory
+    or a shared map of ``/dev/zero``, which no resident set need show: a process can fill one, leave it mapped in a
+    child and unmap it itself. The jobs' seccomp filter refuses the first and the supervisor closes ``/dev/zero``
+    where it can, so a job holds such memory only where they do not hold; the supervisor holds none. The cgroup is
+    read before and after the parts, and the smaller value is used: what goes while they are read is not counted as
+    left, and what comes is at worst missed for one pass.
+
+    Args:
+        memory_stat: The cgroup's ``memory.stat``.
+        mountinfo: The mount table.
+        proc: The ``/proc`` to read.
+
+    Returns:
+        Bytes, 0 at least.
+
+    Raises:
+        OSError: A part cannot be read.
+        KeyError: A part lacks a field.
+        ValueError: A part has an unexpected shape.
+    """
+    first = shmem_charged(memory_stat)
+    counted = tmpfs_used(mountinfo) + sysv_resident(proc)
+    second = shmem_charged(memory_stat)
+    return max(0, min(first, second) - counted)
 
 
 def _run_as_slot(program: str, slot: Slot, extra: list[str], failure: str) -> None:

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from workbench.executor import seccomp
+from workbench.executor import sandbox, seccomp
 from workbench.executor.fs import measure
 from workbench.executor.sandbox import JOB_OOM_SCORE_ADJ, SlotUse, slots_use
 
@@ -305,7 +305,7 @@ def _proc(tmp_path: Path, processes: list[tuple[str, int, int | None, int, int]]
             lines += b"VmRSS:\t   %d kB\nRssAnon:\t   %d kB\nRssShmem:\t   %d kB\n" % (rss, rss - shmem, shmem)
         (proc / pid / "status").write_bytes(lines)
         (proc / pid / "oom_score_adj").write_bytes(b"%d\n" % score)
-    (proc / "sysvipc").mkdir()
+    (proc / "sysvipc").mkdir(parents=True)
     (proc / "sysvipc" / "shm").write_bytes(SHM_HEAD + segments)
     return proc
 
@@ -363,3 +363,71 @@ def test_a_slot_process_below_the_jobs_oom_score_is_found(tmp_path: Path) -> Non
     use = slots_use([20001, 20002], proc=proc)
 
     assert (use[20001].lowered, use[20002].lowered) == (True, False)
+
+
+MIB = 1024 * 1024
+
+
+def _mounts(tmp_path: Path) -> Path:
+    """A mount table of two tmpfs mounts (one with an escaped space) and two of other types."""
+    table = tmp_path / "mountinfo"
+    table.write_text(
+        "20 1 0:20 / / ro - overlay overlay ro\n"
+        "21 20 0:21 / /tmp rw,nosuid master:1 - tmpfs tmpfs rw,size=16m\n"
+        "22 20 0:22 / /dev/shm rw - tmpfs shm rw,size=1m\n"
+        "23 20 0:23 / /scratch\\040space rw - tmpfs tmpfs rw\n"
+        "24 20 98:0 / /data rw - ext4 /dev/vdb rw\n"
+    )
+    return table
+
+
+def _stat(text: str, tmp_path: Path) -> Path:
+    """A cgroup ``memory.stat`` holding ``text``."""
+    path = tmp_path / "memory.stat"
+    path.write_text(text)
+    return path
+
+
+def test_the_shared_memory_no_job_count_shows_is_the_cgroups_less_tmpfs_and_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R90: ``shmem`` of ``memory.stat`` less what every tmpfs mount holds and every SysV segment, each once.
+
+    The ext4 and overlay mounts are not looked at; the escaped mount point is read as the path it names.
+    """
+    used = {"/tmp": 10 * MIB, "/dev/shm": 0, "/scratch space": 50 * MIB}
+    asked: list[str] = []
+
+    def statvfs(path: str) -> os.statvfs_result:
+        asked.append(path)
+        blocks = 1024 * 1024
+        return os.statvfs_result((4096, 4096, blocks, blocks - used[path] // 4096, 0, 0, 0, 0, 0, 255))
+
+    monkeypatch.setattr(sandbox.os, "statvfs", statvfs)
+    proc = _proc(tmp_path, [], _shm_row(1, 1, 20001, 20001, 100 * MIB, 0) + _shm_row(2, 0, 20002, 20002, 4096, 0))
+    memory_stat = _stat(f"anon 999\nfile 999\nshmem {300 * MIB}\nsock 0\n", tmp_path)
+
+    hidden = sandbox.unattributed_shmem(memory_stat=memory_stat, mountinfo=_mounts(tmp_path), proc=proc)
+
+    assert hidden == 300 * MIB - 60 * MIB - (100 * MIB + 4096)
+    assert asked == ["/tmp", "/dev/shm", "/scratch space"]
+
+
+def test_what_goes_while_the_parts_are_read_is_not_counted_as_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cgroup is read before and after the parts; the smaller value is used, and the result is never below 0."""
+    readings = iter([500 * MIB, 200 * MIB])
+    monkeypatch.setattr(sandbox, "shmem_charged", lambda memory_stat: next(readings))
+    monkeypatch.setattr(sandbox, "tmpfs_used", lambda mountinfo: 0)
+    monkeypatch.setattr(sandbox, "sysv_resident", lambda proc: 300 * MIB)
+
+    assert sandbox.unattributed_shmem() == 0
+
+
+def test_a_memory_stat_without_shared_memory_cannot_be_read(tmp_path: Path) -> None:
+    """A cgroup v1 or an unexpected file is an error, which the watchdog turns into a stop (fail closed)."""
+    with pytest.raises(KeyError):
+        sandbox.shmem_charged(_stat("anon 1\nfile 2\n", tmp_path))
+    with pytest.raises(OSError):
+        sandbox.shmem_charged(tmp_path / "absent")

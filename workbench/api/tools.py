@@ -174,9 +174,10 @@ def list_files(p: PrincipalDep, settings: SettingsDep, store: StoreDep) -> FileL
 #: The most hits a search may return.
 MAX_HITS: Final = 200
 
-#: The runner's failures the model is told, and the status each is answered with; any other is a 500. ``storage_full``
-#: is the executor's own: the data volume is below its free-space floor, so the job was stopped or never started; it is
-#: a 507, as a full volume is everywhere in the api.
+#: The runner's failures the model is told, and the status each is answered with; any other is a 500. Two are the
+#: executor's own: ``storage_full``, the data volume is below its free-space floor, so the job was stopped or never
+#: started (507, as a full volume is everywhere in the api); and ``hidden_memory``, the container held shared memory no
+#: job's count showed, so every running job was stopped (503: nothing was wrong with the call, retry later).
 _RUNNER_ERRORS: Final = {
     "unsupported_format": 422,
     "unreadable_file": 422,
@@ -191,6 +192,7 @@ _RUNNER_ERRORS: Final = {
     "invalid_source": 422,
     "write_timeout": 422,
     "storage_full": 507,
+    "hidden_memory": 503,
 }
 _ERROR_CAP: Final = 300
 _CUT_MARK: Final = " [cut]"

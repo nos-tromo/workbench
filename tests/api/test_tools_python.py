@@ -611,6 +611,20 @@ def test_a_job_the_executor_refused_for_a_full_volume_is_a_507_and_recorded_as_a
     assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "storage_full"}
 
 
+def test_a_job_stopped_for_shared_memory_outside_any_jobs_count_is_a_503_and_recorded_as_a_refusal(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """R90: the executor stopped every running job; nothing was wrong with this call, so retry later (503)."""
+    a = put(store, "q.csv")
+    fake_executor.status = "error"
+    fake_executor.payload = {"error": "hidden_memory: memory outside any job's count"}
+    r = run(client)
+    assert (r.status_code, r.json()) == (503, {"detail": "hidden_memory: memory outside any job's count"})
+    (event,) = events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [a.id])
+    assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "hidden_memory"}
+
+
 def test_a_run_python_refusal_whose_record_cannot_be_written_never_reaches_the_model(
     client: TestClient, fake_executor: Scripted, broken_audit: None
 ) -> None:
