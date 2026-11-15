@@ -183,9 +183,11 @@ async def test_a_cpu_hog_is_killed(tmp_path: Path) -> None:
 async def test_death_by_sigkill_is_killed_and_other_signals_are_errors(tmp_path: Path) -> None:
     """``SIGKILL`` means ``killed``; any other fatal signal is an ordinary ``error``."""
     kill = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
-    abort = "import os, signal; os.kill(os.getpid(), signal.SIGABRT)"
+    # SIGTERM, not a core-dumping signal like SIGABRT: on macOS that makes ReportCrash show
+    # "Python quit unexpectedly" for every run of the suite.
+    other = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
     assert await _run(kill, tmp_path) == ("killed", -signal.SIGKILL)
-    assert await _run(abort, tmp_path) == ("error", -signal.SIGABRT)
+    assert await _run(other, tmp_path) == ("error", -signal.SIGTERM)
 
 
 async def test_the_file_size_limit_stops_a_big_write(tmp_path: Path) -> None:
