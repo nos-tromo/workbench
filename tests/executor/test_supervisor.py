@@ -18,7 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import pytest
 import yaml
@@ -2758,6 +2758,51 @@ async def test_a_job_folder_whose_removal_failed_is_tried_again(
 
     assert "removed 1 of 1 job folder a failed removal left" in caplog.text
     assert request.job_id not in caplog.text
+
+
+class _SlowSet(set[str]):
+    """A set whose iteration stops after its first name, until told to go on: a retry in the middle of its copy."""
+
+    def __init__(self, *names: str) -> None:
+        """Hold ``names``."""
+        super().__init__(names)
+        self.reading = threading.Event()
+        self.go_on = threading.Event()
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        """Yield the first name, then wait (at most 2 s) before the rest."""
+        names = super().__iter__()
+        yield next(names)
+        self.reading.set()
+        self.go_on.wait(2)
+        yield from names
+
+
+async def test_a_removal_that_fails_while_the_leftovers_are_tried_again_waits_for_their_copy(
+    volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R86 N5: removals add to the leftovers in worker threads while the retry copies them in another; neither breaks.
+
+    Without a lock the retry's copy fails with "Set changed size during iteration", and the retry comes 300 s later.
+    With it, the removal waits for the copy, then adds its folder for the next retry.
+    """
+    sup = Supervisor(_settings(volume), use_slots=False)
+    leftovers = _SlowSet("a" * 32, "b" * 32)
+    sup._leftovers = leftovers
+    monkeypatch.setattr(Supervisor, "_rmtree", lambda self, name, parent, *, quiet=False: False)
+    request = _request()
+    job = await asyncio.to_thread(sup._set_up, request, None, sup._bounded(request.limits))
+
+    retry = asyncio.create_task(asyncio.to_thread(sup._remove_leftovers))
+    await asyncio.to_thread(leftovers.reading.wait, 5)
+    removal = asyncio.create_task(asyncio.to_thread(sup._remove, job))
+    await asyncio.sleep(0.2)  # the removal adds its folder now, or waits for the copy
+    leftovers.go_on.set()
+
+    assert await retry == 2  # the two names it copied are on no disk, so they are gone
+    assert await removal is False
+    assert sorted(leftovers) == [request.job_id]
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")

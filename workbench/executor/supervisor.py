@@ -887,8 +887,10 @@ class Supervisor:
         self._sockets = seccomp.for_this_machine()
         self._floor = _Floor(settings.data_dir)
         self._watchdog = _Watchdog(self._floor)
-        # Job folders whose removal failed; serve() tries them again every LEFTOVER_RETRY_S.
+        # Job folders whose removal failed; serve() tries them again every LEFTOVER_RETRY_S. Removals add to it in
+        # worker threads while the retry reads it in another, so both hold the lock.
         self._leftovers: set[str] = set()
+        self._leftovers_lock = threading.Lock()
         self._jobs = settings.data_dir / JOBS
         self._staging = settings.data_dir / STAGING
         # The device and inode of the socket this supervisor bound, so that it removes only its own.
@@ -1393,7 +1395,8 @@ class Supervisor:
                 return False
             removed = self._rmtree(job.name, job.jobs)
             if not removed:
-                self._leftovers.add(job.name)
+                with self._leftovers_lock:
+                    self._leftovers.add(job.name)
             return removed
         finally:
             os.close(job.jobs)
@@ -1404,7 +1407,8 @@ class Supervisor:
         Returns:
             How many are gone now.
         """
-        names = sorted(self._leftovers)
+        with self._leftovers_lock:
+            names = sorted(self._leftovers)
         if not names:
             return 0
         try:
@@ -1422,7 +1426,8 @@ class Supervisor:
                 else:
                     present = True
                 if not present or self._rmtree(name, jobs, quiet=True):
-                    self._leftovers.discard(name)
+                    with self._leftovers_lock:
+                        self._leftovers.discard(name)
                     gone += 1
         _log.info(
             "removed %d of %d job folder%s a failed removal left", gone, len(names), "" if len(names) == 1 else "s"
