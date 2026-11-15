@@ -17,10 +17,11 @@ from starlette.types import Message, Receive, Scope, Send
 from tests.api.conftest import DOCINT_KEY, KEY, unrecorded
 from workbench.api import auth
 from workbench.api.audit import AuditLog
-from workbench.api.auth import ALL_TOOLS, CallerRegistry, KeyGate
+from workbench.api.auth import Caller, CallerRegistry, KeyGate
 from workbench.api.contract import system_prompt
 from workbench.api.main import app_factory, create_app
 from workbench.api.openapi import TOOL_TAG, tool_openapi
+from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, Store, TooLarge
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
@@ -156,7 +157,7 @@ def test_openapi_lists_only_tools(client: TestClient) -> None:
 
 
 def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: TestClient) -> None:
-    """An untagged route and a tagged one that is hidden from the schema stay out."""
+    """A tagged route off the caller's list stays out; an untagged one and one hidden from the schema, even on it."""
 
     def echo(text: str) -> dict[str, str]:
         return {"text": text}
@@ -166,8 +167,7 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
     app.add_api_route(
         "/hidden", echo, methods=["POST"], tags=[TOOL_TAG], include_in_schema=False, operation_id="hidden_op"
     )
-    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert set(doc["paths"]) == {
+    nine = {
         "/tools/list_files",
         "/tools/read_document",
         "/tools/search_files",
@@ -177,15 +177,19 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/tools/write_table",
         "/tools/write_document",
         DISPLAY_TOOL,
-        "/tools/echo",
     }
+    assert set(client.get("/openapi.json", headers=KEY_ONLY).json()["paths"]) == nine
+    listed = Caller("every-tool", KEY, WORKSPACE_TOOLS | {"echo_tool", "untagged_op", "hidden_op"})
+    doc = tool_openapi(app, listed)
+    assert set(doc["paths"]) == nine | {"/tools/echo"}
     assert doc["paths"]["/tools/echo"]["post"]["operationId"] == "echo_tool"
 
 
 def test_openapi_is_built_once_and_served_from_memory(app: FastAPI, client: TestClient) -> None:
     """Open WebUI fetches the spec on every chat request."""
-    first = tool_openapi(app)
-    assert tool_openapi(app) is first
+    open_webui = app.state.callers.get("open-webui")
+    first = tool_openapi(app, open_webui)
+    assert tool_openapi(app, open_webui) is first
     assert client.get("/openapi.json", headers=KEY_ONLY).json() == first
 
 
@@ -454,8 +458,8 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
     registry = CallerRegistry.from_settings(settings)
     caller = registry.authenticate(KEY)
     assert caller is not None
-    assert (caller.name, caller.key, caller.tools) == ("open-webui", KEY, ALL_TOOLS)
-    assert {"list_files", "read_document", "run_python", "fill_template", "display_file"} <= ALL_TOOLS
+    assert (caller.name, caller.key, caller.tools) == ("open-webui", KEY, WORKSPACE_TOOLS)
+    assert {"list_files", "read_document", "run_python", "fill_template", "display_file"} <= WORKSPACE_TOOLS
     assert registry.authenticate("wrong") is None
     assert registry.authenticate("") is None
     assert KEY not in repr(caller)

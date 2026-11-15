@@ -22,6 +22,7 @@ from workbench.api.body_limit import BodyLimit, upload_limit
 from workbench.api.hardening import ViewHardening
 from workbench.api.jobs import ExecutorClient, JobQueue
 from workbench.api.metrics import Metrics
+from workbench.api.registry import Registry, workspace_specs
 from workbench.api.retention import Sweeper
 from workbench.api.store import Store
 from workbench.config import Settings, load_settings
@@ -67,10 +68,11 @@ def create_app(
         sweeper: The retention sweep, which the lifespan runs while the app serves; none without one.
 
     Returns:
-        The application, without FastAPI's own spec and documentation routes.
+        The application, without FastAPI's own spec and documentation routes, its tools in ``app.state.registry``.
 
     Raises:
-        ConfigError: If the settings hold no caller key.
+        ConfigError: If the settings hold no caller key, two callers hold one key, or docint's list names a tool that
+            is not an inline tool.
     """
     callers = CallerRegistry.from_settings(settings)
     app_metrics = jobs.metrics if jobs is not None else Metrics(settings.data_dir)
@@ -131,6 +133,7 @@ def create_app(
     app.include_router(files.tool_router)
     app.include_router(tools.router)  # the template and output tools' routes are on it too
     app.include_router(metrics.router)
+    app.state.registry = Registry(workspace_specs(app))
     return app
 
 

@@ -27,12 +27,13 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
+from workbench.api.auth import require_tool
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
@@ -132,6 +133,7 @@ def _fit(files: list[FileInfo], limit_kb: int) -> FileList:
 @router.post(
     "/tools/list_files",
     operation_id="list_files",
+    dependencies=[Depends(require_tool("list_files"))],
     summary="List the files of this conversation",
     description=(
         "List every file in this conversation's workspace, the user's uploads and the files "
@@ -671,6 +673,7 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
 @router.post(
     "/tools/read_document",
     operation_id="read_document",
+    dependencies=[Depends(require_tool("read_document"))],
     summary="Read a file of this conversation as text",
     description=(
         "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
@@ -729,6 +732,7 @@ async def read_document(
 @router.post(
     "/tools/search_files",
     operation_id="search_files",
+    dependencies=[Depends(require_tool("search_files"))],
     summary="Search all files of this conversation",
     description=(
         "Search every file of this conversation for a text or, with regex true, a regular expression; case is "
@@ -976,6 +980,7 @@ def _fit_python(answer: PythonRun, limit_kb: int) -> PythonRun:
 @router.post(
     "/tools/run_python",
     operation_id="run_python",
+    dependencies=[Depends(require_tool("run_python"))],
     summary="Run Python on the files of this conversation",
     description=(
         "Run Python code on this conversation's files and get back what it printed. The files are in the current "

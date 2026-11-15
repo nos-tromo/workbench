@@ -14,8 +14,8 @@ from starlette.types import Message, Receive, Scope, Send
 from tests.api.conftest import DOCINT_KEY, HD, KEY
 from tests.api.test_files import put
 from workbench.api import auth
+from workbench.api.audit import AuditLog
 from workbench.api.auth import (
-    ALL_TOOLS,
     OPEN_PATHS,
     Caller,
     CallerRegistry,
@@ -25,6 +25,9 @@ from workbench.api.auth import (
     principal_from_headers,
     require_caller,
 )
+from workbench.api.main import create_app
+from workbench.api.openapi import tool_openapi
+from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
@@ -192,6 +195,7 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
     )
     assert ("POST", "/tools/run_python") in routes and ("GET", "/openapi.json") in routes
     with TestClient(app) as client:
+        assert client.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
         for method, path in routes:
             r = client.request(method, path, headers=HD)
             assert (r.status_code, r.json()) == NOT_FOUND, (method, path)
@@ -231,9 +235,9 @@ def test_an_open_webui_user_id_with_docints_key_reaches_nothing(client: TestClie
         (DOCINT, "/mcp/", False),
         (DOCINT, "/files/list", False),
         (DOCINT, "/", False),
-        (Caller("open-webui", KEY, ALL_TOOLS), "/mcp", False),
-        (Caller("open-webui", KEY, ALL_TOOLS), "/files/list", True),
-        (Caller("open-webui", KEY, ALL_TOOLS), "/api/v1/terminals/t/mcp", True),
+        (Caller("open-webui", KEY, WORKSPACE_TOOLS), "/mcp", False),
+        (Caller("open-webui", KEY, WORKSPACE_TOOLS), "/files/list", True),
+        (Caller("open-webui", KEY, WORKSPACE_TOOLS), "/api/v1/terminals/t/mcp", True),
     ],
 )
 def test_door_allows_one_path_to_mcp_and_every_other_to_terminal(caller: Caller, path: str, allowed: bool) -> None:
@@ -252,7 +256,7 @@ def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
         return (caller.door, caller.files, caller.tools, caller.wall_s, caller.slots)
 
     assert [caller.name for caller in registry.callers] == ["open-webui", "docint"]
-    assert row(registry.get("open-webui")) == ("terminal", "workspace", ALL_TOOLS, 120, None)
+    assert row(registry.get("open-webui")) == ("terminal", "workspace", WORKSPACE_TOOLS, 120, None)
     assert row(registry.get("docint")) == ("mcp", "inline", frozenset({"run_python"}), 60, 2)
     assert registry.get("open-webui").key == KEY
     assert registry.get("docint").key == DOCINT_KEY
@@ -323,3 +327,38 @@ def test_principal_from_headers_names_the_caller_and_defaults_the_chat() -> None
     assert principal_from_headers(DOCINT, {"x-user-id": "user-a", "x-session-id": "chat-1"}) == Principal(
         "docint", "user-a", "chat-1"
     )
+
+
+# --- the tool list -------------------------------------------------------------------------------------------------
+
+
+def test_a_reduced_list_is_refused_by_require_tool(
+    settings: Settings, store: Store, audit: AuditLog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool off the caller's list is the door's 404 and is not in its document; the rest of the list still works."""
+
+    def reduced(_settings: Settings) -> CallerRegistry:
+        return CallerRegistry([Caller("open-webui", KEY, WORKSPACE_TOOLS - {"read_document"})])
+
+    monkeypatch.setattr(CallerRegistry, "from_settings", reduced)
+    with TestClient(create_app(settings, store=store, audit=audit)) as client:
+        r = client.post("/tools/read_document", json={"path": f"{CHAT}/q.csv"}, headers=H)
+        assert (r.status_code, r.json()) == NOT_FOUND
+        doc = client.get("/openapi.json", headers=H).json()
+        assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == WORKSPACE_TOOLS - {
+            "read_document"
+        }
+        assert client.post("/tools/list_files", headers=H).status_code == 200
+
+
+def test_each_caller_gets_its_own_document(app: FastAPI) -> None:
+    """Open WebUI's holds the nine tools and no header parameter; docint's holds no path; each is built once."""
+    callers: CallerRegistry = app.state.callers
+    open_webui, docint = callers.get("open-webui"), callers.get("docint")
+    doc = tool_openapi(app, open_webui)
+    operations = [op for item in doc["paths"].values() for op in item.values()]
+    assert len(operations) == 9 and {op["operationId"] for op in operations} == WORKSPACE_TOOLS
+    assert [param for op in operations for param in op.get("parameters", []) if param["in"] == "header"] == []
+    assert tool_openapi(app, docint)["paths"] == {}
+    assert tool_openapi(app, open_webui) is doc
+    assert tool_openapi(app, docint) is tool_openapi(app, docint)

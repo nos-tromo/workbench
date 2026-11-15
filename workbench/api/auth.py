@@ -21,7 +21,7 @@ caller every path but that one, and a path outside the door answers ``404`` with
 """
 
 import hmac
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Final, Literal, Self
 
@@ -30,24 +30,10 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.api.errors import NOT_FOUND
+from workbench.api.registry import FORM_TOOLS, WORKSPACE_TOOLS
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
-
-#: Every tool of version 1, by ``operationId``.
-ALL_TOOLS: Final = frozenset(
-    {
-        "list_files",
-        "read_document",
-        "search_files",
-        "run_python",
-        "inspect_template",
-        "fill_template",
-        "write_table",
-        "write_document",
-        "display_file",
-    }
-)
 
 _BEARER: Final = "bearer"
 
@@ -79,7 +65,7 @@ class Caller:
         name: The caller's name. It is the first folder level of its users' workspaces and the
             ``caller`` of every audit event, so it is a safe id.
         key: The bearer key the caller presents; left out of ``repr`` so no log line shows it.
-        tools: The ``operationId`` of every tool the caller may use.
+        tools: The name of every tool the caller may use, each of its file form.
         door: The door the caller comes in through; every other path is a 404 for it.
         files: Whether the caller's files are kept in workspaces or come with each call.
         wall_s: The most wall-clock seconds one of its jobs may run; ``None`` leaves only the job wall.
@@ -115,9 +101,9 @@ class CallerRegistry:
     def from_settings(cls, settings: Settings) -> Self:
         """Build the registry the settings describe: a row for each caller whose key is set.
 
-        Open WebUI comes in through the terminal door, keeps its files in workspaces and may use every tool, each job
-        within the job wall. docint comes in through the MCP door, brings its data with each call and may use its
-        listed tools, within its own wall cap and slot cap.
+        Open WebUI comes in through the terminal door, keeps its files in workspaces and may use every workspace tool,
+        each job within the job wall. docint comes in through the MCP door, brings its data with each call and may use
+        its listed tools, within its own wall cap and slot cap; each of them must be an inline tool.
 
         Args:
             settings: The api's settings.
@@ -126,23 +112,23 @@ class CallerRegistry:
             The registry.
 
         Raises:
-            ConfigError: If the settings hold no caller key, or two callers hold the same key.
+            ConfigError: If the settings hold no caller key, two callers hold the same key, or docint's list names a
+                tool that is not an inline tool.
         """
         callers: list[Caller] = []
         if settings.open_webui_key is not None:
-            callers.append(Caller("open-webui", settings.open_webui_key, ALL_TOOLS, wall_s=settings.job_wall_s))
+            callers.append(Caller("open-webui", settings.open_webui_key, WORKSPACE_TOOLS, wall_s=settings.job_wall_s))
         if settings.docint_key is not None:
-            callers.append(
-                Caller(
-                    "docint",
-                    settings.docint_key,
-                    settings.docint_tools,
-                    door="mcp",
-                    files="inline",
-                    wall_s=settings.docint_wall_s,
-                    slots=settings.docint_slots,
-                )
+            docint = Caller(
+                "docint",
+                settings.docint_key,
+                settings.docint_tools,
+                door="mcp",
+                files="inline",
+                wall_s=settings.docint_wall_s,
+                slots=settings.docint_slots,
             )
+            callers.append(_within_form(docint, "DOCINT_WORKBENCH_TOOLS"))
         if not callers:
             raise ConfigError(NO_CALLER_KEY)
         return cls(callers)
@@ -186,6 +172,26 @@ class CallerRegistry:
             if hmac.compare_digest(presented, caller.key.encode("utf-8")):
                 found = caller
         return found
+
+
+def _within_form(caller: Caller, variable: str) -> Caller:
+    """Check that every tool on a caller's list is one of its file form.
+
+    Args:
+        caller: The caller.
+        variable: The variable its list comes from, for the message.
+
+    Returns:
+        The caller.
+
+    Raises:
+        ConfigError: If the list names a tool of another form, or a name no tool has. The message names the variable
+            and the tools it may list, never the value.
+    """
+    allowed = FORM_TOOLS[caller.files]
+    if not caller.tools <= allowed:
+        raise ConfigError(f"{variable} may list only {caller.files} tools: {', '.join(sorted(allowed))}")
+    return caller
 
 
 def door_allows(caller: Caller, path: str) -> bool:
@@ -261,6 +267,39 @@ async def require_caller(request: Request) -> Caller:
     if caller.door != "terminal":
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     return caller
+
+
+def require_tool(name: str) -> Callable[..., Awaitable[Caller]]:
+    """Make the dependency of the tool route ``name``.
+
+    Like :func:`require_caller`, it reads the request itself and declares no parameter, so the route's
+    OpenAPI operation gains none.
+
+    Args:
+        name: The tool's ``operationId``.
+
+    Returns:
+        A dependency that gives the caller :func:`require_caller` authenticated, and answers 404 with
+        :data:`~workbench.api.errors.NOT_FOUND` when ``name`` is not on that caller's list.
+    """
+
+    async def tool_on_list(caller: Annotated[Caller, Depends(require_caller)]) -> Caller:
+        """Let the caller through if ``name`` is on its list.
+
+        Args:
+            caller: The authenticated caller of the terminal door.
+
+        Returns:
+            The caller.
+
+        Raises:
+            HTTPException: 404 with :data:`~workbench.api.errors.NOT_FOUND` if the tool is not on the caller's list.
+        """
+        if name not in caller.tools:
+            raise HTTPException(status_code=404, detail=NOT_FOUND)
+        return caller
+
+    return tool_on_list
 
 
 class KeyGate:

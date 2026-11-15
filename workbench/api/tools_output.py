@@ -17,11 +17,12 @@ is never kept, and a job that refused is recorded too, by the refusal's code.
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, Literal
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
+from workbench.api.auth import require_tool
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep
 from workbench.api.jobs import JobQueue
 from workbench.api.tools import (
@@ -218,6 +219,7 @@ async def _write(
 @router.post(
     "/tools/write_table",
     operation_id="write_table",
+    dependencies=[Depends(require_tool("write_table"))],
     summary="Write a table into a new Excel or CSV file",
     description=(
         "Write a table into a new file of this conversation: an Excel workbook (format xlsx, a bold header row that "
@@ -279,6 +281,7 @@ async def write_table(
 @router.post(
     "/tools/write_document",
     operation_id="write_document",
+    dependencies=[Depends(require_tool("write_document"))],
     summary="Write a document into a new Word or Markdown file",
     description=(
         "Write a document into a new file of this conversation from Markdown: a Word document (format docx) or the "

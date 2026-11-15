@@ -23,12 +23,13 @@ from collections.abc import Iterator
 from typing import Annotated, BinaryIO, Final
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
+from workbench.api.auth import require_tool
 from workbench.api.deps import AuditDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.errors import NOT_FOUND
 from workbench.api.openapi import TOOL_TAG
@@ -417,6 +418,7 @@ def move_file(body: MoveRequest, p: PrincipalDep, store: StoreDep) -> dict[str, 
 @tool_router.get(
     "/files/display",
     operation_id="display_file",
+    dependencies=[Depends(require_tool("display_file"))],
     summary="Show a file to the user",
     description=(
         "Show one of the user's files in the chat as a card with a preview and a download. "
