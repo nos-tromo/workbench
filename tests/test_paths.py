@@ -218,8 +218,7 @@ def test_the_chat_id_in_the_principal_never_selects_another_users_data(tmp_path:
 def test_a_hostile_caller_or_user_id_never_builds_a_root(tmp_path: Path, field: str, bad: str) -> None:
     """The caller and the user id become folder names, so they pass ``check_id`` too."""
     ws = Workspaces(tmp_path)
-    values = {"caller": "open-webui", "user_id": "user-a", "chat_id": "chat-1", field: bad}
-    p = Principal(**values)
+    p = Principal(bad, "user-a", "chat-1") if field == "caller" else Principal("open-webui", bad, "chat-1")
     with pytest.raises(PathError):
         ws.user_root(p)
     with pytest.raises(PathError):

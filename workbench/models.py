@@ -18,11 +18,13 @@ class Principal:
         caller: Authenticated calling service, for example ``open-webui``.
         user_id: The caller's own id for the end user.
         chat_id: Chat folder used when a path names none; ``default`` without a session.
+        confined: The principal reaches only its own chat folder, ``chat_id``.
     """
 
     caller: str
     user_id: str
     chat_id: str
+    confined: bool = False
 
 
 @dataclass(frozen=True)

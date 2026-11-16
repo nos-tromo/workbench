@@ -15,9 +15,10 @@ answers ``401`` whatever its path, method or body, so a peer without the key can
 neither map the routes nor make the api read a body.
 
 Each caller comes in through one door. :class:`KeyGate` checks it right after the key,
-still before any body is read: an MCP caller finds :data:`MCP_PATH` alone, a terminal
-caller every path but that one, and a path outside the door answers ``404`` with
-:data:`~workbench.api.errors.NOT_FOUND`. Only :data:`OPEN_PATHS` stay open to every caller.
+still before any body is read: an MCP caller finds :data:`MCP_PATH` alone, a confined one
+:data:`FILE_PATHS` too, a terminal caller every path but :data:`MCP_PATH` and :data:`CHAT_PATH`,
+and a path outside the door answers ``404`` with :data:`~workbench.api.errors.NOT_FOUND`. Only
+:data:`OPEN_PATHS` stay open to every caller.
 """
 
 import hmac
@@ -30,7 +31,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.api.errors import NOT_FOUND
-from workbench.api.registry import FORM_TOOLS, WORKSPACE_TOOLS, Files, ToolGuard
+from workbench.api.registry import WORKSPACE_TOOLS, Files, ToolGuard, allowed_tools
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
@@ -45,6 +46,12 @@ OPEN_PATHS: Final = frozenset({"/healthz", "/metrics"})
 
 #: The one path of the MCP door.
 MCP_PATH: Final = "/mcp"
+
+#: The chat delete, a confined caller's alone.
+CHAT_PATH: Final = "/files/chat"
+
+#: The file routes a confined caller reaches besides the MCP door.
+FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", CHAT_PATH})
 
 #: The texts of the two refusals of the user and chat headers, on both doors.
 INVALID_USER: Final = "missing or invalid user"
@@ -77,9 +84,14 @@ class Caller:
     wall_s: int | None = None
     slots: int | None = None
 
+    @property
+    def confined(self) -> bool:
+        """Whether every path the caller names is held to the request's chat: an MCP caller with workspace files."""
+        return self.door == "mcp" and self.files == "workspace"
+
 
 class CallerRegistry:
-    """The callers the api knows, by name and by key: Open WebUI, docint, or both."""
+    """The callers the api knows, by name and by key: Open WebUI, docint and Ghostwriter, each when its key is set."""
 
     def __init__(self, callers: Iterable[Caller]) -> None:
         """Remember ``callers``.
@@ -100,7 +112,9 @@ class CallerRegistry:
 
         Open WebUI comes in through the terminal door, keeps its files in workspaces and may use every workspace tool,
         each job within the job wall. docint comes in through the MCP door, brings its data with each call and may use
-        its listed tools, within its own wall cap and slot cap; each of them must be an inline tool.
+        its listed tools, within its own wall cap and slot cap; each of them must be an inline tool. Ghostwriter comes
+        in through the MCP door too, keeps its files in workspaces, confined to the request's chat, and may use its
+        listed tools within its own caps; each must be a workspace tool the MCP door serves.
 
         Args:
             settings: The api's settings.
@@ -109,8 +123,8 @@ class CallerRegistry:
             The registry.
 
         Raises:
-            ConfigError: If the settings hold no caller key, two callers hold the same key, or docint's list names a
-                tool that is not an inline tool.
+            ConfigError: If the settings hold no caller key, two callers hold the same key, or docint's or
+                Ghostwriter's list names a tool its door and file form do not allow.
         """
         callers: list[Caller] = []
         if settings.open_webui_key is not None:
@@ -126,6 +140,17 @@ class CallerRegistry:
                 slots=settings.docint_slots,
             )
             callers.append(_within_form(docint, "DOCINT_WORKBENCH_TOOLS"))
+        if settings.ghostwriter_key is not None:
+            ghostwriter = Caller(
+                "ghostwriter",
+                settings.ghostwriter_key,
+                settings.ghostwriter_tools,
+                door="mcp",
+                files="workspace",
+                wall_s=settings.ghostwriter_wall_s,
+                slots=settings.ghostwriter_slots,
+            )
+            callers.append(_within_form(ghostwriter, "GHOSTWRITER_WORKBENCH_TOOLS"))
         if not callers:
             raise ConfigError(NO_CALLER_KEY)
         return cls(callers)
@@ -172,7 +197,7 @@ class CallerRegistry:
 
 
 def _within_form(caller: Caller, variable: str) -> Caller:
-    """Check that every tool on a caller's list is one of its file form.
+    """Check that every tool on a caller's list is one its door serves in its file form.
 
     Args:
         caller: The caller.
@@ -182,10 +207,10 @@ def _within_form(caller: Caller, variable: str) -> Caller:
         The caller.
 
     Raises:
-        ConfigError: If the list names a tool of another form, or a name no tool has. The message names the variable
-            and the tools it may list, never the value.
+        ConfigError: If the list names a tool of another form, one its door does not serve, or a name no tool has. The
+            message names the variable and the tools it may list, never the value.
     """
-    allowed = FORM_TOOLS[caller.files]
+    allowed = allowed_tools(caller.door, caller.files)
     if not caller.tools <= allowed:
         raise ConfigError(f"{variable} may list only {caller.files} tools: {', '.join(sorted(allowed))}")
     return caller
@@ -199,11 +224,15 @@ def door_allows(caller: Caller, path: str) -> bool:
         path: The request's path, as routing sees it.
 
     Returns:
-        For an MCP caller, whether the path is :data:`MCP_PATH`; for a terminal caller, whether it is any other.
+        For a confined caller, whether the path is :data:`MCP_PATH` or one of :data:`FILE_PATHS`; for another MCP
+        caller, whether it is :data:`MCP_PATH`; for a terminal caller, whether it is neither that nor
+        :data:`CHAT_PATH`.
     """
+    if caller.confined:
+        return path == MCP_PATH or path in FILE_PATHS
     if caller.door == "mcp":
         return path == MCP_PATH
-    return path != MCP_PATH
+    return path not in (MCP_PATH, CHAT_PATH)
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -415,21 +444,24 @@ def principal_from_headers(caller: Caller, headers: Mapping[str, str]) -> Princi
 
     Returns:
         The caller, the user from ``X-User-Id`` and the chat from ``X-Session-Id``
-        (``default`` when the request has none).
+        (``default`` when the request has none), confined to that chat for a confined caller.
 
     Raises:
         InvalidPrincipal: If ``X-User-Id`` is missing or not a plain id, or
-            ``X-Session-Id`` is present but not a plain id.
+            ``X-Session-Id`` is present but not a plain id; for a confined caller, also if
+            ``X-Session-Id`` is missing or ``default``.
     """
     user_id = _header(headers, "x-user-id")
     if user_id is None or not _is_id(user_id):
         raise InvalidPrincipal(INVALID_USER)
     chat_id = _header(headers, "x-session-id")
+    if caller.confined and chat_id in (None, DEFAULT_CHAT):
+        raise InvalidPrincipal(INVALID_SESSION)
     if chat_id is None:
         chat_id = DEFAULT_CHAT
     if not _is_id(chat_id):
         raise InvalidPrincipal(INVALID_SESSION)
-    return Principal(caller=caller.name, user_id=user_id, chat_id=chat_id)
+    return Principal(caller=caller.name, user_id=user_id, chat_id=chat_id, confined=caller.confined)
 
 
 async def require_principal(request: Request, caller: Annotated[Caller, Depends(require_caller)]) -> Principal:

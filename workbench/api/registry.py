@@ -4,9 +4,9 @@ A tool has a form, as a caller's files do (:class:`~workbench.api.auth.Caller`):
 a user keeps in a chat folder, an ``inline`` tool on data that comes with the call and leaves with its answer. The
 workspace tools are the terminal door's routes tagged :data:`~workbench.api.openapi.TOOL_TAG`, described as specs when
 the app is made (:func:`workspace_specs`); they are not served on the MCP door in version 2. A caller finds the tools of
-its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other
-(:data:`FORM_TOOLS`). Each workspace tool route must also enforce that list itself, through a :class:`ToolGuard` named
-after it, or the api does not start either.
+its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other, or
+one its door does not serve (:func:`allowed_tools`). Each workspace tool route must also enforce that list itself,
+through a :class:`ToolGuard` named after it, or the api does not start either.
 
 ``Caller`` is imported for type checking only, since :mod:`workbench.api.auth` imports this module.
 """
@@ -50,13 +50,31 @@ WORKSPACE_TOOLS: Final = frozenset(
     }
 )
 
+#: The workspace tools the MCP door serves: ``display_file`` is Open WebUI's card.
+MCP_WORKSPACE_TOOLS: Final = WORKSPACE_TOOLS - {"display_file"}
+
 #: Every inline tool, by name.
 INLINE_TOOLS: Final = frozenset({"run_python"})
 
-#: The tools of each file form, read-only. A caller's list must lie within its own form's.
+#: The tools of each file form, read-only.
 FORM_TOOLS: Final[Mapping[Files, frozenset[str]]] = MappingProxyType(
     {"workspace": WORKSPACE_TOOLS, "inline": INLINE_TOOLS}
 )
+
+
+def allowed_tools(door: str, files: Files) -> frozenset[str]:
+    """Name the tools a caller's list may hold: those of its file form that its door serves.
+
+    Args:
+        door: The caller's door, ``terminal`` or ``mcp``.
+        files: The caller's file form.
+
+    Returns:
+        :data:`MCP_WORKSPACE_TOOLS` for an MCP caller with workspace files, else the tools of its form.
+    """
+    if door == "mcp" and files == "workspace":
+        return MCP_WORKSPACE_TOOLS
+    return FORM_TOOLS[files]
 
 
 @dataclass(frozen=True)

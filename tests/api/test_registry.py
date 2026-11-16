@@ -12,7 +12,17 @@ from workbench.api.errors import MAX_ERRORS, compact, describe
 from workbench.api.files import DisplayedFile
 from workbench.api.jobs import Busy, RequestTooLarge
 from workbench.api.openapi import TOOL_TAG
-from workbench.api.registry import FORM_TOOLS, INLINE_TOOLS, WORKSPACE_TOOLS, Files, Registry, ToolSpec, workspace_specs
+from workbench.api.registry import (
+    FORM_TOOLS,
+    INLINE_TOOLS,
+    MCP_WORKSPACE_TOOLS,
+    WORKSPACE_TOOLS,
+    Files,
+    Registry,
+    ToolSpec,
+    allowed_tools,
+    workspace_specs,
+)
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StoreError
 from workbench.api.tools import FileList, PythonRun, RunPythonRequest
 from workbench.config import ConfigError, Settings
@@ -67,6 +77,13 @@ def test_a_tool_without_the_callers_form_stops_the_start(settings: Settings, too
     with pytest.raises(ConfigError, match="DOCINT_WORKBENCH_TOOLS") as refused:
         CallerRegistry.from_settings(dataclasses.replace(settings, docint_tools=tools))
     assert [name for name in tools - INLINE_TOOLS if name in str(refused.value)] == []
+
+
+def test_allowed_tools_by_door_and_form() -> None:
+    """The terminal door serves every workspace tool; the MCP door all but ``display_file``, or the inline tools."""
+    assert allowed_tools("terminal", "workspace") == WORKSPACE_TOOLS
+    assert allowed_tools("mcp", "workspace") == WORKSPACE_TOOLS - {"display_file"} == MCP_WORKSPACE_TOOLS
+    assert allowed_tools("mcp", "inline") == INLINE_TOOLS
 
 
 def test_the_tools_of_each_form_are_read_only() -> None:
