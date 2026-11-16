@@ -1253,6 +1253,71 @@ def test_a_record_that_raises_deletes_nothing(store: Store, workspaces: Workspac
     assert disk_names(workspaces.user_root(PG) / "chat-1") == ["q.csv"]
 
 
+def test_a_deleted_chat_takes_no_new_job_and_no_upload(store: Store, workspaces: Workspaces) -> None:
+    """Work that reaches the store after its chat went is refused: no job row, nothing recorded, written or made."""
+    put(store, PG, "q.csv")
+    store.delete_chat(PG, unrecorded)
+    recorded: list[tuple[object, ...]] = []
+    with pytest.raises(NotFound):
+        store.add_job(PG, "run_python")
+    with pytest.raises(NotFound):
+        store.add_upload(
+            PG,
+            "/workspace/chat-1",
+            "r.csv",
+            io.BytesIO(b"x"),
+            max_bytes=MAX,
+            quota_bytes=QUOTA,
+            record=lambda *args: recorded.append(args),
+        )
+    assert recorded == []
+    assert store.due_jobs(float("inf")) == []
+    assert not (workspaces.user_root(PG) / "chat-1").exists()
+
+
+def test_a_chat_delete_never_slips_between_a_jobs_check_and_its_row(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete that starts right after a new job's check waits for its row, and deletes it with the chat."""
+    check = store._refuse_deleted
+    deleting: list[threading.Thread] = []
+
+    def then_delete(*args: str) -> None:
+        check(*args)
+        thread = threading.Thread(target=store.delete_chat, args=(PG, unrecorded))
+        thread.start()
+        deleting.append(thread)
+        thread.join(0.2)  # it waits for the lock the check holds; without that, it would be done by now
+
+    monkeypatch.setattr(store, "_refuse_deleted", then_delete)
+    job = store.add_job(PG, "run_python")
+    deleting[0].join(5)
+    assert not deleting[0].is_alive()
+    assert store.find_job(job.id) is None
+
+
+def test_the_hold_is_the_deleted_chats_alone(store: Store) -> None:
+    """Another chat of the user, and Open WebUI's chat of the same user id and chat id, still take jobs and uploads."""
+    store.delete_chat(PG, unrecorded)
+    for p in (Principal("open-webui", "user-a", "chat-1"), dataclasses.replace(PG, chat_id="chat-2")):
+        assert store.add_job(p, "run_python").chat_id == p.chat_id
+        assert put(store, p, "q.csv", directory=f"/workspace/{p.chat_id}").chat_id == p.chat_id
+
+
+def test_a_hold_past_its_deadline_is_pruned(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hold refuses until its deadline and no longer after; the next chat delete prunes it."""
+    now = [1000.0]
+    monkeypatch.setattr(store, "_monotonic", lambda: now[0])
+    store.delete_chat(PG, unrecorded)
+    now[0] += store_module.DELETED_CHAT_HOLD_S - 1
+    with pytest.raises(NotFound):
+        store.add_job(PG, "run_python")
+    now[0] += 1
+    assert store.add_job(PG, "run_python").chat_id == "chat-1"
+    store.delete_chat(dataclasses.replace(PG, chat_id="chat-2"), unrecorded)
+    assert list(store._deleted) == [("ghostwriter", "user-a", "chat-2")]
+
+
 def test_a_chat_delete_that_fails_after_its_record_is_recorded_again(
     store: Store, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

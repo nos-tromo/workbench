@@ -54,6 +54,10 @@ _FULL = frozenset({errno.ENOSPC, errno.EDQUOT})
 _BUSY_TIMEOUT_S = 30
 _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 
+#: Seconds a deleted chat takes no new job and no upload (:meth:`Store.delete_chat`): longer than any call waits for its
+#: turn or any upload takes to arrive. A deleted chat's id never comes back, so the hold costs nothing.
+DELETED_CHAT_HOLD_S: Final = 3600
+
 #: A file id: 32 lowercase hex digits (``uuid4().hex``).
 _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 
@@ -422,6 +426,8 @@ class Store:
         self._ws = workspaces
         self._clock = clock
         self._lock = threading.Lock()
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._deleted: dict[tuple[str, str, str], float] = {}
         db_path.parent.mkdir(mode=_PRIVATE_DIR, parents=True, exist_ok=True)
         fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, _PRIVATE_FILE)
         try:
@@ -498,6 +504,23 @@ class Store:
         if len(segments) < 2:
             raise PathError("a file is inside a chat folder")
         return real, segments[0], "/".join(segments[1:])
+
+    def _refuse_deleted(self, caller: str, user_id: str, chat_id: str) -> None:
+        """Refuse new work in a chat :meth:`delete_chat` deleted less than :data:`DELETED_CHAT_HOLD_S` ago.
+
+        Call it under the store's lock, which the chat delete holds as it adds the chat.
+
+        Args:
+            caller: The caller's name.
+            user_id: The user's id.
+            chat_id: The chat's id.
+
+        Raises:
+            NotFound: If the chat is held.
+        """
+        deadline = self._deleted.get((caller, user_id, chat_id))
+        if deadline is not None and deadline > self._monotonic():
+            raise NotFound("chat deleted")
 
     def _require_folder(self, real: Path, segments: list[str]) -> None:
         """Make sure a folder exists; a chat folder is made on first use, a deeper one must exist.
@@ -682,8 +705,8 @@ class Store:
         Raises:
             PathError: If the directory is outside the user's root or is ``/workspace`` itself,
                 or the name is invalid.
-            NotFound: If a folder below the chat folder is missing; for a confined principal, if the directory is
-                not its chat folder.
+            NotFound: If a folder below the chat folder is missing, or the chat was deleted within
+                :data:`DELETED_CHAT_HOLD_S`; for a confined principal, if the directory is not its chat folder.
             TooLarge: If the file is over ``max_bytes``.
             QuotaExceeded: If it would take the user over ``quota_bytes``.
             StorageFull: If the volume is full.
@@ -699,6 +722,7 @@ class Store:
         part = folder / f"{file_id}{_PART}"
         room = quota_bytes - self.usage(p)
         with self._lock:  # the folder is found or made and the part is in it before retention may look at the folder
+            self._refuse_deleted(p.caller, p.user_id, segments[0])
             self._require_folder(folder, segments)
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
         size = self._write_part(fd, part, src, max_bytes=max_bytes, room=room)
@@ -1134,7 +1158,10 @@ class Store:
         All of it holds the store's lock, which every file holds on its way into a chat folder. The ids of the chat's
         files are read, ``record`` writes the deletion by them, the file rows and the job rows go in one transaction,
         and then the chat folder; a folder that is not there is fine. A job of the chat that is still running finds its
-        row gone, so none of its outputs lands in the chat (:meth:`register_output`).
+        row gone, so none of its outputs lands in the chat (:meth:`register_output`). Work that reaches the store later,
+        a call that waited for its turn or an upload whose body was still coming in, finds the chat held for
+        :data:`DELETED_CHAT_HOLD_S` and is refused (:meth:`add_job`, :meth:`add_upload`). The hold lives in this
+        process, as the queue and the uploads in transfer do, and goes with them on a restart.
 
         A record that cannot be written deletes nothing. A failure after the record is recorded again as ``error``, by
         the same ids, and raised; a failure of that second record is logged by its type, never raised. What a failed
@@ -1160,6 +1187,9 @@ class Store:
                 ).fetchall()
             ids = [row[0] for row in rows]
             record(ids, "ok")
+            now = self._monotonic()
+            self._deleted = {chat: deadline for chat, deadline in self._deleted.items() if deadline > now}
+            self._deleted[owner] = now + DELETED_CHAT_HOLD_S
             try:
                 with self._db() as db:
                     db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
@@ -1308,6 +1338,8 @@ class Store:
 
         Raises:
             PathError: If the caller, user or chat id is not a safe id.
+            NotFound: If the chat was deleted within :data:`DELETED_CHAT_HOLD_S`: a call that waited for its turn
+                while its chat went never runs. The check and the row hold the lock the chat delete holds.
         """
         self._ws.user_root(p)
         job = JobRecord(
@@ -1319,11 +1351,13 @@ class Store:
             created_at=self._clock(),
             status="running",
         )
-        with self._db() as db:
-            db.execute(
-                f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (job.id, job.caller, job.user_id, job.chat_id, job.tool, job.created_at, job.status),
-            )
+        with self._lock:
+            self._refuse_deleted(job.caller, job.user_id, job.chat_id)
+            with self._db() as db:
+                db.execute(
+                    f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (job.id, job.caller, job.user_id, job.chat_id, job.tool, job.created_at, job.status),
+                )
         return job
 
     def finish_job(self, job_id: str, status: str) -> None:

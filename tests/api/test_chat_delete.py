@@ -1,6 +1,8 @@
 """Ghostwriter's chat delete: recorded by id first, then the chat's files, job rows and folder go.
 
-A job of that chat still running when it goes keeps no output: its output's row would have no job row to belong to.
+A job of that chat still running when it goes keeps no output: its output's row would have no job row to belong to. A
+call still waiting for its turn, or an upload whose body was still coming in, reaches the store after the delete and
+is refused there: the deleted chat is held from new jobs and uploads.
 """
 
 import dataclasses
@@ -10,22 +12,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from anyio.from_thread import BlockingPortal
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api.conftest import HD, HG, PG
 from tests.api.test_files import ME, H, put
-from tests.api.test_files_ghostwriter import P2, PURPOSE, keep
-from tests.api.test_jobs import FakeClient, until
+from tests.api.test_files_ghostwriter import P2, PURPOSE, keep, upload
+from tests.api.test_jobs import FakeClient, sample, until
 from workbench.api.audit import AuditLog
 from workbench.api.auth import KeyGate
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.store import Store
+from workbench.api.store import NotFound, Store
 from workbench.api.tools import OutputKeeper, python_args
 from workbench.config import Settings
 from workbench.layout import WORKSPACES
+from workbench.models import Principal
 from workbench.protocol import JobResult
 
 AuditLines = Callable[[], list[dict[str, Any]]]
@@ -45,6 +49,11 @@ def chat_folder(settings: Settings, chat: str = "chat-1") -> Path:
 def chat_events(audit_lines: AuditLines) -> list[dict[str, Any]]:
     """The audit events of chat deletes, in order."""
     return [event for event in audit_lines() if event["operation"].startswith("chat.")]
+
+
+def keep_all(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+    """Keep every output a job made, as a tool that makes files does with an answer it can use."""
+    return list(planned), "ok", {"outputs": len(planned)}
 
 
 def without_session(session: str | None) -> dict[str, str]:
@@ -180,11 +189,7 @@ def test_a_late_output_of_a_running_job_is_refused(
     fake.hold = {"ghostwriter/user-a"}
     fake.files = {"r.csv": b"a\n1\n"}
     jobs = JobQueue(settings, fake, store, Metrics(settings.data_dir))
-
-    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
-        return list(planned), "ok", {"outputs": len(planned)}
-
-    keeper = OutputKeeper(audit, PG, "run_python", [], decide)
+    keeper = OutputKeeper(audit, PG, "run_python", [], keep_all)
     with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
         portal = client.portal
         assert portal is not None
@@ -227,3 +232,70 @@ def test_a_required_purpose_is_428_for_delete_when_listed(
         r = delete(strict, {**HG, **PURPOSE})
         assert (r.status_code, r.json()) == (200, {"deleted": 1})
         assert store.files_in_chat(PG) == []
+
+
+def test_a_queued_call_of_the_deleted_chat_never_runs(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines
+) -> None:
+    """A call still waiting for the user's turn when its chat goes is refused when the turn comes.
+
+    It gets no job row, reaches no executor, keeps no output and does not make the chat folder again. The call that
+    held the turn, in another chat of the user, keeps its output.
+    """
+    keep(store, PG)
+    fake = FakeClient(settings.data_dir)
+    fake.hold = {"ghostwriter/user-a"}
+    fake.files = {"r.csv": b"a\n1\n"}
+    metrics = Metrics(settings.data_dir)
+    jobs = JobQueue(settings, fake, store, metrics)
+
+    def submit(portal: BlockingPortal, p: Principal) -> Any:
+        keeper = OutputKeeper(audit, p, "run_python", [], keep_all)
+        return portal.start_task_soon(jobs.submit, p, "run_python", python_args("print(1)", 60), [], keeper)
+
+    with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
+        portal = client.portal
+        assert portal is not None
+        holding = submit(portal, P2)
+        try:
+            portal.call(until, lambda: fake.running == 1)
+            queued = submit(portal, PG)
+            portal.call(until, lambda: sample(metrics, "workbench_queue_length") == 1)
+            r = delete(client)
+        finally:
+            portal.call(fake.gate.set)
+        _, _, made = holding.result(timeout=10)
+        with pytest.raises(NotFound):
+            queued.result(timeout=10)
+    assert (r.status_code, r.json()) == (200, {"deleted": 1})
+    assert [rec.chat_id for rec in made] == ["chat-2"]
+    assert [request.chat_id for request in fake.requests] == ["chat-2"]
+    assert [store.find_job(job_id) is not None for job_id in store.due_jobs(float("inf"))] == [True]
+    assert store.files_in_chat(PG) == []
+    assert not chat_folder(settings).exists()
+    assert [event["outcome"] for event in audit_lines() if event["operation"] == "tool.run_python"] == ["ok"]
+
+
+def test_an_upload_that_reaches_the_store_after_the_delete_is_not_found(
+    client: TestClient, store: Store, settings: Settings, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upload whose body was still coming in when its chat went reaches the store afterwards, and is refused.
+
+    The delete runs after the upload's body is read and before its store call, as it does for a body still in
+    transfer. The upload answers 404 and leaves no row, no bytes, no folder and no ``file.upload`` event.
+    """
+    keep(store, PG)
+    stored = store.add_upload
+
+    def after_the_delete(*args: Any, **kwargs: Any) -> Any:
+        assert delete(client).json() == {"deleted": 1}
+        return stored(*args, **kwargs)
+
+    monkeypatch.setattr(store, "add_upload", after_the_delete)
+    r = upload(client)
+    assert (r.status_code, r.json()) == NOT_FOUND
+    assert store.files_in_chat(PG) == []
+    assert not chat_folder(settings).exists()
+    assert [event["operation"] for event in audit_lines() if event["operation"].startswith(("file.", "chat."))] == [
+        "chat.delete"
+    ]
