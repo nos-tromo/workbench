@@ -2,8 +2,10 @@
 
 Each tool the MCP door serves (:data:`~workbench.api.registry.MCP_WORKSPACE_TOOLS`) runs its route's own function, so
 both doors run the same code (:func:`workspace_run`). The adapter passes each parameter by its name, and swaps in what
-the door decides: the caller's limits on the queue (:class:`CallJobs`) and a settings copy whose job wall leaves
-:data:`PREVIEW_RESERVE_S` for the previews the job reads after its runner.
+the door decides: the audit log bound to the call's purpose and request id, which refuses a recorded tool whose
+purpose rule the call does not meet, as docint's inline tool is refused; the caller's limits on the queue
+(:class:`CallJobs`) and a settings copy whose job wall leaves :data:`PREVIEW_RESERVE_S` for the previews the job reads
+after its runner.
 
 The answer is the route's own, with its ``None`` fields as the inline door sends them, so that it holds to the output
 schema the door lists; plus ``outputs``: every file the call wrote, by reference (:class:`OutputRef`), with the table
@@ -24,6 +26,7 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
+from workbench.api.audit import OPERATIONS
 from workbench.api.auth import Caller
 from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper
 from workbench.api.mcp_wire import _compact_json
@@ -253,10 +256,15 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
             The answer, its outputs and its text.
 
         Raises:
+            PurposeRequired: The tool's audit action needs a stated purpose and the call stated none; the ``denied``
+                event is written and nothing runs.
             Busy: The route needs the queue and the app has none.
             Exception: What the route raised.
         """
         settings, caller = env.settings, env.caller
+        audit = env.audit.bound(env.purpose, env.request_id, required=settings.require_purpose)
+        if key in OPERATIONS:
+            await run_in_threadpool(audit.check, key, env.p)
         wall = min(caller.wall_s or settings.job_wall_s, settings.job_wall_s)
         if "jobs" in takes and env.jobs is None:
             raise Busy("executor_busy")
@@ -266,7 +274,7 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
             "p": env.p,
             "settings": dataclasses.replace(settings, job_wall_s=wall - PREVIEW_RESERVE_S),
             "store": env.store,
-            "audit": env.audit,
+            "audit": audit,
             "jobs": jobs,
         }
         given = {name: offered[name] for name in takes}

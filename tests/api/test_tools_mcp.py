@@ -9,6 +9,7 @@ import dataclasses
 import inspect
 import io
 import json
+import logging
 import sqlite3
 from functools import partial
 from pathlib import Path
@@ -66,6 +67,21 @@ CSV: Final = b"author,posts\nuser-a,12\nuser-b,7\n"
 PNG: Final = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 #: Every parameter a tool route may take: what the MCP door's adapter passes by name.
 KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs"})
+#: Ghostwriter's headers when it states a purpose and a request id.
+PURPOSE: Final = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request-ID": "req-1"}
+#: Valid arguments for each tool the purpose rule covers, with the action its event is recorded under.
+GUARDED: Final[dict[str, tuple[str, dict[str, Any]]]] = {
+    "read_document": ("query", {"path": f"{CHAT}/q.csv"}),
+    "search_files": ("query", {"query": "user-a"}),
+    "run_python": ("combine", {"code": "print(1)"}),
+    "inspect_template": ("query", {"path": f"{CHAT}/form.docx"}),
+    "fill_template": (
+        "modify",
+        {"path": f"{CHAT}/form.docx", "values": {"customer": {"value": "x", "source": {"kind": "assistant"}}}},
+    ),
+    "write_table": ("collect", TABLE),
+    "write_document": ("collect", {"name": "notes", "format": "md", "markdown": "# Hafen"}),
+}
 
 
 def acall(
@@ -481,6 +497,110 @@ def test_arguments_that_do_not_validate_are_invalid_arguments(client: TestClient
     assert refused(acall(client, "write_table", {"name": "x"}))["reason"] == "invalid_arguments"
     assert refused(acall(client, "list_files", {"path": "/workspace/chat-2"}))["reason"] == "invalid_arguments"
     assert fake_executor.requests == []
+
+
+# --- the purpose and the request id -------------------------------------------------------------------------------
+
+
+def strict_client(settings: Settings, store: Store, audit: AuditLog, executor: Local, *actions: str) -> TestClient:
+    """A client on an app that requires a stated purpose for ``actions``."""
+    required = dataclasses.replace(settings, require_purpose=frozenset(actions))
+    queue = JobQueue(required, executor, store, Metrics(required.data_dir))
+    return TestClient(create_app(required, store=store, audit=audit, jobs=queue))
+
+
+@pytest.mark.parametrize("tool", ["read_document", "write_table"])
+def test_a_stated_purpose_and_request_id_reach_the_tool_event(
+    client: TestClient, store: Store, audit_lines: AuditLines, caplog: pytest.LogCaptureFixture, tool: str
+) -> None:
+    """Both come as the headers state them, the purpose as the parser normalizes it; no log line holds it."""
+    caplog.set_level(logging.DEBUG)
+    keep(store, PG, "q.csv")
+    _, arguments = GUARDED[tool]
+    assert result(acall(client, tool, arguments, headers=PURPOSE))["isError"] is False
+    (event,) = tool_events(audit_lines)
+    assert event["operation"] == f"tool.{tool}" and event["outcome"] == "ok"
+    assert event["purpose"] == {"reason": "ghostwriter chat"}
+    assert event["request_id"] == "req-1"
+    assert event["actor"] == {"user": "user-a", "via": "service"}
+    assert event["target"]["container"] == "chat:chat-1"
+    assert event["criteria"]["caller"] == "ghostwriter"
+    assert "ghostwriter chat" not in caplog.text and "ghostwriter+chat" not in caplog.text
+
+
+def test_a_call_without_a_purpose_or_request_id_records_neither(client: TestClient, audit_lines: AuditLines) -> None:
+    """No header, no field: nothing is made up, as no rule requires one here."""
+    assert result(acall(client, "write_table", TABLE))["isError"] is False
+    (event,) = tool_events(audit_lines)
+    assert "purpose" not in event and "request_id" not in event
+
+
+@pytest.mark.parametrize("tool", sorted(GUARDED))
+def test_a_missing_required_purpose_is_denied_before_any_job(
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    audit_lines: AuditLines,
+    fake_executor: Local,
+    tool: str,
+) -> None:
+    """One ``denied`` event with no target, the refusal as an error result, and the executor is never asked."""
+    action, arguments = GUARDED[tool]
+    keep(store, PG, "q.csv")
+    with strict_client(settings, store, audit, fake_executor, action) as client:
+        answer = result(acall(client, tool, arguments, headers={**HG, "X-Request-ID": "req-1"}))
+    assert answer["isError"] is True and answer["structuredContent"] == {"reason": "purpose_required"}
+    assert answer["content"] == [{"type": "text", "text": "a stated purpose is required"}]
+    event = tool_events(audit_lines)[-1]
+    assert (event["action"], event["operation"], event["outcome"]) == (action, f"tool.{tool}", "denied")
+    assert "target" not in event and "purpose" not in event
+    assert event["request_id"] == "req-1"
+    assert event["criteria"] == {"caller": "ghostwriter", "refused": "purpose_required", "container": "chat:chat-1"}
+    assert len(tool_events(audit_lines)) == 1
+    assert fake_executor.requests == []
+    assert job_rows(settings) == []
+
+
+def test_an_empty_purpose_is_none(settings: Settings, store: Store, audit: AuditLog, fake_executor: Local) -> None:
+    """A purpose header with neither a case reference nor a reason is no purpose."""
+    with strict_client(settings, store, audit, fake_executor, "collect") as client:
+        answer = result(acall(client, "write_table", TABLE, headers={**HG, "X-Audit-Purpose": "case_ref=+&reason="}))
+    assert answer["structuredContent"] == {"reason": "purpose_required"}
+    assert fake_executor.requests == []
+
+
+@pytest.mark.parametrize("purpose", ["reason=ghostwriter+chat", "case_ref=case-0001"])
+def test_a_stated_purpose_meets_the_requirement(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, fake_executor: Local, purpose: str
+) -> None:
+    """A reason or a case reference is a purpose: the job runs, and its event is ``ok``."""
+    with strict_client(settings, store, audit, fake_executor, "collect") as client:
+        answer = result(acall(client, "write_table", TABLE, headers={**HG, "X-Audit-Purpose": purpose}))
+    assert answer["isError"] is False
+    (event,) = tool_events(audit_lines)
+    assert event["outcome"] == "ok" and event["purpose"]
+    assert len(fake_executor.requests) == 1
+
+
+def test_list_files_needs_no_purpose(settings: Settings, store: Store, audit: AuditLog, fake_executor: Local) -> None:
+    """It is recorded nowhere, so no rule can cover it: with every action required it still answers."""
+    everything = ("query", "combine", "modify", "collect", "disclose")
+    rec = keep(store, PG, "q.csv")
+    with strict_client(settings, store, audit, fake_executor, *everything) as client:
+        answer = result(acall(client, "list_files"))
+    assert answer["isError"] is False
+    assert [f["path"] for f in answer["structuredContent"]["files"]] == [rec.virtual_path]
+
+
+def test_the_terminal_door_keeps_its_rule(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, fake_executor: Local
+) -> None:
+    """Open WebUI states no purpose: its read_document answers 200 whatever the rule says, and nothing is denied."""
+    put(store, "q.csv", CSV)
+    with strict_client(settings, store, audit, fake_executor, "query") as client:
+        r = client.post("/tools/read_document", json={"path": f"{CHAT}/q.csv"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert [e for e in audit_lines() if e["outcome"] == "denied"] == []
 
 
 # --- the routes both doors run -------------------------------------------------------------------------------------
