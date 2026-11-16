@@ -1,6 +1,6 @@
 [project]
 name = "workbench"
-version = "0.1.1"
+version = "0.2.0"
 description = "The federation's shared tool tier: a FastAPI tool API plus a sandboxed code and document executor"
 authors = [
   { name = "nos-tromo" }
