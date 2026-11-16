@@ -473,8 +473,10 @@ def test_the_contract_runs_open_webui_as_production_does() -> None:
         "bearer",
     )
     assert connection["key"] == "synthetic-key"
+    assert connection["server_type"] == "orchestrator"
     assert connection["config"] == {
         "chat_uploads": "filesystem",
+        "contexts": {"chat": {"context_id": "chat_id"}},
         "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}],
     }
     updates = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))["updates"]

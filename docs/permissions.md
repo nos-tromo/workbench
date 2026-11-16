@@ -153,6 +153,14 @@ of Open WebUI (`edge-guard`) refuses, for every account:
 `ENABLE_TOOL_SERVERS` follows the key: without `OPEN_WEBUI_WORKBENCH_KEY` there,
 no tool or terminal server is on (open-webui-service's `CLAUDE.md`, § Workbench).
 
+From open-webui-service v0.14.1 the connection has a chat context
+(`server_type: orchestrator`, `contexts.chat.context_id: chat_id`): Open WebUI
+holds an attachment of a chat not saved yet until the first message saves it,
+so the file lands in that chat's folder, not in `default`, where the chat's
+`list_files`, `search_files` and `run_python` would not see it. Calls with a
+chat also carry `X-Terminal-Context-Id`, the chat id again; workbench does not
+read it. A temporary chat is not offered workbench.
+
 ### No network
 
 The executor, where every file is opened, has no network at all

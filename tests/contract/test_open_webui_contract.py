@@ -290,13 +290,13 @@ def test_verify_sees_a_plain_terminal(admin: Account, key: str) -> None:
 
 
 def test_every_user_sees_the_connection_with_filesystem_uploads(user_b: Account) -> None:
-    """The grant for ``*`` reaches a plain user, and chat attachments go to workbench."""
+    """The grant for ``*`` reaches a plain user, and chat attachments go to workbench, into the saved chat's folder."""
     r = user_b.client.get("/api/v1/terminals/")
     assert r.status_code == 200, r.text
     (connection,) = r.json()
     assert (connection["id"], connection["name"]) == (TERMINAL, "Workbench")
     assert connection["config"] == {"chat_uploads": "filesystem"}
-    assert connection["contexts"] == {}
+    assert connection["contexts"] == {"chat": {"context_id": "chat_id"}}
 
 
 def test_spec_through_the_proxy_lists_exactly_the_tools(admin: Account) -> None:
