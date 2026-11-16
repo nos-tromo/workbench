@@ -12,6 +12,9 @@ fields or a tool call, which the executor's protocol line (1 MiB) bounds anyway,
 :data:`REQUEST_MAX` (``request too large``). The caller key is checked before this guard runs
 (:class:`~workbench.api.auth.KeyGate`), so a request without a valid key never has its body read at all. Nothing here
 is logged, so no path, query or name can reach a log through it.
+
+On the MCP door the refusal of a declared length is JSON-RPC (:func:`~workbench.api.mcp_wire.too_large`); a body that
+grows past the bound there is answered so by the door itself.
 """
 
 from typing import Final
@@ -20,6 +23,8 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from workbench.api.auth import MCP_PATH
+from workbench.api.mcp_wire import too_large
 from workbench.config import Settings
 
 #: The one route that takes a file.
@@ -107,7 +112,8 @@ class BodyLimit:
             bound, detail = self.request_max, REQUEST_TOO_LARGE
         declared = _declared_length(scope)
         if declared is not None and declared > bound:
-            await JSONResponse({"detail": detail}, status_code=413)(scope, receive, send)
+            refusal = too_large() if scope["path"] == MCP_PATH else JSONResponse({"detail": detail}, status_code=413)
+            await refusal(scope, receive, send)
             return
         seen = 0
 

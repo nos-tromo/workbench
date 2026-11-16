@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -282,6 +283,49 @@ def test_both_images_pin_their_bases_by_tag_and_digest(dockerfile: str) -> None:
         if stage:
             stages.add(stage)
     assert "docker.io/library/python:3.12-slim-trixie" in bases
+
+
+def _requirement_names(requirements: list[str]) -> set[str]:
+    """The distribution names of a list of requirements, lower-cased."""
+    return {re.split(r"[\s<>=!~;\[]", requirement, maxsplit=1)[0].lower() for requirement in requirements}
+
+
+def _shipped_syncs(dockerfile: str) -> list[str]:
+    """Every ``uv sync`` of the stages the production image is built from: the last stage and what it takes from."""
+    text = (DOCKER / dockerfile).read_text(encoding="utf-8").replace("\\\n", " ")
+    stages: list[tuple[str | None, str, list[str]]] = []
+    for line in text.splitlines():
+        found = re.fullmatch(r"FROM (\S+)(?: AS (\S+))?", line.strip())
+        if found is not None:
+            stages.append((found.group(2), found.group(1), []))
+        elif stages and line.strip() and not line.lstrip().startswith("#"):
+            stages[-1][2].append(line.strip())
+    by_name = {name: stage for stage in stages if (name := stage[0]) is not None}
+    shipped: list[tuple[str | None, str, list[str]]] = []
+    todo = [stages[-1]]
+    while todo:
+        stage = todo.pop()
+        if stage in shipped:
+            continue
+        shipped.append(stage)
+        sources = [stage[1], *(m for line in stage[2] for m in re.findall(r"--from=(\S+)", line))]
+        todo.extend(by_name[source] for source in sources if source in by_name)
+    return [line for _, _, lines in shipped for line in lines if "uv sync" in line]
+
+
+def test_the_sdk_stays_in_the_dev_group() -> None:
+    """The MCP SDK tests the door and never ships: it is in the dev group alone, and each image syncs without it."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "mcp" in _requirement_names(project["dependency-groups"]["dev"])
+    assert "mcp" not in _requirement_names(project["project"]["dependencies"])
+    for extra in project["project"]["optional-dependencies"].values():
+        assert "mcp" not in _requirement_names(extra)
+    for dockerfile in ("Dockerfile.api", "Dockerfile.executor"):
+        syncs = _shipped_syncs(dockerfile)
+        assert len(syncs) == 2, dockerfile
+        assert [sync for sync in syncs if "--no-dev" not in sync] == [], dockerfile
+    every_line = (DOCKER / "Dockerfile.executor").read_text(encoding="utf-8").replace("\\\n", " ").splitlines()
+    assert [line for line in every_line if "uv sync" in line and "--no-dev" not in line], "the test stage's is left out"
 
 
 def test_the_test_stack_keeps_nothing_of_a_developers() -> None:

@@ -239,6 +239,27 @@ def _is_id(value: str) -> bool:
     return True
 
 
+def _authenticated(request: Request) -> Caller:
+    """Find the caller that holds the request's bearer key.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The caller.
+
+    Raises:
+        HTTPException: 401 if the key is missing, malformed or not held by any caller; the answer is the same for all
+            three.
+    """
+    registry: CallerRegistry = request.app.state.callers
+    token = _bearer_token(request.headers.get("authorization"))
+    caller = registry.authenticate(token) if token is not None else None
+    if caller is None:
+        raise HTTPException(status_code=401, detail=UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
+    return caller
+
+
 async def require_caller(request: Request) -> Caller:
     """Authenticate the request by its bearer key, for a route of the terminal door.
 
@@ -256,12 +277,31 @@ async def require_caller(request: Request) -> Caller:
             three. 404 with :data:`~workbench.api.errors.NOT_FOUND` if the caller does not come in through the terminal
             door.
     """
-    registry: CallerRegistry = request.app.state.callers
-    token = _bearer_token(request.headers.get("authorization"))
-    caller = registry.authenticate(token) if token is not None else None
-    if caller is None:
-        raise HTTPException(status_code=401, detail=UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
+    caller = _authenticated(request)
     if caller.door != "terminal":
+        raise HTTPException(status_code=404, detail=NOT_FOUND)
+    return caller
+
+
+async def require_mcp_caller(request: Request) -> Caller:
+    """Authenticate the request by its bearer key, for a route of the MCP door.
+
+    Like :func:`require_caller` for the terminal door: a caller of another door is refused here as :class:`KeyGate`
+    refuses it. So is every request under a ``root_path``, where routing would see another path than the gate judged.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The caller that holds the key.
+
+    Raises:
+        HTTPException: 401 if the key is missing, malformed or not held by any caller. 404 with
+            :data:`~workbench.api.errors.NOT_FOUND` if the caller does not come in through the MCP door, or the request
+            has a ``root_path``.
+    """
+    caller = _authenticated(request)
+    if caller.door != "mcp" or request.scope.get("root_path"):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     return caller
 

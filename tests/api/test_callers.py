@@ -16,6 +16,7 @@ from tests.api.test_files import put
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import (
+    MCP_PATH,
     OPEN_PATHS,
     Caller,
     CallerRegistry,
@@ -185,12 +186,15 @@ def test_the_routes_own_key_check_refuses_a_caller_off_the_terminal_door(app: Fa
 
 
 def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) -> None:
-    """Were :class:`KeyGate` bypassed, every keyed route still refuses docint's key: file browser, handshake, tools."""
+    """Were :class:`KeyGate` bypassed, every keyed terminal route still refuses docint's key: files, handshake, tools.
+
+    The MCP door's own routes refuse Open WebUI's key the same way (``tests/api/test_mcp.py``).
+    """
     app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
     routes = sorted(
         (method, path)
         for route in iter_route_contexts(app.routes)
-        if (path := route.path) is not None and path not in OPEN_PATHS
+        if (path := route.path) is not None and path not in OPEN_PATHS | {MCP_PATH}
         for method in route.methods or ()
     )
     assert ("POST", "/tools/run_python") in routes and ("GET", "/openapi.json") in routes

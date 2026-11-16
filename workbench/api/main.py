@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, metrics, tools, tools_output, tools_templates  # noqa: F401 (routes)
+from workbench.api import contract, errors, files, mcp, metrics, tools, tools_output, tools_templates  # noqa: F401
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
 from workbench.api.body_limit import BodyLimit, upload_limit
@@ -120,12 +120,14 @@ def create_app(
         finally:
             audit.close()
 
+    # No slash redirects: a 307 from /mcp/ would point a terminal caller at the MCP door.
     app = FastAPI(
         title="workbench",
         version=__version__,
         openapi_url=None,
         docs_url=None,
         redoc_url=None,
+        redirect_slashes=False,
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -143,6 +145,7 @@ def create_app(
     app.add_middleware(errors.QuietErrors)
     app.add_middleware(ViewHardening)
     app.include_router(contract.router)
+    app.include_router(mcp.router)
     app.include_router(files.router)
     app.include_router(files.tool_router)
     app.include_router(tools.router)  # the template and output tools' routes are on it too
