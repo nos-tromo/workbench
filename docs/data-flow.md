@@ -116,9 +116,9 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
 
 ## What leaves
 
-- **Tool results go to the caller that asked**: Open WebUI, or docint, whose
-  data and outputs are not kept. Open WebUI puts them into the chat and sends
-  them, in the model's context, to whatever model the operator configured
+- **Tool results go to the caller that asked**: Open WebUI, or docint (workbench
+  keeps neither its data nor its outputs). Open WebUI puts them into the chat and
+  sends them, in the model's context, to whatever model the operator configured
   behind the federation's inference router. If that model is run by an outside
   provider (a hosted API, or an Ollama `*-cloud` model), the results leave the
   host and the federation to that provider. They stay in the chat history for
@@ -182,6 +182,7 @@ advance: documents, spreadsheets, e-mails, presentations, and what is in them.
 That can include special categories of personal data. Also what the model
 writes into new files (table values, Markdown, template values) and their
 names. Besides: file names, the Open WebUI account id of each user, chat ids,
+docint's user and session pseudonyms with the purpose and request id it sends,
 and the time and tool of each run.
 
 **Categories of data subjects.** The users of Open WebUI and docint, and every
@@ -190,7 +191,7 @@ person named in the files or data they send or in the values the model writes.
 **Where data flows.** These are the flows, as facts:
 
 - to the caller that asked, for the same user: tool results and files to Open
-  WebUI; results to docint, whose data and outputs are not kept;
+  WebUI; results to docint (workbench keeps neither its data nor its outputs);
 - through Open WebUI, to the federation's inference router and the model the
   operator configured behind it: tool results enter the model's context. When
   that model is run by an outside provider, they leave the host and the
@@ -199,9 +200,9 @@ person named in the files or data they send or in the values the model writes.
   in a temporary chat without Workbench selected takes the same way to the
   model, inline with the message, without passing workbench, which records
   nothing of it;
-- to obs-plane: the audit events (account id, chat id, file ids, times, counts)
-  into its audit store, and the containers' log lines into its log store.
-  Metrics hold no personal data.
+- to obs-plane: the audit events (account id, chat id, file ids, times, counts;
+  docint's pseudonyms, purpose and request id) into its audit store, and the
+  containers' log lines into its log store. Metrics hold no personal data.
 
 workbench itself sends nothing outside the host. Tool results go to whatever
 model the operator configured behind the inference router; if that is an
@@ -214,9 +215,9 @@ obs-plane's audit retention (`AUDIT_RETENTION`, one year by default). Copies in
 Open WebUI's chat history: its chat retention, 365 days by default. Docker's
 `local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a copy of
 each container's output on the host, the api's audit lines (account ids, chat
-ids, file ids) among them: rotated by size, at most five files of 50 MB per
-container, not by time, so with little traffic it can outlive obs-plane's
-retention.
+ids, file ids; docint's pseudonyms, purposes and request ids) among them:
+rotated by size, at most five files of 50 MB per container, not by time, so
+with little traffic it can outlive obs-plane's retention.
 
 **Technical and organisational measures.**
 
