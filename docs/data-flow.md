@@ -125,7 +125,7 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
 ## What leaves
 
 - **Tool results go to the caller that asked**: Open WebUI, Ghostwriter, or docint
-  (workbench keeps neither its data nor its outputs). Open WebUI puts them into
+  (workbench keeps neither docint's data nor its outputs). Open WebUI puts them into
   the chat and sends them, in the model's context, to whatever model the operator
   configured behind the federation's inference router. If that model is run by an
   outside provider (a hosted API, or an Ollama `*-cloud` model), the results leave

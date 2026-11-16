@@ -709,15 +709,17 @@ figure.savefig("out/chart.png")
 
 #: Run in the api: the files of each caller's workspaces that hold the marker, and Open WebUI's folders of the chat.
 WHERE_IT_LIES = r"""
-import glob, json, os, sys
+import glob, json, os, stat, sys
 chat, marker = sys.argv[1], sys.argv[2].encode()
 def holding(root):
     found = []
     for folder, _, names in os.walk(root):
         for name in names:
-            with open(os.path.join(folder, name), "rb") as f:
-                if marker in f.read():
-                    found.append(os.path.relpath(os.path.join(folder, name), root))
+            path = os.path.join(folder, name)
+            if stat.S_ISREG(os.lstat(path).st_mode):
+                with open(path, "rb") as f:
+                    if marker in f.read():
+                        found.append(os.path.relpath(path, root))
     return sorted(found)
 print(json.dumps({
     "ghostwriter": holding("/data/workspaces/ghostwriter"),
@@ -769,6 +771,8 @@ def test_ghostwriters_files_are_apart_from_open_webuis(
     path = f"/workspace/{CHAT_A}/quarterly-figures.csv"
     uploaded = _ghostwriter_upload(api_info, chat=CHAT_A, user="user-a").json()
     assert (uploaded["path"], uploaded["size"]) == (path, len(FIGURES))
+    own = ghostwriter(api_info, "GET", "/files/view", chat=CHAT_A, user="user-a", params={"path": path})
+    assert (own.status_code, own.content) == (200, FIGURES)
 
     open_webui = {"X-User-Id": "user-a", "X-Session-Id": CHAT_A}
     workspace = api.get("/files/list", params={"directory": "/workspace"}, headers=open_webui)
@@ -799,6 +803,10 @@ def test_another_chats_path_is_not_found(api_info: dict[str, Any]) -> None:
     assert (own.status_code, own.content) == (200, FIGURES)
     read = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": path}, chat=CHAT_A))
     assert read["isError"] is False, read["structuredContent"]
+
+    own_list = ghostwriter(api_info, "GET", "/files/list", chat=CHAT_A, params={"directory": f"/workspace/{CHAT_A}"})
+    assert own_list.status_code == 200, own_list.text
+    assert "quarterly-figures.csv" in [entry["name"] for entry in own_list.json()["entries"]]
 
     viewed = ghostwriter(api_info, "GET", "/files/view", chat=CHAT_B, params={"path": path})
     assert (viewed.status_code, viewed.json()) == NOT_FOUND

@@ -346,6 +346,7 @@ def test_require_purpose_is_parsed_and_checked() -> None:
     with pytest.raises(ConfigError, match="AUDIT_REQUIRE_PURPOSE"):
         load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "lifecycle"}, role="api")
     assert load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "quiery"}, role="executor").require_purpose == frozenset()
+    assert load_settings({**env, "AUDIT_REQUIRE_PURPOSE": ""}, role="api").require_purpose == frozenset()
 
 
 @pytest.mark.parametrize("name", ["WORKBENCH_EXECUTOR_SLOTS", "WORKBENCH_RETENTION_DAYS", "WORKBENCH_JOB_WALL_S"])

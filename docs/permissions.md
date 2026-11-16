@@ -30,7 +30,7 @@ file routes are not in the tool document, so the model cannot call them.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
-  that chat answers `404`.
+  that chat is refused (`404` on a route).
 - The tool list is enforced on both doors: a terminal tool route depends on
   `require_tool("<name>")`, which answers `404` for a tool not on the caller's
   list, and `tools/call` on `/mcp` answers it `400`, `-32602`, "unknown tool".

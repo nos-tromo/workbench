@@ -36,8 +36,8 @@ docint's search stays in docint, and workbench never joins `data-net`.
 The design is `docs/superpowers/specs/2026-11-13-workbench-design.md`, the
 build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`; version 2's are
 `docs/superpowers/specs/2026-11-15-v2-mcp-docint-design.md` and
-`docs/superpowers/plans/2026-11-15-workbench-v2.md`; v0.3.0's are deploy's
-`docs/superpowers/specs/2026-11-16-ghostwriter-design.md` and
+`docs/superpowers/plans/2026-11-15-workbench-v2.md`; v0.3.0's are deploy's spec
+`docs/superpowers/specs/2026-11-16-ghostwriter-design.md` and its plan
 `docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`. Where they
 and `docs/` differ, `docs/` describes the code.
 
@@ -200,7 +200,8 @@ container is set up as compose sets it.
   `workbench/utils/audit_runtime.py` are vendored verbatim from
   `nos-tromo/.github` (`configs/audit/`); never edit them, CI fails on drift.
   A purpose on the MCP door and Ghostwriter's file routes (`X-Audit-Purpose`,
-  `AUDIT_REQUIRE_PURPOSE`), none on the terminal door; no `recipient` on `disclose`.
+  `AUDIT_REQUIRE_PURPOSE`), none on the terminal door; no `recipient` on
+  `disclose`.
 - **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
   is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
   first; leftovers of interrupted work after an hour, recorded first; empty
