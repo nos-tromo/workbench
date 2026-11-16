@@ -5,13 +5,14 @@ from there. The last section collects the facts an operator needs for the
 record of processing and the impact assessment.
 
 > **The main copy outside workbench is Open WebUI's chat history.** Every tool
-> result workbench sends (text read from a document, search hits, what code
-> printed, file names and paths) becomes part of the chat in Open WebUI, and so
-> does every argument the model wrote (code, values, Markdown). Open WebUI keeps
-> a chat for its own retention period, 365 days by default
+> result workbench sends to Open WebUI (text read from a document, search hits,
+> what code printed, file names and paths) becomes part of the chat in Open WebUI,
+> and so does every argument the model wrote (code, values, Markdown). Open WebUI
+> keeps a chat for its own retention period, 365 days by default
 > (open-webui-service, `OPEN_WEBUI_CHAT_RETENTION_DAYS`), far longer than
 > workbench's 7 days. Deleting a file in workbench does not remove what a chat
-> already holds of it.
+> already holds of it. docint, the other caller, keeps what a run returns with the
+> chat turn, as an analysis, for its own chat retention.
 
 ## What enters
 
@@ -44,9 +45,15 @@ record of processing and the impact assessment.
   chat (`workbench/api/tools_templates.py:_sources`). By default the filled file
   ends with a table of the sources; the call can leave it out
   (`include_sources: false`).
+- **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
+  8 texts docint builds from the turn (passages of its documents, keyword
+  checks, topic listings), which can hold special categories of data, with the
+  user and session pseudonyms, the purpose and the request id in the headers.
+  The data ends with the job (see
+  [What a docint call leaves](#what-a-docint-call-leaves)).
 - **Identity headers.** The caller key, `X-User-Id` (Open WebUI's opaque account
-  id) and `X-Session-Id` (the chat id). See
-  [permissions.md](permissions.md#the-boundaries).
+  id, or docint's pseudonym) and `X-Session-Id` (the chat id, or docint's session
+  pseudonym). See [permissions.md](permissions.md#the-boundaries).
 
 ## Where it is stored
 
@@ -58,7 +65,7 @@ Everything lives on the external volume `workbench-data`, mounted at `/data`.
 |---|---|---|
 | `/data/` | root, group of the api, `1771` | the parts below; the api may add the database's journal files here |
 | `workspaces/<caller>/<user-id>/<chat-id>/…` | api, `0700` | the users' files: uploads under the names users chose, tool outputs under the names the model chose, as plain bytes |
-| `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder within the same request |
+| `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder within the same request (an inline job's are read back and removed) |
 | `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder root's, `0710`, its group the slot's; its `home/` and `out/` the slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `home/` with its `tmp/` and its answer (`result.json`), and the request (`spec.json`); removed when the job ends |
 | `workbench.db` | api, `0600` | the SQLite database, in WAL mode with `secure_delete` on |
 
@@ -110,7 +117,7 @@ workspace and no file is made.
 | `staging/<job-id>/` | the outputs | until the job settles; retention removes a leftover after an hour |
 | free blocks of `workbench-data` | deleted job files | until overwritten; encrypting the host's disk is the operator's |
 | `workbench.db`, `jobs` | job id, caller, user pseudonym, session pseudonym, tool, status, times | `WORKBENCH_RETENTION_DAYS` |
-| the audit chain | [the inline event](audit.md#the-inline-event) | obs-plane's retention |
+| the audit chain | [the inline event](audit.md#every-event-key) | obs-plane's retention |
 
 No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks).
 
@@ -170,15 +177,16 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
 
 workbench itself sends nothing outside the host: the executor has no network,
 and the api calls no model and no other service. What leaves the federation
-leaves through Open WebUI's model call, above.
+leaves through the callers' model calls: Open WebUI's, above, and docint's.
 
 ## Facts for the record of processing and the impact assessment
 
 These are facts about the software. The legal assessment stays with the
 operator (deploy ADR 0003, "Consequences").
 
-**Categories of data.** Whatever users upload, which workbench cannot know in
-advance: documents, spreadsheets, e-mails, presentations, and what is in them.
+**Categories of data.** Whatever users upload, or docint sends with a call
+(passages of its documents), which workbench cannot know in advance: documents,
+spreadsheets, e-mails, presentations, and what is in them.
 That can include special categories of personal data. Also what the model
 writes into new files (table values, Markdown, template values) and their
 names. Besides: file names, the Open WebUI account id of each user, chat ids,
@@ -200,6 +208,9 @@ person named in the files or data they send or in the values the model writes.
   in a temporary chat without Workbench selected takes the same way to the
   model, inline with the message, without passing workbench, which records
   nothing of it;
+- through docint, to its model and its session database: what a run returns
+  enters docint's model context and is kept with the turn; docint's own
+  processing, recorded there;
 - to obs-plane: the audit events (account id, chat id, file ids, times, counts;
   docint's pseudonyms, purpose and request id) into its audit store, and the
   containers' log lines into its log store. Metrics hold no personal data.
@@ -212,10 +223,12 @@ is a recipient in the legal sense is for the operator to decide.
 **Storage periods.** Files and job records: `WORKBENCH_RETENTION_DAYS`, 7 days by
 default, from creation. Leftovers of interrupted work: one hour. Audit events:
 obs-plane's audit retention (`AUDIT_RETENTION`, one year by default). Copies in
-Open WebUI's chat history: its chat retention, 365 days by default. Docker's
-`local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a copy of
-each container's output on the host, the api's audit lines (account ids, chat
-ids, file ids; docint's pseudonyms, purposes and request ids) among them:
+Open WebUI's chat history: its chat retention, 365 days by default. Copies in
+docint's session database, the analyses kept with the chat turn: docint's own
+retention; workbench keeps neither the data nor the outputs of a docint call.
+Docker's `local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a
+copy of each container's output on the host, the api's audit lines (account ids,
+chat ids, file ids; docint's pseudonyms, purposes and request ids) among them:
 rotated by size, at most five files of 50 MB per container, not by time, so
 with little traffic it can outlive obs-plane's retention.
 
@@ -240,9 +253,9 @@ with little traffic it can outlive obs-plane's retention.
 - whether any of the flows above goes to a recipient in the legal sense;
 - the outcome of the impact assessment;
 - the notice to users: what workbench keeps and for how long, and that Open
-  WebUI's chat history keeps tool results for longer;
-- whether the retention periods (workbench's, Open WebUI's, the audit store's)
-  fit the rules that apply;
+  WebUI's chat history and docint's analyses keep tool results for longer;
+- whether the retention periods (workbench's, Open WebUI's, docint's, the audit
+  store's) fit the rules that apply;
 - whether temporary chats stay available in Open WebUI, where an attachment in
   a chat without Workbench selected goes to the model without passing workbench
   (`USER_PERMISSIONS_CHAT_TEMPORARY`, which open-webui-service leaves at Open

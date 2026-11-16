@@ -33,7 +33,7 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | Field | Value |
 |---|---|
 | `action` / `operation` | by event key, below |
-| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id (see [Who](#who-the-actor)) |
+| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id, or docint's keyed pseudonym (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
 | `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
 | `criteria` | `caller` (`open-webui` or `docint`), and the keys below |
@@ -118,7 +118,8 @@ as `dropped`.
 
 No event holds a file's content, a file name or a path, a search query, code,
 a value the model wrote, Markdown, a template's field names, the text a tool
-returned, or the message of a refusal (only its code). The api's audit methods take file ids and counts and no name
+returned, the data a call brings, or a digest of it, or the message of a refusal
+(only its code). The api's audit methods take file ids and counts and no name
 (`workbench/api/audit.py`). The criteria are flags and counts.
 
 ### Long lists of files
@@ -169,10 +170,12 @@ A retention record that cannot be written stops the api (see
 ## Who: the actor
 
 The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id
-or the id docint sends, with `via: service`: the caller acts for the user. While
-the account exists, an Open WebUI admin resolves the id in Open WebUI's user
-table, and Open WebUI's own per-request audit records carry the same id with the
-account. The caller, `open-webui` or `docint`, is in every event's `criteria`.
+or docint's keyed pseudonym, with `via: service`: the caller acts for the user.
+While the account exists, an Open WebUI admin resolves the id in Open WebUI's
+user table, and Open WebUI's own per-request audit records carry the same id
+with the account. A docint pseudonym resolves through docint's own `disclose`
+event for the call (same request id and job), which names the user. The caller,
+`open-webui` or `docint`, is in every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user

@@ -39,6 +39,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import re
 import shutil
 import stat
 import time
@@ -95,6 +96,10 @@ TEXT_MAX: Final = 256 * 1024
 RETURN_MAX: Final = 1024 * 1024
 #: The first bytes of every PNG file.
 PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
+
+#: A C0 control character other than tab, LF and CR, or DEL. A text holding one does not come back: JSON escapes
+#: it to six bytes, which would grow the answer past what a caller accepts.
+_CONTROL: Final = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 #: Why an output does not come back.
 SkipReason = Literal["type", "signature", "encoding", "count", "size", "total", "unreadable"]
@@ -909,9 +914,10 @@ class JobQueue:
 
         A type outside :data:`RETURN_TYPES` is skipped before any cap applies. The rest go in return order (charts,
         then tables, then the rest, each by name): past :data:`MAX_RETURNED` kept files, past its own cap
-        (:data:`IMAGE_MAX` or :data:`TEXT_MAX`), a PNG without its signature, a text that is not strict UTF-8, or a
-        file past :data:`RETURN_MAX` in all is skipped, and the next file is still tried. Only a regular file the
-        executor staged for this job is read, at most its cap and one byte; anything else is ``unreadable``.
+        (:data:`IMAGE_MAX` or :data:`TEXT_MAX`), a PNG without its signature, a text that is not strict UTF-8 or holds
+        a control character (:data:`_CONTROL`), or a file past :data:`RETURN_MAX` in all is skipped, and the next file
+        is still tried. Only a regular file the executor staged for this job is read, at most its cap and one byte;
+        anything else is ``unreadable``.
 
         Args:
             job_id: The job's id.
@@ -971,6 +977,8 @@ class JobQueue:
                 data.decode("utf-8")
             except UnicodeDecodeError:
                 raise _Skip("encoding") from None
+            if _CONTROL.search(data):
+                raise _Skip("encoding")
         if len(data) > room:
             raise _Skip("total")
         return TakenFile(output.name, mime, data)

@@ -202,15 +202,16 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
         if open_webui_key is None and docint_key is None:
             raise ConfigError(NO_CALLER_KEY)
         docint_tools = _docint_tools(env)
-        docint_wall_s = _positive_int(env, "DOCINT_WORKBENCH_WALL_S", DOCINT_DEFAULT_WALL_S)
-        docint_slots = _positive_int(env, "DOCINT_WORKBENCH_SLOTS", DOCINT_DEFAULT_SLOTS)
         require_purpose = _required_purpose(env)
-        if docint_key is not None and not MIN_DOCINT_WALL_S <= docint_wall_s <= job_wall_s:
-            raise ConfigError(
-                f"DOCINT_WORKBENCH_WALL_S must be from {MIN_DOCINT_WALL_S} to WORKBENCH_JOB_WALL_S ({job_wall_s})"
-            )
-        if docint_key is not None and docint_slots >= slots:
-            raise ConfigError(f"DOCINT_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS ({slots})")
+        if docint_key is not None:
+            docint_wall_s = _positive_int(env, "DOCINT_WORKBENCH_WALL_S", DOCINT_DEFAULT_WALL_S)
+            docint_slots = _positive_int(env, "DOCINT_WORKBENCH_SLOTS", DOCINT_DEFAULT_SLOTS)
+            if not MIN_DOCINT_WALL_S <= docint_wall_s <= job_wall_s:
+                raise ConfigError(
+                    f"DOCINT_WORKBENCH_WALL_S must be from {MIN_DOCINT_WALL_S} to WORKBENCH_JOB_WALL_S ({job_wall_s})"
+                )
+            if docint_slots >= slots:
+                raise ConfigError(f"DOCINT_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS ({slots})")
     return Settings(
         data_dir=Path(_text(env, "WORKBENCH_DATA_DIR") or "/data"),
         open_webui_key=open_webui_key,

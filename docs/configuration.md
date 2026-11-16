@@ -80,6 +80,10 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   `WORKBENCH_QUEUE_MAX / WORKBENCH_EXECUTOR_SLOTS`, rounded down, at least 1
   (4 by default). A user past it gets `503` at once, and the other users are not
   affected: one user cannot fill every waiting place.
+- docint's calls wait at most 5 s for their turn (`MCP_QUEUE_WAIT_S`, fixed; not
+  `WORKBENCH_QUEUE_WAIT_S`), may fill 8 of the 16 waiting places by default
+  (`DOCINT_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
+  slot and that user's turn until its wall time.
 - An executor with no free slot, or one the api cannot reach, is a `503` too.
 - So is a job the executor stopped because the container held more than
   64 MiB of shared memory that no job's count showed (`hidden_memory`): it

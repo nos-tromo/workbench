@@ -157,11 +157,11 @@ no tool or terminal server is on (open-webui-service's `CLAUDE.md`, § Workbench
 
 The executor, where every file is opened, has no network at all
 (`network_mode: none` in `docker/compose.yaml`), and a job has no socket at all.
-A job sees only copies of its own chat's files, read-only, and can write only
-into its own `out/` folder and its private `home/` (with its `tmp/`); both are
-removed with the job, and only what is in `out/` can become a file of the
-workspace (see [sandbox.md](sandbox.md)). The api calls no model and joins only
-`workbench-net`.
+A job sees only copies of its own chat's files, read-only (a docint job, only
+the data its call brings), and can write only into its own `out/` folder and its
+private `home/` (with its `tmp/`); both are removed with the job, and only what
+is in `out/` can become a file of the workspace (see [sandbox.md](sandbox.md)).
+The api calls no model and joins only `workbench-net`.
 
 ### The agent deletes nothing
 

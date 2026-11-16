@@ -11,7 +11,8 @@ are not. Every file is deleted 7 days after it was made.
 Open WebUI connects to workbench as a "terminal server", with a bearer key. Its
 browser uploads chat attachments straight into workbench through Open WebUI's
 proxy, and the model's tools are the operations of workbench's
-`/openapi.json`.
+`/openapi.json`. docint calls `run_python` through `/mcp`, on data each call
+brings.
 
 ## Architecture
 

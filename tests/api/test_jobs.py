@@ -1837,6 +1837,26 @@ async def test_a_png_needs_its_signature_and_text_must_be_strict_utf8(
     assert skipped(taken) == {("fake.png", "signature"), ("t.csv", "encoding")}
 
 
+@pytest.mark.parametrize("char", ["\x00", "\x01", "\x08", "\x0b", "\x0c", "\x1b", "\x1f", "\x7f"])
+async def test_a_text_with_a_control_character_is_skipped_as_encoding(
+    char: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A C0 control character other than tab, LF and CR, or DEL, keeps a text back: its JSON escape would grow it."""
+    taken = await take_back({"t.csv": f"a,b\n1,x{char}y\n".encode()}, settings, store, executor, metrics)
+    assert taken.files == ()
+    assert skipped(taken) == {("t.csv", "encoding")}
+
+
+async def test_a_text_with_tabs_and_line_ends_comes_back(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Tab, LF and CR are text, and so are the C1 controls and any other UTF-8: they come back as written."""
+    files = {"t.csv": b"a\tb\r\n1\t2\r\n", "u.txt": "caf\u00e9\u0085\u2028\n".encode()}
+    taken = await take_back(files, settings, store, executor, metrics)
+    assert [(f.name, f.data) for f in taken.files] == [(n, d) for n, d in files.items()]
+    assert taken.skipped == ()
+
+
 async def test_the_return_caps(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
     """At most 8 files, an image up to 512 KiB, a text up to 256 KiB, 1 MiB in all; past the total the next is tried."""
     files = {f"{c}.csv": b"a,b\n" for c in "abcdefghi"} | {"0.csv": "Müller\n".encode("latin-1"), "x.xlsx": b"x"}

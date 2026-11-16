@@ -147,9 +147,11 @@ caller's paths. The api starts with either key.
 `docs/permissions.md` has them in full. In short:
 
 - **The user is the boundary; the chat is a folder.** The caller is its bearer
-  key; the user is `X-User-Id`, Open WebUI's opaque account id; the chat is
-  `X-Session-Id`, or `default`. Every path resolves below the user's root
-  (`workbench/paths.py:Workspaces`); another user's file is a 404.
+  key; the user is `X-User-Id`, Open WebUI's opaque account id, or docint's
+  keyed pseudonym, resolved through docint's own `disclose` event (same request
+  id and job); the chat is `X-Session-Id`, or `default`. Every path resolves
+  below the user's root (`workbench/paths.py:Workspaces`); another user's file
+  is a 404.
 - **Files live only inside chat folders.** Nothing is ever a file directly
   under `/workspace`.
 - **No network** in the executor, and no socket in a job (a seccomp filter of

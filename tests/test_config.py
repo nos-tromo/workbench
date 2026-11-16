@@ -228,6 +228,15 @@ def test_the_docint_rules_wait_for_its_key() -> None:
     assert load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, "WORKBENCH_JOB_WALL_S": "30"}, role="api").job_wall_s == 30
 
 
+@pytest.mark.parametrize("name", ["DOCINT_WORKBENCH_WALL_S", "DOCINT_WORKBENCH_SLOTS"])
+def test_docint_limits_are_not_parsed_without_its_key(name: str) -> None:
+    """A malformed limit of docint's does not stop an api that has only Open WebUI's key; with docint's key it does."""
+    env = {"OPEN_WEBUI_WORKBENCH_KEY": KEY, name: "abc"}
+    assert load_settings(env, role="api").docint_key is None
+    with pytest.raises(ConfigError, match=name):
+        load_settings({**env, "DOCINT_WORKBENCH_KEY": D}, role="api")
+
+
 def test_the_docint_limits_take_their_bounds() -> None:
     """The bounds themselves are allowed: a wall cap of 5 or of the job wall, and one slot fewer than the executor's."""
     env = {"DOCINT_WORKBENCH_KEY": D, "WORKBENCH_EXECUTOR_SLOTS": "3"}
