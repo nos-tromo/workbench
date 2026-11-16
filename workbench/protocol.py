@@ -7,7 +7,7 @@ paths that stay below the chat folder, and inline inputs that are each one plain
 
 import re
 from collections.abc import Sequence
-from typing import Any, Final, Literal, Self
+from typing import Any, Final, Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -125,8 +125,24 @@ class InlineFile(_Message):
         return _check_inline_name(value)
 
 
-def check_inline_inputs(entries: Sequence[InlineFile]) -> None:
+class NamedText(Protocol):
+    """An inline input as its rules see it, whichever model carries it: a name and a text."""
+
+    @property
+    def name(self) -> str:
+        """The file's name."""
+        ...
+
+    @property
+    def content(self) -> str:
+        """Its text."""
+        ...
+
+
+def check_inline_inputs(entries: Sequence[NamedText]) -> None:
     """Accept the inline inputs of one request: the protocol's rules, also for entries built without validation.
+
+    The inline tool checks its arguments by these rules too, so the two cannot drift apart.
 
     Args:
         entries: The inline inputs.

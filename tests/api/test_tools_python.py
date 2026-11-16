@@ -216,6 +216,28 @@ def test_outputs_the_executor_refused_still_answer_with_what_the_code_printed(
 
 
 @pytest.mark.parametrize(
+    ("status", "message", "hint"),
+    [
+        (
+            "ok",
+            "dropped 1 output: not the job's own file",
+            "Not every file in out/ was kept: dropped 1 output: not the job's own file.",
+        ),
+        ("error", "too many outputs: at most 20", "No file in out/ was kept: too many outputs: at most 20."),
+        ("error", "", "No file in out/ was kept: the outputs could not be kept."),
+    ],
+)
+def test_the_note_on_the_outputs_keeps_its_words(
+    client: TestClient, fake_executor: Scripted, status: str, message: str, hint: str
+) -> None:
+    """The executor's note on the outputs reaches Open WebUI in the words it always had, byte for byte."""
+    fake_executor.status = status
+    fake_executor.message = message
+    fake_executor.payload = ran("made files\n")
+    assert run(client).json()["hint"] == hint
+
+
+@pytest.mark.parametrize(
     ("status", "message", "said"),
     [
         ("timeout", "the job ran past its wall time of 120 s", "wall time"),

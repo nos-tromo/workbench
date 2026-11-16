@@ -364,7 +364,7 @@ class _CallerGate:
         self.waiting_max = waiting_max
 
 
-def _suffix(name: str) -> str:
+def suffix_of(name: str) -> str:
     """The suffix of an output's name, lower-cased, by which its type is known.
 
     Args:
@@ -385,7 +385,7 @@ def _return_order(output: OutputFile) -> tuple[int, str]:
     Returns:
         Its sort key.
     """
-    return {".png": 0, ".csv": 1}.get(_suffix(output.name), 2), output.name
+    return {".png": 0, ".csv": 1}.get(suffix_of(output.name), 2), output.name
 
 
 def _read_regular(path: Path, limit: int) -> bytes:
@@ -950,7 +950,7 @@ class JobQueue:
         Raises:
             _Skip: It does not come back, and why.
         """
-        suffix = _suffix(output.name)
+        suffix = suffix_of(output.name)
         mime = RETURN_TYPES.get(suffix)
         if mime is None:
             raise _Skip("type")

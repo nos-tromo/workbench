@@ -1993,6 +1993,9 @@ async def test_inline_data_past_the_line_is_too_large_and_not_sent(
     assert taker.calls == []
     assert sample(metrics, "workbench_job_refusals_total", reason="executor_busy") == 0
     assert queue.tracked_users == 0
+    (job_id,) = store.due_jobs(float("inf"))
+    record = store.find_job(job_id)
+    assert record is not None and record.status == "error"
 
 
 async def test_open_webui_is_never_capped(

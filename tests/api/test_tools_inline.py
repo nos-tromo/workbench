@@ -21,6 +21,7 @@ from tests.api.conftest import DOCINT_KEY, KEY
 from tests.api.test_files import AuditLines, H
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
+from workbench import protocol
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
 from workbench.api.jobs import Busy, CallLimits, ExecutorClient, JobQueue, RequestTooLarge, SkippedOutput
@@ -138,6 +139,14 @@ def test_all_data_together_is_at_most_512_kib_in_utf8() -> None:
     assert body(data=[full]).data[0].content == full["content"]
     with pytest.raises(ValidationError, match="512 KiB"):
         body(data=[full, {"name": "notes.txt", "content": "x"}])
+
+
+def test_the_data_bounds_are_the_protocols(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tool refuses what the job's protocol would refuse, by the protocol's own rules, so the two cannot drift."""
+    assert (MAX_DATA, MAX_DATA_BYTES) == (protocol.MAX_INLINE_FILES, protocol.MAX_INLINE_BYTES)
+    monkeypatch.setattr(protocol, "MAX_INLINE_BYTES", 4)
+    with pytest.raises(ValidationError):
+        body(data=[{"name": "notes.txt", "content": "12345"}])
 
 
 def test_data_utf8_cannot_hold_is_refused() -> None:
@@ -341,6 +350,30 @@ def test_the_hint_joins_the_runners_and_the_executors_notes(client: TestClient, 
     assert "2 files" in hint
 
 
+@pytest.mark.parametrize(
+    ("status", "message", "said"),
+    [
+        (
+            "ok",
+            "dropped 1 output: not the job's own file",
+            "Not every file in out/ came back: dropped 1 output: not the job's own file.",
+        ),
+        ("error", "too many outputs: at most 20", "No file in out/ came back: too many outputs: at most 20."),
+        ("error", "", "No file in out/ came back: the outputs could not be returned."),
+    ],
+)
+def test_the_executors_note_says_what_did_not_come_back(
+    client: TestClient, fake_executor: Scripted, status: str, message: str, said: str
+) -> None:
+    """Nothing is kept on this door, so the executor's note on the outputs says that a file did not come back."""
+    fake_executor.status = status
+    fake_executor.message = message
+    fake_executor.payload = ran("made files")
+    hint = call(client, body()).structured["hint"]
+    assert hint == said
+    assert "kept" not in hint
+
+
 def test_a_uri_holds_the_name_percent_encoded(client: TestClient, fake_executor: Scripted) -> None:
     """A name a model writes, with spaces, umlauts, ``#`` and ``%``, comes back as written and percent-encoded."""
     fake_executor.files = {"Übersicht März #1.csv": COUNTS, "50% share.csv": COUNTS}
@@ -418,7 +451,10 @@ def test_escape_heavy_data_is_too_large_never_a_500(
     assert inline_events(audit_lines) == []
     staging = settings.data_dir / "staging"
     assert not staging.exists() or list(staging.iterdir()) == []
-    assert not (settings.data_dir / "jobs").exists()
+    assert store.count_files() == 0
+    (job_id,) = store.due_jobs(float("inf"))
+    record = store.find_job(job_id)
+    assert record is not None and record.status == "error"
 
 
 def test_without_a_queue_the_executor_is_busy(client: TestClient, audit_lines: AuditLines) -> None:

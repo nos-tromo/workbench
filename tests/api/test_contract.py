@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import hashlib
 import hmac
 import io
 import json
@@ -191,6 +192,19 @@ def test_openapi_is_built_once_and_served_from_memory(app: FastAPI, client: Test
     first = tool_openapi(app, open_webui)
     assert tool_openapi(app, open_webui) is first
     assert client.get("/openapi.json", headers=KEY_ONLY).json() == first
+
+
+#: The sha256 of Open WebUI's tool document as v0.1.1 served it, ``info.version`` set to ``0.0.0``, written as
+#: sorted compact JSON. Changing it changes Open WebUI's contract: the tools, schemas and texts its model is offered.
+OPEN_WEBUI_CONTRACT_SHA256 = "1fb4316b8b05091df74af89fa79199e6fd8ff15b60c148ccf3b694b21da20b13"
+
+
+def test_open_webuis_tool_document_is_its_contract_and_does_not_change(client: TestClient) -> None:
+    """Open WebUI's document is v0.1.1's apart from its version; a change here is a change to Open WebUI's contract."""
+    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
+    doc["info"]["version"] = "0.0.0"
+    written = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    assert hashlib.sha256(written).hexdigest() == OPEN_WEBUI_CONTRACT_SHA256
 
 
 @pytest.mark.parametrize(("method", "url"), KEYED_ROUTES)

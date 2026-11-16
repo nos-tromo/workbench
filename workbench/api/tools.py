@@ -903,7 +903,8 @@ def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
         result: The executor's answer.
 
     Returns:
-        The runner's answer, and the executor's note on the outputs, if it has one.
+        The runner's answer, and the executor's note on the outputs, cleaned, if it has one; each door says in its
+        own words what the note means for the files.
 
     Raises:
         NotCompleted: The job ran out of time, was stopped on a resource limit or left no result, as when the
@@ -912,10 +913,8 @@ def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
             fixed text: the runner's own may hold a path).
     """
     note = _clean(result.message) if result.message else None
-    if result.status == "ok":
-        return result.result, None if note is None else f"Not every file in out/ was kept: {note}."
-    if result.status == "error" and "stdout" in result.result:
-        return result.result, f"No file in out/ was kept: {note or 'the outputs could not be kept'}."
+    if result.status == "ok" or (result.status == "error" and "stdout" in result.result):
+        return result.result, note
     if result.status == "error" and "error" in result.result:
         _payload(result, "code")  # raises, with the runner's code or the fixed text
     reason = _clean(result.message) or "the job failed"
@@ -944,7 +943,8 @@ def read_code_run(result: JobResult) -> tuple[CodeRun, str | None]:
         result: The executor's answer.
 
     Returns:
-        What the code printed, and the executor's note on the outputs, if it has one.
+        What the code printed, and the executor's bare note on the outputs, if it has one. The job is ``ok``, or an
+        ``error`` whose outputs broke the executor's limits, so that none of them is there.
 
     Raises:
         NotCompleted: The code could not be completed (:func:`_python_payload`).
@@ -952,6 +952,21 @@ def read_code_run(result: JobResult) -> tuple[CodeRun, str | None]:
     """
     payload, note = _python_payload(result)
     return _parse(CodeRun, payload), note
+
+
+def _kept_note(result: JobResult, note: str | None) -> str | None:
+    """Say in the terminal's words what the executor's note means: which files in ``out/`` were not kept.
+
+    Args:
+        result: The executor's answer, as :func:`read_code_run` read it.
+        note: The executor's bare note, or ``None``.
+
+    Returns:
+        The sentence, or ``None`` for an ``ok`` job without a note.
+    """
+    if result.status == "ok":
+        return None if note is None else f"Not every file in out/ was kept: {note}."
+    return f"No file in out/ was kept: {note or 'the outputs could not be kept'}."
 
 
 def _readable(model: type[BaseModel], payload: object) -> bool:
@@ -1085,7 +1100,7 @@ async def run_python(
     keeper = OutputKeeper(audit, p, "run_python", [rec.id for rec in chosen], decide)
     job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen], keeper)
     run, note = read_code_run(result)
-    notes: list[str | None] = [run.hint, note]
+    notes: list[str | None] = [run.hint, _kept_note(result, note)]
     if len(readable) > len(chosen):
         notes.append(
             f"The code was given the {len(chosen)} newest of {len(readable)} files; the "

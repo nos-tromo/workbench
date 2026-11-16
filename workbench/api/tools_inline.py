@@ -31,21 +31,21 @@ from workbench.api.jobs import (
     SkippedOutput,
     TakenFile,
     TakenOutputs,
-    _suffix,
+    suffix_of,
 )
 from workbench.api.registry import PurposeRequired, ToolEnv, ToolOutcome, ToolSpec
 from workbench.api.tools import MAX_CODE, MAX_HINT, NotCompleted, _capped, _join, fit_python, python_args, read_code_run
 from workbench.models import Principal
-from workbench.protocol import InlineFile, JobResult
+from workbench.protocol import MAX_INLINE_BYTES, MAX_INLINE_FILES, InlineFile, JobResult, check_inline_inputs
 from workbench.utils.audit_event import Purpose
 
 #: What a data entry may be named: a letter or digit, up to 99 more of letters, digits, ``_``, ``.`` and ``-``, and
 #: one of the suffixes docint sends.
 DATA_NAME: Final = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\.(json|csv|txt|md)$"
-#: Most data entries one call brings.
-MAX_DATA: Final = 8
-#: Most bytes, in UTF-8, all data entries of one call hold together.
-MAX_DATA_BYTES: Final = 512 * 1024
+#: Most data entries one call brings: the protocol's own bound.
+MAX_DATA: Final = MAX_INLINE_FILES
+#: Most bytes, in UTF-8, all data entries of one call hold together: the protocol's own bound.
+MAX_DATA_BYTES: Final = MAX_INLINE_BYTES
 #: The least ``time_limit_s`` a call may ask for.
 MIN_TIME_LIMIT_S: Final = 5
 
@@ -105,7 +105,7 @@ class InlinePythonRequest(BaseModel):
     @field_validator("data")
     @classmethod
     def _check_data(cls, value: list[InlineData]) -> list[InlineData]:
-        """Accept entries of distinct names that hold at most :data:`MAX_DATA_BYTES` in UTF-8 together.
+        """Accept the entries the job's protocol accepts (:func:`~workbench.protocol.check_inline_inputs`).
 
         Args:
             value: The entries.
@@ -116,15 +116,7 @@ class InlinePythonRequest(BaseModel):
         Raises:
             ValueError: A name is repeated, a text cannot be encoded as UTF-8, or the texts are too large together.
         """
-        names = [entry.name for entry in value]
-        if len(set(names)) != len(names):
-            raise ValueError("data names must be unique")
-        try:
-            size = sum(len(entry.content.encode("utf-8")) for entry in value)
-        except UnicodeEncodeError:
-            raise ValueError("data must be text UTF-8 can hold") from None
-        if size > MAX_DATA_BYTES:
-            raise ValueError(f"data holds more than {MAX_DATA_BYTES // 1024} KiB in UTF-8 together")
+        check_inline_inputs(value)
         return value
 
     @field_validator("time_limit_s")
@@ -313,7 +305,8 @@ def _skip_hint(skipped: Sequence[SkippedOutput]) -> list[str]:
     """
     counts: dict[str, int] = {}
     for skip in skipped:
-        reason = f"size-{'image' if _suffix(skip.name) == '.png' else 'text'}" if skip.reason == "size" else skip.reason
+        kind = "image" if suffix_of(skip.name) == ".png" else "text"
+        reason = f"size-{kind}" if skip.reason == "size" else skip.reason
         counts[reason] = counts.get(reason, 0) + 1
     sentences = {
         "type": "{} of another type did not come back: only .png, .csv, .txt, .md and .json come back.",
@@ -331,6 +324,21 @@ def _skip_hint(skipped: Sequence[SkippedOutput]) -> list[str]:
     return [text.format(_files(counts[reason])) for reason, text in sentences.items() if reason in counts]
 
 
+def _returned_note(result: JobResult, note: str | None) -> str | None:
+    """Say what the executor's note means on this door, where nothing is kept: which files did not come back.
+
+    Args:
+        result: The executor's answer, as :func:`~workbench.api.tools.read_code_run` read it.
+        note: The executor's bare note, or ``None``.
+
+    Returns:
+        The sentence, or ``None`` for an ``ok`` job without a note.
+    """
+    if result.status == "ok":
+        return None if note is None else f"Not every file in out/ came back: {note}."
+    return f"No file in out/ came back: {note or 'the outputs could not be returned'}."
+
+
 def _info(skip: SkippedOutput) -> OutputInfo:
     """Describe an output that did not come back.
 
@@ -341,7 +349,7 @@ def _info(skip: SkippedOutput) -> OutputInfo:
         Its entry in ``files``, typed by its suffix where that is a type that comes back.
     """
     return OutputInfo(
-        name=skip.name, mime=RETURN_TYPES.get(_suffix(skip.name), _UNKNOWN_TYPE), bytes=skip.size, returned=False
+        name=skip.name, mime=RETURN_TYPES.get(suffix_of(skip.name), _UNKNOWN_TYPE), bytes=skip.size, returned=False
     )
 
 
@@ -425,7 +433,7 @@ async def run_python_inline(body: InlinePythonRequest, env: ToolEnv) -> ToolOutc
         truncated=run.truncated,
         job_id=job.id,
         files=files,
-        hint=_capped(_join(run.hint, note, *_skip_hint(taken.skipped)), MAX_HINT),
+        hint=_capped(_join(run.hint, _returned_note(result, note), *_skip_hint(taken.skipped)), MAX_HINT),
     )
     answer = fit_python(answer, settings.result_max_kb, keep_none=True)
     return ToolOutcome(structured=answer.model_dump(mode="json"), blocks=[_block(job.id, f) for f in taken.files])
