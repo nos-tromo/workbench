@@ -9,6 +9,7 @@ from workbench.api.auth import (
     Caller,
     InvalidPurpose,
     purpose_from_headers,
+    require_chat_principal,
     require_file_caller,
     require_file_principal,
     require_principal,
@@ -111,6 +112,8 @@ async def call_audit(
 
 #: Route parameter types: the authenticated user and chat, and the collaborators the app was built with.
 PrincipalDep = Annotated[Principal, Depends(require_principal)]
+#: The user and the chat the chat delete deletes: a confined caller's alone.
+ChatPrincipalDep = Annotated[Principal, Depends(require_chat_principal)]
 #: The user and chat on a file route a confined caller shares with the terminal door, and the log it records through.
 FilePrincipalDep = Annotated[Principal, Depends(require_file_principal)]
 CallAuditDep = Annotated[AuditLog, Depends(call_audit)]

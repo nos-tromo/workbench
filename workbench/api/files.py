@@ -6,7 +6,8 @@ it, as the ``display_file`` tool.
 
 Ghostwriter calls three of them, list, upload and view, held to the request's chat: any other
 path is ``404`` for it. Its calls state a purpose and a request id, which its events carry, and
-an upload or a view that must state a purpose and does not is ``428``, recorded as denied.
+an upload or a view that must state a purpose and does not is ``428``, recorded as denied. The
+chat delete, ``DELETE /files/chat``, is Ghostwriter's alone: it deletes the request's chat.
 
 Every read or change of content is one audit event, by file id and never by name, and it is
 written *before* the content leaves, the file becomes visible or the file goes: an action that
@@ -23,7 +24,7 @@ import dataclasses
 import logging
 import os
 import posixpath
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Annotated, BinaryIO, Final
 from urllib.parse import quote
 
@@ -33,8 +34,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import require_tool
-from workbench.api.deps import AuditDep, CallAuditDep, FilePrincipalDep, PrincipalDep, SettingsDep, StoreDep
+from workbench.api.auth import CHAT_PATH, require_tool
+from workbench.api.deps import (
+    AuditDep,
+    CallAuditDep,
+    ChatPrincipalDep,
+    FilePrincipalDep,
+    PrincipalDep,
+    SettingsDep,
+    StoreDep,
+)
 from workbench.api.errors import NOT_FOUND
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
@@ -393,6 +402,28 @@ def delete_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) ->
             _log.warning("could not record a delete that failed (%s)", type(exc).__name__)
         raise
     return {"path": rec.virtual_path}
+
+
+@router.delete(CHAT_PATH)
+def delete_chat(p: ChatPrincipalDep, store: StoreDep, audit: CallAuditDep) -> dict[str, int]:
+    """Delete Ghostwriter's chat, after recording it by the ids of its files: its files, rows, job rows and folder.
+
+    A job of the chat still running keeps no output. A chat that holds nothing is deleted and recorded too.
+
+    Args:
+        p: Ghostwriter, the user and the chat to delete.
+        store: The file store.
+        audit: The audit log, bound to the call.
+
+    Returns:
+        How many files the chat held.
+    """
+    audit.check("chat_delete", p)
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        audit.record("chat_delete", p, file_ids=ids, outcome=outcome)
+
+    return {"deleted": store.delete_chat(p, record)}
 
 
 @router.post("/files/mkdir")

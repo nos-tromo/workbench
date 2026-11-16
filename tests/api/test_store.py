@@ -4,9 +4,11 @@ import dataclasses
 import errno
 import io
 import os
+import shutil
 import sqlite3
 import stat
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import override
 
@@ -931,6 +933,19 @@ def test_register_output_of_a_missing_staged_file_is_not_found(store: Store, ali
         store.register_output(alice, tmp_path / "gone.csv", "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
 
 
+def test_register_output_refuses_a_job_whose_row_is_gone(store: Store, workspaces: Workspaces, tmp_path: Path) -> None:
+    """An output of a job whose chat was deleted while it ran is not found; the chat folder is not made again."""
+    put(store, PG, "q.csv")
+    job = store.add_job(PG, "run_python")
+    store.delete_chat(PG, unrecorded)
+    staged = stage(tmp_path, job.id, "r.csv")
+    with pytest.raises(NotFound):
+        store.register_output(PG, staged, "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
+    assert not (workspaces.user_root(PG) / "chat-1").exists()
+    assert staged.exists()
+    assert store.files_in_chat(PG) == []
+
+
 def test_register_output_lands_in_the_principals_chat_only(
     store: Store, alice: Principal, bob: Principal, tmp_path: Path
 ) -> None:
@@ -1187,6 +1202,84 @@ def test_find_job_looks_a_job_up_by_its_id_alone(store: Store, alice: Principal)
     job = store.add_job(alice, "run_python")
     assert store.find_job(job.id) == job
     assert store.find_job("0" * 32) is None
+
+
+# --- deleting a chat -----------------------------------------------------------
+
+
+def test_delete_chat_records_first_then_rows_jobs_and_folder(store: Store, workspaces: Workspaces) -> None:
+    """The record sees every file of the chat, a folder's too, still there; then the rows, jobs and folder go.
+
+    Another chat of the user keeps its file, its job and its folder.
+    """
+    p2 = dataclasses.replace(PG, chat_id="chat-2")
+    store.mkdir(dataclasses.replace(PG, confined=False), "/workspace/chat-1/sub")
+    files = [
+        put(store, PG, "q.csv"),
+        put(store, PG, "r.csv"),
+        put(store, dataclasses.replace(PG, confined=False), "s.csv", directory="/workspace/chat-1/sub"),
+    ]
+    other = put(store, p2, "q.csv", directory="/workspace/chat-2")
+    job, theirs = store.add_job(PG, "run_python"), store.add_job(p2, "run_python")
+    folder = workspaces.user_root(PG) / "chat-1"
+    seen: list[tuple[list[str], str, list[str], bool, bool]] = []
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        names = [rec.name for rec in store.files_in_chat(PG)]
+        seen.append((sorted(ids), outcome, names, store.find_job(job.id) is not None, folder.is_dir()))
+
+    assert store.delete_chat(PG, record) == 3
+    assert seen == [(sorted(rec.id for rec in files), "ok", ["q.csv", "r.csv", "sub/s.csv"], True, True)]
+    assert store.files_in_chat(PG) == []
+    assert store.find_job(job.id) is None
+    assert not folder.exists()
+    assert store.files_in_chat(p2) == [other]
+    assert store.find_job(theirs.id) == theirs
+    assert disk_names(workspaces.user_root(PG) / "chat-2") == ["q.csv"]
+
+
+def test_a_record_that_raises_deletes_nothing(store: Store, workspaces: Workspaces) -> None:
+    """A chat delete whose record cannot be written leaves the files, their rows, the job row and the folder."""
+    files = [put(store, PG, "q.csv")]
+    job = store.add_job(PG, "run_python")
+
+    def refuse(*_: object) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    with pytest.raises(RuntimeError):
+        store.delete_chat(PG, refuse)
+    assert store.files_in_chat(PG) == files
+    assert store.find_job(job.id) == job
+    assert disk_names(workspaces.user_root(PG) / "chat-1") == ["q.csv"]
+
+
+def test_a_chat_delete_that_fails_after_its_record_is_recorded_again(
+    store: Store, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The removal's error is raised and the same ids are recorded as ``error``; a failure of that is only logged.
+
+    The rows are gone; the files left on disk have none, so retention's orphan sweep records and removes them.
+    """
+    rec = put(store, PG, "q.csv")
+    seen: list[tuple[list[str], str]] = []
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        seen.append((list(ids), outcome))
+        if outcome == "error":
+            raise RuntimeError("synthetic audit failure")
+
+    def refuse(*_: object, **__: object) -> None:
+        raise OSError("synthetic removal failure")
+
+    monkeypatch.setattr(shutil, "rmtree", refuse)
+    with pytest.raises(OSError, match="synthetic removal failure"):
+        store.delete_chat(PG, record)
+    assert seen == [([rec.id], "ok"), ([rec.id], "error")]
+    assert [entry.getMessage() for entry in caplog.records] == [
+        "could not record a chat delete that failed (RuntimeError)"
+    ]
+    assert store.files_in_chat(PG) == []
+    assert disk_names(workspaces.user_root(PG) / "chat-1") == ["q.csv"]
 
 
 # --- persistence and storage ------------------------------------------------------

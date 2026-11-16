@@ -68,6 +68,7 @@ The browser's routes (`workbench/api/files.py`).
 | view and download, `GET /files/view` | one file's bytes, sent to the browser | nothing | `disclose` / `file.view` | nothing |
 | read as text, `GET /files/read` | one text file, sent whole | nothing | `disclose` / `file.read` | nothing |
 | delete, `DELETE /files/delete` | nothing | removes one file and its row | `delete` / `file.delete`, before the file goes; again as `error` if it could not go | nothing |
+| `DELETE /files/chat` (Ghostwriter only) | nothing | the chat's files and rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | mkdir, `POST /files/mkdir` | nothing | one folder, with its parents | not recorded: no content | the folder, until retention removes it empty |
 | move, `POST /files/move` | nothing | a new name or folder for one file of the same user; nothing is overwritten | not recorded: no content | the file keeps its id and its creation time |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |

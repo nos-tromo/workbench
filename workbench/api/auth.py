@@ -573,3 +573,25 @@ async def require_file_principal(
             ``X-Session-Id`` is not a plain id; for a confined caller, also if it is missing or ``default``.
     """
     return _principal(request, caller)
+
+
+async def require_chat_principal(
+    request: Request, caller: Annotated[Caller, Depends(require_file_caller)]
+) -> Principal:
+    """Authenticate the request for the chat delete, a confined caller's alone, and say whose chat it deletes.
+
+    Args:
+        request: The request.
+        caller: The caller :func:`require_file_caller` let through; the key is checked before any other header.
+
+    Returns:
+        The caller, the user and the chat, confined to that chat.
+
+    Raises:
+        HTTPException: 404 with :data:`~workbench.api.errors.NOT_FOUND` for a caller that is not confined, as
+            :class:`KeyGate` answers it. 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or
+            not a plain id, or ``X-Session-Id`` is missing, ``default`` or not a plain id.
+    """
+    if not caller.confined:
+        raise HTTPException(status_code=404, detail=NOT_FOUND)
+    return _principal(request, caller)

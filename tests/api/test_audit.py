@@ -9,6 +9,7 @@ from typing import Any, override
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.api.conftest import HG
 from tests.api.conftest import KEY as CALLER_KEY
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_inline import body as inline_body
@@ -38,6 +39,7 @@ EXPECTED_OPERATIONS = {
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
     "write_document": ("collect", "tool.write_document"),
+    "chat_delete": ("delete", "chat.delete"),
 }
 
 
@@ -351,6 +353,9 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
         assert len(inline_call(client, inline).blocks) == 1
         assert client.delete("/files/delete", params={"path": csv}, headers=h).status_code == 200
+        draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
+        assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 1}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

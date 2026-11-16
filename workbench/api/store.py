@@ -15,7 +15,8 @@ ever stored without its record. A job's output is registered under an id the
 caller chose and recorded before it called, for the same reason.
 
 The store never deletes a file of its own accord; :meth:`Store.remove` is called
-only once its deletion is recorded.
+only once its deletion is recorded, and :meth:`Store.delete_chat` records a chat's
+deletion itself before anything of it goes.
 """
 
 import dataclasses
@@ -26,6 +27,7 @@ import mimetypes
 import os
 import posixpath
 import re
+import shutil
 import sqlite3
 import stat
 import threading
@@ -75,6 +77,10 @@ OrphanRecord = Callable[[str, Sequence[str], int, str], object]
 #: Records an upload: called with the chat id of its folder, its file id and the outcome, ``ok`` before the file
 #: becomes visible or ``error`` when it could not be stored after all. It raises when the record cannot be written.
 UploadRecord = Callable[[str, str, str], object]
+
+#: Records a chat's deletion: called with the file ids of the chat's files and the outcome, ``ok`` before anything goes
+#: or ``error`` when the deletion failed after that. It raises when the record cannot be written.
+ChatRecord = Callable[[Sequence[str], str], object]
 
 _OFFICE_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -803,6 +809,9 @@ class Store:
         The caller records the output by ``file_id`` before it calls, so that the file is never visible without its
         event, and records it again as ``error`` if this raises.
 
+        An output whose job row is gone, because :meth:`delete_chat` deleted the job's chat while it ran, is refused
+        before the chat folder is made, under the lock the chat delete holds too.
+
         Args:
             p: The caller, user and chat that ran the job.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
@@ -816,7 +825,7 @@ class Store:
 
         Raises:
             PathError: If the name is invalid, or ``staged`` is not a regular file.
-            NotFound: If ``staged`` does not exist.
+            NotFound: If ``staged`` does not exist, or the job's row is gone; ``staged`` stays.
             QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
@@ -839,6 +848,8 @@ class Store:
         if _FILE_ID.fullmatch(file_id) is None:
             raise ValueError("a file id is 32 lowercase hex digits")
         with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
+            if self.find_job(job_id) is None:
+                raise NotFound("job gone")
             if self.usage(p) + st.st_size > quota_bytes:
                 raise QuotaExceeded("workspace quota exceeded")
             folder = self._ws.chat_dir(p)
@@ -1116,6 +1127,55 @@ class Store:
         """
         with self._db() as db:
             db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+    def delete_chat(self, p: Principal, record: ChatRecord) -> int:
+        """Delete a chat, once its deletion is recorded: its files' rows, its job rows, and its folder with the files.
+
+        All of it holds the store's lock, which every file holds on its way into a chat folder. The ids of the chat's
+        files are read, ``record`` writes the deletion by them, the file rows and the job rows go in one transaction,
+        and then the chat folder; a folder that is not there is fine. A job of the chat that is still running finds its
+        row gone, so none of its outputs lands in the chat (:meth:`register_output`).
+
+        A record that cannot be written deletes nothing. A failure after the record is recorded again as ``error``, by
+        the same ids, and raised; a failure of that second record is logged by its type, never raised. What a failed
+        removal leaves on disk has no rows, so retention's orphan sweep records and removes it.
+
+        Args:
+            p: The caller, user and chat to delete.
+            record: Writes the deletion's event (:data:`ChatRecord`), under the store's lock.
+
+        Returns:
+            How many files the chat held.
+
+        Raises:
+            PathError: If an id is unsafe, or the chat folder is a link; the rows are gone by then.
+            Exception: What ``record`` raised, with nothing deleted; or what the deletion raised after the record.
+        """
+        owner = (p.caller, p.user_id, p.chat_id)
+        with self._lock:
+            with self._db() as db:
+                rows = db.execute(
+                    "SELECT id FROM files WHERE caller = ? AND user_id = ? AND chat_id = ? ORDER BY created_at, id",
+                    owner,
+                ).fetchall()
+            ids = [row[0] for row in rows]
+            record(ids, "ok")
+            try:
+                with self._db() as db:
+                    db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                    db.execute("DELETE FROM jobs WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                folder = self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}")
+                try:
+                    shutil.rmtree(folder)
+                except FileNotFoundError:
+                    pass
+            except BaseException:
+                try:
+                    record(ids, "error")
+                except Exception as exc:  # the deletion's error is the answer; this one is only logged
+                    _log.warning("could not record a chat delete that failed (%s)", type(exc).__name__)
+                raise
+        return len(ids)
 
     def checkpoint(self) -> bool:
         """Copy the write-ahead log into the database file and empty it.

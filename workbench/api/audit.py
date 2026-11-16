@@ -54,6 +54,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
     "write_document": ("collect", "tool.write_document"),
+    "chat_delete": ("delete", "chat.delete"),
 }
 
 _SYSTEM_ACTOR: Final = Actor(user=None, via="system")

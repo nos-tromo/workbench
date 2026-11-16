@@ -647,7 +647,8 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
             return answer
 
         monkeypatch.setattr(store._ws, "chat_dir", slow)
-        staged = settings.data_dir / "staging" / ("e" * 32) / "chart.png"
+        job_id = store.add_job(ME, "run_python").id
+        staged = settings.data_dir / "staging" / job_id / "chart.png"
         staged.parent.mkdir(parents=True)
         staged.write_bytes(b"\x89PNG")
     made: list[FileRecord] = []
@@ -657,7 +658,7 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
             made.append(put(store, "quarterly-figures.xlsx"))
         else:
             made.append(
-                store.register_output(ME, staged, "chart.png", "e" * 32, file_id=new_file_id(), quota_bytes=10**12)
+                store.register_output(ME, staged, "chart.png", job_id, file_id=new_file_id(), quota_bytes=10**12)
             )
 
     arriving = threading.Thread(target=arrive)
@@ -1233,7 +1234,7 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
     Never a name, an id, a user or a chat.
     """
     now = time.time()
-    ages = iter([10.0, 9.0, 3.0, 12.0])
+    ages = iter([10.0, 9.0, 3.0, 12.0, 12.0])
     store = Store(volume / "workbench.db", Workspaces(volume), lambda: now - next(ages) * DAY)
     who = Principal("open-webui", "user-7f3a9c", "chat-5e1b2d")
     secrets = [who.user_id, who.chat_id]
@@ -1242,11 +1243,12 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
             who, f"/workspace/{who.chat_id}", name, io.BytesIO(b"x"), max_bytes=10, quota_bytes=100, record=unrecorded
         )
         secrets += [name, rec.id]
-    staged = volume / "staging" / ("e" * 32) / "dredging-chart.png"
+    job = store.add_job(who, "run_python")
+    staged = volume / "staging" / job.id / "dredging-chart.png"
     staged.parent.mkdir(parents=True)
     staged.write_bytes(b"\x89PNG")
-    out = store.register_output(who, staged, "dredging-chart.png", "e" * 32, file_id=new_file_id(), quota_bytes=10**12)
-    secrets += [out.name, out.id, "e" * 32]
+    out = store.register_output(who, staged, "dredging-chart.png", job.id, file_id=new_file_id(), quota_bytes=10**12)
+    secrets += [out.name, out.id, job.id]
     database = volume / "workbench.db"
     before, listed = database.read_bytes(), {p.name for p in volume.iterdir()}
     assert main(["dry-run"]) == 0
