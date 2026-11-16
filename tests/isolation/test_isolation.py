@@ -2,12 +2,15 @@
 
 The configuration tests read ``docker inspect`` and look from inside the running executor, so
 they prove what the kernel enforces, not only what the compose file asks for. The tests that
-run code go through the ``run_python`` tool, as the model would.
+run code go through the ``run_python`` tool, as the model would, on Open WebUI's door or docint's.
 """
 
+import base64
 import io
 import json
 import stat
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,7 @@ import pytest
 from docx import Document
 
 from tests.fixtures import make_templates as mt
-from tests.isolation.conftest import docker, environment, inspect, run_python, stdout_of
+from tests.isolation.conftest import docker, environment, inspect, mcp_call, mcp_result, run_python, stdout_of
 
 pytestmark = pytest.mark.isolation
 
@@ -114,7 +117,7 @@ def test_executor_is_isolated_by_configuration(executor: str) -> None:
     }
     assert host["Sysctls"] == {"fs.mqueue.queues_max": "0", "kernel.shm_rmid_forced": "1"}
     assert info["Config"]["User"] == "0:0"
-    assert "OPEN_WEBUI_WORKBENCH_KEY" not in env
+    assert "OPEN_WEBUI_WORKBENCH_KEY" not in env and "DOCINT_WORKBENCH_KEY" not in env
 
 
 def test_the_running_executor_has_what_its_configuration_asks_for(executor: str) -> None:
@@ -570,3 +573,92 @@ def test_the_retention_dry_run_runs_in_the_api_container(api_info: dict[str, Any
     assert "upload: none due; " in printed
     assert name not in printed
     assert "chat-retention" not in printed
+
+
+# --- docint's inline jobs ------------------------------------------------------------------------------------------
+
+MARKER = "synthetic-harbour-marker-7f3a"
+INLINE_OPERATION = "tool.run_python.inline"
+
+CHART_OF_THE_DATA = r"""
+import json, pathlib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+passages = json.loads(pathlib.Path("passages.json").read_text())
+print(len(passages))
+pathlib.Path("out/counts.csv").write_text("n,text\n" + "".join(f"{p['n']},{p['text']}\n" for p in passages))
+figure, axes = plt.subplots()
+axes.bar([p["n"] for p in passages], [len(p["text"]) for p in passages])
+figure.savefig("out/chart.png")
+"""
+
+#: Run in the executor, as root: what the volume holds of a job, and how many of its regular files hold the marker.
+LEFT_ON_THE_VOLUME = r"""
+import json, os, stat, sys
+marker = sys.argv[1].encode()
+holding = 0
+for folder, _, names in os.walk("/data"):
+    for name in names:
+        path = os.path.join(folder, name)
+        if stat.S_ISREG(os.lstat(path).st_mode):
+            with open(path, "rb") as f:
+                holding += marker in f.read()
+left = {"jobs": os.listdir("/data/jobs"), "staging": os.listdir("/data/staging")}
+print(json.dumps({**left, "docint": os.path.exists("/data/workspaces/docint"), "holding": holding}))
+"""
+
+#: Run in the api: how many job records docint has, read-only.
+DOCINT_JOBS = (
+    "import sqlite3; db = sqlite3.connect('file:/data/workbench.db?mode=ro', uri=True); "
+    "print(db.execute(\"SELECT COUNT(*) FROM jobs WHERE caller = 'docint'\").fetchone()[0])"
+)
+
+
+def _logs(container: str) -> str:
+    """Read everything a container has logged, its standard output and its standard error."""
+    found = subprocess.run(["docker", "logs", container], check=True, capture_output=True, text=True, timeout=120)
+    return found.stdout + found.stderr
+
+
+def _logged(container: str, text: str, seconds: float = 30.0) -> str:
+    """Read a container's log again until it holds ``text``, or the time is up; docker may copy a line late."""
+    deadline = time.monotonic() + seconds
+    while text not in (found := _logs(container)) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    return found
+
+
+def test_an_inline_job_leaves_nothing_on_the_volume(api_info: dict[str, Any], executor: str) -> None:
+    """The data and outputs of docint's job come back in the answer and stay nowhere; only its record is kept.
+
+    No job or staging folder is left and docint has no workspace; no file on the volume and no line of either
+    container's log holds the data.
+    """
+    before = int(docker("exec", api_info["Id"], "python", "-I", "-c", DOCINT_JOBS))
+    data = [{"name": "passages.json", "content": json.dumps([{"n": 1, "text": MARKER}])}]
+    answer = mcp_result(mcp_call(api_info, CHART_OF_THE_DATA, data))
+
+    assert answer["isError"] is False, answer["structuredContent"]
+    assert answer["structuredContent"]["stdout"].strip() == "1"
+    assert [block["type"] for block in answer["content"]] == ["text", "image", "resource"]
+    _, image, resource = answer["content"]
+    assert image["mimeType"] == "image/png"
+    assert base64.b64decode(image["data"]).startswith(b"\x89PNG\r\n\x1a\n")
+    assert MARKER in resource["resource"]["text"]
+
+    left = json.loads(docker("exec", executor, "python", "-I", "-c", LEFT_ON_THE_VOLUME, MARKER))
+    assert left == {"jobs": [], "staging": [], "docint": False, "holding": 0}
+    assert int(docker("exec", api_info["Id"], "python", "-I", "-c", DOCINT_JOBS)) == before + 1
+    api_logs = _logged(api_info["Id"], INLINE_OPERATION)
+    assert INLINE_OPERATION in api_logs and MARKER not in api_logs
+    assert MARKER not in _logs(executor)
+
+
+def test_no_core_dumps_in_either_container(api_info: dict[str, Any], executor: str) -> None:
+    """Compose's ``ulimits: core: 0`` holds in the api and the executor; an inline job runs with a core limit of 0."""
+    for info in (api_info, inspect(executor)):
+        assert info["HostConfig"]["Ulimits"] == [{"Name": "core", "Hard": 0, "Soft": 0}]
+    answer = mcp_result(mcp_call(api_info, "import resource; print(resource.getrlimit(resource.RLIMIT_CORE))", []))
+    assert answer["isError"] is False, answer["structuredContent"]
+    assert answer["structuredContent"]["stdout"].strip() == "(0, 0)"

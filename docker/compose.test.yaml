@@ -5,7 +5,7 @@
 ### developer's: a project-local data volume and network in place of the
 ### external ones, and images tagged :test. `down -v` removes all of it. The
 ### executor's isolation is compose.yaml's, unchanged; this file sets only the
-### synthetic caller key, a shorter wall time and the published test port.
+### synthetic caller keys, a shorter wall time and the published test port.
 
 name: workbench-test
 
@@ -22,8 +22,11 @@ services:
     ports:
       - "127.0.0.1:18100:8000"
     environment:
-      # Synthetic, test-only; never a real key.
+      # Synthetic, test-only; never real keys.
       OPEN_WEBUI_WORKBENCH_KEY: synthetic-isolation-test-key-not-a-secret
+      DOCINT_WORKBENCH_KEY: synthetic-docint-test-key-not-a-secret-0000
+      # docint's cap may not pass the stack's wall time, or the api does not start.
+      DOCINT_WORKBENCH_WALL_S: "20"
       WORKBENCH_JOB_WALL_S: "20"
 
   executor:

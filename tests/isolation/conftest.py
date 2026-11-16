@@ -22,6 +22,12 @@ API_URL = os.environ.get("WORKBENCH_TEST_API", "http://127.0.0.1:18100")
 COMPOSE_FILE = Path(__file__).resolve().parents[2] / "docker" / "compose.yaml"
 _SETTLE_S = 60.0
 
+#: The MCP revision docint speaks, and the prefix of the client's keys in ``params._meta``.
+MCP_REVISION = "2026-07-28"
+_META = "io.modelcontextprotocol/"
+#: A synthetic purpose: the door requires one for ``combine`` (``AUDIT_REQUIRE_PURPOSE``).
+PURPOSE = "case_ref=case-0001&reason=isolation+test"
+
 
 def docker(*args: str) -> str:
     """Run the docker CLI and return what it printed.
@@ -137,7 +143,7 @@ def api_info() -> dict[str, Any]:
 
 @pytest.fixture(scope="session")
 def api(api_info: dict[str, Any]) -> Iterator[httpx.Client]:
-    """A client of the api on its published test port, holding the test stack's synthetic caller key."""
+    """A client of the api on its published test port, holding Open WebUI's synthetic key of the test stack."""
     key = environment(api_info)["OPEN_WEBUI_WORKBENCH_KEY"]
     with httpx.Client(base_url=API_URL, headers={"Authorization": f"Bearer {key}"}, timeout=300) as client:
         yield client
@@ -156,6 +162,54 @@ def run_python(api: httpx.Client, code: str, *, user: str = "user-a", chat: str 
         The api's answer.
     """
     return api.post("/tools/run_python", json={"code": code}, headers={"X-User-Id": user, "X-Session-Id": chat})
+
+
+def mcp_call(
+    api_info: dict[str, Any], code: str, data: list[dict[str, str]], *, user: str = "a" * 64, session: str = "b" * 64
+) -> httpx.Response:
+    """Run ``code`` over ``data`` through docint's door: a modern ``tools/call`` of inline ``run_python``.
+
+    Args:
+        api_info: ``docker inspect`` of the api's container, whose environment holds docint's key.
+        code: The Python to run.
+        data: The data entries, each ``{"name": ..., "content": ...}``.
+        user: The user pseudonym docint would send.
+        session: The session pseudonym docint would send.
+
+    Returns:
+        The api's answer.
+    """
+    key = environment(api_info)["DOCINT_WORKBENCH_KEY"]
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_REVISION,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": "run_python",
+        "X-User-Id": user,
+        "X-Session-Id": session,
+        "X-Audit-Purpose": PURPOSE,
+    }
+    meta = {f"{_META}protocolVersion": MCP_REVISION, f"{_META}clientCapabilities": {}}
+    params = {"name": "run_python", "arguments": {"code": code, "data": data}, "_meta": meta}
+    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+    return httpx.post(f"{API_URL}/mcp", json=message, headers=headers, timeout=300)
+
+
+def mcp_result(response: httpx.Response) -> dict[str, Any]:
+    """Take the ``result`` of a JSON-RPC answer of the MCP door.
+
+    Args:
+        response: The api's answer.
+
+    Returns:
+        The result: ``content``, ``structuredContent`` and ``isError``.
+    """
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "error" not in body, body
+    return body["result"]
 
 
 def stdout_of(response: httpx.Response) -> str:
