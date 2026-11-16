@@ -18,7 +18,8 @@ Each caller comes in through one door. :class:`KeyGate` checks it right after th
 still before any body is read: an MCP caller finds :data:`MCP_PATH` alone, a confined one
 :data:`FILE_PATHS` too, a terminal caller every path but :data:`MCP_PATH` and :data:`CHAT_PATH`,
 and a path outside the door answers ``404`` with :data:`~workbench.api.errors.NOT_FOUND`. Only
-:data:`OPEN_PATHS` stay open to every caller.
+:data:`OPEN_PATHS` stay open to every caller. The file routes a confined caller shares with the terminal door
+check the same again for themselves (:func:`require_file_caller`).
 """
 
 import hmac
@@ -30,11 +31,13 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from workbench.api.errors import NOT_FOUND
+from workbench.api.errors import INVALID_PURPOSE, NOT_FOUND
 from workbench.api.registry import WORKSPACE_TOOLS, Files, ToolGuard, allowed_tools
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
+from workbench.utils.audit_event import Purpose
+from workbench.utils.audit_runtime import PurposeError, parse_purpose_header
 
 _BEARER: Final = "bearer"
 
@@ -312,6 +315,32 @@ async def require_caller(request: Request) -> Caller:
     return caller
 
 
+async def require_file_caller(request: Request) -> Caller:
+    """Authenticate the request by its bearer key, for a file route a confined caller shares with the terminal door.
+
+    A terminal caller passes, as :func:`require_caller` lets it. A confined caller passes on :data:`FILE_PATHS` alone,
+    and never under a ``root_path``, where routing would see another path than :class:`KeyGate` judged. Any other
+    caller is refused here as the gate refuses it.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The caller that holds the key.
+
+    Raises:
+        HTTPException: 401 if the key is missing, malformed or not held by any caller. 404 with
+            :data:`~workbench.api.errors.NOT_FOUND` for a caller that is neither of the terminal door nor confined, and
+            for a confined one off :data:`FILE_PATHS` or under a ``root_path``.
+    """
+    caller = _authenticated(request)
+    if caller.door == "terminal":
+        return caller
+    if caller.confined and request.scope["path"] in FILE_PATHS and not request.scope.get("root_path"):
+        return caller
+    raise HTTPException(status_code=404, detail=NOT_FOUND)
+
+
 async def require_mcp_caller(request: Request) -> Caller:
     """Authenticate the request by its bearer key, for a route of the MCP door.
 
@@ -415,6 +444,13 @@ class KeyGate:
         await self.app(scope, receive, send)
 
 
+class InvalidPurpose(ValueError):
+    """The ``X-Audit-Purpose`` header is malformed, oversized or ambiguous.
+
+    The message is :data:`~workbench.api.errors.INVALID_PURPOSE`, never the value sent.
+    """
+
+
 class InvalidPrincipal(ValueError):
     """The user or chat header is missing or not a plain id.
 
@@ -464,6 +500,44 @@ def principal_from_headers(caller: Caller, headers: Mapping[str, str]) -> Princi
     return Principal(caller=caller.name, user_id=user_id, chat_id=chat_id, confined=caller.confined)
 
 
+def purpose_from_headers(headers: Mapping[str, str]) -> Purpose | None:
+    """Read the purpose a request states in ``X-Audit-Purpose``, as the vendored parser reads it.
+
+    Args:
+        headers: The request's headers.
+
+    Returns:
+        The purpose, or ``None`` if the request states none.
+
+    Raises:
+        InvalidPurpose: If the header is not form-encoded UTF-8 in ASCII, is too long, or repeats a field.
+    """
+    try:
+        case_ref, reason = parse_purpose_header(_header(headers, "x-audit-purpose"))
+    except PurposeError:
+        raise InvalidPurpose(INVALID_PURPOSE) from None
+    return Purpose(case_ref=case_ref, reason=reason) if case_ref or reason else None
+
+
+def _principal(request: Request, caller: Caller) -> Principal:
+    """Say whose files a request is about, refusing bad headers as a route answers them.
+
+    Args:
+        request: The request.
+        caller: The authenticated caller.
+
+    Returns:
+        What :func:`principal_from_headers` returns.
+
+    Raises:
+        HTTPException: 400 with the text of :class:`InvalidPrincipal`.
+    """
+    try:
+        return principal_from_headers(caller, request.headers)
+    except InvalidPrincipal as refused:
+        raise HTTPException(status_code=400, detail=str(refused)) from None
+
+
 async def require_principal(request: Request, caller: Annotated[Caller, Depends(require_caller)]) -> Principal:
     """Authenticate the request and say whose files it is about.
 
@@ -479,7 +553,23 @@ async def require_principal(request: Request, caller: Annotated[Caller, Depends(
         HTTPException: 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or not a plain id, or
             ``X-Session-Id`` is present but not a plain id.
     """
-    try:
-        return principal_from_headers(caller, request.headers)
-    except InvalidPrincipal as refused:
-        raise HTTPException(status_code=400, detail=str(refused)) from None
+    return _principal(request, caller)
+
+
+async def require_file_principal(
+    request: Request, caller: Annotated[Caller, Depends(require_file_caller)]
+) -> Principal:
+    """Authenticate the request for a file route a confined caller shares, and say whose files it is about.
+
+    Args:
+        request: The request.
+        caller: The caller :func:`require_file_caller` let through; the key is checked before any other header.
+
+    Returns:
+        The caller, the user and the chat, confined to that chat for a confined caller.
+
+    Raises:
+        HTTPException: 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or not a plain id, or
+            ``X-Session-Id`` is not a plain id; for a confined caller, also if it is missing or ``default``.
+    """
+    return _principal(request, caller)

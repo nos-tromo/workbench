@@ -4,6 +4,10 @@ Open WebUI's browser calls these routes through its proxy: list, upload, view, r
 delete, mkdir and move, all hidden from the tool document. Only ``GET /files/display`` is in
 it, as the ``display_file`` tool.
 
+Ghostwriter calls three of them, list, upload and view, held to the request's chat: any other
+path is ``404`` for it. Its calls state a purpose and a request id, which its events carry, and
+an upload or a view that must state a purpose and does not is ``428``, recorded as denied.
+
 Every read or change of content is one audit event, by file id and never by name, and it is
 written *before* the content leaves, the file becomes visible or the file goes: an action that
 cannot be recorded does not happen. An upload is recorded by the id it was given before its first
@@ -30,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
 from workbench.api.auth import require_tool
-from workbench.api.deps import AuditDep, PrincipalDep, SettingsDep, StoreDep
+from workbench.api.deps import AuditDep, CallAuditDep, FilePrincipalDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.errors import NOT_FOUND
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
@@ -245,13 +249,14 @@ def _save_upload(
 
 
 @router.get("/files/list")
-def list_directory(directory: str, p: PrincipalDep, store: StoreDep) -> dict[str, object]:
-    """List a folder of the user's.
+def list_directory(directory: str, p: FilePrincipalDep, store: StoreDep, _audit: CallAuditDep) -> dict[str, object]:
+    """List a folder of the user's; Ghostwriter's chat folder or a folder in it alone.
 
     Args:
         directory: The folder: ``/workspace``, a chat folder or a folder inside one.
         p: The caller, user and chat.
         store: The file store.
+        _audit: Not recorded through; it refuses a malformed purpose, as the other file routes do.
 
     Returns:
         The folder in its plain form, whether it may be written, and its entries.
@@ -266,9 +271,9 @@ def list_directory(directory: str, p: PrincipalDep, store: StoreDep) -> dict[str
 
 @router.post("/files/upload")
 async def upload_file(
-    directory: str, file: UploadFile, p: PrincipalDep, settings: SettingsDep, store: StoreDep, audit: AuditDep
+    directory: str, file: UploadFile, p: FilePrincipalDep, settings: SettingsDep, store: StoreDep, audit: CallAuditDep
 ) -> dict[str, object]:
-    """Store an uploaded file in a chat folder, or a folder inside one.
+    """Store an uploaded file in a chat folder, or a folder inside one; Ghostwriter's in its chat folder itself.
 
     Args:
         directory: The folder to put the file in.
@@ -276,17 +281,21 @@ async def upload_file(
         p: The caller, user and chat.
         settings: The api's settings.
         store: The file store.
-        audit: The audit log.
+        audit: The audit log, bound to Ghostwriter's call.
 
     Returns:
-        The file's path, which has a number in it if the name was taken, and its size.
+        The file's path, which has a number in it if the name was taken, and its size; for Ghostwriter, its id too.
     """
+    await run_in_threadpool(audit.check, "upload", p)
     rec = await run_in_threadpool(_save_upload, store, audit, settings, p, directory, file)
-    return {"path": rec.virtual_path, "size": rec.size}
+    answer: dict[str, object] = {"path": rec.virtual_path, "size": rec.size}
+    if p.confined:
+        answer["id"] = rec.id
+    return answer
 
 
 @router.get("/files/view")
-def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> StreamingResponse:
+def view_file(path: str, p: FilePrincipalDep, store: StoreDep, audit: CallAuditDep) -> StreamingResponse:
     """Send a file's bytes with its own media type.
 
     Open WebUI may add ``preview=true`` to ask for a rendering of an Office file; it is ignored,
@@ -300,11 +309,12 @@ def view_file(path: str, p: PrincipalDep, store: StoreDep, audit: AuditDep) -> S
         path: The file's virtual path.
         p: The caller, user and chat.
         store: The file store.
-        audit: The audit log.
+        audit: The audit log, bound to Ghostwriter's call.
 
     Returns:
         The file, streamed.
     """
+    audit.check("view", p)
     rec, src = store.open_file(p, path)
     try:
         audit.record("view", _in_folder_of(p, rec), file_ids=[rec.id])

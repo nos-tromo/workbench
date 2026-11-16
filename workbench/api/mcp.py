@@ -22,8 +22,16 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 
-from workbench.api.auth import MCP_PATH, Caller, InvalidPrincipal, principal_from_headers, require_mcp_caller
-from workbench.api.errors import BUSY, TOO_LARGE, compact, describe
+from workbench.api.auth import (
+    MCP_PATH,
+    Caller,
+    InvalidPrincipal,
+    InvalidPurpose,
+    principal_from_headers,
+    purpose_from_headers,
+    require_mcp_caller,
+)
+from workbench.api.errors import BUSY, INVALID_PURPOSE, PURPOSE_REQUIRED, TOO_LARGE, compact, describe
 from workbench.api.jobs import Busy, RequestTooLarge
 from workbench.api.mcp_wire import (
     INTERNAL_ERROR,
@@ -52,8 +60,8 @@ from workbench.api.routing import EncodableRoute
 from workbench.api.store import StoreError
 from workbench.api.tools import NotCompleted
 from workbench.paths import PathError
-from workbench.utils.audit_event import AuditWriteError, Purpose
-from workbench.utils.audit_runtime import PurposeError, clean_request_id, parse_purpose_header
+from workbench.utils.audit_event import AuditWriteError
+from workbench.utils.audit_runtime import clean_request_id
 
 _log = logging.getLogger(__name__)
 
@@ -90,7 +98,7 @@ def call_failure(exc: Exception) -> tuple[str, str] | None:
         The token and the text of an ``isError`` result, or ``None`` for an error that is no tool's refusal.
     """
     if isinstance(exc, PurposeRequired):
-        return "purpose_required", "a stated purpose is required"
+        return "purpose_required", PURPOSE_REQUIRED
     if isinstance(exc, Busy):
         return exc.reason, BUSY
     if isinstance(exc, RequestTooLarge):
@@ -128,10 +136,9 @@ async def _call(request: Request, caller: Caller, params: dict[str, Any]) -> dic
     except InvalidPrincipal as refused:
         raise WireError(400, INVALID_REQUEST, str(refused)) from None
     try:
-        case_ref, reason = parse_purpose_header(request.headers.get("x-audit-purpose"))
-    except PurposeError:
-        raise WireError(400, INVALID_PARAMS, "invalid purpose") from None
-    purpose = Purpose(case_ref=case_ref, reason=reason) if case_ref or reason else None
+        purpose = purpose_from_headers(request.headers)
+    except InvalidPurpose:
+        raise WireError(400, INVALID_PARAMS, INVALID_PURPOSE) from None
     request_id = clean_request_id(request.headers.get("x-request-id"))
     try:
         body = spec.input_model.model_validate(params.get("arguments", {}), context={"wall_cap": caller.wall_s})

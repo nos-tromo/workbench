@@ -21,6 +21,7 @@ from fastapi.dependencies.models import Dependant
 from pydantic import BaseModel
 
 from workbench.api.audit import AuditLog
+from workbench.api.audit import PurposeRequired as PurposeRequired
 from workbench.api.jobs import JobQueue
 from workbench.api.openapi import tool_routes
 from workbench.api.store import Store
@@ -113,10 +114,6 @@ class ToolOutcome:
 
     structured: dict[str, Any]
     blocks: list[dict[str, Any]]
-
-
-class PurposeRequired(Exception):
-    """A purpose the call had to state was not stated; the ``denied`` event is already written."""
 
 
 class ToolGuard:

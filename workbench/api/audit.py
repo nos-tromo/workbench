@@ -20,9 +20,15 @@ further 200 go on a continuation event, ``<operation>.ids``, whose
 A failed write raises :class:`~workbench.utils.audit_event.AuditWriteError`, a
 continuation's as much as the event's; the caller turns it into a refusal and
 returns nothing, because an action that cannot be recorded must not happen.
+
+A call that states its purpose and request id in its headers records through a log
+bound to them (:meth:`AuditLog.bound`), on the same chain. Such a log also refuses an
+action that must state a purpose and did not (:meth:`AuditLog.check`), after recording
+the refusal.
 """
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Final, Self
 
 from workbench.config import Settings
@@ -57,6 +63,37 @@ _FILE: Final = "file"
 CONTINUATION: Final = ".ids"
 
 
+class PurposeRequired(Exception):
+    """A purpose the call had to state was not stated; the ``denied`` event is already written."""
+
+
+def stated(purpose: Purpose | None) -> bool:
+    """Say whether a call stated a purpose.
+
+    Args:
+        purpose: The purpose the call stated, or ``None``.
+
+    Returns:
+        Whether it holds a case reference or a reason.
+    """
+    return purpose is not None and bool(purpose.to_dict())
+
+
+@dataclass(frozen=True)
+class _Binding:
+    """What one call's headers say, for the log bound to it.
+
+    Attributes:
+        purpose: The purpose the call stated, or ``None``.
+        request_id: The call's request id, or ``None``.
+        required: The audit actions the call must state a purpose for.
+    """
+
+    purpose: Purpose | None
+    request_id: str | None
+    required: frozenset[str]
+
+
 class AuditLog:
     """The api's one audit chain, with one method per kind of event.
 
@@ -71,6 +108,50 @@ class AuditLog:
             emitter: The process's emitter, not yet started.
         """
         self.emitter = emitter
+        self._binding: _Binding | None = None
+
+    def bound(
+        self, purpose: Purpose | None, request_id: str | None, *, required: frozenset[str] = frozenset()
+    ) -> "AuditLog":
+        """Make a log for one call, on the same chain: its purpose, its request id and the actions that need a purpose.
+
+        Args:
+            purpose: The purpose the call stated, or ``None``.
+            request_id: The call's request id, or ``None``.
+            required: The audit actions the call must state a purpose for (:meth:`check`).
+
+        Returns:
+            A log on this log's emitter whose :meth:`record` writes ``purpose`` and ``request_id`` where a call gives
+            none. This log is unchanged.
+        """
+        log = AuditLog(self.emitter)
+        log._binding = _Binding(purpose, request_id, required)
+        return log
+
+    def check(self, key: str, p: Principal) -> None:
+        """Refuse an action the call must state a purpose for and did not, after recording the refusal.
+
+        A log that is not :meth:`bound` checks nothing.
+
+        Args:
+            key: The action, a key of :data:`OPERATIONS`.
+            p: The caller, user and chat of the request; the chat is named in the refusal's criteria.
+
+        Raises:
+            PurposeRequired: The key's audit action is one the call must state a purpose for, and it stated none.
+                The ``denied`` event is written first, with no target.
+            KeyError: If ``key`` is not in :data:`OPERATIONS`.
+            AuditWriteError: If the ``denied`` event cannot be written.
+        """
+        binding = self._binding
+        if binding is None:
+            return
+        action, _ = OPERATIONS[key]
+        if action not in binding.required or stated(binding.purpose):
+            return
+        criteria = {"refused": "purpose_required", "container": f"chat:{p.chat_id}"}
+        self.record(key, p, outcome="denied", target_kind=None, criteria=criteria)
+        raise PurposeRequired
 
     @classmethod
     def open(cls, settings: Settings, version: str) -> Self:
@@ -131,11 +212,12 @@ class AuditLog:
             outcome: ``ok``, ``denied`` or ``error``.
             criteria: The action's parameters, never content. ``caller`` is
                 added, and replaces a ``caller`` given here.
-            purpose: The stated purpose, if any.
+            purpose: The stated purpose, if any; a :meth:`bound` log's when ``None``.
             target_kind: What the action touched, ``file`` by default; ``None`` writes no target, as for a call
                 refused before it touched anything.
             count: How many objects it touched, in place of ``len(file_ids)``.
-            request_id: The call's request id, on the event and on each continuation.
+            request_id: The call's request id, on the event and on each continuation; a :meth:`bound` log's when
+                ``None``.
 
         Returns:
             The id of the written event; more than 200 ids add continuations (:meth:`_emit`).
@@ -146,6 +228,9 @@ class AuditLog:
             RuntimeError: If the chain is not started or already closed.
         """
         action, operation = OPERATIONS[key]
+        if self._binding is not None:
+            purpose = self._binding.purpose if purpose is None else purpose
+            request_id = self._binding.request_id if request_id is None else request_id
         # caller goes first so it is among the criteria the emitter keeps when it caps their number.
         merged: dict[str, object] = {"caller": p.caller}
         merged.update((name, value) for name, value in (criteria or {}).items() if name != "caller")

@@ -1,5 +1,6 @@
 """The store keeps files on disk and their metadata in SQLite, and never crosses the user's own root."""
 
+import dataclasses
 import errno
 import io
 import os
@@ -11,7 +12,7 @@ from typing import override
 
 import pytest
 
-from tests.api.conftest import unrecorded
+from tests.api.conftest import PG, unrecorded
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
@@ -462,6 +463,34 @@ def test_two_users_may_hold_the_same_name(store: Store, alice: Principal, bob: P
     """A clash is only within one user's own chat folder."""
     assert put(store, alice).name == "q.xlsx"
     assert put(store, bob).name == "q.xlsx"
+
+
+# --- a confined principal ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/workspace", "/workspace/chat-2", "/workspace/chat-2/q.csv", "/workspace/chat-1/../chat-2/q.csv", "/etc"],
+)
+def test_a_confined_principal_finds_nothing_outside_its_chat(store: Store, path: str) -> None:
+    """The user's other chat, the root and a path outside the workspace are all not found for a confined principal."""
+    other = put(store, dataclasses.replace(PG, chat_id="chat-2"), "q.csv", directory="/workspace/chat-2")
+    assert store.get(dataclasses.replace(PG, confined=False), other.virtual_path) == other
+    with pytest.raises(NotFound):
+        store.list_dir(PG, path)
+    with pytest.raises(NotFound):
+        store.get(PG, path)
+    with pytest.raises(NotFound):
+        store.open_file(PG, path)
+
+
+def test_a_confined_upload_goes_into_the_chat_folder_itself(store: Store) -> None:
+    """A confined principal uploads into its chat folder, never into a folder below it, even one its user made."""
+    store.mkdir(dataclasses.replace(PG, confined=False), "/workspace/chat-1/sub")
+    with pytest.raises(NotFound):
+        put(store, PG, "q.csv", directory="/workspace/chat-1/sub")
+    assert put(store, PG, "q.csv", directory="/workspace/chat-1").virtual_path == "/workspace/chat-1/q.csv"
+    assert [rec.name for rec in store.files_in_chat(PG)] == ["q.csv"]
 
 
 @pytest.mark.parametrize(

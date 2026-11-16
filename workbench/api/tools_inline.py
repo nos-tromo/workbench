@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
-from workbench.api.audit import AuditLog
+from workbench.api.audit import AuditLog, stated
 from workbench.api.auth import Caller
 from workbench.api.jobs import (
     MCP_QUEUE_WAIT_S,
@@ -216,18 +216,6 @@ def output_uri(job_id: str, name: str) -> str:
     return f"workbench://jobs/{job_id}/out/{urllib.parse.quote(name, safe='')}"
 
 
-def _stated(purpose: Purpose | None) -> bool:
-    """Say whether a call stated a purpose.
-
-    Args:
-        purpose: The purpose the call stated, or ``None``.
-
-    Returns:
-        Whether it holds a case reference or a reason.
-    """
-    return purpose is not None and bool(purpose.to_dict())
-
-
 @dataclasses.dataclass(frozen=True)
 class InlineTaker:
     """Records an inline run before anything of its answer goes out (:class:`~workbench.api.jobs.Taker`).
@@ -403,7 +391,7 @@ async def run_python_inline(body: InlinePythonRequest, env: ToolEnv) -> ToolOutc
         AuditWriteError: The event could not be written; nothing of the answer goes out.
     """
     p, caller, settings = env.p, env.caller, env.settings
-    if "combine" in settings.require_purpose and not _stated(env.purpose):
+    if "combine" in settings.require_purpose and not stated(env.purpose):
         criteria = {"refused": "purpose_required", "container": f"chat:{p.chat_id}"}
         await run_in_threadpool(
             env.audit.record,

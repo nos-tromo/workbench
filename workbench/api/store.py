@@ -430,6 +430,9 @@ class Store:
     def _locate(self, p: Principal, virtual: str) -> tuple[Path, list[str]]:
         """Resolve a virtual path and split it into its segments below ``/workspace``.
 
+        A confined principal finds only its own chat folder and what is below it; every other path, and every path
+        :meth:`~workbench.paths.Workspaces.resolve` refuses, is not found for it, so nothing tells it what is there.
+
         Args:
             p: The caller and user.
             virtual: Any virtual path.
@@ -439,9 +442,18 @@ class Store:
 
         Raises:
             PathError: If the path is not inside the user's root.
+            NotFound: For a confined principal, if the path is not its chat folder or below it, or is refused.
         """
-        real = self._ws.resolve(p, virtual)
-        return real, self._ws.to_virtual(p, real).split("/")[2:]
+        try:
+            real = self._ws.resolve(p, virtual)
+        except PathError:
+            if p.confined:
+                raise NotFound("not in the chat") from None
+            raise
+        segments = self._ws.to_virtual(p, real).split("/")[2:]
+        if p.confined and segments[:1] != [p.chat_id]:
+            raise NotFound("not in the chat")
+        return real, segments
 
     def _file_target(self, p: Principal, virtual: str) -> tuple[Path, str, str]:
         """Resolve the path of a file, which must be inside a chat folder.
@@ -631,7 +643,7 @@ class Store:
 
         Args:
             p: The caller and user; the chat comes from ``directory``.
-            directory: ``/workspace/<chat-id>`` or a folder inside it.
+            directory: ``/workspace/<chat-id>`` or a folder inside it; for a confined principal, its chat folder alone.
             filename: The file's name.
             src: The bytes; read in chunks until empty.
             max_bytes: Largest file allowed.
@@ -644,7 +656,8 @@ class Store:
         Raises:
             PathError: If the directory is outside the user's root or is ``/workspace`` itself,
                 or the name is invalid.
-            NotFound: If a folder below the chat folder is missing.
+            NotFound: If a folder below the chat folder is missing; for a confined principal, if the directory is
+                not its chat folder.
             TooLarge: If the file is over ``max_bytes``.
             QuotaExceeded: If it would take the user over ``quota_bytes``.
             StorageFull: If the volume is full.
@@ -654,6 +667,8 @@ class Store:
         folder, segments = self._locate(p, directory)
         if not segments:
             raise PathError("files live inside a chat folder")
+        if p.confined and len(segments) > 1:
+            raise NotFound("not in the chat")
         file_id = uuid.uuid4().hex
         part = folder / f"{file_id}{_PART}"
         room = quota_bytes - self.usage(p)
