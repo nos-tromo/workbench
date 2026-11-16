@@ -42,6 +42,7 @@ from workbench.paths import PathError, Workspaces
 from workbench.protocol import (
     JOB_ID,
     MAX_INLINE_BYTES,
+    MAX_INLINE_FILES,
     MAX_LINE,
     InlineFile,
     JobRequest,
@@ -1570,6 +1571,50 @@ def test_mcp_callers_wait_five_seconds() -> None:
     assert MCP_QUEUE_WAIT_S == 5
 
 
+@pytest.mark.parametrize(
+    ("wall_s", "wait_s", "slots"), [(0, 5, 2), (-1, 5, None), (60, -1, 2), (60, 5, 0), (60, 5, -2)]
+)
+def test_call_limits_refuse_what_no_call_can_have(wall_s: int, wait_s: int, slots: int | None) -> None:
+    """A wall under a second, a negative wait or slots below one are a door's bug, refused where the limits are made."""
+    with pytest.raises(ValueError, match="call limits"):
+        CallLimits(wall_s, wait_s, slots)
+
+
+def test_call_limits_take_the_least_a_call_can_have() -> None:
+    """One second of wall, no wait, one slot or no cap of the caller's own."""
+    assert (CallLimits(1, 0).slots, CallLimits(1, 0, 1).slots) == (None, 1)
+
+
+@pytest.mark.parametrize(
+    "inline",
+    [
+        [PASSAGES, PASSAGES],
+        [InlineFile(name="big.txt", content="x" * (MAX_INLINE_BYTES + 1))],
+        [InlineFile(name=f"p{n}.json", content="[]") for n in range(MAX_INLINE_FILES + 1)],
+        [InlineFile.model_construct(name="../passages.json", content="[]")],
+        [InlineFile.model_construct(name="out", content="[]")],
+    ],
+    ids=["repeated", "too-large", "too-many", "not-a-name", "out"],
+)
+async def test_inline_data_the_protocol_refuses_is_refused_before_a_turn_or_a_job_row(
+    inline: list[InlineFile], settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """As ``submit`` refuses its inputs: at once, while the user's turn is taken, with no job row and nothing sent."""
+    p = docint_user(1)
+    executor.hold = {f"docint/{p.user_id}"}
+    queue = queue_for(settings, executor, store, metrics)
+    first = asyncio.create_task(run_inline(queue, Takes(settings), p))
+    await until(lambda: executor.running == 1)
+    taker = Takes(settings)
+    async with asyncio.timeout(scaled(1)):
+        with pytest.raises(ValueError):
+            await queue.submit_inline(p, "run_python", ARGS, inline, taker, DOCINT)
+    assert (jobs_recorded(settings), len(executor.requests), taker.calls) == (1, 1, [])
+    executor.gate.set()
+    await first
+    assert queue.tracked_users == 0
+
+
 async def test_a_capped_caller_runs_at_most_its_slots_and_leaves_room_for_others(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
@@ -1635,6 +1680,77 @@ async def test_a_per_call_wait_replaces_the_queue_wait(
     await until(lambda: executor.running == 2)
     executor.gate.set()
     await asyncio.gather(*both)
+
+
+async def test_cancelled_docint_calls_give_the_callers_places_back(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """One call cancelled while it waits, one while it runs: then both slots and all 8 waiting places serve again."""
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)}
+    queue = queue_for(settings, executor, store, metrics)
+    calls = {n: asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(4)}
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 2)
+    started = {req.user_id for req in executor.requests}
+    running = next(n for n in calls if docint_user(n).user_id in started)
+    waiting = next(n for n in calls if docint_user(n).user_id not in started)
+    calls[waiting].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await calls[waiting]
+    assert sample(metrics, "workbench_queue_length") == 1
+    calls[running].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await calls[running]
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 0)
+    executor.gate.set()
+    await asyncio.gather(*(call for n, call in calls.items() if n not in {waiting, running}))
+    statuses = [store.get_job(Principal("docint", r.user_id, "default"), r.job_id).status for r in executor.requests]
+    assert sorted(statuses) == ["cancelled", "ok", "ok"]
+    executor.gate.clear()
+    again = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(10)]
+    await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 8)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await run_inline(queue, Takes(settings), docint_user(10))
+    assert refused.value.reason == "queue_full"
+    executor.gate.set()
+    await asyncio.gather(*again)
+    assert queue.tracked_users == 0
+
+
+async def test_a_cancel_while_the_taker_records_waits_for_it_before_staging_goes(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The caller goes away while the taker records: the taker ends with the outputs still staged, then they go."""
+
+    class Held(Takes):
+        def __init__(self, settings: Settings) -> None:
+            super().__init__(settings)
+            self.taking = threading.Event()
+            self.go_on = threading.Event()
+
+        @override
+        def take(self, result: JobResult, taken: TakenOutputs) -> None:
+            self.taking.set()
+            self.go_on.wait(10)
+            super().take(result, taken)
+
+    executor.files = {"counts.csv": b"a,b\n"}
+    taker = Held(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    call = asyncio.create_task(run_inline(queue, taker))
+    await until(taker.taking.is_set)
+    job_id = executor.requests[0].job_id
+    call.cancel()
+    await asyncio.sleep(0.05)
+    assert not call.done()
+    assert (settings.data_dir / "staging" / job_id).is_dir()
+    taker.go_on.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert taker.seen == [["counts.csv"]]
+    assert not (settings.data_dir / "staging" / job_id).exists()
+    assert store.get_job(docint_user(1), job_id).status == "cancelled"
+    assert queue.tracked_users == 0
 
 
 @pytest.mark.parametrize(("wall", "job_wall", "expected"), [(30, 120, 30), (200, 120, 120)])
@@ -1752,10 +1868,16 @@ async def test_the_return_caps(settings: Settings, store: Store, executor: FakeC
 async def test_only_the_jobs_own_staged_regular_files_are_read(
     settings: Settings, store: Store, metrics: Metrics
 ) -> None:
-    """A path outside ``staging/<job-id>/``, a symlink, a folder and a FIFO in a staged file's place are not read."""
+    """A path outside ``staging/<job-id>/``, a symlink, a folder and a FIFO in a staged file's place are not read.
+
+    ``../elsewhere.csv`` names a regular file next to the job's staging folder, so only the name check refuses it.
+    """
     secret = settings.data_dir / "elsewhere.csv"
     secret.parent.mkdir(parents=True, exist_ok=True)
     secret.write_bytes(b"not an output\n")
+    beside = settings.data_dir / "staging" / "elsewhere.csv"
+    beside.parent.mkdir(parents=True)
+    beside.write_bytes(b"not an output either\n")
 
     class Planted(FakeClient):
         @override
@@ -1785,6 +1907,7 @@ async def test_only_the_jobs_own_staged_regular_files_are_read(
         (name, "unreadable") for name in ("link.csv", "folder.csv", "fifo.csv", "elsewhere.csv", "../elsewhere.csv")
     }
     assert secret.read_bytes() == b"not an output\n"
+    assert beside.read_bytes() == b"not an output either\n"
 
 
 async def test_the_taker_records_before_anything_returns_and_its_failure_sends_nothing(

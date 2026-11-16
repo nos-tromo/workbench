@@ -6,6 +6,7 @@ paths that stay below the chat folder, and inline inputs that are each one plain
 """
 
 import re
+from collections.abc import Sequence
 from typing import Any, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
@@ -29,7 +30,11 @@ JOB_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class _Message(BaseModel):
-    """A protocol message: a field it does not declare is refused, not ignored, and a refusal never quotes the input."""
+    """A protocol message: a field it does not declare is refused, not ignored.
+
+    A refusal's ``str()`` and ``repr()`` never quote the input; its ``errors()`` and ``json()`` still carry it unless
+    called with ``include_input=False``.
+    """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -52,6 +57,24 @@ def check_input_path(path: str) -> str:
     for segment in path.split("/"):
         check_filename(segment)
     return path
+
+
+def _check_inline_name(name: str) -> str:
+    """Accept one plain file name that is not the job's output folder.
+
+    Args:
+        name: An inline input's name.
+
+    Returns:
+        ``name``, unchanged.
+
+    Raises:
+        ValueError: It is not a valid file name (``workbench.paths.check_filename``), or it is ``out``.
+    """
+    check_filename(name)
+    if name == OUT_DIR:
+        raise ValueError("an inline input cannot be named out")
+    return name
 
 
 class Limits(_Message):
@@ -99,10 +122,31 @@ class InlineFile(_Message):
         Raises:
             ValueError: It is not a valid file name (``workbench.paths.check_filename``), or it is ``out``.
         """
-        check_filename(value)
-        if value == OUT_DIR:
-            raise ValueError("an inline input cannot be named out")
-        return value
+        return _check_inline_name(value)
+
+
+def check_inline_inputs(entries: Sequence[InlineFile]) -> None:
+    """Accept the inline inputs of one request: the protocol's rules, also for entries built without validation.
+
+    Args:
+        entries: The inline inputs.
+
+    Raises:
+        ValueError: There are more than ``MAX_INLINE_FILES``; a name is not one plain file name or is ``out``; a name
+            is repeated; a text cannot be encoded as UTF-8; or the texts together are more than ``MAX_INLINE_BYTES``
+            in UTF-8. The message never quotes a name or a text.
+    """
+    if len(entries) > MAX_INLINE_FILES:
+        raise ValueError(f"at most {MAX_INLINE_FILES} inline inputs")
+    names = [_check_inline_name(entry.name) for entry in entries]
+    if len(set(names)) != len(names):
+        raise ValueError("inline input names must be unique")
+    try:
+        size = sum(len(entry.content.encode("utf-8")) for entry in entries)
+    except UnicodeEncodeError:
+        raise ValueError("inline inputs must be text UTF-8 can hold") from None
+    if size > MAX_INLINE_BYTES:
+        raise ValueError(f"inline inputs hold more than {MAX_INLINE_BYTES // 1024} KiB together")
 
 
 class JobRequest(_Message):
@@ -202,15 +246,7 @@ class JobRequest(_Message):
                 are more than ``MAX_INLINE_BYTES`` in UTF-8; or the request also names
                 ``input_files``.
         """
-        names = [entry.name for entry in self.inline_inputs]
-        if len(set(names)) != len(names):
-            raise ValueError("inline input names must be unique")
-        try:
-            size = sum(len(entry.content.encode("utf-8")) for entry in self.inline_inputs)
-        except UnicodeEncodeError as exc:
-            raise ValueError("inline inputs must be text UTF-8 can hold") from exc
-        if size > MAX_INLINE_BYTES:
-            raise ValueError(f"inline inputs hold more than {MAX_INLINE_BYTES // 1024} KiB together")
+        check_inline_inputs(self.inline_inputs)
         if self.inline_inputs and self.input_files:
             raise ValueError("inline_inputs cannot come with input_files")
         return self

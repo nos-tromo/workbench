@@ -61,6 +61,7 @@ from workbench.protocol import (
     JobResult,
     Limits,
     OutputFile,
+    check_inline_inputs,
     decode_result,
     encodable,
     encode,
@@ -112,6 +113,15 @@ class CallLimits:
     wall_s: int
     wait_s: int
     slots: int | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse limits no call can have: they are a door's bug, caught here rather than in the queue.
+
+        Raises:
+            ValueError: ``wall_s`` is below 1, ``wait_s`` below 0, or ``slots`` is set and below 1.
+        """
+        if self.wall_s < 1 or self.wait_s < 0 or (self.slots is not None and self.slots < 1):
+            raise ValueError("call limits need a wall of at least 1 s, a wait of at least 0 s and at least 1 slot")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -573,7 +583,8 @@ class JobQueue:
 
         Raises:
             ValueError: ``tool`` is not one of :data:`TOOLS`, or the inline inputs are not what the protocol takes
-                (the door checks them first).
+                (:func:`~workbench.protocol.check_inline_inputs`; the door checks them first). Like ``submit``'s
+                inputs, they are checked before the call waits for its turn, and no job record is made for them.
             PathError: The caller, user or session id is not a safe id.
             Busy: The queue is full, the user's or the caller's share of it is, the turn did not come in time, or the
                 executor has no free slot or cannot be reached.
@@ -583,6 +594,7 @@ class JobQueue:
         """
         if tool not in TOOLS:
             raise ValueError("unknown tool")
+        check_inline_inputs(inline_inputs)
         async with self._turn(p, call):
             return await self._run_inline(p, tool, args, inline_inputs, taker, call)
 
@@ -717,6 +729,44 @@ class JobQueue:
         wall = settings.job_wall_s if call is None else min(call.wall_s, settings.job_wall_s)
         return Limits(wall_s=wall, cpu_s=wall, memory_mb=settings.job_memory_mb, file_mb=settings.upload_max_mb)
 
+    def _request(
+        self,
+        job_id: str,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        call: CallLimits | None,
+        *,
+        input_files: Sequence[str] = (),
+        inline_inputs: Sequence[InlineFile] = (),
+    ) -> JobRequest:
+        """Build a job's request: the inputs it copies or the data it carries, within its limits.
+
+        Args:
+            job_id: The job's id.
+            p: The caller, user and chat.
+            tool: Name of the runner.
+            args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
+            call: The call's wall; ``None`` for ``job_wall_s``.
+            input_files: Paths relative to the chat folder.
+            inline_inputs: The data.
+
+        Returns:
+            The request.
+        """
+        return JobRequest(
+            job_id=job_id,
+            tool=tool,
+            args=encodable(args),  # a lone surrogate from the model would make the request unsendable
+            caller=p.caller,
+            user_id=p.user_id,
+            chat_id=p.chat_id,
+            input_files=list(input_files),
+            inline_inputs=list(inline_inputs),
+            limits=self._limits(call),
+            max_chars=self._settings.result_max_kb * 1024,
+        )
+
     async def _run(
         self,
         p: Principal,
@@ -743,23 +793,12 @@ class JobQueue:
             Busy: The executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
         """
-        settings = self._settings
         job = await asyncio.to_thread(self._store.add_job, p, tool)
         status = "error"
         completed = False
         files: list[FileRecord] = []
         try:
-            req = JobRequest(
-                job_id=job.id,
-                tool=tool,
-                args=encodable(args),  # a lone surrogate from the model would make the request unsendable
-                caller=p.caller,
-                user_id=p.user_id,
-                chat_id=p.chat_id,
-                input_files=list(input_files),
-                limits=self._limits(call),
-                max_chars=settings.result_max_kb * 1024,
-            )
+            req = self._request(job.id, p, tool, args, call, input_files=input_files)
             result = await self._execute(req)
             if keeper is not None:
                 result, files = await self._keep(p, job.id, result, keeper)
@@ -811,18 +850,7 @@ class JobQueue:
         status = "error"
         completed = False
         try:
-            req = JobRequest(
-                job_id=job.id,
-                tool=tool,
-                args=encodable(args),
-                caller=p.caller,
-                user_id=p.user_id,
-                chat_id=p.chat_id,
-                input_files=[],
-                inline_inputs=list(inline_inputs),
-                limits=self._limits(call),
-                max_chars=self._settings.result_max_kb * 1024,
-            )
+            req = self._request(job.id, p, tool, args, call, inline_inputs=inline_inputs)
             result = await self._execute(req)
             taken = await self._hand_over(job.id, result, taker)
             result = result.model_copy(update={"outputs": []})  # staged paths are gone once the job settles

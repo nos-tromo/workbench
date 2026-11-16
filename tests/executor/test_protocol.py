@@ -292,6 +292,7 @@ def test_inline_text_stays_out_of_reprs() -> None:
     with pytest.raises(ValueError, match="unique") as refused:
         decode_request(line)
     assert "Hafen" not in str(refused.value)
+    assert "Hafen" not in repr(refused.value)
 
 
 def test_inline_inputs_never_come_with_input_files() -> None:
