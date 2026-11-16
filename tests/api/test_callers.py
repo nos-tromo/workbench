@@ -178,26 +178,34 @@ def _passes_the_gate(callers: CallerRegistry, method: str, target: str, key: str
 
 
 @pytest.mark.parametrize(
-    ("method", "target", "docint", "open_webui"),
+    ("method", "target", "docint", "open_webui", "ghostwriter"),
     [
-        ("POST", "/MCP", False, True),
-        ("POST", "//mcp", False, True),
-        ("POST", "/%6Dcp", True, False),
-        ("POST", "/mcp?x=1", True, False),
-        ("POST", "/mcp/", False, True),
-        ("HEAD", "/mcp", True, False),
-        ("OPTIONS", "/mcp", True, False),
-        ("HEAD", "/files/list", False, True),
-        ("OPTIONS", "/files/list", False, True),
+        ("POST", "/MCP", False, True, False),
+        ("POST", "//mcp", False, True, False),
+        ("POST", "/%6Dcp", True, False, True),
+        ("POST", "/mcp?x=1", True, False, True),
+        ("POST", "/mcp/", False, True, False),
+        ("HEAD", "/mcp", True, False, True),
+        ("OPTIONS", "/mcp", True, False, True),
+        ("HEAD", "/files/list", False, True, True),
+        ("OPTIONS", "/files/list", False, True, True),
+        ("POST", "/Files/upload", False, True, False),
+        ("POST", "//files/upload", False, True, False),
+        ("POST", "/files/upload/", False, True, False),
+        ("POST", "/files/./upload", False, True, False),
+        ("POST", "/files/upload%2F", False, True, False),
+        ("POST", "/files/%75pload", False, True, True),
+        ("DELETE", "/files/%63hat", False, False, True),
     ],
 )
 def test_the_gate_judges_the_path_routing_will_see(
-    settings: Settings, method: str, target: str, docint: bool, open_webui: bool
+    settings: Settings, method: str, target: str, docint: bool, open_webui: bool, ghostwriter: bool
 ) -> None:
     """Each form of a path reaches the app for the caller whose door it is, whatever the method, and for no other."""
     callers = CallerRegistry.from_settings(settings)
     assert _passes_the_gate(callers, method, target, DOCINT_KEY) is docint
     assert _passes_the_gate(callers, method, target, KEY) is open_webui
+    assert _passes_the_gate(callers, method, target, GHOSTWRITER_KEY) is ghostwriter
 
 
 def test_the_routes_own_key_check_refuses_a_caller_off_the_terminal_door(app: FastAPI) -> None:
