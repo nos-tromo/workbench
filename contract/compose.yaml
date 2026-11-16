@@ -42,13 +42,15 @@ services:
     environment:
       HOME: /tmp
       WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
-      # The terminal server: one bearer connection to workbench, chat attachments uploaded into it, every user.
+      # The terminal server: one bearer connection to workbench, chat attachments uploaded into it, every user. The
+      # chat context (server_type orchestrator, contexts.chat) holds an attachment of an unsaved chat until the chat
+      # is saved, so it lands in that chat's folder, not in default (open-webui-service CLAUDE.md, § Workbench).
       ENABLE_TOOL_SERVERS: "true"
       TERMINAL_SERVER_CONNECTIONS: >-
-        [{"id": "workbench", "name": "Workbench", "enabled": true,
+        [{"id": "workbench", "name": "Workbench", "enabled": true, "server_type": "orchestrator",
         "url": "http://workbench-api:8000", "path": "/openapi.json",
         "key": "${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}", "auth_type": "bearer",
-        "config": {"chat_uploads": "filesystem",
+        "config": {"chat_uploads": "filesystem", "contexts": {"chat": {"context_id": "chat_id"}},
         "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}]}}]
       # As in production: .env, not the admin UI, is the configuration.
       ENABLE_PERSISTENT_CONFIG: "false"
