@@ -2,7 +2,7 @@
 
 The configuration tests read ``docker inspect`` and look from inside the running executor, so
 they prove what the kernel enforces, not only what the compose file asks for. The tests that
-run code go through the ``run_python`` tool, as the model would, on Open WebUI's door or docint's.
+run code go through the ``run_python`` tool, as the model would, on Open WebUI's door, docint's or Ghostwriter's.
 """
 
 import base64
@@ -21,7 +21,17 @@ import pytest
 from docx import Document
 
 from tests.fixtures import make_templates as mt
-from tests.isolation.conftest import docker, environment, inspect, mcp_call, mcp_result, run_python, stdout_of
+from tests.isolation.conftest import (
+    docker,
+    environment,
+    ghostwriter,
+    ghostwriter_mcp,
+    inspect,
+    mcp_call,
+    mcp_result,
+    run_python,
+    stdout_of,
+)
 
 pytestmark = pytest.mark.isolation
 
@@ -117,7 +127,7 @@ def test_executor_is_isolated_by_configuration(executor: str) -> None:
     }
     assert host["Sysctls"] == {"fs.mqueue.queues_max": "0", "kernel.shm_rmid_forced": "1"}
     assert info["Config"]["User"] == "0:0"
-    assert "OPEN_WEBUI_WORKBENCH_KEY" not in env and "DOCINT_WORKBENCH_KEY" not in env
+    assert not {"OPEN_WEBUI_WORKBENCH_KEY", "DOCINT_WORKBENCH_KEY", "GHOSTWRITER_WORKBENCH_KEY"} & set(env)
 
 
 def test_the_running_executor_has_what_its_configuration_asks_for(executor: str) -> None:
@@ -662,3 +672,184 @@ def test_no_core_dumps_in_either_container(api_info: dict[str, Any], executor: s
     answer = mcp_result(mcp_call(api_info, "import resource; print(resource.getrlimit(resource.RLIMIT_CORE))", []))
     assert answer["isError"] is False, answer["structuredContent"]
     assert answer["structuredContent"]["stdout"].strip() == "(0, 0)"
+
+
+# --- Ghostwriter's chats -------------------------------------------------------------------------------------------
+
+CHAT_A, CHAT_B = "c" * 64, "e" * 64
+#: The user of the chat delete, whose chat holds that test's files alone.
+DELETING_USER = "d" * 64
+NOT_FOUND = (404, {"detail": "not found"})
+GHOSTWRITER_MARKER = "synthetic-ghostwriter-marker-5c1e"
+FIGURES = f"quarter,figure\nq1,10\n{GHOSTWRITER_MARKER},32\n".encode()
+TABLE: dict[str, Any] = {
+    "name": "counts",
+    "format": "csv",
+    "columns": ["author", "posts"],
+    "rows": [["user-a", 12], ["user-b", 7]],
+}
+PREVIEW = {
+    "columns": ["author", "posts"],
+    "rows": [["user-a", "12"], ["user-b", "7"]],
+    "row_count": 2,
+    "truncated": False,
+}
+
+TABLE_AND_CHART = r"""
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+table = pd.DataFrame({"author": ["user-a", "user-b"], "posts": [12, 7]})
+table.to_csv("out/t.csv", index=False)
+figure, axes = plt.subplots()
+axes.bar(table["author"], table["posts"])
+figure.savefig("out/chart.png")
+"""
+
+#: Run in the api: the files of each caller's workspaces that hold the marker, and Open WebUI's folders of the chat.
+WHERE_IT_LIES = r"""
+import glob, json, os, sys
+chat, marker = sys.argv[1], sys.argv[2].encode()
+def holding(root):
+    found = []
+    for folder, _, names in os.walk(root):
+        for name in names:
+            with open(os.path.join(folder, name), "rb") as f:
+                if marker in f.read():
+                    found.append(os.path.relpath(os.path.join(folder, name), root))
+    return sorted(found)
+print(json.dumps({
+    "ghostwriter": holding("/data/workspaces/ghostwriter"),
+    "open-webui": holding("/data/workspaces/open-webui"),
+    "open-webui chats": glob.glob(f"/data/workspaces/open-webui/*/{chat}"),
+}))
+"""
+
+#: Run in the api: what is left of one Ghostwriter chat on the volume and in the database, read-only.
+LEFT_OF_THE_CHAT = r"""
+import json, os, sqlite3, sys
+user, chat = sys.argv[1], sys.argv[2]
+owner = ("ghostwriter", user, chat)
+db = sqlite3.connect("file:/data/workbench.db?mode=ro", uri=True)
+mine = "WHERE caller = ? AND user_id = ? AND chat_id = ?"
+print(json.dumps({
+    "folder": os.path.exists(f"/data/workspaces/ghostwriter/{user}/{chat}"),
+    "files": db.execute(f"SELECT COUNT(*) FROM files {mine}", owner).fetchone()[0],
+    "jobs": db.execute(f"SELECT COUNT(*) FROM jobs {mine}", owner).fetchone()[0],
+    "staging": os.listdir("/data/staging"),
+}))
+"""
+
+
+def _ghostwriter_upload(api_info: dict[str, Any], *, chat: str, user: str = "a" * 64) -> httpx.Response:
+    """Upload :data:`FIGURES` as ``quarterly-figures.csv`` into Ghostwriter's chat ``chat``."""
+    files = {"file": ("quarterly-figures.csv", FIGURES)}
+    answer = ghostwriter(
+        api_info, "POST", "/files/upload", chat=chat, user=user, params={"directory": f"/workspace/{chat}"}, files=files
+    )
+    assert answer.status_code == 200, answer.text
+    return answer
+
+
+def _audit_events(container: str) -> list[dict[str, Any]]:
+    """Read a container's audit events so far: the JSON lines of its standard output."""
+    lines = docker("logs", container).splitlines()
+    return [event for line in lines if line.startswith("{") and "operation" in (event := json.loads(line))]
+
+
+def test_ghostwriters_files_are_apart_from_open_webuis(
+    api: httpx.Client, api_info: dict[str, Any], executor: str
+) -> None:
+    """The same user id in both callers: Ghostwriter's upload is in its own workspace, and Open WebUI finds none of it.
+
+    Open WebUI's workspace of that user has no such chat, the chat lists empty and the file's path is not found, though
+    the request names that very chat. On the volume, the file lies in Ghostwriter's chat folder and nowhere else.
+    """
+    path = f"/workspace/{CHAT_A}/quarterly-figures.csv"
+    uploaded = _ghostwriter_upload(api_info, chat=CHAT_A, user="user-a").json()
+    assert (uploaded["path"], uploaded["size"]) == (path, len(FIGURES))
+
+    open_webui = {"X-User-Id": "user-a", "X-Session-Id": CHAT_A}
+    workspace = api.get("/files/list", params={"directory": "/workspace"}, headers=open_webui)
+    assert workspace.status_code == 200, workspace.text
+    assert CHAT_A not in [entry["name"] for entry in workspace.json()["entries"]]
+    listed = api.get("/files/list", params={"directory": f"/workspace/{CHAT_A}"}, headers=open_webui)
+    assert (listed.status_code, listed.json()["entries"]) == (200, [])
+    viewed = api.get("/files/view", params={"path": path}, headers=open_webui)
+    assert (viewed.status_code, viewed.json()) == NOT_FOUND
+
+    lies = json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", WHERE_IT_LIES, CHAT_A, GHOSTWRITER_MARKER))
+    assert lies == {
+        "ghostwriter": [f"user-a/{CHAT_A}/quarterly-figures.csv"],
+        "open-webui": [],
+        "open-webui chats": [],
+    }
+
+
+def test_another_chats_path_is_not_found(api_info: dict[str, Any]) -> None:
+    """A path into another chat of the same user is not found: on the file routes, and through a tool.
+
+    In its own chat the file is viewed and read; named from another chat it is the plain 404 on the routes, and an
+    error result through ``read_document``, ``refused`` and ``not found``, as any refusal.
+    """
+    path = f"/workspace/{CHAT_A}/quarterly-figures.csv"
+    _ghostwriter_upload(api_info, chat=CHAT_A)
+    own = ghostwriter(api_info, "GET", "/files/view", chat=CHAT_A, params={"path": path})
+    assert (own.status_code, own.content) == (200, FIGURES)
+    read = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": path}, chat=CHAT_A))
+    assert read["isError"] is False, read["structuredContent"]
+
+    viewed = ghostwriter(api_info, "GET", "/files/view", chat=CHAT_B, params={"path": path})
+    assert (viewed.status_code, viewed.json()) == NOT_FOUND
+    listed = ghostwriter(api_info, "GET", "/files/list", chat=CHAT_B, params={"directory": f"/workspace/{CHAT_A}"})
+    assert (listed.status_code, listed.json()) == NOT_FOUND
+    refused = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": path}, chat=CHAT_B))
+    assert (refused["isError"], refused["structuredContent"]) == (True, {"reason": "refused"})
+    assert refused["content"] == [{"type": "text", "text": "not found"}]
+
+
+def test_a_real_preview_comes_back(api_info: dict[str, Any]) -> None:
+    """The executor reads each table's preview in the job: ``write_table``'s csv and xlsx, ``run_python``'s csv.
+
+    The chart ``run_python`` writes beside its table is an output too, with no preview.
+    """
+    for kind in ("csv", "xlsx"):
+        wrote = mcp_result(ghostwriter_mcp(api_info, "write_table", {**TABLE, "format": kind}, chat=CHAT_A))
+        assert wrote["isError"] is False, wrote["structuredContent"]
+        (output,) = wrote["structuredContent"]["outputs"]
+        assert (output["name"], output["preview"]) == (f"counts.{kind}", PREVIEW)
+
+    ran = mcp_result(ghostwriter_mcp(api_info, "run_python", {"code": TABLE_AND_CHART}, chat=CHAT_A))
+    assert ran["isError"] is False, ran["structuredContent"]
+    outputs = ran["structuredContent"]["outputs"]
+    assert {output["name"]: output["preview"] for output in outputs} == {"t.csv": PREVIEW, "chart.png": None}
+    assert {output["name"]: output["mime"] for output in outputs} == {"t.csv": "text/csv", "chart.png": "image/png"}
+
+
+def test_a_chat_delete_leaves_nothing(api_info: dict[str, Any], executor: str) -> None:
+    """Ghostwriter deletes a chat it uploaded into, wrote a table in and ran Python in: its four files, and the rest.
+
+    Before, the chat has its folder, four file rows and two job rows; after, none of them, and nothing is staged. The
+    api's log holds the delete's event, by the ids of the four files.
+    """
+    user = DELETING_USER
+    uploaded = _ghostwriter_upload(api_info, chat=CHAT_A, user=user).json()
+    wrote = mcp_result(ghostwriter_mcp(api_info, "write_table", TABLE, chat=CHAT_A, user=user))
+    ran = mcp_result(ghostwriter_mcp(api_info, "run_python", {"code": TABLE_AND_CHART}, chat=CHAT_A, user=user))
+    assert (wrote["isError"], ran["isError"]) == (False, False), (wrote, ran)
+    made = [output["id"] for answer in (wrote, ran) for output in answer["structuredContent"]["outputs"]]
+
+    def left() -> dict[str, Any]:
+        return json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", LEFT_OF_THE_CHAT, user, CHAT_A))
+
+    assert left() == {"folder": True, "files": 4, "jobs": 2, "staging": []}
+    deleted = ghostwriter(api_info, "DELETE", "/files/chat", chat=CHAT_A, user=user)
+    assert (deleted.status_code, deleted.json()) == (200, {"deleted": 4})
+    assert left() == {"folder": False, "files": 0, "jobs": 0, "staging": []}
+
+    _logged(api_info["Id"], "chat.delete")
+    (event,) = [e for e in _audit_events(api_info["Id"]) if e["operation"] == "chat.delete"]
+    assert (event["action"], event["outcome"], event["actor"]) == ("delete", "ok", {"user": user, "via": "service"})
+    assert sorted(event["target"].pop("ids")) == sorted([uploaded["id"], *made])
+    assert event["target"] == {"kind": "file", "count": 4, "container": f"chat:{CHAT_A}"}

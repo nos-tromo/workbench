@@ -22,10 +22,10 @@ API_URL = os.environ.get("WORKBENCH_TEST_API", "http://127.0.0.1:18100")
 COMPOSE_FILE = Path(__file__).resolve().parents[2] / "docker" / "compose.yaml"
 _SETTLE_S = 60.0
 
-#: The MCP revision docint speaks, and the prefix of the client's keys in ``params._meta``.
+#: The MCP revision docint and Ghostwriter speak, and the prefix of the client's keys in ``params._meta``.
 MCP_REVISION = "2026-07-28"
 _META = "io.modelcontextprotocol/"
-#: A synthetic purpose: the door requires one for ``combine`` (``AUDIT_REQUIRE_PURPOSE``).
+#: A synthetic purpose: ``AUDIT_REQUIRE_PURPOSE`` asks one of the MCP door's tools and Ghostwriter's file routes.
 PURPOSE = "case_ref=case-0001&reason=isolation+test"
 
 
@@ -164,6 +164,36 @@ def run_python(api: httpx.Client, code: str, *, user: str = "user-a", chat: str 
     return api.post("/tools/run_python", json={"code": code}, headers={"X-User-Id": user, "X-Session-Id": chat})
 
 
+def _tools_call(key: str, tool: str, arguments: dict[str, Any], *, user: str, session: str) -> httpx.Response:
+    """Call a tool on the MCP door: a modern ``tools/call`` with :data:`PURPOSE`.
+
+    Args:
+        key: The caller's key.
+        tool: The tool's name.
+        arguments: The tool's arguments.
+        user: The user pseudonym the caller would send.
+        session: The session pseudonym the caller would send.
+
+    Returns:
+        The api's answer.
+    """
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_REVISION,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": tool,
+        "X-User-Id": user,
+        "X-Session-Id": session,
+        "X-Audit-Purpose": PURPOSE,
+    }
+    meta = {f"{_META}protocolVersion": MCP_REVISION, f"{_META}clientCapabilities": {}}
+    params = {"name": tool, "arguments": arguments, "_meta": meta}
+    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+    return httpx.post(f"{API_URL}/mcp", json=message, headers=headers, timeout=300)
+
+
 def mcp_call(
     api_info: dict[str, Any], code: str, data: list[dict[str, str]], *, user: str = "a" * 64, session: str = "b" * 64
 ) -> httpx.Response:
@@ -180,21 +210,47 @@ def mcp_call(
         The api's answer.
     """
     key = environment(api_info)["DOCINT_WORKBENCH_KEY"]
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": MCP_REVISION,
-        "Mcp-Method": "tools/call",
-        "Mcp-Name": "run_python",
-        "X-User-Id": user,
-        "X-Session-Id": session,
-        "X-Audit-Purpose": PURPOSE,
-    }
-    meta = {f"{_META}protocolVersion": MCP_REVISION, f"{_META}clientCapabilities": {}}
-    params = {"name": "run_python", "arguments": {"code": code, "data": data}, "_meta": meta}
-    message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
-    return httpx.post(f"{API_URL}/mcp", json=message, headers=headers, timeout=300)
+    return _tools_call(key, "run_python", {"code": code, "data": data}, user=user, session=session)
+
+
+def ghostwriter(
+    api_info: dict[str, Any], method: str, path: str, *, chat: str, user: str = "a" * 64, **kwargs: Any
+) -> httpx.Response:
+    """Call a file route as Ghostwriter does: its key, the user and the chat pseudonyms, and :data:`PURPOSE`.
+
+    Args:
+        api_info: ``docker inspect`` of the api's container, whose environment holds Ghostwriter's key.
+        method: The HTTP method.
+        path: The route's path.
+        chat: The chat pseudonym, sent as ``X-Session-Id``.
+        user: The user pseudonym, sent as ``X-User-Id``.
+        **kwargs: What ``httpx`` takes besides.
+
+    Returns:
+        The api's answer.
+    """
+    key = environment(api_info)["GHOSTWRITER_WORKBENCH_KEY"]
+    headers = {"Authorization": f"Bearer {key}", "X-User-Id": user, "X-Session-Id": chat, "X-Audit-Purpose": PURPOSE}
+    return httpx.request(method, f"{API_URL}{path}", headers=headers, timeout=300, **kwargs)
+
+
+def ghostwriter_mcp(
+    api_info: dict[str, Any], tool: str, arguments: dict[str, Any], *, chat: str, user: str = "a" * 64
+) -> httpx.Response:
+    """Call a workspace tool through Ghostwriter's door: a modern ``tools/call``, as :func:`mcp_call` builds one.
+
+    Args:
+        api_info: ``docker inspect`` of the api's container, whose environment holds Ghostwriter's key.
+        tool: The tool's name.
+        arguments: The tool's arguments.
+        chat: The chat pseudonym, sent as ``X-Session-Id``.
+        user: The user pseudonym, sent as ``X-User-Id``.
+
+    Returns:
+        The api's answer.
+    """
+    key = environment(api_info)["GHOSTWRITER_WORKBENCH_KEY"]
+    return _tools_call(key, tool, arguments, user=user, session=chat)
 
 
 def mcp_result(response: httpx.Response) -> dict[str, Any]:
