@@ -98,7 +98,10 @@ class InlinePythonRequest(BaseModel):
     data: list[InlineData] = Field(
         default_factory=list,
         max_length=MAX_DATA,
-        description="The data, at most 8 entries and 512 KiB in all: each is a read-only file of the current folder.",
+        description=(
+            f"The data, at most {MAX_DATA} entries and {MAX_DATA_BYTES // 1024} KiB in all: each is a read-only file "
+            "of the current folder."
+        ),
     )
     time_limit_s: int | None = Field(default=None, strict=True, description=_TIME_LIMIT)
 

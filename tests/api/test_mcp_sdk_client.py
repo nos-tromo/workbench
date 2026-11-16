@@ -82,6 +82,7 @@ def served(app: FastAPI) -> Iterator[tuple[str, list[str | None]]]:
     finally:
         server.should_exit = True
         thread.join(scaled(10))
+        assert not thread.is_alive(), "uvicorn did not shut down"
         sock.close()
 
 

@@ -68,8 +68,8 @@ _NAME_HEADER: Final = "mcp-name"
 #: A header value that is one token of visible ASCII.
 _TOKEN: Final = re.compile(r"[\x21-\x7e]+")
 _BASE64: Final = re.compile(r"=\?base64\?(.*)\?=", re.DOTALL)
-#: The media ranges that allow a JSON answer.
-_JSON_RANGES: Final = frozenset({"*/*", "application/*", "application/json"})
+#: The media ranges that cover a JSON answer, by how specific each is (RFC 9110 section 12.5.1).
+_JSON_RANGES: Final = {"*/*": 0, "application/*": 1, "application/json": 2}
 
 
 @dataclass(frozen=True)
@@ -181,15 +181,19 @@ def check_media(content_type: str | None, accept: str | None) -> None:
         accept: The ``Accept`` header, or ``None``.
 
     Raises:
-        WireError: ``415`` if the body is not ``application/json``; ``406`` if no range of ``Accept`` that is not
-            weighted ``q=0`` is ``*/*``, ``application/*`` or ``application/json``.
+        WireError: ``415`` if the body is not ``application/json``; ``406`` if the most specific range of ``Accept``
+            that covers ``application/json`` (itself, ``application/*`` or ``*/*``) is weighted ``q=0``, or none does.
     """
     if content_type is None or _media_type(content_type) != "application/json":
         raise WireError(415, INVALID_REQUEST, "the body must be application/json")
     if accept is None:
         return
-    ranges = [item for item in accept.split(",") if item.strip()]
-    if not any(_media_type(item) in _JSON_RANGES and not _refused_by_q(item) for item in ranges):
+    covering = [
+        (_JSON_RANGES[_media_type(item)], not _refused_by_q(item))
+        for item in accept.split(",")
+        if _media_type(item) in _JSON_RANGES
+    ]
+    if not covering or not any(allowed for rank, allowed in covering if rank == max(rank for rank, _ in covering)):
         raise WireError(406, INVALID_REQUEST, "the answer is application/json")
 
 
@@ -360,22 +364,20 @@ def discover_result() -> dict[str, Any]:
 
 
 def _tool(spec: "ToolSpec", caller: "Caller") -> dict[str, Any]:
-    """One tool as ``tools/list`` names it."""
-    if spec.input_schema is not None:
-        input_schema = spec.input_schema(caller)
-    elif spec.input_model is not None:
-        input_schema = spec.input_model.model_json_schema()
-    else:
-        input_schema = {"type": "object"}
-    tool: dict[str, Any] = {
+    """One tool as ``tools/list`` names it.
+
+    Raises:
+        ValueError: The spec has no ``input_schema`` or no ``output_model``; every inline spec has both.
+    """
+    if spec.input_schema is None or spec.output_model is None:
+        raise ValueError(f"{spec.name} cannot be listed: it has no input schema or no output model")
+    return {
         "name": spec.name,
         "title": spec.title,
         "description": spec.description,
-        "inputSchema": input_schema,
+        "inputSchema": spec.input_schema(caller),
+        "outputSchema": spec.output_model.model_json_schema(),
     }
-    if spec.output_model is not None:
-        tool["outputSchema"] = spec.output_model.model_json_schema()
-    return tool
 
 
 def tools_list_result(specs: Sequence["ToolSpec"], caller: "Caller", era: Era) -> dict[str, Any]:

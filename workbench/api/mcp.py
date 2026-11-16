@@ -211,6 +211,8 @@ async def mcp(request: Request, caller: McpCaller) -> Response:
         except HTTPException as exc:
             if exc.status_code == 413:
                 return too_large()
+            if exc.status_code != 422:
+                raise
             raise WireError(400, INVALID_REQUEST, "request nested too deeply") from None
         except ValueError:
             raise WireError(400, PARSE_ERROR, "parse error") from None

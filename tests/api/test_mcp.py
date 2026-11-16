@@ -9,13 +9,13 @@ import base64
 import dataclasses
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final
 
 import httpx2
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
@@ -31,10 +31,12 @@ from workbench.api.audit import AuditLog
 from workbench.api.auth import MCP_PATH, KeyGate
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue
 from workbench.api.main import create_app
-from workbench.api.mcp_wire import INSTRUCTIONS, MODERN
+from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, tools_list_result
 from workbench.api.metrics import Metrics
-from workbench.api.routing import MAX_DEPTH, nested_deeper_than
+from workbench.api.registry import ToolSpec
+from workbench.api.routing import MAX_DEPTH, EncodableRequest, nested_deeper_than
 from workbench.api.store import Store
+from workbench.api.tools_inline import INLINE_SPECS
 from workbench.config import Settings
 
 #: The fixtures of ``run_python``'s tests: the real app over the scripted executor.
@@ -220,6 +222,17 @@ def test_a_body_nested_past_the_depth_limit_is_an_invalid_request(client: TestCl
     assert "id" not in body
 
 
+def test_only_a_422_from_the_body_is_too_deep(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any other refusal the body's reader raises is an unexpected error, never mislabelled as nesting."""
+
+    async def refuse(self: object) -> Any:
+        raise HTTPException(status_code=418, detail="synthetic")
+
+    monkeypatch.setattr(EncodableRequest, "json", refuse)
+    body = error(rpc(client, "tools/list"), 500, -32603)
+    assert body["error"] == {"code": -32603, "message": "internal error", "data": {"reason": "internal"}}
+
+
 def test_a_declared_body_over_2_mib_is_a_jsonrpc_413_before_it_is_read(app: FastAPI) -> None:
     """Through the whole stack: the declared length is refused, as JSON-RPC, before a chunk is asked for."""
     asked, sent = asgi(app, [(b"authorization", f"Bearer {DOCINT_KEY}".encode())])
@@ -265,6 +278,10 @@ def test_a_streamed_body_over_2_mib_is_a_jsonrpc_413(client: TestClient) -> None
         ("application/json", "text/event-stream", 406),
         ("application/json", "text/html", 406),
         ("application/json", "application/json;q=0, text/event-stream", 406),
+        ("application/json", "application/json;q=0, */*", 406),
+        ("application/json", "application/*;q=0, */*", 406),
+        ("application/json", "*/*;q=0, application/json", 200),
+        ("application/json", "application/*;q=0, application/json;q=0.1", 200),
         ("application/json", "*/*", 200),
         ("application/json", "application/*", 200),
         ("application/json", "text/html, Application/JSON;q=0.5", 200),
@@ -273,7 +290,7 @@ def test_a_streamed_body_over_2_mib_is_a_jsonrpc_413(client: TestClient) -> None
 def test_media_types_are_matched_as_http_says(
     client: TestClient, content_type: str | None, accept: str | None, status: int
 ) -> None:
-    """Case-insensitively, parameters allowed; a missing ``Accept`` is ``*/*``, and ``q=0`` refuses a type."""
+    """Case-insensitively, parameters allowed; a missing ``Accept`` is ``*/*``; the most specific range decides."""
     r = rpc(client, "tools/list", headers={**HD, "Content-Type": content_type, "Accept": accept})
     if status == 200:
         assert [tool["name"] for tool in result(r)["tools"]] == ["run_python"]
@@ -595,6 +612,26 @@ def test_tools_list_is_the_callers_inline_tools_in_name_order(client: TestClient
     assert "x-mcp-header" not in json.dumps(listed)
 
 
+@pytest.mark.parametrize(
+    "lacking",
+    [
+        lambda spec: dataclasses.replace(spec, input_schema=None),
+        lambda spec: dataclasses.replace(spec, output_model=None),
+    ],
+    ids=["no_input_schema", "no_output_model"],
+)
+def test_a_spec_without_a_schema_or_an_output_model_cannot_be_listed(
+    app: FastAPI, lacking: Callable[[ToolSpec], ToolSpec]
+) -> None:
+    """Every inline spec has both, so a spec that lacks one fails loudly instead of listing a made-up shape."""
+    caller = app.state.callers.get("docint")
+    (spec,) = INLINE_SPECS
+    era = Era(MODERN, modern=True)
+    assert tools_list_result([spec], caller, era)["tools"]
+    with pytest.raises(ValueError, match="run_python"):
+        tools_list_result([lacking(spec)], caller, era)
+
+
 def test_a_tool_result_is_the_structured_answer_and_its_blocks(client: TestClient, fake_executor: Scripted) -> None:
     """The structured answer as compact JSON text, then the chart for the user and the table as a resource."""
     fake_executor.payload = ran("2 authors")
@@ -804,6 +841,7 @@ def test_a_missing_required_purpose_is_purpose_required_and_recorded_denied(
         assert result(call(strict, headers={**HD, "X-Audit-Purpose": "reason=docint+chat"}))["isError"] is False
     denied, ran_once = inline_events(audit_lines)
     assert (denied["outcome"], denied["request_id"]) == ("denied", "req-1")
+    assert "target" not in denied
     assert ran_once["outcome"] == "ok"
     assert len(fake_executor.requests) == 1
 
