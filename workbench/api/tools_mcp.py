@@ -5,8 +5,9 @@ both doors run the same code (:func:`workspace_run`). The adapter passes each pa
 the door decides: the caller's limits on the queue (:class:`CallJobs`) and a settings copy whose job wall leaves
 :data:`PREVIEW_RESERVE_S` for the previews the job reads after its runner.
 
-The answer is the route's own, plus ``outputs``: every file the call wrote, by reference (:class:`OutputRef`), with the
-table preview the executor read for a csv or xlsx output. The text block is that answer without the previews, so a
+The answer is the route's own, with its ``None`` fields as the inline door sends them, so that it holds to the output
+schema the door lists; plus ``outputs``: every file the call wrote, by reference (:class:`OutputRef`), with the table
+preview the executor read for a csv or xlsx output. The text block is that answer without the previews, so a
 model fed the text gets no table rows it did not ask for; the caller's cards read ``structuredContent``. The tools'
 texts tell the model the user sees each new file as a card, since ``display_file``, Open WebUI's card, is not served
 here (:data:`MCP_TEXT`); the terminal door's texts stay as they are.
@@ -235,8 +236,8 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         key: The tool, a key of the audit's operations.
 
     Returns:
-        The adapter: it passes the route each parameter it takes, by name, and answers the route's answer plus
-        ``outputs``, its text without the previews.
+        The adapter: it passes the route each parameter it takes, by name, and answers the route's answer, with its
+        ``None`` fields, plus ``outputs``, its text without the previews.
     """
     takes = frozenset(inspect.signature(endpoint).parameters)
     asynchronous = inspect.iscoroutinefunction(endpoint)
@@ -272,7 +273,7 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         answer = await endpoint(**given) if asynchronous else await run_in_threadpool(endpoint, **given)
         outputs: list[OutputRef] = [] if jobs is None else jobs.outputs()
         structured = {
-            **answer.model_dump(mode="json", exclude_none=True),
+            **answer.model_dump(mode="json"),
             "outputs": [output.model_dump(mode="json") for output in outputs],
         }
         told = [

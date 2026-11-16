@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 import httpx2
+import jsonschema
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -158,13 +159,14 @@ def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> No
 
 
 def test_a_call_answers_the_rest_model_plus_outputs(client: TestClient, store: Store) -> None:
-    """The REST answer, and the new file by reference: its id, path, name, type, size and its table preview."""
+    """The REST answer with its null fields, and the new file by reference: id, path, name, type, size, preview."""
     answer = result(acall(client, "write_table", TABLE))
     rec = store.get(PG, f"{CHAT}/counts.csv")
     assert answer["isError"] is False and [b["type"] for b in answer["content"]] == ["text"]
     assert answer["structuredContent"] == {
         "path": rec.virtual_path,
         "rows": 2,
+        "hint": None,
         "outputs": [
             {
                 "id": rec.id,
@@ -176,6 +178,40 @@ def test_a_call_answers_the_rest_model_plus_outputs(client: TestClient, store: S
             }
         ],
     }
+
+
+def test_every_answer_holds_to_the_output_schema_it_lists(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
+    """Each tool's structured answer is valid against its outputSchema from tools/list, its null fields kept.
+
+    The template's text controls have no options, so inspect_template answers ``options: null`` for them.
+    """
+    schemas = {t["name"]: t["outputSchema"] for t in result(rpc(client, "tools/list", headers=HG))["tools"]}
+    form = keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
+    keep(store, PG, "q.csv")
+    assistant = {"kind": "assistant"}
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("list_files", {}),
+        ("read_document", {"path": f"{CHAT}/q.csv"}),
+        ("search_files", {"query": "user-a"}),
+        ("inspect_template", {"path": form.virtual_path}),
+        ("fill_template", {"path": form.virtual_path, "values": {"customer": {"value": "x", "source": assistant}}}),
+        ("write_table", TABLE),
+        ("write_document", {"name": "notes", "format": "md", "markdown": "# Hafen"}),
+    ]
+    answers = {tool: result(acall(client, tool, arguments)) for tool, arguments in calls}
+    fake_executor.payload = ran("ok")
+    fake_executor.files = {"chart.png": PNG, "counts.csv": CSV}
+    fake_executor.previews = {"counts.csv": PREVIEW}
+    answers["run_python"] = result(acall(client, "run_python", {"code": "print('ok')"}))
+    assert set(answers) == EIGHT
+    for tool, answer in answers.items():
+        assert answer["isError"] is False, tool
+        validator = jsonschema.Draft202012Validator(schemas[tool])
+        assert [e.message for e in validator.iter_errors(answer["structuredContent"])] == [], tool
+    (customer,) = [f for f in answers["inspect_template"]["structuredContent"]["fields"] if f["name"] == "customer"]
+    assert customer["options"] is None
 
 
 def test_the_text_block_leaves_the_previews_out(client: TestClient) -> None:
