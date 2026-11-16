@@ -31,9 +31,13 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
 | `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
+| `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and four file routes. The same rules; unset, Ghostwriter's door is off. |
+| `GHOSTWRITER_WORKBENCH_TOOLS` | the eight workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool, never `display_file`. |
+| `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
+| `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 
-The api needs at least one of the two keys, or it refuses to start; two callers
-with the same key stop the start too.
+The api needs at least one of the three keys, or it refuses to start; two
+callers with the same key stop the start too.
 
 ### The caller key
 
@@ -47,7 +51,8 @@ deploy's `env-sync.conf`, the `[shared: open-webui-service]` tag in
 is unset in both. From open-webui-service v0.14.0 the key also switches the
 connection on: its `ENABLE_TOOL_SERVERS` follows the key, so without it there
 Open WebUI runs without workbench. `DOCINT_WORKBENCH_KEY` is shared the same
-way with docint, whose `WORKBENCH_API_KEY` holds the value.
+way with docint, and `GHOSTWRITER_WORKBENCH_KEY` with Ghostwriter; each holds
+the value as its `WORKBENCH_API_KEY`.
 
 The keys are compared in constant time (`workbench/api/auth.py`). They reach only
 the api: the executor never reads them.
@@ -59,8 +64,8 @@ the api: the executor never reads them.
 | `WORKBENCH_NET` | `workbench-net` | Name of the external network between the api and its callers; `make network` creates it. Change it only if you renamed the network. |
 
 The api joins it as `workbench-api` on port 8000, exposed and never published.
-Only callers (Open WebUI, docint) and obs-plane's scraper join it. The executor
-has no network.
+Only callers (Open WebUI, docint, Ghostwriter) and obs-plane's scraper join it.
+The executor has no network.
 
 ## Jobs
 
@@ -177,14 +182,15 @@ The formulas, for other slot counts or job memory:
 |---|---|---|
 | `WORKBENCH_RETENTION_DAYS` | 7 | Days a workspace file or job record is kept after it was made. A changed value applies at once, with no notice ([retention.md](retention.md#a-changed-period-applies-at-once)). |
 | `WORKBENCH_RETENTION_INTERVAL_S` | 300 | Seconds between retention sweeps. |
-| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door only; Open WebUI cannot state one. An empty value set in `.env` requires none. An unknown action stops the start. |
+| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine,modify,collect` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door and Ghostwriter's file routes; Open WebUI cannot state one. An empty value set in `.env` requires none. An unknown action stops the start. |
 
-The period is shared with open-webui-service: from v0.14.0 a banner there tells
-every user how long workspace files are kept, and deploy's `make env` copies
-`WORKBENCH_RETENTION_DAYS` from workbench's `.env` to open-webui-service's
-(`[shared: open-webui-service]` in `.env.example`). Set it in workbench's `.env`:
-a value set only in open-webui-service's would be copied into workbench's, and
-workbench would delete by it, with no notice.
+The period is shared with open-webui-service and Ghostwriter, which keeps tool
+previews until it: from v0.14.0 a banner in open-webui-service tells every user
+how long workspace files are kept, and deploy's `make env` copies
+`WORKBENCH_RETENTION_DAYS` from workbench's `.env` to both
+(`[shared: open-webui-service, ghostwriter]` in `.env.example`). Set it in
+workbench's `.env`: a value set only in a partner's would be copied into
+workbench's, and workbench would delete by it, with no notice.
 
 `AUDIT_OUTPUT` is set by compose (`container`) and is not in `.env.example`
 ([audit.md](audit.md#settings)).

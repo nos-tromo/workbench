@@ -36,8 +36,10 @@ docint's search stays in docint, and workbench never joins `data-net`.
 The design is `docs/superpowers/specs/2026-11-13-workbench-design.md`, the
 build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`; version 2's are
 `docs/superpowers/specs/2026-11-15-v2-mcp-docint-design.md` and
-`docs/superpowers/plans/2026-11-15-workbench-v2.md`. Where they and `docs/`
-differ, `docs/` describes the code.
+`docs/superpowers/plans/2026-11-15-workbench-v2.md`; v0.3.0's are deploy's
+`docs/superpowers/specs/2026-11-16-ghostwriter-design.md` and
+`docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`. Where they
+and `docs/` differ, `docs/` describes the code.
 
 ## Planning
 
@@ -109,8 +111,15 @@ makes a tool of every operation in it. The nine: `list_files`,
   the inline tools (`run_python` on data that comes with the call, outputs
   returned and never kept). `mcp.py` is the MCP door's dispatch and
   `mcp_wire.py` its wire rules, with no I/O.
+- `workbench/api/tools_mcp.py`: Ghostwriter's eight workspace tools on `/mcp`,
+  each calling its route function. A call's `structuredContent` is the route's
+  answer plus `outputs`, each file it wrote with its id and, for csv and xlsx, a
+  preview that `workbench/executor/preview.py` reads in the job. The text block
+  carries no previews and is not re-cut after `outputs`; 5 s of the wall
+  (`PREVIEW_RESERVE_S`) are kept for the previews.
 
-Adding a tool touches: its route and a name in `registry.WORKSPACE_TOOLS`, or
+Adding a tool touches: its route and a name in `registry.WORKSPACE_TOOLS` (and
+`registry.MCP_WORKSPACE_TOOLS`, if Ghostwriter may call it), or
 for an inline tool its spec in `tools_inline.INLINE_SPECS` and a name in
 `registry.INLINE_TOOLS`; its runner and `jobs.TOOLS`, if it runs in the
 executor; `audit.OPERATIONS`, if it is recorded; `docs/permissions.md` and
@@ -136,11 +145,13 @@ path the browser sends, so the allow-list is workbench's. A trailing slash is a
 Handshake routes answer from memory or the database, never through the queue.
 
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
-key, door, file form and allowed tools. Two, each with a door and a file form:
-`open-webui` (terminal door, workspace files, all nine tools) and `docint` (MCP
+key, door, file form and allowed tools. Three, each with a door and a file form:
+`open-webui` (terminal door, workspace files, all nine tools), `docint` (MCP
 door at `/mcp`, inline data, `DOCINT_WORKBENCH_TOOLS`, with its own wall cap and
-running-job cap). The key picks the caller; the door answers 404 on any other
-caller's paths. The api starts with either key.
+running-job cap) and `ghostwriter` (`/mcp` and four file routes, workspace files,
+the eight tools, its own caps, confined to its chat). The key picks the caller;
+the door answers 404 on any other caller's paths. The api starts with any one of
+the three keys.
 
 ## The boundaries
 
@@ -188,8 +199,8 @@ container is set up as compose sets it.
   verifier, `AUDIT_OUTPUT=container`. `workbench/utils/audit_event.py` and
   `workbench/utils/audit_runtime.py` are vendored verbatim from
   `nos-tromo/.github` (`configs/audit/`); never edit them, CI fails on drift.
-  A purpose on the MCP door (`X-Audit-Purpose`, `AUDIT_REQUIRE_PURPOSE`), none on
-  the terminal door; no `recipient` on `disclose`.
+  A purpose on the MCP door and Ghostwriter's file routes (`X-Audit-Purpose`,
+  `AUDIT_REQUIRE_PURPOSE`), none on the terminal door; no `recipient` on `disclose`.
 - **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
   is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
   first; leftovers of interrupted work after an hour, recorded first; empty
@@ -210,7 +221,7 @@ make test-isolation       # the sandbox on a real stack (project workbench-test)
 make test-load            # the 10-user load test on that stack (manual, not in CI)
 make test-contract        # against the pinned Open WebUI (project workbench-contract)
 
-cp .env.example .env      # set OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY (32+ characters)
+cp .env.example .env      # set one of the three caller keys (32+ characters)
 make network volumes      # the external workbench-net and workbench-data
 make build && make up     # production shape, no host port; make dev = build + up-dev (:8100)
 make health               # container status, then the api's /healthz from inside
@@ -250,9 +261,10 @@ executor one shared block (`x-settings`), since the executor bounds every job by
 its own copy. `WORKBENCH_DATA_DIR`, `WORKBENCH_EXECUTOR_SOCKET` and
 `WORKBENCH_SLOT_UID_BASE` are tied to the images and mounts and are never set
 in compose. `OPEN_WEBUI_WORKBENCH_KEY` holds the same value as
-open-webui-service's, `DOCINT_WORKBENCH_KEY` as docint's `WORKBENCH_API_KEY`;
-docint's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's `environment:`
-alone, since the executor reads none of them.
+open-webui-service's, `DOCINT_WORKBENCH_KEY` as docint's `WORKBENCH_API_KEY` and
+`GHOSTWRITER_WORKBENCH_KEY` as Ghostwriter's; docint's and Ghostwriter's
+variables and `AUDIT_REQUIRE_PURPOSE` are in the api's `environment:` alone,
+since the executor reads none of them.
 
 ## Gotchas (verified)
 

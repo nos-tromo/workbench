@@ -81,7 +81,8 @@ class Settings:
         docint_tools: The tools docint may use.
         docint_wall_s: Wall-clock seconds one of docint's jobs may run; at most ``job_wall_s``.
         docint_slots: Jobs of docint's that may run at once; fewer than ``executor_slots``.
-        require_purpose: The audit actions a call through the MCP door must state a purpose for.
+        require_purpose: The audit actions a call through the MCP door, or one of Ghostwriter's file routes, must state
+            a purpose for.
         ghostwriter_key: Bearer key Ghostwriter presents; ``None`` when unset, and always for the executor role.
         ghostwriter_tools: The tools Ghostwriter may use.
         ghostwriter_wall_s: Wall-clock seconds one of Ghostwriter's jobs may run; from ``MIN_GHOSTWRITER_WALL_S`` to

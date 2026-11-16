@@ -101,16 +101,21 @@ services:
     environment:
       <<: *settings
       # The bearer key Open WebUI presents: at least 32 characters when set.
-      # The api starts with either caller key and refuses to start with none.
+      # The api starts with any one caller key and refuses to start with none.
       OPEN_WEBUI_WORKBENCH_KEY: ${OPEN_WEBUI_WORKBENCH_KEY:-}
       # docint, the second caller: its key (at least 32 characters when set),
-      # its tools and its limits. The executor reads none of these. The purpose
-      # rule is colon-less, so an empty value set in .env requires none.
+      # its tools and its limits. The executor reads none of these.
       DOCINT_WORKBENCH_KEY: ${DOCINT_WORKBENCH_KEY:-}
       DOCINT_WORKBENCH_TOOLS: ${DOCINT_WORKBENCH_TOOLS:-run_python}
       DOCINT_WORKBENCH_WALL_S: ${DOCINT_WORKBENCH_WALL_S:-60}
       DOCINT_WORKBENCH_SLOTS: ${DOCINT_WORKBENCH_SLOTS:-2}
-      AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-query,disclose,combine}
+      # Ghostwriter, the third caller: the same four.
+      GHOSTWRITER_WORKBENCH_KEY: ${GHOSTWRITER_WORKBENCH_KEY:-}
+      GHOSTWRITER_WORKBENCH_TOOLS: ${GHOSTWRITER_WORKBENCH_TOOLS:-list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document}
+      GHOSTWRITER_WORKBENCH_WALL_S: ${GHOSTWRITER_WORKBENCH_WALL_S:-120}
+      GHOSTWRITER_WORKBENCH_SLOTS: ${GHOSTWRITER_WORKBENCH_SLOTS:-2}
+      # Colon-less, so an empty value set in .env requires no purpose.
+      AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-query,disclose,combine,modify,collect}
       # Data-protection audit log: the hash-chained events go to the
       # container's main stdout under a container-wide lock (on the /tmp
       # tmpfs); ops logs go to stderr.

@@ -33,10 +33,10 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | Field | Value |
 |---|---|
 | `action` / `operation` | by event key, below |
-| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id, or docint's keyed pseudonym (see [Who](#who-the-actor)) |
+| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id, or a keyed pseudonym of docint's or Ghostwriter's (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
 | `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
-| `criteria` | `caller` (`open-webui` or `docint`), and the keys below |
+| `criteria` | `caller` (`open-webui`, `docint` or `ghostwriter`), and the keys below |
 
 The `container` is the chat folder the files live in, never the chat the
 request named (`workbench/api/files.py:_in_folder_of`). Open WebUI's browser can
@@ -48,7 +48,7 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 
 | Key | `action` / `operation` | `target.ids` | `criteria` besides `caller` | Outcome |
 |---|---|---|---|---|
-| `upload` | `collect` / `file.upload` | the new file | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
+| `upload` | `collect` / `file.upload` | the new file (Ghostwriter's answer names it as `id`) | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
 | `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
 | `read` | `disclose` / `file.read` | the text file read whole | — | `ok`, before the text goes; a file that is not text or is too large is refused and not recorded |
 | `display` | `disclose` / `file.display` | the file shown as a card | — | `ok`; a file that does not exist is not recorded |
@@ -171,12 +171,13 @@ A retention record that cannot be written stops the api (see
 ## Who: the actor
 
 The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id
-or docint's keyed pseudonym, with `via: service`: the caller acts for the user.
-While the account exists, an Open WebUI admin resolves the id in Open WebUI's
-user table, and Open WebUI's own per-request audit records carry the same id
-with the account. A docint pseudonym resolves through docint's own `disclose`
-event for the call (same request id and job), which names the user. The caller,
-`open-webui` or `docint`, is in every event's `criteria`.
+or a keyed pseudonym of docint's or Ghostwriter's, with `via: service`: the
+caller acts for the user. While the account exists, an Open WebUI admin
+resolves the id in Open WebUI's user table, and Open WebUI's own per-request
+audit records carry the same id with the account. A docint pseudonym resolves
+through docint's own `disclose` event for the call (same request id and job),
+which names the user. The caller, `open-webui`, `docint` or `ghostwriter`, is in
+every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user
@@ -188,18 +189,20 @@ not use it.
 
 ## Purpose, recipient and request id
 
-- **Purpose.** On the MCP door a call states its purpose in `X-Audit-Purpose`,
-  and it is recorded. `AUDIT_REQUIRE_PURPOSE` (`query,disclose,combine` in
-  compose) makes a call without one `denied`. Open WebUI cannot send a purpose,
-  so the terminal door records none and requires none.
+- **Purpose.** On the MCP door, and on Ghostwriter's file routes, a call states
+  its purpose in `X-Audit-Purpose`, and it is recorded. `AUDIT_REQUIRE_PURPOSE`
+  (`query,disclose,combine,modify,collect` in compose) makes a call without one
+  `denied`, with no target (`428` on a file route). Open WebUI cannot send a
+  purpose, so the terminal door records none and requires none.
 - **No `recipient` on `disclose`.** A view, read or display goes to the user's
   own session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
-- **Request id.** An MCP call's `X-Request-ID` is on its event, which ties it to
-  docint's `disclose`. Open WebUI's tool calls carry no message id workbench
-  could tie together: the events of one agent turn share their `container` and
-  follow each other in the chain. Only a continuation of a long id list names a
-  parent (see [Long lists of files](#long-lists-of-files)).
+- **Request id.** The `X-Request-ID` of an MCP call, or of a Ghostwriter file
+  route, is on its event, which ties it to docint's `disclose`. Open WebUI's
+  tool calls carry no message id workbench could tie together: the events of one
+  agent turn share their `container` and follow each other in the chain. Only a
+  continuation of a long id list names a parent (see [Long lists of
+  files](#long-lists-of-files)).
 
 ## The Open WebUI side
 
@@ -256,8 +259,8 @@ as `service_version`:
 - `lifecycle` / `start` opens it;
 - `admin` / `config.audit` (actor `via: system`) records the limits in force:
   `retention_days`, `executor_slots`, `queue_max`, `job_wall_s`,
-  `upload_max_mb`, `workspace_max_mb`, `callers` (each by name, door, tools,
-  wall cap and slots) and `require_purpose`, sorted. Never a key;
+  `upload_max_mb`, `workspace_max_mb`, `callers` (up to three, each by name,
+  door, tools, wall cap and slots) and `require_purpose`, sorted. Never a key;
 - `lifecycle` / `heartbeat` follows every 60 seconds;
 - `lifecycle` / `shutdown` closes it on a clean stop.
 
@@ -285,7 +288,7 @@ lock file is `/tmp/audit-stream.lock` on the api's `/tmp` tmpfs.
 | Variable | Default | Purpose |
 |---|---|---|
 | `AUDIT_OUTPUT` | `stdout` (compose sets `container`) | Where the chain goes: `stdout` for the process's stdout, `container` for the container's main stdout under the container-wide lock. Any other value stops the start. Not in `.env.example`: compose fixes it |
-| `AUDIT_REQUIRE_PURPOSE` | none in the code; compose sets `query,disclose,combine` | The actions a call must state a purpose for, on the MCP door only ([configuration.md](configuration.md#audit-and-retention)) |
+| `AUDIT_REQUIRE_PURPOSE` | none in the code; compose sets `query,disclose,combine,modify,collect` | The actions a call must state a purpose for, on the MCP door and Ghostwriter's file routes ([configuration.md](configuration.md#audit-and-retention)) |
 
 `AUDIT_CASE_REF`, `AUDIT_REASON` and `AUDIT_CLI_USER` are read by other members
 of the federation. workbench reads none of them.

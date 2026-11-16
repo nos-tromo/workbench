@@ -184,22 +184,25 @@ leaves through the callers' model calls: Open WebUI's, above, and docint's.
 These are facts about the software. The legal assessment stays with the
 operator (deploy ADR 0003, "Consequences").
 
-**Categories of data.** Whatever users upload, or docint sends with a call
-(passages of its documents), which workbench cannot know in advance: documents,
-spreadsheets, e-mails, presentations, and what is in them.
+**Categories of data.** Whatever users upload (Ghostwriter's, by chat), or docint
+sends with a call (passages of its documents), which workbench cannot know in
+advance: documents, spreadsheets, e-mails, presentations, and what is in them.
 That can include special categories of personal data. Also what the model
 writes into new files (table values, Markdown, template values) and their
 names. Besides: file names, the Open WebUI account id of each user, chat ids,
-docint's user and session pseudonyms with the purpose and request id it sends,
-and the time and tool of each run.
+the user and session pseudonyms of docint and Ghostwriter with the purpose and
+request id they send, and the time and tool of each run.
 
-**Categories of data subjects.** The users of Open WebUI and docint, and every
-person named in the files or data they send or in the values the model writes.
+**Categories of data subjects.** The users of Open WebUI, docint and Ghostwriter
+(the last two as pseudonyms), and every person named in the files or data they
+send or in the values the model writes.
 
 **Where data flows.** These are the flows, as facts:
 
 - to the caller that asked, for the same user: tool results and files to Open
   WebUI; results to docint (workbench keeps neither its data nor its outputs);
+  results to Ghostwriter, with `outputs` and a preview of each csv or xlsx file,
+  which Ghostwriter keeps for `WORKBENCH_RETENTION_DAYS`;
 - through Open WebUI, to the federation's inference router and the model the
   operator configured behind it: tool results enter the model's context. When
   that model is run by an outside provider, they leave the host and the
@@ -221,8 +224,10 @@ outside provider, they leave the host and the federation. Whether any of these
 is a recipient in the legal sense is for the operator to decide.
 
 **Storage periods.** Files and job records: `WORKBENCH_RETENTION_DAYS`, 7 days by
-default, from creation. Leftovers of interrupted work: one hour. Audit events:
-obs-plane's audit retention (`AUDIT_RETENTION`, one year by default). Copies in
+default, from creation. Ghostwriter's chat delete (`DELETE /files/chat`) removes
+the chat's files at once and leaves an event by file id, nothing else.
+Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
+retention (`AUDIT_RETENTION`, one year by default). Copies in
 Open WebUI's chat history: its chat retention, 365 days by default. Copies in
 docint's session database, the analyses kept with the chat turn: docint's own
 retention; workbench keeps neither the data nor the outputs of a docint call.

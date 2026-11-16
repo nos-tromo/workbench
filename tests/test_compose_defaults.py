@@ -16,7 +16,8 @@ import pytest
 import yaml
 
 from tests.conftest import _time_scale
-from workbench.config import load_settings
+from workbench.api.audit import OPERATIONS
+from workbench.config import GHOSTWRITER_DEFAULT_TOOLS, load_settings
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKER = ROOT / "docker"
@@ -42,6 +43,17 @@ CALLER_DEFAULTS = {
     "DOCINT_WORKBENCH_TOOLS": "run_python",
     "DOCINT_WORKBENCH_WALL_S": "60",
     "DOCINT_WORKBENCH_SLOTS": "2",
+}
+
+#: Ghostwriter's variables in the api's environment: the key, its tools and its two limits.
+EIGHT_LIST = (
+    "list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document"
+)
+GHOSTWRITER_DEFAULTS = {
+    "GHOSTWRITER_WORKBENCH_KEY": "",
+    "GHOSTWRITER_WORKBENCH_TOOLS": EIGHT_LIST,
+    "GHOSTWRITER_WORKBENCH_WALL_S": "120",
+    "GHOSTWRITER_WORKBENCH_SLOTS": "2",
 }
 
 #: The executor supervisor's capabilities (docs/sandbox.md).
@@ -104,9 +116,38 @@ def test_the_api_alone_gets_the_callers_variables() -> None:
     assert {key: default_of(api[key]) for key in CALLER_DEFAULTS} == {
         key: (key, value) for key, value in CALLER_DEFAULTS.items()
     }
-    assert api["AUDIT_REQUIRE_PURPOSE"] == "${AUDIT_REQUIRE_PURPOSE-query,disclose,combine}"
+    assert api["AUDIT_REQUIRE_PURPOSE"] == "${AUDIT_REQUIRE_PURPOSE-query,disclose,combine,modify,collect}"
     names = {*CALLER_DEFAULTS, "AUDIT_REQUIRE_PURPOSE"}
     assert names.isdisjoint(spec["services"]["executor"]["environment"]) and names.isdisjoint(spec["x-settings"])
+
+
+def test_the_api_alone_gets_ghostwriters_variables() -> None:
+    """Ghostwriter's key, tools and limits reach the api, not the executor and not the shared block."""
+    spec = compose()
+    api = spec["services"]["api"]["environment"]
+    assert {key: default_of(api[key]) for key in GHOSTWRITER_DEFAULTS} == {
+        key: (key, value) for key, value in GHOSTWRITER_DEFAULTS.items()
+    }
+    assert set(GHOSTWRITER_DEFAULTS).isdisjoint(spec["services"]["executor"]["environment"])
+    assert set(GHOSTWRITER_DEFAULTS).isdisjoint(spec["x-settings"])
+
+
+def test_the_purpose_default_covers_every_recorded_ghostwriter_tool() -> None:
+    """Each action Ghostwriter's tools, its upload and its view are recorded under needs a purpose; ``delete`` does not.
+
+    ``chat.delete`` is Ghostwriter's own retention too, which states none, so it never gets a 428.
+    """
+    api = compose()["services"]["api"]["environment"]
+    default = _ANY_DEFAULT.fullmatch(api["AUDIT_REQUIRE_PURPOSE"])
+    assert default is not None
+    required = set(default.group(2).split(","))
+    tools = {OPERATIONS[tool][0] for tool in GHOSTWRITER_DEFAULT_TOOLS if tool in OPERATIONS}
+    assert tools | {OPERATIONS["upload"][0], OPERATIONS["view"][0]} <= required
+    assert OPERATIONS["chat_delete"][0] not in required
+    settings = load_settings(
+        {"OPEN_WEBUI_WORKBENCH_KEY": "k" * 32, "AUDIT_REQUIRE_PURPOSE": default.group(2)}, role="api"
+    )
+    assert settings.require_purpose == required
 
 
 def test_the_settings_tied_to_the_images_stay_out_of_compose() -> None:
@@ -626,6 +667,20 @@ def test_open_webuis_key_is_no_longer_required() -> None:
         ("DOCINT_WORKBENCH_KEY", "# [secret] [shared: docint WORKBENCH_API_KEY]"),
     ):
         assert lines[lines.index(f"# {key}=") - 1] == tags, key
+
+
+def test_the_ghostwriter_lines_of_env_example() -> None:
+    """Ghostwriter's key is shared and commented out, never active or required; its tools are the code's own."""
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    assert (
+        lines[lines.index("# GHOSTWRITER_WORKBENCH_KEY=") - 1] == "# [secret] [shared: ghostwriter WORKBENCH_API_KEY]"
+    )
+    assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: open-webui-service, ghostwriter]"
+    assert not any(line.startswith("GHOSTWRITER_WORKBENCH_KEY=") for line in lines)
+    assert not any("[required]" in line for line in lines if not line.startswith("#   "))
+    assert f"# GHOSTWRITER_WORKBENCH_TOOLS={EIGHT_LIST}" in lines
+    assert set(EIGHT_LIST.split(",")) == GHOSTWRITER_DEFAULT_TOOLS
+    assert "# --- ghostwriter ---" in lines
 
 
 def test_health_shows_the_containers_and_asks_the_api() -> None:

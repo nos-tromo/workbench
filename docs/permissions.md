@@ -4,8 +4,8 @@ What each tool and each file route of workbench may read and write, what it
 records in the audit log, and what it keeps. Then the boundaries that hold for
 all of them, and what the model is told.
 
-workbench serves two callers, Open WebUI and docint (see [Callers and
-doors](#callers-and-doors)). Open WebUI turns every
+workbench serves three callers, Open WebUI, docint and Ghostwriter (see [Callers
+and doors](#callers-and-doors)). Open WebUI turns every
 operation of `GET /openapi.json` into a tool for the model
 (`workbench/api/openapi.py:tool_openapi`). Its file browser calls the file
 routes through Open WebUI's terminal proxy, `/api/v1/terminals/<id>/…`. The
@@ -17,12 +17,20 @@ file routes are not in the tool document, so the model cannot call them.
 |---|---|---|---|---|---|
 | `open-webui` | terminal | workspace | all nine | `WORKBENCH_JOB_WALL_S` | not capped |
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the eight, never `display_file`) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). An MCP caller gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`; a terminal caller gets `404` on `/mcp`,
   and so on `/api/v1/terminals/<id>/mcp` through Open WebUI's proxy. Every such
   `404` is `{"detail": "not found"}`.
+- Ghostwriter's key reaches `/mcp` and four file routes: `/files/upload`,
+  `/files/view`, `/files/list` and `/files/chat`. A purpose it must state and
+  did not is `428` on a file route.
+- Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
+  else being `404`; `default` or no session is `400`. For up to an hour after
+  `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
+  that chat answers `404`.
 - The tool list is enforced on both doors: a terminal tool route depends on
   `require_tool("<name>")`, which answers `404` for a tool not on the caller's
   list, and `tools/call` on `/mcp` answers it `400`, `-32602`, "unknown tool".
@@ -51,6 +59,9 @@ Every tool that runs in the executor also leaves a job record (see
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
 | `write_document` | nothing of the chat: the Markdown comes in the call | one new `.docx` or `.md` in the chat | `collect` / `tool.write_document` | the new file and a job record |
 | `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
+
+On `/mcp` the eight tools answer Ghostwriter as their routes do, plus `outputs`:
+the id of each file the call wrote and, for a csv or xlsx file, a preview of it.
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
 `read_document`, `search_files`, `run_python`),

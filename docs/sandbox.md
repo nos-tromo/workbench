@@ -501,6 +501,11 @@ Each of these is accepted. Each says what it would take.
   whatever the limit. systemd-coredump honours a limit of 0; other handlers may
   not. The operator's measure: the host keeps a file pattern or
   systemd-coredump, or turns dumps off (`Storage=none` in `coredump.conf`).
+- **A job can forge the preview of its own file.** The preview of a csv or xlsx
+  output is read in the job's own process after its runner, within 2 s, so
+  `run_python` can write its own `previews.json`. A preview describes only the
+  caller's own output; the supervisor and the api check its shape and caps
+  (`TablePreview`) and parse no file.
 
 ## gVisor
 
