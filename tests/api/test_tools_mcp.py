@@ -32,7 +32,7 @@ from tests.api.test_tools_templates import Local
 from tests.callers import EIGHT
 from tests.conftest import scaled
 from tests.fixtures import make_templates as mt
-from workbench.api.audit import AuditLog
+from workbench.api.audit import OPERATIONS, AuditLog
 from workbench.api.auth import CallerRegistry
 from workbench.api.jobs import Busy, CallLimits, JobQueue
 from workbench.api.main import create_app
@@ -509,13 +509,30 @@ def strict_client(settings: Settings, store: Store, audit: AuditLog, executor: L
     return TestClient(create_app(required, store=store, audit=audit, jobs=queue))
 
 
-@pytest.mark.parametrize("tool", ["read_document", "write_table"])
+def test_the_guard_covers_every_recorded_workspace_tool() -> None:
+    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other seven, each under its recorded action."""
+    assert set(EIGHT) - set(OPERATIONS) == {"list_files"}
+    assert {tool: action for tool, (action, _) in GUARDED.items()} == {
+        tool: OPERATIONS[tool][0] for tool in EIGHT - {"list_files"}
+    }
+
+
+@pytest.mark.parametrize("tool", sorted(GUARDED))
 def test_a_stated_purpose_and_request_id_reach_the_tool_event(
-    client: TestClient, store: Store, audit_lines: AuditLines, caplog: pytest.LogCaptureFixture, tool: str
+    client: TestClient,
+    store: Store,
+    audit_lines: AuditLines,
+    caplog: pytest.LogCaptureFixture,
+    fake_executor: Local,
+    tmp_path: Path,
+    tool: str,
 ) -> None:
     """Both come as the headers state them, the purpose as the parser normalizes it; no log line holds it."""
     caplog.set_level(logging.DEBUG)
     keep(store, PG, "q.csv")
+    keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
+    if tool == "run_python":
+        fake_executor.payload = ran("1")
     _, arguments = GUARDED[tool]
     assert result(acall(client, tool, arguments, headers=PURPOSE))["isError"] is False
     (event,) = tool_events(audit_lines)
@@ -561,12 +578,15 @@ def test_a_missing_required_purpose_is_denied_before_any_job(
     assert job_rows(settings) == []
 
 
-def test_an_empty_purpose_is_none(settings: Settings, store: Store, audit: AuditLog, fake_executor: Local) -> None:
-    """A purpose header with neither a case reference nor a reason is no purpose."""
+def test_an_empty_purpose_is_none(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, fake_executor: Local
+) -> None:
+    """A purpose header with neither a case reference nor a reason is no purpose: the denied event has none."""
     with strict_client(settings, store, audit, fake_executor, "collect") as client:
         answer = result(acall(client, "write_table", TABLE, headers={**HG, "X-Audit-Purpose": "case_ref=+&reason="}))
     assert answer["structuredContent"] == {"reason": "purpose_required"}
     assert fake_executor.requests == []
+    assert "purpose" not in tool_events(audit_lines)[-1]
 
 
 @pytest.mark.parametrize("purpose", ["reason=ghostwriter+chat", "case_ref=case-0001"])

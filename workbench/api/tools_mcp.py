@@ -236,7 +236,8 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
 
     Args:
         endpoint: The route function.
-        key: The tool, a key of the audit's operations.
+        key: The tool's name; the purpose rule checks it, and its events are recorded, only if it is a key of the
+            audit's operations (``list_files`` is not).
 
     Returns:
         The adapter: it passes the route each parameter it takes, by name, and answers the route's answer, with its
