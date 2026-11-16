@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import KEY as CALLER_KEY
 from tests.api.test_tools_documents import Scripted
+from tests.api.test_tools_inline import body as inline_body
+from tests.api.test_tools_inline import call as inline_call
 from workbench.api.audit import OPERATIONS, SERVICE, AuditLog
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
@@ -31,6 +33,7 @@ EXPECTED_OPERATIONS = {
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
     "run_python": ("combine", "tool.run_python"),
+    "run_python_inline": ("combine", "tool.run_python.inline"),
     "inspect_template": ("query", "tool.inspect_template"),
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
@@ -214,6 +217,25 @@ def test_a_call_without_files_records_an_empty_target(log: AuditLog, stream: Str
     assert stream.events()[-1]["target"] == {"kind": "file", "count": 0, "container": "chat:chat-1"}
 
 
+def test_record_takes_a_target_kind_a_count_and_a_request_id(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """Data that came with a call is counted, not named; the call's request id ties the event to the caller's own."""
+    log.record("run_python_inline", alice, target_kind="inline_data", count=3, request_id="req-1")
+
+    last = stream.events()[-1]
+    assert last["target"] == {"kind": "inline_data", "count": 3, "container": "chat:chat-1"}
+    assert last["request_id"] == "req-1"
+
+
+def test_a_denial_has_no_target(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """A call refused before it touched anything names nothing it touched."""
+    log.record("run_python_inline", alice, target_kind=None, outcome="denied", criteria={"refused": "purpose_required"})
+
+    last = stream.events()[-1]
+    assert "target" not in last
+    assert (last["outcome"], last["criteria"]) == ("denied", {"caller": "open-webui", "refused": "purpose_required"})
+    assert "request_id" not in last
+
+
 def test_unknown_key_is_refused_and_writes_nothing(log: AuditLog, stream: Stream, alice: Principal) -> None:
     """A key outside ``OPERATIONS`` is a programming error, not an event."""
     before = len(stream.events())
@@ -293,6 +315,10 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         executor.files = {f"{word}-notes.md": b"#"}
         document = {"name": f"{word}-notes", "format": "md", "markdown": word}
         assert client.post("/tools/write_document", json=document, headers=h).status_code == 200
+        executor.files = {f"{word}-inline.csv": b"a\n"}
+        executor.payload = {"stdout": word, "stderr": "", "truncated": False}
+        inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
+        assert len(inline_call(client, inline).blocks) == 1
         assert client.delete("/files/delete", params={"path": csv}, headers=h).status_code == 200
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
@@ -368,6 +394,15 @@ def test_400_ids_are_exactly_two_events(log: AuditLog, stream: Stream, alice: Pr
         ("tool.run_python.ids", 200, 200),
     ]
     assert [i for e in written for i in e["target"]["ids"]] == file_ids(400)
+
+
+def test_a_continuation_keeps_the_request_id(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """Every event of one call carries its request id, the continuations too."""
+    log.record("search_files", alice, file_ids=file_ids(201), request_id="req-1")
+
+    primary, more = stream.events()[-2:]
+    assert more["parent_event_id"] == primary["event_id"]
+    assert (primary["request_id"], more["request_id"]) == ("req-1", "req-1")
 
 
 def test_a_continuation_keeps_the_outcome_and_the_purpose(log: AuditLog, stream: Stream, alice: Principal) -> None:

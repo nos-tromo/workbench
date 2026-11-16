@@ -526,8 +526,14 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "job_wall_s": settings.job_wall_s,
         "upload_max_mb": settings.upload_max_mb,
         "workspace_max_mb": settings.workspace_max_mb,
+        "callers": [
+            {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
+            {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
+        ],
+        "require_purpose": [],
     }
     assert KEY not in audit_stream.getvalue()
+    assert DOCINT_KEY not in audit_stream.getvalue()
 
 
 def test_a_start_that_fails_after_the_chain_opened_closes_it(
