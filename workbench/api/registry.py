@@ -3,10 +3,11 @@
 A tool has a form, as a caller's files do (:class:`~workbench.api.auth.Caller`): a ``workspace`` tool works on the files
 a user keeps in a chat folder, an ``inline`` tool on data that comes with the call and leaves with its answer. The
 workspace tools are the terminal door's routes tagged :data:`~workbench.api.openapi.TOOL_TAG`, described as specs when
-the app is made (:func:`workspace_specs`); they are not served on the MCP door in version 2. A caller finds the tools of
-its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other, or
-one its door does not serve (:func:`allowed_tools`). Each workspace tool route must also enforce that list itself,
-through a :class:`ToolGuard` named after it, or the api does not start either.
+the app is made (:func:`workspace_specs`); :mod:`workbench.api.tools_mcp` gives those the MCP door serves an adapter
+that calls the route. A caller finds the tools of its own form that its list names (:class:`Registry`), and the api
+does not start with a list that names any other, or one its door does not serve (:func:`allowed_tools`). Each
+workspace tool route must also enforce that list itself, through a :class:`ToolGuard` named after it, or the api does
+not start either.
 
 ``Caller`` is imported for type checking only, since :mod:`workbench.api.auth` imports this module.
 """
@@ -110,10 +111,12 @@ class ToolOutcome:
     Attributes:
         structured: The answer, as the fields of the tool's output model.
         blocks: The content blocks that go with it.
+        text: The text block's text, or ``None`` for the structured answer as compact JSON.
     """
 
     structured: dict[str, Any]
     blocks: list[dict[str, Any]]
+    text: str | None = None
 
 
 class ToolGuard:
@@ -139,7 +142,8 @@ class ToolGuard:
 class ToolSpec:
     """A tool, whichever door serves it.
 
-    A workspace spec has ``run`` and ``input_schema`` ``None``: it is a route, not served on MCP in version 2.
+    A spec of :func:`workspace_specs` has ``run`` and ``input_schema`` ``None``: it is a route. Those the MCP door
+    serves get both from :func:`~workbench.api.tools_mcp.workspace_tools`.
 
     Attributes:
         name: Its name; a workspace tool's is its route's ``operationId``.
@@ -150,6 +154,7 @@ class ToolSpec:
         form: Whether it works on a workspace's files or on data that comes with the call.
         run: Runs it on arguments its input model has validated.
         input_schema: The arguments' JSON schema for a caller, where it depends on the caller.
+        output_schema: The answer's JSON schema for a caller, in place of ``output_model``'s own.
     """
 
     name: str
@@ -160,6 +165,7 @@ class ToolSpec:
     form: Files
     run: Callable[[Any, ToolEnv], Awaitable[ToolOutcome]] | None = None
     input_schema: Callable[["Caller"], dict[str, Any]] | None = None
+    output_schema: Callable[["Caller"], dict[str, Any]] | None = None
 
 
 def _model(candidate: object) -> type[BaseModel] | None:

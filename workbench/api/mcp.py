@@ -188,7 +188,7 @@ async def _dispatch(request: Request, caller: Caller, message: Message) -> dict[
     if message.method == "ping":
         result: dict[str, Any] = {}
     elif message.method == "server/discover":
-        result = discover_result()
+        result = discover_result(caller)
     elif message.method == "tools/list":
         registry: Registry = request.app.state.registry
         result = tools_list_result(registry.for_caller(caller), caller, era)
