@@ -23,7 +23,15 @@ from typing import TYPE_CHECKING, Final
 
 from workbench.executor import readers
 from workbench.executor.timer import TimeLimit, limit_until
-from workbench.protocol import PREVIEW_CELL, PREVIEW_COLUMNS, PREVIEW_ROWS, TablePreview
+from workbench.protocol import (
+    PREVIEW_BUDGET,
+    PREVIEW_CELL,
+    PREVIEW_COLUMNS,
+    PREVIEW_COUNT_MAX,
+    PREVIEW_ROWS,
+    TablePreview,
+    preview_size,
+)
 from workbench.tables import DELIMITERS
 
 if TYPE_CHECKING:
@@ -34,9 +42,6 @@ PREVIEW_SUFFIXES: Final = (".csv", ".xlsx")
 
 #: Seconds all of a job's previews may take together.
 PREVIEW_TOTAL_S: Final = 2.0
-
-#: Most rows below the header that are counted; a table with more has no count.
-PREVIEW_COUNT_MAX: Final = 100_000
 
 #: The file beside the job's result that holds the previews, by output name.
 PREVIEWS_FILE: Final = "previews.json"
@@ -221,12 +226,15 @@ def table_preview(path: Path, deadline: float) -> TablePreview | None:
 def previews_of(out_dir: Path, deadline: float) -> dict[str, TablePreview]:
     """Read the previews of the csv and xlsx files directly in a job's ``out/``, in name order, while time is left.
 
+    The previews hold at most ``PREVIEW_BUDGET`` bytes together (``preview_size``): the one that would pass it, and
+    every file after it, is left out, so the file they are written to never outgrows the protocol's line.
+
     Args:
         out_dir: The job's ``out/``.
         deadline: A :func:`time.monotonic` time all the previews share.
 
     Returns:
-        Each regular file's preview by its name; a file with none is left out.
+        Each regular file's preview by its name, those read before the budget ran out; a file with none is left out.
     """
     try:
         with os.scandir(out_dir) as entries:
@@ -238,10 +246,15 @@ def previews_of(out_dir: Path, deadline: float) -> dict[str, TablePreview]:
     except OSError:
         return {}
     found: dict[str, TablePreview] = {}
+    room = PREVIEW_BUDGET
     for name in names:
         if time.monotonic() >= deadline:
             break
         preview = table_preview(out_dir / name, deadline)
-        if preview is not None:
-            found[name] = preview
+        if preview is None:
+            continue
+        room -= preview_size(preview)
+        if room < 0:
+            break
+        found[name] = preview
     return found

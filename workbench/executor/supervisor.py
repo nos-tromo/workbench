@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Literal
 
 from workbench.config import UID_POOL_SIZE, ConfigError, Settings, load_settings
 from workbench.executor import seccomp
@@ -84,6 +84,7 @@ from workbench.protocol import (
     KILLED,
     MAX_LINE,
     OUT_DIR,
+    PREVIEW_BUDGET,
     JobRequest,
     JobResult,
     Limits,
@@ -92,6 +93,7 @@ from workbench.protocol import (
     decode_request,
     encodable,
     encode,
+    preview_size,
 )
 
 MB = 1024 * 1024
@@ -125,8 +127,6 @@ _TMP = "tmp"
 _SPEC = "spec.json"
 _RESULT = "result.json"
 _RESULT_SLACK = 64 * 1024
-#: Most bytes of UTF-8 the table previews of one answer hold together (``req.previews``).
-PREVIEW_BUDGET: Final = 256 * 1024
 _REQUEST_TIMEOUT_S = 30.0
 # The protocol's defaults; R19 sizes the container's pids limit from them.
 _MAX_NPROC = 64
@@ -496,12 +496,13 @@ def _read_previews(home: int, owner: int) -> dict[str, TablePreview]:
 
     Returns:
         Each valid preview by its output's name; none when the file is missing, not the job's own regular file,
-        larger than ``MAX_LINE`` or not a JSON object. An entry that does not validate is left out.
+        larger than ``MAX_LINE`` or not a JSON object. An entry that does not validate is left out, and validating is
+        strict: ``"7"`` is not a count and ``"yes"`` is not a boolean, however a lax parse would read them.
     """
     found: dict[str, TablePreview] = {}
     for name, value in (_read_result(home, MAX_LINE, owner, PREVIEWS_FILE) or {}).items():
         try:
-            found[name] = TablePreview.model_validate(value)
+            found[name] = TablePreview.model_validate(value, strict=True)
         except ValueError:  # pydantic's ValidationError
             continue
     return found
@@ -529,7 +530,7 @@ def _with_previews(answer: JobResult, previews: dict[str, TablePreview]) -> JobR
     for output in answer.outputs:
         preview = previews.get(output.name)
         if preview is not None and room >= 0:
-            room -= len(preview.model_dump_json().encode())
+            room -= preview_size(preview)
             if room >= 0:
                 output = output.model_copy(update={"preview": preview})
         outputs.append(output)

@@ -20,7 +20,15 @@ from workbench.executor.preview import (
     previews_of,
     table_preview,
 )
-from workbench.protocol import TablePreview
+from workbench.protocol import (
+    MAX_LINE,
+    PREVIEW_BUDGET,
+    PREVIEW_CELL,
+    PREVIEW_COLUMNS,
+    PREVIEW_ROWS,
+    TablePreview,
+    preview_size,
+)
 
 
 def _soon() -> float:
@@ -238,3 +246,52 @@ def test_previews_stop_at_the_deadline(tmp_path: Path) -> None:
 
     assert previews_of(out, time.monotonic() - 1) == {}
     assert table_preview(out / "a.csv", time.monotonic() - 1) is None
+
+
+def _control_table(path: Path) -> Path:
+    """A csv of a full preview's size made of C0 control characters, which JSON escapes to 6 bytes each."""
+    cell = "\x01" * PREVIEW_CELL
+    record = ",".join([cell] * PREVIEW_COLUMNS)
+    path.write_text("\n".join([record] * (PREVIEW_ROWS + 1)) + "\n", encoding="utf-8")
+    return path
+
+
+def test_previews_stop_at_their_budget_and_keep_those_already_read_in_name_order(tmp_path: Path) -> None:
+    """Twenty near-maximal previews would pass the line's cap: the job keeps the first few by name and stops there."""
+    out = tmp_path / "out"
+    out.mkdir()
+    names = [f"t-{n:02d}.csv" for n in range(20)]
+    for name in names:
+        _control_table(out / name)
+
+    got = previews_of(out, _soon())
+
+    sizes = [preview_size(p) for p in got.values()]
+    assert 20 * sizes[0] > MAX_LINE  # all twenty could never be attached
+    assert list(got) == names[: len(got)]
+    assert len(got) == 3
+    assert sum(sizes) <= PREVIEW_BUDGET < sum(sizes) + sizes[0]
+
+
+def test_a_budget_that_the_next_preview_would_pass_stops_the_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once one preview does not fit, no later file is read: the job spends no time on what could not be attached."""
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in ["a.csv", "b.csv", "c.csv"]:
+        _table(out / name, [["author", "posts"], ["user-a", 12]])
+    first = table_preview(out / "a.csv", _soon())
+    assert first is not None
+    monkeypatch.setattr(preview, "PREVIEW_BUDGET", preview_size(first) + 1)
+    read: list[str] = []
+    real = preview.table_preview
+
+    def spy(path: Path, deadline: float) -> TablePreview | None:
+        read.append(path.name)
+        return real(path, deadline)
+
+    monkeypatch.setattr(preview, "table_preview", spy)
+
+    assert list(previews_of(out, _soon())) == ["a.csv"]
+    assert read == ["a.csv", "b.csv"]

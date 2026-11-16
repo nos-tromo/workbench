@@ -12,6 +12,7 @@ import pytest
 from workbench.executor import job
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.executor.timer import TimeLimit
+from workbench.protocol import MAX_LINE, PREVIEW_BUDGET, PREVIEW_CELL, PREVIEW_COLUMNS, PREVIEW_ROWS, TablePreview
 
 SPEC = {"tool": "echo", "args": {"x": 1}, "chat_id": "chat-1", "max_chars": 16384, "file_mb": 50}
 
@@ -326,6 +327,55 @@ def test_a_previews_file_cut_short_is_not_left_behind(tmp_path: Path, monkeypatc
     monkeypatch.undo()
     assert json.loads((control / "result.json").read_text()) == {"x": 1}
     assert not (control / "previews.json").exists()
+
+
+def test_previews_that_would_pass_the_budget_are_left_off_and_the_file_stays_below_the_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twenty near-maximal previews of control characters (6 bytes each, escaped) leave the first few by name."""
+    work = tmp_path / "work"
+    (work / "out").mkdir(parents=True)
+    monkeypatch.chdir(work)
+    cell = "\x01" * PREVIEW_CELL
+    record = ",".join([cell] * PREVIEW_COLUMNS)
+    names = [f"t-{n:02d}.csv" for n in range(20)]
+    for name in names:
+        (work / "out" / name).write_text("\n".join([record] * (PREVIEW_ROWS + 1)) + "\n", encoding="utf-8")
+    control = tmp_path / "control"
+    spec = _write_spec(control, previews=True)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    raw = (control / "previews.json").read_bytes()
+    written = json.loads(raw)
+    assert len(raw) <= MAX_LINE
+    assert list(written) == names[:3]
+    assert (
+        sum(len(TablePreview.model_validate(v).model_dump_json().encode()) for v in written.values()) <= PREVIEW_BUDGET
+    )
+
+
+def test_a_result_that_fell_back_to_the_short_error_reads_no_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The result could not be written, so the supervisor answers "the tool failed": no preview is worth the time."""
+    real_write_text = Path.write_text
+
+    def write_text(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if self.name == "result.json" and len(data) > 100:
+            raise OSError(27, "File too large")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setitem(RUNNERS, "big", lambda args, ctx: {"text": "x" * 1000})
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control, tool="big", previews=True)
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    monkeypatch.undo()
+    assert json.loads((control / "result.json").read_text()) == {"error": "result_unwritable: OSError"}
+    assert sorted(p.name for p in control.iterdir()) == ["result.json", "spec.json"]
 
 
 def test_the_registered_runners() -> None:

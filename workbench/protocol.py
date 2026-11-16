@@ -34,6 +34,11 @@ OUT_DIR: Final = "out"
 PREVIEW_ROWS: Final = 5
 PREVIEW_COLUMNS: Final = 20
 PREVIEW_CELL: Final = 100
+#: Most bytes of UTF-8 the table previews of one answer hold together; a job reads no more, the supervisor attaches no
+#: more.
+PREVIEW_BUDGET: Final = 256 * 1024
+#: Most rows below the header that a job counts for a preview; a table with more has no count.
+PREVIEW_COUNT_MAX: Final = 100_000
 
 #: One cell of a table preview.
 Cell = Annotated[str, StringConstraints(max_length=PREVIEW_CELL)]
@@ -294,14 +299,27 @@ class TablePreview(_Message):
     Attributes:
         columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.
         rows: The rows below the header, at most ``PREVIEW_ROWS``.
-        row_count: How many rows lie below the header, or ``None`` when they were not counted to the end.
+        row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not
+            counted to the end.
         truncated: Whether a row, a column or a cell was left out or cut.
     """
 
     columns: list[Cell] = Field(max_length=PREVIEW_COLUMNS)
     rows: list[Annotated[list[Cell], Field(max_length=PREVIEW_COLUMNS)]] = Field(max_length=PREVIEW_ROWS)
-    row_count: int | None = Field(ge=0)
+    row_count: int | None = Field(ge=0, le=PREVIEW_COUNT_MAX)
     truncated: bool
+
+
+def preview_size(preview: TablePreview) -> int:
+    """Measure a preview as the budget counts it.
+
+    Args:
+        preview: The preview.
+
+    Returns:
+        Its JSON in UTF-8 bytes, the way it travels in a job's answer.
+    """
+    return len(preview.model_dump_json().encode())
 
 
 class OutputFile(_Message):

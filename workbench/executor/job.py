@@ -32,7 +32,8 @@ def main(argv: Sequence[str]) -> int:
         ``0`` once ``result.json`` is written, whether the runner succeeded, raised (``SystemExit`` and
         ``KeyboardInterrupt`` too), returned something other than a JSON object, or let a time limit
         (:class:`~workbench.executor.timer.TimeLimit`, which is not an ``Exception``) escape; ``1`` if no
-        result could be written at all. The previews never change it.
+        result could be written at all. The previews never change it, and none are read once the result has fallen
+        back to a short error.
     """
     spec_path = Path(argv[1])
     result_path = Path(argv[2]) if len(argv) > 2 else spec_path.with_name("result.json")
@@ -58,8 +59,8 @@ def main(argv: Sequence[str]) -> int:
         payload = json.dumps({"error": "read_timeout: the work ran past its time limit"})
     except BaseException as exc:  # SystemExit and KeyboardInterrupt too: the job always answers
         payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-    status = _write(result_path, payload)
-    if status == 0 and previews_for is not None:
+    status, whole = _write(result_path, payload)
+    if status == 0 and whole and previews_for is not None:
         _write_previews(previews_for, result_path.with_name(PREVIEWS_FILE))
     return status
 
@@ -80,7 +81,7 @@ def _write_previews(out_dir: Path, path: Path) -> None:
             path.unlink(missing_ok=True)
 
 
-def _write(path: Path, payload: str) -> int:
+def _write(path: Path, payload: str) -> tuple[int, bool]:
     """Write the result, or a short error in its place if it cannot be written.
 
     Code a job runs can fill the volume or lower its own file-size limit; the supervisor would then find a torn
@@ -91,7 +92,8 @@ def _write(path: Path, payload: str) -> int:
         payload: The result, JSON.
 
     Returns:
-        ``0`` once a result is written, ``1`` if not even the short error could be.
+        The exit status, ``0`` once a result is written and ``1`` if not even the short error could be; and whether
+        the result written is ``payload`` itself, not the short error.
     """
     try:
         path.write_text(payload, encoding="utf-8")
@@ -99,8 +101,9 @@ def _write(path: Path, payload: str) -> int:
         try:
             path.write_text(json.dumps({"error": f"result_unwritable: {type(exc).__name__}"}), encoding="utf-8")
         except OSError:
-            return 1
-    return 0
+            return 1, False
+        return 0, False
+    return 0, True
 
 
 if __name__ == "__main__":

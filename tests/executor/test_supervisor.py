@@ -796,6 +796,64 @@ async def test_a_preview_that_does_not_validate_is_dropped_and_the_output_kept(
     assert Path(answer.outputs[0].staged_path).exists()
 
 
+@pytest.mark.parametrize(
+    "forged",
+    [
+        {"row_count": 100_001},
+        {"row_count": "7"},
+        {"row_count": 7.0},
+        {"row_count": True},
+        {"truncated": "yes"},
+        {"truncated": 1},
+    ],
+    ids=["count past the cap", "string count", "float count", "bool count", "string boolean", "int boolean"],
+)
+async def test_a_preview_is_checked_strictly_and_a_forged_one_is_dropped_not_coerced(
+    forged: dict[str, Any], volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A count above what a job counts and a value of another type are dropped, never read as ``7`` or ``true``."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            pathlib.Path("out/t.csv").write_text("author,posts\\n")
+            pathlib.Path("out/u.csv").write_text("author,posts\\n")
+            write_previews({{"t.csv": {{**{COUNTS_PREVIEW!r}, **{forged!r}}}, "u.csv": {COUNTS_PREVIEW!r}}})
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True))
+
+    assert answer.status == "ok"
+    assert [o.name for o in answer.outputs] == ["t.csv", "u.csv"]
+    assert answer.outputs[0].preview is None
+    assert answer.outputs[1].preview is not None
+    assert Path(answer.outputs[0].staged_path).exists()
+
+
+async def test_a_count_at_the_cap_is_a_valid_count(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cap itself is what a job reports for a table of exactly that many rows."""
+    _chat(volume)
+    at_cap = {**COUNTS_PREVIEW, "row_count": 100_000}
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            pathlib.Path("out/t.csv").write_text("author,posts\\n")
+            write_previews({{"t.csv": {at_cap!r}}})
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True))
+
+    assert [o.preview and o.preview.row_count for o in answer.outputs] == [100_000]
+
+
 async def test_previews_past_256_kib_are_left_out_in_name_order(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The previews of one answer hold at most 256 KiB of UTF-8: seven of 36 KB fit, the eighth by name does not."""
     _chat(volume)

@@ -11,8 +11,10 @@ from workbench.protocol import (
     MAX_INLINE_FILES,
     MAX_INPUT_FILES,
     MAX_LINE,
+    PREVIEW_BUDGET,
     PREVIEW_CELL,
     PREVIEW_COLUMNS,
+    PREVIEW_COUNT_MAX,
     PREVIEW_ROWS,
     InlineFile,
     JobRequest,
@@ -23,6 +25,7 @@ from workbench.protocol import (
     decode_request,
     decode_result,
     encode,
+    preview_size,
 )
 
 LIMITS = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
@@ -258,6 +261,24 @@ def test_a_preview_counts_no_negative_rows_and_may_leave_the_count_open() -> Non
         TablePreview(**_preview(row_count=-1))
     with pytest.raises(ValidationError):
         TablePreview.model_validate({"columns": [], "rows": []})
+
+
+def test_a_preview_counts_at_most_the_rows_a_job_counts() -> None:
+    """The count a job reports never passes ``PREVIEW_COUNT_MAX``; a forged larger one is refused, not passed on."""
+    assert (PREVIEW_BUDGET, PREVIEW_COUNT_MAX) == (256 * 1024, 100_000)
+    assert TablePreview(**_preview(row_count=PREVIEW_COUNT_MAX)).row_count == PREVIEW_COUNT_MAX
+    with pytest.raises(ValidationError):
+        TablePreview(**_preview(row_count=PREVIEW_COUNT_MAX + 1))
+
+
+def test_a_preview_is_measured_as_its_json_in_utf8_bytes() -> None:
+    """The budget counts bytes, not characters: a cell of "€" is 3 of them, a control character 6 once escaped."""
+    plain = TablePreview(columns=["a"], rows=[], row_count=0, truncated=False)
+    euro = TablePreview(columns=["€"], rows=[], row_count=0, truncated=False)
+    control = TablePreview(columns=["\x01"], rows=[], row_count=0, truncated=False)
+
+    assert preview_size(plain) == len(plain.model_dump_json().encode())
+    assert (preview_size(euro) - preview_size(plain), preview_size(control) - preview_size(plain)) == (2, 5)
 
 
 def test_an_output_has_no_preview_by_default_and_round_trips_with_one() -> None:
