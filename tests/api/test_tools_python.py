@@ -444,9 +444,10 @@ class CancelledOnReturn(JobQueue):
         keeper: Keeper | None = None,
         *,
         call: CallLimits | None = None,
+        previews: bool = False,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
-        answer = await super().submit(p, tool, args, input_files, keeper, call=call)
+        answer = await super().submit(p, tool, args, input_files, keeper, call=call, previews=previews)
         caller = asyncio.current_task()
         assert caller is not None
         caller.cancel()

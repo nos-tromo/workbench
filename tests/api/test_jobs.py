@@ -48,6 +48,7 @@ from workbench.protocol import (
     JobRequest,
     JobResult,
     OutputFile,
+    TablePreview,
     decode_request,
     encode,
 )
@@ -94,6 +95,8 @@ class FakeClient(ExecutorClient):
         running: Jobs in flight now.
         peak: The most jobs in flight at once.
         gate: While set, a job that ``hold`` marks does not finish until the test sets it.
+        previews: A preview, as the arguments of ``TablePreview``, by the name of the output that has it; a job that
+            asked for previews (``req.previews``) gets each staged output's.
     """
 
     def __init__(self, data_dir: Path, *, delay: float = 0.0) -> None:
@@ -108,6 +111,7 @@ class FakeClient(ExecutorClient):
         self.gate = asyncio.Event()
         self.hold: set[str] = set()
         self.files: dict[str, bytes] = {}
+        self.previews: dict[str, dict[str, Any]] = {}
         self.status = "ok"
         self.message = ""
         self.error: Exception | None = None
@@ -135,7 +139,8 @@ class FakeClient(ExecutorClient):
                 path = self.staged(req.job_id, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
-                outputs.append(OutputFile(name=name, staged_path=str(path), size=len(data)))
+                preview = TablePreview(**self.previews[name]) if req.previews and name in self.previews else None
+                outputs.append(OutputFile(name=name, staged_path=str(path), size=len(data), preview=preview))
             return sample_result(req.job_id, outputs, status=self.status, message=self.message)
         finally:
             self.running -= 1
@@ -146,6 +151,7 @@ class KeepAll:
 
     Attributes:
         recorded: Per answer recorded: its status, the ids planned, and the names of the chat's files at that moment.
+        results: Every answer recorded, as the executor gave it.
         again: Every list of ids recorded again as errors.
         store: Where it looks, at the moment it records, for files of the chat.
         p: Whose chat it looks into.
@@ -154,6 +160,7 @@ class KeepAll:
     def __init__(self, store: Store | None = None, p: Principal | None = None) -> None:
         """Look into ``p``'s chat in ``store`` when recording, if both are given."""
         self.recorded: list[tuple[str, list[str], list[str]]] = []
+        self.results: list[JobResult] = []
         self.again_ids: list[list[str]] = []
         self.store = store
         self.p = p
@@ -162,6 +169,7 @@ class KeepAll:
         """Keep every output."""
         seen = [] if self.store is None or self.p is None else [r.name for r in self.store.files_in_chat(self.p)]
         self.recorded.append((result.status, list(planned), seen))
+        self.results.append(result)
         return planned
 
     def again(self, ids: Sequence[str]) -> None:
@@ -1402,6 +1410,48 @@ async def test_the_keeper_records_before_any_output_is_a_file_and_by_the_ids_the
     assert keeper.again_ids == []
 
 
+COUNTS_PREVIEW: dict[str, Any] = {
+    "columns": ["author", "posts"],
+    "rows": [["user-a", "12"], ["user-b", "7"]],
+    "row_count": 2,
+    "truncated": False,
+}
+TOTALS_PREVIEW: dict[str, Any] = {"columns": ["total"], "rows": [["19"]], "row_count": 1, "truncated": False}
+
+
+async def test_the_keeper_sees_each_outputs_preview(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The keeper records the answer with each output's preview, in the order of the ids it plans."""
+    me = user("user-a")
+    executor.files = {"counts.csv": b"x", "notes.txt": b"x", "totals.csv": b"x"}
+    executor.previews = {"counts.csv": COUNTS_PREVIEW, "totals.csv": TOTALS_PREVIEW}
+    queue = queue_for(settings, executor, store, metrics)
+    keeper = KeepAll()
+    _, _, files = await queue.submit(me, "run_python", ARGS, [], keeper, previews=True)
+    (result,) = keeper.results
+    (_, planned, _) = keeper.recorded[0]
+    assert [(o.name, o.preview) for o in result.outputs] == [
+        ("counts.csv", TablePreview(**COUNTS_PREVIEW)),
+        ("notes.txt", None),
+        ("totals.csv", TablePreview(**TOTALS_PREVIEW)),
+    ]
+    assert planned == [f.id for f in files]
+    assert [f.name for f in files] == [o.name for o in result.outputs]
+
+
+async def test_without_the_ask_the_keeper_sees_no_preview(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Previews that the executor could give are not asked for, and the keeper sees none."""
+    executor.files = {"counts.csv": b"x"}
+    executor.previews = {"counts.csv": COUNTS_PREVIEW}
+    keeper = KeepAll()
+    await queue_for(settings, executor, store, metrics).submit(user("user-a"), "run_python", ARGS, [], keeper)
+    (result,) = keeper.results
+    assert [o.preview for o in result.outputs] == [None]
+
+
 async def test_a_keeper_that_cannot_record_keeps_nothing(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
@@ -1783,6 +1833,25 @@ async def test_a_workspace_call_with_limits_takes_them_too(
     executor.gate.set()
     await first
     assert (executor.requests[0].limits.wall_s, executor.timeouts[0]) == (30, 330)
+
+
+async def test_previews_are_asked_only_when_told(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A job asks the executor for previews when its call says so; the default, and an inline job, never do."""
+    me = user("user-a")
+    queue = queue_for(settings, executor, store, metrics)
+    await queue.submit(me, "run_python", ARGS, [])
+    assert executor.requests[-1].previews is False
+    await queue.submit(me, "run_python", ARGS, [], previews=True)
+    assert executor.requests[-1].previews is True
+    await queue.submit(me, "run_python", ARGS, [], call=DOCINT, previews=True)
+    assert executor.requests[-1].previews is True
+    await queue.submit(me, "run_python", ARGS, [], call=DOCINT)
+    assert executor.requests[-1].previews is False
+    await run_inline(queue, Takes(settings))
+    assert executor.requests[-1].previews is False
+    assert [r.previews for r in executor.requests] == [False, True, True, False, False]
 
 
 async def test_inline_inputs_reach_the_request_and_nothing_the_workspace(
