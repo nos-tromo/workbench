@@ -11,11 +11,15 @@ from workbench.protocol import (
     MAX_INLINE_FILES,
     MAX_INPUT_FILES,
     MAX_LINE,
+    PREVIEW_CELL,
+    PREVIEW_COLUMNS,
+    PREVIEW_ROWS,
     InlineFile,
     JobRequest,
     JobResult,
     Limits,
     OutputFile,
+    TablePreview,
     decode_request,
     decode_result,
     encode,
@@ -217,6 +221,64 @@ def test_an_output_size_is_never_negative() -> None:
     assert OutputFile(name="r.csv", staged_path="/data/staging/r.csv", size=0).size == 0
     with pytest.raises(ValidationError):
         OutputFile.model_validate({"name": "r.csv", "staged_path": "/data/staging/r.csv", "size": -1})
+
+
+FULL_CELL = "c" * PREVIEW_CELL
+FULL_ROW = [FULL_CELL] * PREVIEW_COLUMNS
+
+
+def _preview(**overrides: Any) -> dict[str, Any]:
+    """A preview at every limit: 5 rows, 20 columns, 100-character cells, with ``overrides`` applied."""
+    return {"columns": FULL_ROW, "rows": [FULL_ROW] * PREVIEW_ROWS, "row_count": 7, "truncated": True, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("field", "over"),
+    [
+        ("rows", {"rows": [FULL_ROW] * (PREVIEW_ROWS + 1)}),
+        ("columns", {"columns": [*FULL_ROW, "c"]}),
+        ("columns", {"rows": [[*FULL_ROW, "c"]]}),
+        ("cell", {"columns": [FULL_CELL + "c"]}),
+        ("cell", {"rows": [[FULL_CELL + "c"]]}),
+    ],
+    ids=["rows", "columns", "columns of a row", "cell", "cell of a row"],
+)
+def test_a_preview_holds_at_most_5_rows_20_columns_100_characters(field: str, over: dict[str, Any]) -> None:
+    """At the limits a preview validates; a sixth row, a 21st column or a 101st character is refused."""
+    assert (PREVIEW_ROWS, PREVIEW_COLUMNS, PREVIEW_CELL) == (5, 20, 100)
+    assert TablePreview(**_preview()).rows == [FULL_ROW] * 5
+    with pytest.raises(ValidationError):
+        TablePreview(**_preview(**over))
+
+
+def test_a_preview_counts_no_negative_rows_and_may_leave_the_count_open() -> None:
+    """``row_count`` is a count of rows or ``None``; every field must be given."""
+    assert TablePreview(**_preview(row_count=None)).row_count is None
+    with pytest.raises(ValidationError):
+        TablePreview(**_preview(row_count=-1))
+    with pytest.raises(ValidationError):
+        TablePreview.model_validate({"columns": [], "rows": []})
+
+
+def test_an_output_has_no_preview_by_default_and_round_trips_with_one() -> None:
+    """A preview rides on its output to the api and comes back as it went."""
+    assert OutputFile(name="r.csv", staged_path="/data/staging/r.csv", size=1).preview is None
+    preview = TablePreview(columns=["author", "posts"], rows=[["user-a", "12"]], row_count=1, truncated=False)
+    result = JobResult(
+        job_id="job-1",
+        status="ok",
+        result={},
+        outputs=[OutputFile(name="counts.csv", staged_path="job-1/counts.csv", size=24, preview=preview)],
+    )
+    assert decode_result(encode(result)) == result
+    assert decode_result(encode(result)).outputs[0].preview == preview
+
+
+def test_a_request_asks_for_no_previews_by_default() -> None:
+    """Only a caller that shows previews asks for them; the flag round-trips."""
+    assert JobRequest(**_fields()).previews is False
+    asked = JobRequest(**_fields(previews=True))
+    assert decode_request(encode(asked)).previews is True
 
 
 def test_a_refused_request_line_is_a_value_error() -> None:

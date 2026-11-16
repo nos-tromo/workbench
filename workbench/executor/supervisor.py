@@ -15,8 +15,8 @@ The job folder, ``<data_dir>/jobs/<job-id>/``:
   copies of the inputs at their paths below the chat folder, or the request's inline inputs as
   root-owned ``0444`` files of their names;
 - ``workspace/<chat-id>/out/``: the slot's, ``0700``, where the job writes its outputs;
-- ``home/``: the slot's, ``0700``, the job's ``HOME``, where it writes ``result.json``; with
-  ``home/tmp/``, the slot's, ``0700``, its ``TMPDIR``.
+- ``home/``: the slot's, ``0700``, the job's ``HOME``, where it writes ``result.json`` (and, when the
+  request asks for them, ``previews.json``); with ``home/tmp/``, the slot's, ``0700``, its ``TMPDIR``.
 
 ``out/`` and ``home/`` are all the job can write. While it runs, a watchdog measures them, and
 the memory and OOM scores of the slot's processes, about twice a second, and stops the job past
@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from workbench.config import UID_POOL_SIZE, ConfigError, Settings, load_settings
 from workbench.executor import seccomp
@@ -66,6 +66,7 @@ from workbench.executor.fs import (
     write_all,
 )
 from workbench.executor.prepare_volume import API_UID, Owners
+from workbench.executor.preview import PREVIEWS_FILE
 from workbench.executor.sandbox import (
     MEMORY_STAT,
     WATCH_INTERVAL_S,
@@ -87,6 +88,7 @@ from workbench.protocol import (
     JobResult,
     Limits,
     OutputFile,
+    TablePreview,
     decode_request,
     encodable,
     encode,
@@ -123,6 +125,8 @@ _TMP = "tmp"
 _SPEC = "spec.json"
 _RESULT = "result.json"
 _RESULT_SLACK = 64 * 1024
+#: Most bytes of UTF-8 the table previews of one answer hold together (``req.previews``).
+PREVIEW_BUDGET: Final = 256 * 1024
 _REQUEST_TIMEOUT_S = 30.0
 # The protocol's defaults; R19 sizes the container's pids limit from them.
 _MAX_NPROC = 64
@@ -442,20 +446,21 @@ def _mqueue_mounted(mountinfo: Path) -> bool:
     return False
 
 
-def _read_result(home: int, limit: int, owner: int) -> dict[str, Any] | None:
-    """Read the job's ``result.json`` as a JSON object.
+def _read_result(home: int, limit: int, owner: int, name: str = _RESULT) -> dict[str, Any] | None:
+    """Read the job's ``result.json``, or another file it leaves in ``home/``, as a JSON object.
 
     Args:
         home: The job's ``home/``, opened.
         limit: Most bytes to read.
         owner: The uid the job ran as, which must own the file (``_own_file``).
+        name: The file's name in ``home/``.
 
     Returns:
         The object, or ``None`` if the file is missing, not a regular file of the job's alone,
         larger than ``limit``, not JSON or not an object.
     """
     try:
-        fd = os.open(_RESULT, READ_FLAGS, dir_fd=home)
+        fd = os.open(name, READ_FLAGS, dir_fd=home)
     except OSError:
         return None
     chunks: list[bytes] = []
@@ -478,6 +483,57 @@ def _read_result(home: int, limit: int, owner: int) -> dict[str, Any] | None:
     except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _read_previews(home: int, owner: int) -> dict[str, TablePreview]:
+    """Read the table previews the job left beside its result, as the result is read.
+
+    The job's own code could have written them, so each is checked for its shape and caps (``TablePreview``).
+
+    Args:
+        home: The job's ``home/``, opened.
+        owner: The uid the job ran as, which must own the file (``_own_file``).
+
+    Returns:
+        Each valid preview by its output's name; none when the file is missing, not the job's own regular file,
+        larger than ``MAX_LINE`` or not a JSON object. An entry that does not validate is left out.
+    """
+    found: dict[str, TablePreview] = {}
+    for name, value in (_read_result(home, MAX_LINE, owner, PREVIEWS_FILE) or {}).items():
+        try:
+            found[name] = TablePreview.model_validate(value)
+        except ValueError:  # pydantic's ValidationError
+            continue
+    return found
+
+
+def _with_previews(answer: JobResult, previews: dict[str, TablePreview]) -> JobResult:
+    """Attach to each output its preview, in name order, while they fit in the answer's budget.
+
+    The budget is ``PREVIEW_BUDGET``, or what ``MAX_LINE`` leaves beside the answer without them where that is less:
+    a result near its cap leaves less room. Each preview counts as its JSON in UTF-8 bytes; once one does not fit,
+    it and every later output go without.
+
+    Args:
+        answer: An ``ok`` answer, its outputs in name order, none with a preview.
+        previews: The previews by output name (``_read_previews``).
+
+    Returns:
+        The answer with the previews that fit.
+    """
+    try:
+        room = min(PREVIEW_BUDGET, MAX_LINE - len(encode(answer)))
+    except ValueError:  # it cannot be sent anyway: _line answers for it
+        return answer
+    outputs: list[OutputFile] = []
+    for output in answer.outputs:
+        preview = previews.get(output.name)
+        if preview is not None and room >= 0:
+            room -= len(preview.model_dump_json().encode())
+            if room >= 0:
+                output = output.model_copy(update={"preview": preview})
+        outputs.append(output)
+    return answer.model_copy(update={"outputs": outputs})
 
 
 def _own_file(st: os.stat_result, owner: int) -> bool:
@@ -1224,6 +1280,7 @@ class Supervisor:
                 "chat_id": req.chat_id,
                 "max_chars": req.max_chars,
                 "file_mb": limits.file_mb,
+                "previews": req.previews,
             }
             with closing(os.open(_SPEC, CREATE_FLAGS, 0o444, dir_fd=folder)) as fd:
                 write_all(fd, json.dumps(spec).encode())
@@ -1390,7 +1447,8 @@ class Supervisor:
             broken: The limit the watchdog stopped it on, if it did: the answer names it.
 
         Returns:
-            The answer.
+            The answer; when the request asked for previews, its outputs carry those that are valid and fit
+            (``_with_previews``).
         """
         if outcome == "timeout":
             return _answer(req.job_id, "timeout", f"the job ran past its wall time of {limits.wall_s} s")
@@ -1418,7 +1476,10 @@ class Supervisor:
         except OSError:
             return _answer(req.job_id, "error", "the outputs could not be staged", result)
         dropped += len(found) - len(outputs)
-        return JobResult(job_id=req.job_id, status="ok", result=result, outputs=outputs, message=_dropped(dropped))
+        answer = JobResult(job_id=req.job_id, status="ok", result=result, outputs=outputs, message=_dropped(dropped))
+        if req.previews and outputs:
+            answer = _with_previews(answer, _read_previews(job.home, job.runner))
+        return answer
 
     def _stage(
         self, job_id: str, out: int, found: Iterable[tuple[str, os.stat_result]], owner: int

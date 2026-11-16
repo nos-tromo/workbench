@@ -486,6 +486,7 @@ async def test_the_job_folder_has_its_layout_and_modes(volume: Path, monkeypatch
         "chat_id": CHAT,
         "max_chars": 100,
         "file_mb": 50,
+        "previews": False,
     }
     assert answer.result["top"] == ["home", "spec.json", "workspace"]
 
@@ -545,7 +546,7 @@ async def test_inline_inputs_are_written_into_the_working_folder_read_only(
 
 
 async def test_inline_data_never_reaches_the_spec(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """``spec.json`` keeps its five keys: the data lives only in its own files."""
+    """``spec.json`` keeps its six keys: the data lives only in its own files."""
     _runner(
         monkeypatch,
         f"""
@@ -556,7 +557,10 @@ async def test_inline_data_never_reaches_the_spec(volume: Path, monkeypatch: pyt
 
     answer = await Supervisor(_settings(volume), use_slots=False).run_job(_inline_request())
 
-    assert answer.result == {"keys": sorted(["tool", "args", "chat_id", "max_chars", "file_mb"]), "marker": False}
+    assert answer.result == {
+        "keys": sorted(["tool", "args", "chat_id", "max_chars", "file_mb", "previews"]),
+        "marker": False,
+    }
 
 
 async def test_an_inline_job_opens_no_workspace(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -700,6 +704,184 @@ async def test_a_job_the_kernel_stopped_is_killed(volume: Path, monkeypatch: pyt
     answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request())
 
     assert (answer.status, answer.message) == ("killed", "the job was stopped on a resource limit")
+
+
+# --- the previews ----------------------------------------------------------------------------
+
+#: What a job leaves beside its result: ``PREVIEWS`` maps each output's name to ``PREVIEW``, as the job writes it.
+WRITE_PREVIEWS = """
+def write_previews(previews, name="previews.json"):
+    result_path.with_name(name).write_text(json.dumps(previews))
+"""
+COUNTS_PREVIEW = {"columns": ["author", "posts"], "rows": [["user-a", "12"]], "row_count": 1, "truncated": False}
+#: A preview of 6 rows of 20 cells of 100 "€": about 36 KB of UTF-8.
+WIDE_PREVIEW = {"columns": ["€" * 100] * 20, "rows": [["€" * 100] * 20] * 5, "row_count": 5, "truncated": False}
+
+
+@pytest.mark.parametrize("asked", [False, True])
+async def test_the_spec_says_whether_previews_are_asked(
+    asked: bool, volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``spec.json`` carries the request's flag, so the job reads previews only when asked."""
+    _chat(volume)
+    _runner(monkeypatch, 'result = {"keys": sorted(spec), "previews": spec["previews"]}')
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=asked))
+
+    assert answer.result == {
+        "keys": sorted(["tool", "args", "chat_id", "max_chars", "file_mb", "previews"]),
+        "previews": asked,
+    }
+
+
+async def test_a_staged_csv_carries_its_preview(volume: Path) -> None:
+    """Through the real job: ``write_table`` writes ``t.csv``, the job reads its preview, the answer carries it."""
+    _chat(volume)
+    args = {"name": "t.csv", "format": "csv", "columns": ["author", "posts"], "rows": [["user-a", 12]]}
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(
+        _request(tool="write_table", args=args, previews=True)
+    )
+
+    assert answer.status == "ok", answer
+    assert [o.name for o in answer.outputs] == ["t.csv"]
+    preview = answer.outputs[0].preview
+    assert preview is not None
+    assert preview.model_dump() == COUNTS_PREVIEW
+
+
+async def test_no_preview_unless_asked(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not asked, the supervisor reads no previews file, even one the job left."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            pathlib.Path("out/t.csv").write_text("author,posts\\nuser-a,12\\n")
+            write_previews({{"t.csv": {COUNTS_PREVIEW!r}}})
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=False))
+
+    assert (answer.status, [(o.name, o.preview) for o in answer.outputs]) == ("ok", [("t.csv", None)])
+
+
+async def test_a_preview_that_does_not_validate_is_dropped_and_the_output_kept(
+    volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview of six rows is not a preview: it is dropped, its file is staged, the next file keeps its own."""
+    six_rows = {**COUNTS_PREVIEW, "rows": [["user-a", "12"]] * 6}
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            pathlib.Path("out/t.csv").write_text("author,posts\\n")
+            pathlib.Path("out/u.csv").write_text("author,posts\\n")
+            write_previews({{"t.csv": {six_rows!r}, "u.csv": {COUNTS_PREVIEW!r}}})
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True))
+
+    assert answer.status == "ok"
+    assert [o.name for o in answer.outputs] == ["t.csv", "u.csv"]
+    assert answer.outputs[0].preview is None
+    assert answer.outputs[1].preview is not None
+    assert Path(answer.outputs[0].staged_path).exists()
+
+
+async def test_previews_past_256_kib_are_left_out_in_name_order(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The previews of one answer hold at most 256 KiB of UTF-8: seven of 36 KB fit, the eighth by name does not."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            names = [f"t-{{n}}.csv" for n in range(8)]
+            for name in names:
+                pathlib.Path("out/" + name).write_text("x")
+            write_previews({{name: {WIDE_PREVIEW!r} for name in names}})
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True))
+
+    assert answer.status == "ok"
+    assert len(answer.outputs) == 8 <= MAX_OUTPUTS
+    previews = [o.preview for o in answer.outputs]
+    assert [p is not None for p in previews] == [True] * 7 + [False]
+    sizes = [len(p.model_dump_json().encode()) for p in previews if p is not None]
+    assert supervisor.PREVIEW_BUDGET == 256 * 1024
+    assert sum(sizes) <= supervisor.PREVIEW_BUDGET < sum(sizes) + sizes[0]
+
+
+async def test_previews_never_push_the_answer_line_past_max_line(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A result near its cap leaves the previews only what the line has left: the later ones go without."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            names = [f"t-{{n}}.csv" for n in range(4)]
+            for name in names:
+                pathlib.Path("out/" + name).write_text("x")
+            write_previews({{name: {WIDE_PREVIEW!r} for name in names}})
+            result = {{"x": "y" * {MAX_LINE - 100 * 1024}}}
+            """
+        ),
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True, max_chars=256 * 1024))
+
+    assert answer.status == "ok", answer.message
+    previews = [o.preview for o in answer.outputs]
+    sizes = [len(p.model_dump_json().encode()) for p in previews if p is not None]
+    assert 4 * sizes[0] <= supervisor.PREVIEW_BUDGET  # the budget alone would have taken all four
+    assert [p is not None for p in previews] == [True, True, False, False]
+    assert len(encode(answer)) <= MAX_LINE
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'write_previews(PREVIEWS, "own.json")\nos.link(OWN, AS_READ)',
+        'write_previews(PREVIEWS, "own.json")\nos.symlink("own.json", AS_READ)',
+        'write_previews({**PREVIEWS, "pad": "x" * 1_048_576})',
+        'AS_READ.write_text("[1, 2]")',
+        'AS_READ.write_text("not json")',
+    ],
+    ids=["hard link", "symlink", "too big", "not an object", "not json"],
+)
+async def test_a_previews_file_that_is_not_the_jobs_own_is_ignored(
+    body: str, volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previews file is read as the result is: the job's own regular file, at most 1 MiB, one JSON object."""
+    _chat(volume)
+    _runner(
+        monkeypatch,
+        WRITE_PREVIEWS
+        + textwrap.dedent(
+            f"""
+            PREVIEWS = {{"t.csv": {COUNTS_PREVIEW!r}}}
+            OWN, AS_READ = result_path.with_name("own.json"), result_path.with_name("previews.json")
+            pathlib.Path("out/t.csv").write_text("author,posts\\nuser-a,12\\n")
+            """
+        )
+        + body,
+    )
+
+    answer = await Supervisor(_settings(volume), use_slots=False).run_job(_request(previews=True))
+
+    assert (answer.status, [(o.name, o.preview) for o in answer.outputs]) == ("ok", [("t.csv", None)])
 
 
 # --- the job folder and the staging folder ---------------------------------------------------

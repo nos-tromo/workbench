@@ -236,6 +236,98 @@ def test_the_runner_gets_its_context_from_the_spec_and_the_cwd(tmp_path: Path, m
     ]
 
 
+COUNTS = "author,posts\nuser-a,12\n"
+
+
+def _with_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Work in a folder whose ``out/`` holds ``t.csv``, as a tool would have left it; return the control folder."""
+    work = tmp_path / "work"
+    (work / "out").mkdir(parents=True)
+    (work / "out" / "t.csv").write_text(COUNTS, encoding="utf-8")
+    monkeypatch.chdir(work)
+    return tmp_path / "control"
+
+
+def test_previews_are_written_beside_the_result_when_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asked, the job reads its outputs' previews once the runner has answered and writes them next to the result."""
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control, previews=True)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    assert json.loads((control / "result.json").read_text()) == {"x": 1}
+    assert json.loads((control / "previews.json").read_text(encoding="utf-8")) == {
+        "t.csv": {"columns": ["author", "posts"], "rows": [["user-a", "12"]], "row_count": 1, "truncated": False}
+    }
+
+
+@pytest.mark.parametrize("asked", [None, False], ids=["unsaid", "false"])
+def test_no_previews_file_unless_asked(asked: bool | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spec without the flag, as every job before the previews had, or with it false, reads no preview."""
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control) if asked is None else _write_spec(control, previews=asked)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    assert sorted(p.name for p in control.iterdir()) == ["result.json", "spec.json"]
+
+
+@pytest.mark.parametrize("tool", ["refusing", "no-such-tool"])
+def test_a_tool_that_failed_reads_no_preview(tool: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The supervisor keeps no output of a failed tool, so the job spends no time on their previews."""
+    monkeypatch.setitem(RUNNERS, "refusing", lambda args, ctx: {"error": "invalid_value: refused"})
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control, tool=tool, previews=True)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    assert sorted(p.name for p in control.iterdir()) == ["result.json", "spec.json"]
+
+
+class _Late(TimeLimit):
+    """A time limit that lands in the previews."""
+
+
+@pytest.mark.parametrize("raised", [RuntimeError("broken"), _Late(), KeyboardInterrupt()])
+def test_a_preview_that_fails_leaves_the_result_alone(
+    raised: BaseException, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever the previews raise, there is no previews file, and the result and the exit status are as before."""
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control, previews=True)
+
+    def fail(out_dir: Path, deadline: float) -> dict[str, Any]:
+        raise raised
+
+    monkeypatch.setattr(job, "previews_of", fail)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    assert json.loads((control / "result.json").read_text()) == {"x": 1}
+    assert not (control / "previews.json").exists()
+
+
+def test_a_previews_file_cut_short_is_not_left_behind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A write that fails half-way (a full volume, the file-size limit) leaves no torn previews file."""
+    control = _with_output(tmp_path, monkeypatch)
+    spec = _write_spec(control, previews=True)
+    real_write_text = Path.write_text
+
+    def write_text(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if self.name == "previews.json":
+            real_write_text(self, data[:10], *args, **kwargs)
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+    assert job.main(["job", str(spec)]) == 0
+
+    monkeypatch.undo()
+    assert json.loads((control / "result.json").read_text()) == {"x": 1}
+    assert not (control / "previews.json").exists()
+
+
 def test_the_registered_runners() -> None:
     """Each tool task registers its own runners: ``echo`` proves the sandbox, the document tools read files."""
     assert set(RUNNERS) == {
