@@ -46,7 +46,8 @@ def test_every_tool_is_in_the_permission_matrix(tmp_path: Path) -> None:
     settings = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "k" * 32, "WORKBENCH_DATA_DIR": str(tmp_path)}, role="api")
     store = Store(tmp_path / "workbench.db", Workspaces(tmp_path))
     audit = AuditLog(AuditEmitter(SERVICE, __version__, stream=io.StringIO(), heartbeat_interval_s=0))
-    spec = tool_openapi(create_app(settings, store=store, audit=audit))
+    app = create_app(settings, store=store, audit=audit)
+    spec = tool_openapi(app, app.state.callers.get("open-webui"))
     tools = [op["operationId"] for item in spec["paths"].values() for op in item.values() if "operationId" in op]
     assert len(tools) == 9
     rows = {line.split("|")[1].strip() for line in doc("permissions.md").splitlines() if line.startswith("| `")}

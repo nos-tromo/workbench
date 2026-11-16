@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,14 @@ SPEC_DEFAULTS = {
     "WORKBENCH_WORKSPACE_MAX_MB": "500",
 }
 
+#: docint's variables in the api's environment: the key, its tools and its two limits (the spec's §3.8).
+CALLER_DEFAULTS = {
+    "DOCINT_WORKBENCH_KEY": "",
+    "DOCINT_WORKBENCH_TOOLS": "run_python",
+    "DOCINT_WORKBENCH_WALL_S": "60",
+    "DOCINT_WORKBENCH_SLOTS": "2",
+}
+
 #: The executor supervisor's capabilities (docs/sandbox.md).
 EXECUTOR_CAPABILITIES = {"SETUID", "SETGID", "CHOWN", "FOWNER", "DAC_OVERRIDE", "KILL"}
 
@@ -48,6 +57,8 @@ FIXED_BY_THE_IMAGES = ("WORKBENCH_DATA_DIR", "WORKBENCH_EXECUTOR_SOCKET", "WORKB
 SERVICES = ("volume-permissions", "api", "executor")
 
 _DEFAULT = re.compile(r"\$\{([A-Z0-9_]+):-([^}]*)\}")
+#: Either form of a default: ``${VAR:-default}``, or the colon-less ``${VAR-default}``, which keeps a value set empty.
+_ANY_DEFAULT = re.compile(r"\$\{([A-Z0-9_]+):?-([^}]*)\}")
 
 
 def compose(name: str = "compose.yaml") -> dict[str, Any]:
@@ -86,6 +97,18 @@ def test_compose_defaults_match_the_spec() -> None:
     assert {key: example.get(key) for key in SPEC_DEFAULTS} == SPEC_DEFAULTS
 
 
+def test_the_api_alone_gets_the_callers_variables() -> None:
+    """Docint's variables and the purpose rule reach the api, not the executor, which reads none of them."""
+    spec = compose()
+    api = spec["services"]["api"]["environment"]
+    assert {key: default_of(api[key]) for key in CALLER_DEFAULTS} == {
+        key: (key, value) for key, value in CALLER_DEFAULTS.items()
+    }
+    assert api["AUDIT_REQUIRE_PURPOSE"] == "${AUDIT_REQUIRE_PURPOSE-query,disclose,combine}"
+    names = {*CALLER_DEFAULTS, "AUDIT_REQUIRE_PURPOSE"}
+    assert names.isdisjoint(spec["services"]["executor"]["environment"]) and names.isdisjoint(spec["x-settings"])
+
+
 def test_the_settings_tied_to_the_images_stay_out_of_compose() -> None:
     """The data folder, the socket and the slot uids follow the mounts and the image's users, not ``.env``."""
     for name in ("compose.yaml", "compose.override.yaml", "compose.test.yaml"):
@@ -95,10 +118,10 @@ def test_the_settings_tied_to_the_images_stay_out_of_compose() -> None:
 
 
 def test_every_compose_default_is_the_examples() -> None:
-    """Each ``${VAR:-default}`` in the production and dev shapes is the value ``.env.example`` shows."""
+    """Each default in the production and dev shapes, colon-less ones too, is the value ``.env.example`` shows."""
     example = example_values()
     for name in ("compose.yaml", "compose.override.yaml"):
-        for key, value in _DEFAULT.findall((DOCKER / name).read_text(encoding="utf-8")):
+        for key, value in _ANY_DEFAULT.findall((DOCKER / name).read_text(encoding="utf-8")):
             if not key.endswith("_VERSION"):
                 assert example.get(key) == value, (name, key)
 
@@ -257,6 +280,15 @@ def test_every_service_is_hardened() -> None:
     assert "cap_add" not in compose()["services"]["api"]
 
 
+def test_no_core_dumps() -> None:
+    """A core file of the api or the executor could hold a call's data: both services set the core limit to 0."""
+    services = compose()["services"]
+    assert {name: services[name]["ulimits"] for name in ("api", "executor")} == {
+        "api": {"core": 0},
+        "executor": {"core": 0},
+    }
+
+
 def test_volume_permissions_has_only_what_prepare_volume_needs() -> None:
     """Root with three capabilities, no network, running prepare_volume once."""
     service = compose()["services"]["volume-permissions"]
@@ -282,6 +314,49 @@ def test_both_images_pin_their_bases_by_tag_and_digest(dockerfile: str) -> None:
         if stage:
             stages.add(stage)
     assert "docker.io/library/python:3.12-slim-trixie" in bases
+
+
+def _requirement_names(requirements: list[str]) -> set[str]:
+    """The distribution names of a list of requirements, lower-cased."""
+    return {re.split(r"[\s<>=!~;\[]", requirement, maxsplit=1)[0].lower() for requirement in requirements}
+
+
+def _shipped_syncs(dockerfile: str) -> list[str]:
+    """Every ``uv sync`` of the stages the production image is built from: the last stage and what it takes from."""
+    text = (DOCKER / dockerfile).read_text(encoding="utf-8").replace("\\\n", " ")
+    stages: list[tuple[str | None, str, list[str]]] = []
+    for line in text.splitlines():
+        found = re.fullmatch(r"FROM (\S+)(?: AS (\S+))?", line.strip())
+        if found is not None:
+            stages.append((found.group(2), found.group(1), []))
+        elif stages and line.strip() and not line.lstrip().startswith("#"):
+            stages[-1][2].append(line.strip())
+    by_name = {name: stage for stage in stages if (name := stage[0]) is not None}
+    shipped: list[tuple[str | None, str, list[str]]] = []
+    todo = [stages[-1]]
+    while todo:
+        stage = todo.pop()
+        if stage in shipped:
+            continue
+        shipped.append(stage)
+        sources = [stage[1], *(m for line in stage[2] for m in re.findall(r"--from=(\S+)", line))]
+        todo.extend(by_name[source] for source in sources if source in by_name)
+    return [line for _, _, lines in shipped for line in lines if "uv sync" in line]
+
+
+def test_the_sdk_stays_in_the_dev_group() -> None:
+    """The MCP SDK tests the door and never ships: it is in the dev group alone, and each image syncs without it."""
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "mcp" in _requirement_names(project["dependency-groups"]["dev"])
+    assert "mcp" not in _requirement_names(project["project"]["dependencies"])
+    for extra in project["project"]["optional-dependencies"].values():
+        assert "mcp" not in _requirement_names(extra)
+    for dockerfile in ("Dockerfile.api", "Dockerfile.executor"):
+        syncs = _shipped_syncs(dockerfile)
+        assert len(syncs) == 2, dockerfile
+        assert [sync for sync in syncs if "--no-dev" not in sync] == [], dockerfile
+    every_line = (DOCKER / "Dockerfile.executor").read_text(encoding="utf-8").replace("\\\n", " ").splitlines()
+    assert [line for line in every_line if "uv sync" in line and "--no-dev" not in line], "the test stage's is left out"
 
 
 def test_the_test_stack_keeps_nothing_of_a_developers() -> None:
@@ -536,6 +611,19 @@ def test_the_examples_workbench_settings_are_all_commented_out() -> None:
     settings = [match for match in found if match is not None]
     assert len(settings) >= len(SPEC_DEFAULTS)
     assert [match.group(2) for match in settings if match.group(1) is None] == []
+
+
+def test_open_webuis_key_is_no_longer_required() -> None:
+    """The api starts with either key: neither is ``[required]`` or active; each is a shared secret."""
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    assert [line for line in lines if line.startswith("# [") and "[required]" in line] == []
+    assert "# Required" not in lines
+    assert "OPEN_WEBUI_WORKBENCH_KEY=" not in lines and "DOCINT_WORKBENCH_KEY=" not in lines
+    for key, tags in (
+        ("OPEN_WEBUI_WORKBENCH_KEY", "# [secret] [shared: open-webui-service]"),
+        ("DOCINT_WORKBENCH_KEY", "# [secret] [shared: docint WORKBENCH_API_KEY]"),
+    ):
+        assert lines[lines.index(f"# {key}=") - 1] == tags, key
 
 
 def test_health_shows_the_containers_and_asks_the_api() -> None:

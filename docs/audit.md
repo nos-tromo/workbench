@@ -33,10 +33,10 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | Field | Value |
 |---|---|
 | `action` / `operation` | by event key, below |
-| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id (see [Who](#who-the-actor)) |
+| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id, or docint's keyed pseudonym (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
 | `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
-| `criteria` | `caller` (`open-webui`), and the keys below |
+| `criteria` | `caller` (`open-webui` or `docint`), and the keys below |
 
 The `container` is the chat folder the files live in, never the chat the
 request named (`workbench/api/files.py:_in_folder_of`). Open WebUI's browser can
@@ -56,6 +56,7 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 | `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
 | `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
 | `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made that is kept | `outputs`: how many files it made that are kept | before any file it made is visible and before the answer goes. `ok` when the job ran to an answer: the code may have raised (its traceback is the answer) or run out of its own time, 9/10 of the wall time (stderr then says it timed out); `error` when the job failed, was stopped at the wall time or on a resource limit, its outputs broke the executor's limits, or its answer could not be used |
+| `run_python_inline` | `combine` / `tool.run_python.inline` | none: `target.kind` is `inline_data`, `count` the data entries, `container` `chat:<session>` | `job`, `input_bytes`, `outputs` (returned), `dropped`; `refused` on a refusal | once the job has answered, before anything of the answer goes: `ok`, or `error`; `denied`, without a target, for a missing required purpose |
 | `inspect_template` | `query` / `tool.inspect_template` | the template | — | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
 | `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 | `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size; `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
@@ -89,6 +90,13 @@ failed or its caller went away (`workbench/api/jobs.py:JobQueue`).
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.
 
+### The inline event
+
+Written before the answer goes out, the event can, in a rare cancellation, name
+outputs that never reached docint, whose own `disclose` records whether an
+answer came. An answer that cannot be read records `outputs` 0 and every output
+as `dropped`.
+
 ### Not recorded
 
 - Listing a folder (`/files/list`), `list_files`, `mkdir` and `move`: they read
@@ -110,7 +118,8 @@ recorded and which are not.
 
 No event holds a file's content, a file name or a path, a search query, code,
 a value the model wrote, Markdown, a template's field names, the text a tool
-returned, or the message of a refusal (only its code). The api's audit methods take file ids and counts and no name
+returned, the data a call brings, or a digest of it, or the message of a refusal
+(only its code). The api's audit methods take file ids and counts and no name
 (`workbench/api/audit.py`). The criteria are flags and counts.
 
 ### Long lists of files
@@ -160,11 +169,13 @@ A retention record that cannot be written stops the api (see
 
 ## Who: the actor
 
-The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id,
-with `via: service`: Open WebUI acts for the user. While the account exists, an
-Open WebUI admin resolves the id in Open WebUI's user table, and Open WebUI's
-own per-request audit records carry the same id with the account. The caller,
-`open-webui`, is in every event's `criteria`.
+The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id
+or docint's keyed pseudonym, with `via: service`: the caller acts for the user.
+While the account exists, an Open WebUI admin resolves the id in Open WebUI's
+user table, and Open WebUI's own per-request audit records carry the same id
+with the account. A docint pseudonym resolves through docint's own `disclose`
+event for the call (same request id and job), which names the user. The caller,
+`open-webui` or `docint`, is in every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user
@@ -174,20 +185,20 @@ no test pins that (see
 [permissions.md](permissions.md#what-open-webui-v0133-sends)). workbench does
 not use it.
 
-## No purpose and no recipient in version 1
+## Purpose, recipient and request id
 
-- **No purpose.** Open WebUI cannot send a stated purpose with each call, so
-  version 1 records none and requires none. workbench does not read
-  `X-Audit-Purpose` or `AUDIT_REQUIRE_PURPOSE`. A caller that sends a purpose
-  (docint, in version 2) will have it recorded.
+- **Purpose.** On the MCP door a call states its purpose in `X-Audit-Purpose`,
+  and it is recorded. `AUDIT_REQUIRE_PURPOSE` (`query,disclose,combine` in
+  compose) makes a call without one `denied`. Open WebUI cannot send a purpose,
+  so the terminal door records none and requires none.
 - **No `recipient` on `disclose`.** A view, read or display goes to the user's
   own session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
-- **No request id, and no parent but a continuation's.** Open WebUI's tool calls
-  carry no message id workbench could tie together. The events of one agent turn
-  share their `container` and follow each other in the chain. Only a
-  continuation of a long id list names a parent (see
-  [Long lists of files](#long-lists-of-files)).
+- **Request id.** An MCP call's `X-Request-ID` is on its event, which ties it to
+  docint's `disclose`. Open WebUI's tool calls carry no message id workbench
+  could tie together: the events of one agent turn share their `container` and
+  follow each other in the chain. Only a continuation of a long id list names a
+  parent (see [Long lists of files](#long-lists-of-files)).
 
 ## The Open WebUI side
 
@@ -244,7 +255,8 @@ as `service_version`:
 - `lifecycle` / `start` opens it;
 - `admin` / `config.audit` (actor `via: system`) records the limits in force:
   `retention_days`, `executor_slots`, `queue_max`, `job_wall_s`,
-  `upload_max_mb`, `workspace_max_mb`. Never the key;
+  `upload_max_mb`, `workspace_max_mb`, `callers` (each by name, door, tools,
+  wall cap and slots) and `require_purpose`, sorted. Never a key;
 - `lifecycle` / `heartbeat` follows every 60 seconds;
 - `lifecycle` / `shutdown` closes it on a clean stop.
 
@@ -272,6 +284,7 @@ lock file is `/tmp/audit-stream.lock` on the api's `/tmp` tmpfs.
 | Variable | Default | Purpose |
 |---|---|---|
 | `AUDIT_OUTPUT` | `stdout` (compose sets `container`) | Where the chain goes: `stdout` for the process's stdout, `container` for the container's main stdout under the container-wide lock. Any other value stops the start. Not in `.env.example`: compose fixes it |
+| `AUDIT_REQUIRE_PURPOSE` | none in the code; compose sets `query,disclose,combine` | The actions a call must state a purpose for, on the MCP door only ([configuration.md](configuration.md#audit-and-retention)) |
 
-`AUDIT_REQUIRE_PURPOSE`, `AUDIT_CASE_REF`, `AUDIT_REASON` and `AUDIT_CLI_USER`
-are read by other members of the federation. workbench reads none of them.
+`AUDIT_CASE_REF`, `AUDIT_REASON` and `AUDIT_CLI_USER` are read by other members
+of the federation. workbench reads none of them.

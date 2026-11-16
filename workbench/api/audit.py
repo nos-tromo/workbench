@@ -1,7 +1,8 @@
 """The api's data-protection audit chain.
 
 Every file and tool action is recorded by reference: file ids, counts and the
-chat folder the files are in as container. Never content and never a file name, so nothing here takes
+chat folder the files are in as container; data that came with a call is counted,
+never named. Never content and never a file name, so nothing here takes
 one. One emitter, and so one hash chain, per process; the lifespan opens it with
 :meth:`AuditLog.open` and ends it with :meth:`AuditLog.close`.
 
@@ -42,6 +43,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
     "run_python": ("combine", "tool.run_python"),
+    "run_python_inline": ("combine", "tool.run_python.inline"),
     "inspect_template": ("query", "tool.inspect_template"),
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
@@ -115,8 +117,11 @@ class AuditLog:
         outcome: str = "ok",
         criteria: Mapping[str, object] | None = None,
         purpose: Purpose | None = None,
+        target_kind: str | None = _FILE,
+        count: int | None = None,
+        request_id: str | None = None,
     ) -> str:
-        """Record one file or tool action of a user, by file id.
+        """Record one file or tool action of a user, by file id, or by count for data that came with the call.
 
         Args:
             key: The action, a key of :data:`OPERATIONS`.
@@ -127,6 +132,10 @@ class AuditLog:
             criteria: The action's parameters, never content. ``caller`` is
                 added, and replaces a ``caller`` given here.
             purpose: The stated purpose, if any.
+            target_kind: What the action touched, ``file`` by default; ``None`` writes no target, as for a call
+                refused before it touched anything.
+            count: How many objects it touched, in place of ``len(file_ids)``.
+            request_id: The call's request id, on the event and on each continuation.
 
         Returns:
             The id of the written event; more than 200 ids add continuations (:meth:`_emit`).
@@ -140,14 +149,19 @@ class AuditLog:
         # caller goes first so it is among the criteria the emitter keeps when it caps their number.
         merged: dict[str, object] = {"caller": p.caller}
         merged.update((name, value) for name, value in (criteria or {}).items() if name != "caller")
+        target = None
+        if target_kind is not None:
+            touched = len(file_ids) if count is None else count
+            target = Target(kind=target_kind, ids=file_ids, count=touched, container=f"chat:{p.chat_id}")
         return self._emit(
             action,
             operation,
             Actor(user=p.user_id, via="service"),
             outcome=outcome,
             purpose=purpose,
-            target=Target(kind=_FILE, ids=file_ids, count=len(file_ids), container=f"chat:{p.chat_id}"),
+            target=target,
             criteria=merged,
+            request_id=request_id,
         )
 
     def record_system(
@@ -199,12 +213,13 @@ class AuditLog:
         target: Target | None,
         criteria: Mapping[str, object] | None,
         purpose: Purpose | None = None,
+        request_id: str | None = None,
     ) -> str:
         """Write an event, and a continuation for each further 200 of its ids, so that no id is cut.
 
         The event carries the first 200 ids and the target's full count. Each continuation is ``<operation>.ids``, with
-        ``parent_event_id`` the event's id, the same action, actor, outcome, purpose and container, ``count`` the
-        number of its own ids, and no criteria.
+        ``parent_event_id`` the event's id, the same action, actor, outcome, purpose, request id and container,
+        ``count`` the number of its own ids, and no criteria.
 
         Args:
             action: The audit action.
@@ -214,6 +229,7 @@ class AuditLog:
             target: What it touched, every id given; ``None`` for no target.
             criteria: The event's criteria.
             purpose: The stated purpose, if any.
+            request_id: The call's request id, if any.
 
         Returns:
             The id of the event.
@@ -222,13 +238,22 @@ class AuditLog:
             AuditWriteError: If the event or a continuation cannot be written; the events before it stay written.
         """
         if target is None:
-            event = self.emitter.emit(action, operation, actor, outcome=outcome, purpose=purpose, criteria=criteria)
+            event = self.emitter.emit(
+                action, operation, actor, outcome=outcome, request_id=request_id, purpose=purpose, criteria=criteria
+            )
             return str(event["event_id"])
         chunks = id_chunks([str(item) for item in target.ids])
         count = len(target.ids) if target.count is None else target.count
         first = Target(kind=target.kind, ids=chunks[0] if chunks else (), count=count, container=target.container)
         event = self.emitter.emit(
-            action, operation, actor, outcome=outcome, purpose=purpose, target=first, criteria=criteria
+            action,
+            operation,
+            actor,
+            outcome=outcome,
+            request_id=request_id,
+            purpose=purpose,
+            target=first,
+            criteria=criteria,
         )
         event_id = str(event["event_id"])
         for chunk in chunks[1:]:
@@ -237,6 +262,7 @@ class AuditLog:
                 operation + CONTINUATION,
                 actor,
                 outcome=outcome,
+                request_id=request_id,
                 parent_event_id=event_id,
                 purpose=purpose,
                 target=Target(kind=target.kind, ids=chunk, count=len(chunk), container=target.container),

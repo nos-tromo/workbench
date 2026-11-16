@@ -1,6 +1,6 @@
 [project]
 name = "workbench"
-version = "0.1.1"
+version = "0.2.0"
 description = "The federation's shared tool tier: a FastAPI tool API plus a sandboxed code and document executor"
 authors = [
   { name = "nos-tromo" }
@@ -43,6 +43,7 @@ Repository = "https://github.com/nos-tromo/workbench.git"
 dev = [
     "httpx>=0.28.1",
     "httpx2>=2.16.0",
+    "mcp>=2",
     "pre-commit>=4.7.0",
     "pyrefly==1.1.1",
     "pytest>=9.2.0",

@@ -12,6 +12,9 @@ A job the queue refuses (``Busy``) is a 503 with one fixed text, whatever the re
 told to retry later, and which limit was hit is for the metrics, not for the model. A request too
 large for the executor's protocol (``RequestTooLarge``) is a 422: retrying it cannot help.
 
+Both doors answer with the same texts: :func:`describe` gives an error's status and text, :func:`compact` the body of
+a request that does not validate.
+
 A request that does not validate is FastAPI's 422, but smaller: each error keeps its ``type``, ``loc`` and ``msg``,
 never the ``input`` that failed or its ``ctx``, so a 200 000-character document or a 100 000-row table never goes back
 into the model's context. The text a location part or a message quotes from the request (a key, a tag) is cut, and at
@@ -20,15 +23,19 @@ most :data:`MAX_ERRORS` are listed, the rest counted in ``more_errors``.
 Any other error is one no handler expected: :class:`QuietErrors` answers it as a 500 with one fixed text and logs it by
 the method, the route's template and the error's type, never its message or a traceback, which can name a path on the
 volume, a file name or a user id.
+
+A path no route serves answers 404 with :data:`NOT_FOUND`, as a path outside a caller's door does, so the text does not
+tell ``/mcp`` from a path that is not there.
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Final, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from workbench.api.jobs import Busy, RequestTooLarge
@@ -71,6 +78,27 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
 )
 
 
+def describe(exc: Exception) -> tuple[int, str]:
+    """Say what an error is answered with: its status and its short fixed text.
+
+    Args:
+        exc: The error.
+
+    Returns:
+        For a path, store, audit, queue or request-size error, the status and text of :data:`_ANSWERS`, and
+        ``(500, "storage error")`` for any other store error. For an ``HTTPException`` with a string detail, its status
+        and detail. For anything else, ``(500, INTERNAL)``: its message is never the answer.
+    """
+    for kind, status, detail in _ANSWERS:
+        if isinstance(exc, kind):
+            return status, detail or str(exc)
+    if isinstance(exc, StoreError):
+        return 500, "storage error"
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, str):
+        return exc.status_code, exc.detail
+    return 500, INTERNAL
+
+
 async def _answer(_request: Request, exc: Exception) -> JSONResponse:
     """Turn a path, store, audit, queue or request-size error into its short answer, without logging it.
 
@@ -81,10 +109,8 @@ async def _answer(_request: Request, exc: Exception) -> JSONResponse:
     Returns:
         The JSON response.
     """
-    for kind, status, detail in _ANSWERS:
-        if isinstance(exc, kind):
-            return JSONResponse({"detail": detail or str(exc)}, status_code=status)
-    return JSONResponse({"detail": "storage error"}, status_code=500)
+    status, detail = describe(exc)
+    return JSONResponse({"detail": detail}, status_code=status)
 
 
 def _cut(text: str) -> str:
@@ -99,18 +125,16 @@ def _cut(text: str) -> str:
     return text if len(text) <= _ERROR_TEXT else text[:_ERROR_TEXT] + _CUT_MARK
 
 
-async def _invalid(_request: Request, exc: Exception) -> JSONResponse:
-    """Answer a request that does not validate: where and why, never the value.
+def compact(errors: Sequence[Mapping[str, Any]]) -> dict[str, object]:
+    """Say where and why validation failed, never the value.
 
     Args:
-        _request: The request that failed.
-        exc: The :class:`RequestValidationError`.
+        errors: The validation errors, as pydantic lists them.
 
     Returns:
-        The 422: ``detail`` lists the first :data:`MAX_ERRORS` errors as ``type``, ``loc`` and ``msg``;
-        ``more_errors`` counts the rest, when there are more.
+        ``detail``, the first :data:`MAX_ERRORS` errors as ``type``, ``loc`` and ``msg``, a location part or a message
+        cut at :data:`_ERROR_TEXT` characters; and ``more_errors``, the count of the rest, when there are more.
     """
-    errors: Sequence[Any] = cast(RequestValidationError, exc).errors()  # install() registers it for no other
     detail = [
         {
             "type": str(error.get("type", "")),
@@ -122,7 +146,20 @@ async def _invalid(_request: Request, exc: Exception) -> JSONResponse:
     body: dict[str, object] = {"detail": detail}
     if len(errors) > MAX_ERRORS:
         body["more_errors"] = len(errors) - MAX_ERRORS
-    return JSONResponse(body, status_code=422)
+    return body
+
+
+async def _invalid(_request: Request, exc: Exception) -> JSONResponse:
+    """Answer a request that does not validate: where and why, never the value.
+
+    Args:
+        _request: The request that failed.
+        exc: The :class:`RequestValidationError`.
+
+    Returns:
+        The 422, with :func:`compact`'s body.
+    """
+    return JSONResponse(compact(cast(RequestValidationError, exc).errors()), status_code=422)  # registered for no other
 
 
 class QuietErrors:
@@ -180,11 +217,21 @@ class QuietErrors:
 
 
 def install(app: FastAPI) -> None:
-    """Register the handlers on ``app``.
+    """Register the handlers on ``app``, and its answer to a path no route serves.
 
     Args:
         app: The application.
     """
+    unrouted = app.router.default
+
+    async def not_found(scope: Scope, receive: Receive, send: Send) -> None:
+        """Answer an HTTP request no route serves with :data:`NOT_FOUND`; leave anything else to the router."""
+        if scope["type"] != "http":
+            await unrouted(scope, receive, send)
+            return
+        await JSONResponse({"detail": NOT_FOUND}, status_code=404)(scope, receive, send)
+
+    app.router.default = not_found
     app.add_exception_handler(PathError, _answer)
     app.add_exception_handler(StoreError, _answer)
     app.add_exception_handler(AuditWriteError, _answer)

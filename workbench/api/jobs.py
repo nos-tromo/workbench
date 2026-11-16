@@ -12,30 +12,40 @@ is sent:
 - one user has at most ``queue_max // executor_slots`` calls waiting (at least one), so a user
   who sends many calls fills their own share of the queue and no more; their next call is
   refused at once (``queue_full``), and the other users are not affected;
-- a job waits at most ``queue_wait_s`` for its turn (``wait_timeout``);
+- a caller with slots of its own (:class:`CallLimits`) has that many jobs running at once over
+  all its users, and that many times a user's share waiting; its further calls wait without a
+  slot, and past its share they are refused at once (``queue_full``);
+- a job waits at most ``queue_wait_s`` for its turn, or its call's own wait (``wait_timeout``);
 - an executor with no free slot, or one that cannot be reached, is a refusal too
   (``executor_busy``).
 
 Every refusal is :class:`Busy`, which the api answers as ``503``, "busy, retry later". A request
 that is too large for the protocol's line is not a refusal and not worth a retry:
 :class:`RequestTooLarge`, ``422``. The queue is the only user of the staging folder: it moves what
-a job wrote into the chat folder (:meth:`~workbench.api.store.Store.register_output`) and removes
-the job's staging folder afterwards, whatever came of the job.
+a job wrote into the chat folder (:meth:`~workbench.api.store.Store.register_output`), or reads it
+back for the answer (:meth:`JobQueue.submit_inline`), and removes the job's staging folder
+afterwards, whatever came of the job.
 
 No output becomes a file without its record. Once the executor has answered, the caller's
 :class:`Keeper` records the job by the ids the queue chose for its outputs, and only then are they
 moved into the chat folder; one that cannot be kept, for any reason, or is removed again because
 the call failed, is recorded again as an error. A call without a keeper keeps no output at all.
+An inline job keeps none either: its :class:`Taker` records it, with the outputs that come back,
+before anything of it goes out.
 """
 
 import asyncio
 import contextlib
 import dataclasses
 import logging
+import os
+import re
 import shutil
+import stat
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, get_args
 
 from workbench.api.metrics import Metrics
@@ -47,10 +57,12 @@ from workbench.paths import PathError, check_filename
 from workbench.protocol import (
     MAX_INPUT_FILES,
     MAX_LINE,
+    InlineFile,
     JobRequest,
     JobResult,
     Limits,
     OutputFile,
+    check_inline_inputs,
     decode_result,
     encodable,
     encode,
@@ -66,6 +78,119 @@ _READ_GRACE_S: Final = 300
 Reason = Literal["queue_full", "wait_timeout", "executor_busy"]
 
 _MIB: Final = 1024 * 1024
+
+#: Seconds a call through the MCP door waits for its turn at the most.
+MCP_QUEUE_WAIT_S: Final = 5
+
+#: The media type of each output type an inline job gives back, by its suffix, lower-cased.
+RETURN_TYPES: Final[Mapping[str, str]] = MappingProxyType(
+    {".png": "image/png", ".csv": "text/csv", ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json"}
+)
+#: Most outputs that come back.
+MAX_RETURNED: Final = 8
+#: Largest image that comes back, in bytes.
+IMAGE_MAX: Final = 512 * 1024
+#: Largest text that comes back, in bytes.
+TEXT_MAX: Final = 256 * 1024
+#: Most bytes that come back in all.
+RETURN_MAX: Final = 1024 * 1024
+#: The first bytes of every PNG file.
+PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
+
+#: A C0 control character other than tab, LF and CR, or DEL. A text holding one does not come back: JSON escapes
+#: it to six bytes, which would grow the answer past what a caller accepts.
+_CONTROL: Final = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+#: Why an output does not come back.
+SkipReason = Literal["type", "signature", "encoding", "control", "count", "size", "total", "unreadable"]
+
+
+@dataclasses.dataclass(frozen=True)
+class CallLimits:
+    """What one call may take of the queue: its caller's limits, as its door applies them.
+
+    Attributes:
+        wall_s: The most wall-clock seconds its job may run; the job gets the least of this and ``job_wall_s``.
+        wait_s: The most seconds it waits for its turn, in place of ``queue_wait_s``.
+        slots: The most jobs of its caller that run at once; ``None`` for no cap of the caller's own.
+    """
+
+    wall_s: int
+    wait_s: int
+    slots: int | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse limits no call can have: they are a door's bug, caught here rather than in the queue.
+
+        Raises:
+            ValueError: ``wall_s`` is below 1, ``wait_s`` below 0, or ``slots`` is set and below 1.
+        """
+        if self.wall_s < 1 or self.wait_s < 0 or (self.slots is not None and self.slots < 1):
+            raise ValueError("call limits need a wall of at least 1 s, a wait of at least 0 s and at least 1 slot")
+
+
+@dataclasses.dataclass(frozen=True)
+class TakenFile:
+    """An output that comes back with the answer.
+
+    Attributes:
+        name: Its name in the job's ``out/``, as the job wrote it.
+        mime: Its media type, from :data:`RETURN_TYPES`.
+        data: Its bytes, as the job wrote them; left out of ``repr``.
+    """
+
+    name: str
+    mime: str
+    data: bytes = dataclasses.field(repr=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class SkippedOutput:
+    """An output that does not come back.
+
+    Attributes:
+        name: Its name in the job's ``out/``.
+        size: Its size in bytes, as the executor staged it.
+        reason: Why it does not come back.
+    """
+
+    name: str
+    size: int
+    reason: SkipReason
+
+
+@dataclasses.dataclass(frozen=True)
+class TakenOutputs:
+    """What an inline job's outputs come to.
+
+    Attributes:
+        files: The outputs that come back, in return order.
+        skipped: The outputs that do not, in return order.
+    """
+
+    files: tuple[TakenFile, ...] = ()
+    skipped: tuple[SkippedOutput, ...] = ()
+
+
+class Taker(Protocol):
+    """What the caller of :meth:`JobQueue.submit_inline` does with a job's answer before anything of it goes out.
+
+    It runs in a worker thread of the loop, under the queue's guard against cancellation: once called, it runs to its
+    end.
+    """
+
+    def take(self, result: JobResult, taken: TakenOutputs) -> None:
+        """Record the job.
+
+        Args:
+            result: The executor's answer, whatever its status.
+            taken: The outputs that come back and those that do not; empty unless the job is ``ok``.
+
+        Raises:
+            Exception: The event could not be written (``AuditWriteError``); then ``submit_inline`` raises it, and
+                nothing of the answer goes out.
+        """
+        ...
 
 
 class Keeper(Protocol):
@@ -223,6 +348,98 @@ class _UserGate:
         self.waiting = 0
 
 
+class _CallerGate:
+    """The jobs of one capped caller, over all its users: how many may run, and how many of its calls may wait.
+
+    Attributes:
+        running: Held while a job of the caller runs.
+        waiting: Calls of the caller that are waiting for their turn, the gate or a slot.
+        waiting_max: The most calls of the caller that may wait.
+    """
+
+    def __init__(self, slots: int, waiting_max: int) -> None:
+        """Allow ``slots`` jobs at once and ``waiting_max`` calls waiting.
+
+        Args:
+            slots: The caller's slots.
+            waiting_max: ``slots`` times the user's share of the queue.
+        """
+        self.running = asyncio.Semaphore(slots)
+        self.waiting = 0
+        self.waiting_max = waiting_max
+
+
+def suffix_of(name: str) -> str:
+    """The suffix of an output's name, lower-cased, by which its type is known.
+
+    Args:
+        name: The name, as the job wrote it.
+
+    Returns:
+        The suffix with its dot, such as ``.png``; empty when the name has none.
+    """
+    return os.path.splitext(name)[1].lower()
+
+
+def _return_order(output: OutputFile) -> tuple[int, str]:
+    """Charts first, then tables, then the rest, each by name.
+
+    Args:
+        output: A staged output.
+
+    Returns:
+        Its sort key.
+    """
+    return {".png": 0, ".csv": 1}.get(suffix_of(output.name), 2), output.name
+
+
+def _read_regular(path: Path, limit: int) -> bytes:
+    """Read at most ``limit`` bytes of a regular file, never through a symlink in its place and never waiting on one.
+
+    Args:
+        path: The file.
+        limit: The most bytes to read.
+
+    Returns:
+        Its first ``limit`` bytes, or all of it.
+
+    Raises:
+        OSError: It cannot be opened or read, is a symlink or is not a regular file.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        chunks: list[bytes] = []
+        left = limit
+        while left > 0:
+            chunk = os.read(fd, left)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+class _Skip(Exception):
+    """An output does not come back.
+
+    Attributes:
+        reason: Why.
+    """
+
+    def __init__(self, reason: SkipReason) -> None:
+        """Remember why.
+
+        Args:
+            reason: Why the output does not come back.
+        """
+        super().__init__(reason)
+        self.reason: SkipReason = reason
+
+
 async def outlast[T](work: asyncio.Future[T]) -> T:
     """Wait for work to end, whatever cancellation comes meanwhile; the caller has one on its way out already.
 
@@ -263,7 +480,7 @@ def _check_inputs(input_files: Sequence[str]) -> None:
 
 
 class JobQueue:
-    """Runs jobs in the executor within the global, per-user and queue limits.
+    """Runs jobs in the executor within the global, per-caller, per-user and queue limits.
 
     Attributes:
         metrics: The metrics the queue reports to; ``/metrics`` serves them.
@@ -284,6 +501,7 @@ class JobQueue:
         self.metrics = metrics
         self._slots = asyncio.Semaphore(settings.executor_slots)
         self._gates: dict[tuple[str, str], _UserGate] = {}
+        self._caller_gates: dict[str, _CallerGate] = {}
         self._waiting = 0
         self._user_waiting_max = max(1, settings.queue_max // settings.executor_slots)
         self._staging = settings.data_dir / STAGING
@@ -302,6 +520,8 @@ class JobQueue:
         args: dict[str, Any],
         input_files: Sequence[str],
         keeper: Keeper | None = None,
+        *,
+        call: CallLimits | None = None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run a tool in the executor, when its turn comes, and keep what it makes.
 
@@ -312,6 +532,8 @@ class JobQueue:
             input_files: Paths relative to the chat folder that the job may read.
             keeper: Records the job once the executor has answered, before any output is moved into the chat folder,
                 and picks the outputs to keep. Without one, no output is kept: a tool that makes no file has none.
+            call: The call's wall, wait and caller slots; without it, ``job_wall_s``, ``queue_wait_s`` and no cap of
+                the caller's own.
 
         Returns:
             The job record with its final status, the executor's answer and the files the job
@@ -324,7 +546,7 @@ class JobQueue:
             PathError: An input file is not a plain path below the chat folder, there are more
                 than ``MAX_INPUT_FILES`` of them, or the caller, user or chat id is not a safe id.
                 No job record is made for a request refused for its input files.
-            Busy: The queue is full, the user's share of it is, the turn did not come in time,
+            Busy: The queue is full, the user's or the caller's share of it is, the turn did not come in time,
                 or the executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
             Exception: What the keeper raised (no output is kept), or what the store raises, such as a failure to
@@ -334,22 +556,103 @@ class JobQueue:
         if tool not in TOOLS:
             raise ValueError("unknown tool")
         _check_inputs(input_files)
+        async with self._turn(p, call):
+            return await self._run(p, tool, args, input_files, keeper, call)
+
+    async def submit_inline(
+        self,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        inline_inputs: Sequence[InlineFile],
+        taker: Taker,
+        call: CallLimits,
+    ) -> tuple[JobRecord, JobResult, TakenOutputs]:
+        """Run a tool in the executor on data the call brings, when its turn comes, and take its outputs back.
+
+        No input is copied from a workspace, and no output is kept: the outputs of an ``ok`` job are read from the
+        staging folder by type and cap (:meth:`_take`), the taker records the job, and only then does anything of it
+        go out. The staging folder goes whatever came of the job.
+
+        Args:
+            p: The caller, user and session the job runs for.
+            tool: Name of the runner to run.
+            args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
+            inline_inputs: The data, each entry written as one read-only file into the job's working folder.
+            taker: Records every job the executor answered, whatever its status, before anything of it goes out.
+            call: The call's wall, wait and caller slots.
+
+        Returns:
+            The job record with its final status, the executor's answer without its staged outputs, and the outputs
+            that come back and those that do not.
+
+        Raises:
+            ValueError: ``tool`` is not one of :data:`TOOLS`, or the inline inputs are not what the protocol takes
+                (:func:`~workbench.protocol.check_inline_inputs`; the door checks them first). Like ``submit``'s
+                inputs, they are checked before the call waits for its turn, and no job record is made for them.
+            PathError: The caller, user or session id is not a safe id.
+            Busy: The queue is full, the user's or the caller's share of it is, the turn did not come in time, or the
+                executor has no free slot or cannot be reached.
+            RequestTooLarge: The request does not fit the protocol's line; escaping can make data of 512 KiB that.
+            Exception: What the taker raised; nothing of the answer goes out. Or what the store raises, such as a
+                failure to settle the job's record.
+        """
+        if tool not in TOOLS:
+            raise ValueError("unknown tool")
+        check_inline_inputs(inline_inputs)
+        async with self._turn(p, call):
+            return await self._run_inline(p, tool, args, inline_inputs, taker, call)
+
+    @contextlib.asynccontextmanager
+    async def _turn(self, p: Principal, call: CallLimits | None) -> AsyncIterator[None]:
+        """Hold the user's turn, the caller's gate and a slot while the job runs; give them back whatever happens.
+
+        Args:
+            p: The caller and user.
+            call: The call's wait and caller slots; ``None`` for ``queue_wait_s`` and no cap of the caller's own.
+
+        Yields:
+            Once the job may run.
+
+        Raises:
+            Busy: ``queue_full`` or ``wait_timeout`` (:meth:`_admit`).
+        """
         key = (p.caller, p.user_id)
         gate = self._gates.get(key)
         if gate is None:
             gate = self._gates[key] = _UserGate(self._settings.jobs_per_user)
+        caller_gate = self._caller_gate(p.caller, call)
         gate.refs += 1
         try:
-            await self._admit(gate)
+            await self._admit(gate, caller_gate, self._settings.queue_wait_s if call is None else call.wait_s)
             try:
-                return await self._run(p, tool, args, input_files, keeper)
+                yield
             finally:
                 self._slots.release()
+                if caller_gate is not None:
+                    caller_gate.running.release()
                 gate.running.release()
         finally:
             gate.refs -= 1
             if gate.refs == 0:
                 del self._gates[key]
+
+    def _caller_gate(self, caller: str, call: CallLimits | None) -> _CallerGate | None:
+        """The gate of a capped caller, made on its first capped call.
+
+        Args:
+            caller: The caller's name.
+            call: The call's caller slots.
+
+        Returns:
+            The gate; ``None`` for a call with no cap of its caller's own.
+        """
+        if call is None or call.slots is None:
+            return None
+        gate = self._caller_gates.get(caller)
+        if gate is None:
+            gate = self._caller_gates[caller] = _CallerGate(call.slots, call.slots * self._user_waiting_max)
+        return gate
 
     def _refuse(self, reason: Reason) -> Busy:
         """Count a refusal.
@@ -363,51 +666,120 @@ class JobQueue:
         self.metrics.job_refusals_total.labels(reason).inc()
         return Busy(reason)
 
-    async def _admit(self, gate: _UserGate) -> None:
-        """Wait for the user's turn, then for a slot; hold both on return.
+    async def _admit(self, gate: _UserGate, caller_gate: _CallerGate | None, wait_s: float) -> None:
+        """Wait for the user's turn, then for the caller's gate, then for a slot; hold them all on return.
 
-        A call that can start at once does not count as waiting. One that cannot is counted
-        against ``queue_max``, and against the user's own share of it, until it starts or gives up.
-        The user's turn comes before the slot, so a user's second job waits without holding a slot
-        another user could use.
+        A call that can start at once does not count as waiting. One that cannot is counted against
+        ``queue_max``, against the user's own share of it and against the caller's, until it starts or
+        gives up. The user's turn and the caller's gate come before the slot, so a call that waits for
+        either holds no slot another caller could use.
 
         Args:
             gate: The calling user's gate.
+            caller_gate: The calling caller's gate; ``None`` for a caller with no cap of its own.
+            wait_s: The most seconds to wait.
 
         Raises:
             Busy: ``queue_full`` at once when ``queue_max`` calls wait already, or when the user's
-                share (``queue_max // executor_slots``, at least one) is used up; ``wait_timeout``
-                after ``queue_wait_s`` seconds.
+                share (``queue_max // executor_slots``, at least one) or the caller's (its slots times
+                the user's share) is used up; ``wait_timeout`` after ``wait_s`` seconds.
         """
-        waits = gate.running.locked() or self._slots.locked()
+        turns = [gate.running, *([caller_gate.running] if caller_gate is not None else []), self._slots]
+        waits = any(turn.locked() for turn in turns)
         if waits:
-            if self._waiting >= self._settings.queue_max or gate.waiting >= self._user_waiting_max:
+            if (
+                self._waiting >= self._settings.queue_max
+                or gate.waiting >= self._user_waiting_max
+                or (caller_gate is not None and caller_gate.waiting >= caller_gate.waiting_max)
+            ):
                 raise self._refuse("queue_full")
             self._waiting += 1
             gate.waiting += 1
+            if caller_gate is not None:
+                caller_gate.waiting += 1
             self.metrics.queue_length.set(self._waiting)
         began = time.monotonic()
-        holds_turn = False
+        held: list[asyncio.Semaphore] = []
         admitted = False
         try:
-            async with asyncio.timeout(self._settings.queue_wait_s):
-                await gate.running.acquire()
-                holds_turn = True
-                await self._slots.acquire()
+            async with asyncio.timeout(wait_s):
+                for turn in turns:
+                    await turn.acquire()
+                    held.append(turn)
             admitted = True
         except TimeoutError:
             raise self._refuse("wait_timeout") from None
         finally:
-            if holds_turn and not admitted:
-                gate.running.release()
+            if not admitted:
+                for turn in reversed(held):
+                    turn.release()
             if waits:
                 self._waiting -= 1
                 gate.waiting -= 1
+                if caller_gate is not None:
+                    caller_gate.waiting -= 1
                 self.metrics.queue_length.set(self._waiting)
             self.metrics.queue_wait_seconds.observe(time.monotonic() - began)
 
+    def _limits(self, call: CallLimits | None) -> Limits:
+        """The limits of a job: its wall, the least of the call's and ``job_wall_s``, as wall and CPU time.
+
+        Args:
+            call: The call's wall; ``None`` for ``job_wall_s``.
+
+        Returns:
+            The job's limits.
+        """
+        settings = self._settings
+        wall = settings.job_wall_s if call is None else min(call.wall_s, settings.job_wall_s)
+        return Limits(wall_s=wall, cpu_s=wall, memory_mb=settings.job_memory_mb, file_mb=settings.upload_max_mb)
+
+    def _request(
+        self,
+        job_id: str,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        call: CallLimits | None,
+        *,
+        input_files: Sequence[str] = (),
+        inline_inputs: Sequence[InlineFile] = (),
+    ) -> JobRequest:
+        """Build a job's request: the inputs it copies or the data it carries, within its limits.
+
+        Args:
+            job_id: The job's id.
+            p: The caller, user and chat.
+            tool: Name of the runner.
+            args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
+            call: The call's wall; ``None`` for ``job_wall_s``.
+            input_files: Paths relative to the chat folder.
+            inline_inputs: The data.
+
+        Returns:
+            The request.
+        """
+        return JobRequest(
+            job_id=job_id,
+            tool=tool,
+            args=encodable(args),  # a lone surrogate from the model would make the request unsendable
+            caller=p.caller,
+            user_id=p.user_id,
+            chat_id=p.chat_id,
+            input_files=list(input_files),
+            inline_inputs=list(inline_inputs),
+            limits=self._limits(call),
+            max_chars=self._settings.result_max_kb * 1024,
+        )
+
     async def _run(
-        self, p: Principal, tool: str, args: dict[str, Any], input_files: Sequence[str], keeper: Keeper | None
+        self,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        input_files: Sequence[str],
+        keeper: Keeper | None,
+        call: CallLimits | None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Record the job, run it, keep its outputs and settle its record and staging folder.
 
@@ -417,6 +789,7 @@ class JobQueue:
             args: The runner's arguments.
             input_files: Paths relative to the chat folder.
             keeper: Records the answer and picks the outputs to keep; ``None`` keeps none.
+            call: The call's wall; ``None`` for ``job_wall_s``.
 
         Returns:
             What :meth:`submit` returns.
@@ -425,28 +798,12 @@ class JobQueue:
             Busy: The executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
         """
-        settings = self._settings
         job = await asyncio.to_thread(self._store.add_job, p, tool)
         status = "error"
         completed = False
         files: list[FileRecord] = []
         try:
-            req = JobRequest(
-                job_id=job.id,
-                tool=tool,
-                args=encodable(args),  # a lone surrogate from the model would make the request unsendable
-                caller=p.caller,
-                user_id=p.user_id,
-                chat_id=p.chat_id,
-                input_files=list(input_files),
-                limits=Limits(
-                    wall_s=settings.job_wall_s,
-                    cpu_s=settings.job_wall_s,
-                    memory_mb=settings.job_memory_mb,
-                    file_mb=settings.upload_max_mb,
-                ),
-                max_chars=settings.result_max_kb * 1024,
-            )
+            req = self._request(job.id, p, tool, args, call, input_files=input_files)
             result = await self._execute(req)
             if keeper is not None:
                 result, files = await self._keep(p, job.id, result, keeper)
@@ -467,6 +824,184 @@ class JobQueue:
                 # The caller gets this error and tells the model of no file, so no file the job made may stay.
                 await asyncio.to_thread(self._discard, files, keeper)
                 raise
+
+    async def _run_inline(
+        self,
+        p: Principal,
+        tool: str,
+        args: dict[str, Any],
+        inline_inputs: Sequence[InlineFile],
+        taker: Taker,
+        call: CallLimits,
+    ) -> tuple[JobRecord, JobResult, TakenOutputs]:
+        """Record the job, run it, hand its answer and outputs to the taker and settle its record and staging folder.
+
+        Args:
+            p: The caller, user and session.
+            tool: Name of the runner.
+            args: The runner's arguments.
+            inline_inputs: The data.
+            taker: Records the answer.
+            call: The call's wall.
+
+        Returns:
+            What :meth:`submit_inline` returns.
+
+        Raises:
+            Busy: The executor has no free slot or cannot be reached.
+            RequestTooLarge: The request does not fit the protocol's line.
+        """
+        job = await asyncio.to_thread(self._store.add_job, p, tool)
+        status = "error"
+        completed = False
+        try:
+            req = self._request(job.id, p, tool, args, call, inline_inputs=inline_inputs)
+            result = await self._execute(req)
+            taken = await self._hand_over(job.id, result, taker)
+            result = result.model_copy(update={"outputs": []})  # staged paths are gone once the job settles
+            status = result.status
+            completed = True
+            return dataclasses.replace(job, status=status), result, taken
+        except Busy:
+            status = "busy"
+            raise
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            await self._settle(job.id, status, pending=not completed)
+
+    async def _hand_over(self, job_id: str, result: JobResult, taker: Taker) -> TakenOutputs:
+        """Take the outputs back and have the taker record the job, as one call in a thread.
+
+        A cancellation does not cut it off half way: it finishes, and then the cancellation goes on. It is a plain
+        future of the loop's executor, not a task, as in :meth:`_keep`.
+
+        Args:
+            job_id: The job's id.
+            result: The executor's answer, whatever its status.
+            taker: Records the answer.
+
+        Returns:
+            The outputs that come back and those that do not.
+        """
+        loop = asyncio.get_running_loop()
+        handing = loop.run_in_executor(None, self._take_and_hand, job_id, result, taker)
+        try:
+            return await asyncio.shield(handing)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await outlast(handing)
+            raise
+
+    def _take_and_hand(self, job_id: str, result: JobResult, taker: Taker) -> TakenOutputs:
+        """Take the outputs back, then hand them and the answer to the taker.
+
+        Args:
+            job_id: The job's id.
+            result: The executor's answer.
+            taker: Records the answer.
+
+        Returns:
+            What :meth:`_take` returns.
+        """
+        taken = self._take(job_id, result)
+        taker.take(result, taken)
+        return taken
+
+    def _take(self, job_id: str, result: JobResult) -> TakenOutputs:
+        """Read back the outputs of an ``ok`` job that come back, by type, order and cap.
+
+        A type outside :data:`RETURN_TYPES` is skipped before any cap applies. The rest go in return order (charts,
+        then tables, then the rest, each by name): past :data:`MAX_RETURNED` kept files, past its own cap
+        (:data:`IMAGE_MAX` or :data:`TEXT_MAX`), a PNG without its signature, a text that is not strict UTF-8 or holds
+        a control character (:data:`_CONTROL`), or a file past :data:`RETURN_MAX` in all is skipped, and the next file
+        is still tried. Only a regular file the executor staged for this job is read, at most its cap and one byte;
+        anything else is ``unreadable``.
+
+        Args:
+            job_id: The job's id.
+            result: The executor's answer.
+
+        Returns:
+            The outputs that come back and those that do not; empty unless the job is ``ok``.
+        """
+        if result.status != "ok":
+            return TakenOutputs()
+        files: list[TakenFile] = []
+        skipped: list[SkippedOutput] = []
+        total = 0
+        for output in sorted(result.outputs, key=_return_order):
+            try:
+                file = self._take_one(job_id, output, kept=len(files), room=RETURN_MAX - total)
+            except _Skip as skip:
+                skipped.append(SkippedOutput(output.name, output.size, skip.reason))
+                continue
+            files.append(file)
+            total += len(file.data)
+        return TakenOutputs(tuple(files), tuple(skipped))
+
+    def _take_one(self, job_id: str, output: OutputFile, *, kept: int, room: int) -> TakenFile:
+        """Read back one output, if it comes back.
+
+        Args:
+            job_id: The job's id.
+            output: The staged output.
+            kept: How many outputs come back before it.
+            room: How many bytes may still come back.
+
+        Returns:
+            The output.
+
+        Raises:
+            _Skip: It does not come back, and why.
+        """
+        suffix = suffix_of(output.name)
+        mime = RETURN_TYPES.get(suffix)
+        if mime is None:
+            raise _Skip("type")
+        if kept >= MAX_RETURNED:
+            raise _Skip("count")
+        cap = IMAGE_MAX if suffix == ".png" else TEXT_MAX
+        try:
+            data = _read_regular(self._staged(job_id, output), cap + 1)
+        except (PathError, OSError):
+            raise _Skip("unreadable") from None
+        if len(data) > cap:
+            raise _Skip("size")
+        if suffix == ".png":
+            if not data.startswith(PNG_SIGNATURE):
+                raise _Skip("signature")
+        else:
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise _Skip("encoding") from None
+            if _CONTROL.search(data):
+                raise _Skip("control")
+        if len(data) > room:
+            raise _Skip("total")
+        return TakenFile(output.name, mime, data)
+
+    def _staged(self, job_id: str, output: OutputFile) -> Path:
+        """The staged file of an output, which must be where the executor stages this job's files.
+
+        The store and the reader trust the path they are given, so only ``staging/<job-id>/<name>`` passes.
+
+        Args:
+            job_id: The job's id.
+            output: The staged output.
+
+        Returns:
+            Its path.
+
+        Raises:
+            PathError: Its name is not one plain file name, or its path is not that one.
+        """
+        staged = self._staging / job_id / check_filename(output.name)
+        if Path(output.staged_path) != staged:
+            raise PathError("not the job's staging folder")
+        return staged
 
     def _discard(self, files: Sequence[FileRecord], keeper: Keeper | None) -> None:
         """Remove outputs the model will not be told of: the job could not be settled, or its caller went away.
@@ -525,7 +1060,7 @@ class JobQueue:
         """
         began = time.monotonic()
         try:
-            result = await self._client.run(req, self._settings.job_wall_s + _READ_GRACE_S)
+            result = await self._client.run(req, req.limits.wall_s + _READ_GRACE_S)
         except (ExecutorUnavailable, OSError) as exc:
             detail = str(exc) if isinstance(exc, ExecutorUnavailable) else type(exc).__name__
             _log.warning("the executor is unavailable (%s)", detail)
@@ -597,7 +1132,6 @@ class JobQueue:
         outputs: list[OutputFile] = result.outputs if result.status == "ok" else []
         planned = [new_file_id() for _ in outputs]
         chosen = set(keeper.record(result, planned))
-        folder = self._staging / job_id
         quota = self._settings.workspace_max_mb * _MIB
         kept: list[FileRecord] = []
         lost: dict[str, int] = {}
@@ -607,9 +1141,7 @@ class JobQueue:
                 if file_id not in chosen:
                     continue
                 try:
-                    staged = folder / check_filename(output.name)
-                    if Path(output.staged_path) != staged:
-                        raise PathError("not the job's staging folder")
+                    staged = self._staged(job_id, output)
                     kept.append(
                         self._store.register_output(p, staged, output.name, job_id, file_id=file_id, quota_bytes=quota)
                     )

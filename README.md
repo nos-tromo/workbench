@@ -11,7 +11,8 @@ are not. Every file is deleted 7 days after it was made.
 Open WebUI connects to workbench as a "terminal server", with a bearer key. Its
 browser uploads chat attachments straight into workbench through Open WebUI's
 proxy, and the model's tools are the operations of workbench's
-`/openapi.json`.
+`/openapi.json`. docint calls `run_python` through `/mcp`, on data each call
+brings.
 
 ## Architecture
 
@@ -31,7 +32,7 @@ work without it; only its workbench tools need it.
 ## Quick start
 
 ```bash
-cp .env.example .env          # set OPEN_WEBUI_WORKBENCH_KEY: openssl rand -hex 32
+cp .env.example .env          # set OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY: openssl rand -hex 32
 make network volumes          # the external workbench-net and workbench-data
 make build && make up         # production shape: no host port
 make health                   # both services, then the api's /healthz

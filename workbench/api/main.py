@@ -1,6 +1,6 @@
 """The workbench api application.
 
-Run it as ``uvicorn --factory workbench.api.main:app_factory``. The caller key is
+Run it as ``uvicorn --factory workbench.api.main:app_factory``. A caller key is
 checked before any body is read (:class:`~workbench.api.auth.KeyGate`), and again
 per route; a path that is not registered answers 404 to a caller with the key and
 401 to anyone else.
@@ -15,28 +15,32 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, metrics, tools, tools_output, tools_templates  # noqa: F401 (routes)
+from workbench.api import contract, errors, files, mcp, metrics, tools, tools_output, tools_templates  # noqa: F401
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
 from workbench.api.body_limit import BodyLimit, upload_limit
 from workbench.api.hardening import ViewHardening
 from workbench.api.jobs import ExecutorClient, JobQueue
 from workbench.api.metrics import Metrics
+from workbench.api.registry import Registry, workspace_specs
 from workbench.api.retention import Sweeper
 from workbench.api.store import Store
+from workbench.api.tools_inline import INLINE_SPECS
 from workbench.config import Settings, load_settings
 from workbench.layout import DATABASE
 from workbench.paths import Workspaces
 
 
-def _audit_config(settings: Settings) -> dict[str, object]:
-    """Pick what the audit chain records of the configuration: limits and periods only.
+def _audit_config(settings: Settings, callers: CallerRegistry) -> dict[str, object]:
+    """Pick what the audit chain records of the configuration: limits, periods, the callers and the purpose rule.
 
     Args:
         settings: The api's settings.
+        callers: The callers the api serves.
 
     Returns:
-        The values to record. It never holds a key or any other secret.
+        The values to record: each caller by its name, door, tools, wall cap and slots, in name order, and the
+        actions that need a stated purpose, sorted. It never holds a key or any other secret.
     """
     return {
         "retention_days": settings.retention_days,
@@ -45,6 +49,17 @@ def _audit_config(settings: Settings) -> dict[str, object]:
         "job_wall_s": settings.job_wall_s,
         "upload_max_mb": settings.upload_max_mb,
         "workspace_max_mb": settings.workspace_max_mb,
+        "callers": [
+            {
+                "name": caller.name,
+                "door": caller.door,
+                "tools": sorted(caller.tools),
+                "wall_s": caller.wall_s,
+                "slots": caller.slots,
+            }
+            for caller in sorted(callers.callers, key=lambda caller: caller.name)
+        ],
+        "require_purpose": sorted(settings.require_purpose),
     }
 
 
@@ -59,7 +74,7 @@ def create_app(
     """Build the application over its collaborators.
 
     Args:
-        settings: The api's settings; they must hold the caller key.
+        settings: The api's settings; they must hold a caller key.
         store: Files and job records on the data volume.
         audit: The audit chain; the lifespan starts it and ends it.
         jobs: The job queue that runs tools in the executor, once there is one. ``/metrics`` serves its
@@ -67,10 +82,11 @@ def create_app(
         sweeper: The retention sweep, which the lifespan runs while the app serves; none without one.
 
     Returns:
-        The application, without FastAPI's own spec and documentation routes.
+        The application, without FastAPI's own spec and documentation routes, its tools in ``app.state.registry``.
 
     Raises:
-        ConfigError: If the settings hold no caller key.
+        ConfigError: If the settings hold no caller key, two callers hold one key, or docint's list names a tool that
+            is not an inline tool.
     """
     callers = CallerRegistry.from_settings(settings)
     app_metrics = jobs.metrics if jobs is not None else Metrics(settings.data_dir)
@@ -90,7 +106,7 @@ def create_app(
         Yields:
             Once the chain is open and the sweep started.
         """
-        audit.start(_audit_config(settings))
+        audit.start(_audit_config(settings, callers))
         try:
             app_metrics.refresh(files=store.count_files())
             sweeping = None if sweeper is None else asyncio.create_task(sweeper.run_forever())
@@ -104,12 +120,14 @@ def create_app(
         finally:
             audit.close()
 
+    # No slash redirects: a 307 from /mcp/ would point a terminal caller at the MCP door.
     app = FastAPI(
         title="workbench",
         version=__version__,
         openapi_url=None,
         docs_url=None,
         redoc_url=None,
+        redirect_slashes=False,
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -127,10 +145,12 @@ def create_app(
     app.add_middleware(errors.QuietErrors)
     app.add_middleware(ViewHardening)
     app.include_router(contract.router)
+    app.include_router(mcp.router)
     app.include_router(files.router)
     app.include_router(files.tool_router)
     app.include_router(tools.router)  # the template and output tools' routes are on it too
     app.include_router(metrics.router)
+    app.state.registry = Registry([*workspace_specs(app), *INLINE_SPECS])
     return app
 
 

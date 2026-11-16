@@ -91,15 +91,26 @@ services:
       dockerfile: docker/Dockerfile.api
     logging: *default-logging
     read_only: true
+    # No core dump, which could hold a call's data.
+    ulimits:
+      core: 0
     tmpfs:
       # Starlette spools uploads here; UploadLimit caps each request at the
       # upload limit + 1 MiB. The audit chain's container lock lives here too.
       - /tmp:size=512m
     environment:
       <<: *settings
-      # The bearer key Open WebUI presents; at least 32 characters, or the api
-      # refuses to start.
+      # The bearer key Open WebUI presents: at least 32 characters when set.
+      # The api starts with either caller key and refuses to start with none.
       OPEN_WEBUI_WORKBENCH_KEY: ${OPEN_WEBUI_WORKBENCH_KEY:-}
+      # docint, the second caller: its key (at least 32 characters when set),
+      # its tools and its limits. The executor reads none of these. The purpose
+      # rule is colon-less, so an empty value set in .env requires none.
+      DOCINT_WORKBENCH_KEY: ${DOCINT_WORKBENCH_KEY:-}
+      DOCINT_WORKBENCH_TOOLS: ${DOCINT_WORKBENCH_TOOLS:-run_python}
+      DOCINT_WORKBENCH_WALL_S: ${DOCINT_WORKBENCH_WALL_S:-60}
+      DOCINT_WORKBENCH_SLOTS: ${DOCINT_WORKBENCH_SLOTS:-2}
+      AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-query,disclose,combine}
       # Data-protection audit log: the hash-chained events go to the
       # container's main stdout under a container-wide lock (on the /tmp
       # tmpfs); ops logs go to stderr.
@@ -174,6 +185,9 @@ services:
       - DAC_OVERRIDE
       - KILL
     read_only: true
+    # No core dump, which could hold a job's data.
+    ulimits:
+      core: 0
     tmpfs:
       # R30: jobs get a TMPDIR of their own; /tmp is root's alone.
       - /tmp:size=16m,mode=0700

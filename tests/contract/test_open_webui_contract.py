@@ -57,6 +57,7 @@ TERMINAL_PATHS: Final = (
     "/system",
     "/tools/list_files",
     "/tools/read_document",
+    "/mcp",
 )
 
 #: The paths a chat makes Open WebUI call on workbench itself, server side, in order: loading the tools
@@ -306,6 +307,19 @@ def test_spec_through_the_proxy_lists_exactly_the_tools(admin: Account) -> None:
         op["operationId"] for item in r.json()["paths"].values() for op in item.values() if "operationId" in op
     }
     assert operations == TOOLS
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_mcp_through_the_proxy_is_not_found(admin: Account, method: str) -> None:
+    """Open WebUI's key never opens docint's door: ``/mcp`` through the proxy is workbench's own 404."""
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2026-07-28",
+        "Mcp-Method": "tools/list",
+    }
+    body: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    r = admin.terminal(method, "/mcp", headers=headers, json=body if method == "POST" else None)
+    assert (r.status_code, r.json()) == (404, {"detail": "not found"})
 
 
 # --- files and tools through the proxy ----------------------------------------------------------------------------

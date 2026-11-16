@@ -113,7 +113,8 @@ that times the other jobs.
   `jobs/` itself (root's, `0711`). `spec.json` in it is root's, `0444`.
 - `workspace/<chat-id>/` below it, root's, `0755`: the job's working folder,
   with root-owned `0444` copies of its input files. The job can read them and
-  change nothing.
+  change nothing. The inline inputs of a docint call are root's `0444` files
+  there too, under the names the call gave.
 - `workspace/<chat-id>/out/`, the slot's, `0700`: the only place its outputs
   go.
 - `home/`, the slot's, `0700`: its `HOME`, where it writes `result.json`, with
@@ -206,7 +207,7 @@ supervisor caps whatever a request asks at its own settings
 | Free space on the volume | 1 GiB, or 5 % of the filesystem that holds `workbench-data` where that is more (`supervisor.py:free_space_floor`, a fixed rule, not a setting): below it every running job is stopped and no job starts |
 | `RLIMIT_NPROC` | 64 processes of the slot's uid |
 | `RLIMIT_NOFILE` | 256 open files |
-| `RLIMIT_CORE` | 0 |
+| `RLIMIT_CORE` | 0; compose also sets `ulimits: core: 0` on the api and the executor, so no core dump holds a call's data, a host's core-dump handler aside ([Residual risks](#residual-risks)) |
 | Priority | niceness 10 or more, which a job cannot lower again (`sandbox.py:JOB_NICENESS`) |
 | OOM score | `oom_score_adj` 1000 (`sandbox.py:JOB_OOM_SCORE_ADJ`): the kernel's OOM killer picks a job's process first; a process of the slot below it is a broken limit (below) |
 
@@ -496,6 +497,10 @@ Each of these is accepted. Each says what it would take.
   Docker daemon remaps user namespaces (deploy `docs/runbooks/userns-remap.md`).
   Nothing in its start-up refuses there for `/dev/zero` (above); the other
   start-up checks have not been tried on such a host.
+- **A host's `kernel.core_pattern` can pipe core dumps to a handler**, which runs
+  whatever the limit. systemd-coredump honours a limit of 0; other handlers may
+  not. The operator's measure: the host keeps a file pattern or
+  systemd-coredump, or turns dumps off (`Storage=none` in `coredump.conf`).
 
 ## gVisor
 

@@ -27,17 +27,18 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
+from workbench.api.auth import require_tool
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
 from workbench.models import Principal
-from workbench.protocol import KILLED, MAX_INPUT_FILES, JobResult
+from workbench.protocol import KILLED, MAX_INPUT_FILES, OUT_DIR, JobResult
 
 router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
@@ -72,16 +73,17 @@ class FileList(BaseModel):
     hint: str | None = Field(default=None, description="When truncated, how many older files are not listed.")
 
 
-def _json_size(model: BaseModel) -> int:
+def _json_size(model: BaseModel, *, keep_none: bool = False) -> int:
     """Measure a model as the answer sends it: compact JSON, in bytes, without the hint if there is none.
 
     Args:
         model: The model.
+        keep_none: Whether the answer sends its ``None`` fields too, as the inline answer does.
 
     Returns:
         The size in bytes of its JSON.
     """
-    return len(model.model_dump_json(exclude_none=True).encode())
+    return len(model.model_dump_json(exclude_none=not keep_none).encode())
 
 
 def _notice(left: int, total: int, limit_kb: int) -> str:
@@ -132,6 +134,7 @@ def _fit(files: list[FileInfo], limit_kb: int) -> FileList:
 @router.post(
     "/tools/list_files",
     operation_id="list_files",
+    dependencies=[Depends(require_tool("list_files"))],
     summary="List the files of this conversation",
     description=(
         "List every file in this conversation's workspace, the user's uploads and the files "
@@ -558,25 +561,26 @@ def _cut_part(shell: DocumentRead, part: DocumentPart, limit: int, limit_kb: int
     return best
 
 
-def _within[M: BaseModel](answer: M, limit: int) -> M:
+def _within[M: BaseModel](answer: M, limit: int, *, keep_none: bool = False) -> M:
     """Shorten the hint, as a last resort, so that an answer whose parts or hits are cut as far as they go fits.
 
     Args:
         answer: The answer, already cut; a model with a ``hint``.
         limit: The limit in bytes.
+        keep_none: Whether the answer sends its ``None`` fields too (:func:`_json_size`).
 
     Returns:
         The answer, with its hint cut to what fits if it was over the limit; as it is otherwise.
     """
     hint: str | None = getattr(answer, "hint", None)
-    if _json_size(answer) <= limit or not hint:
+    if _json_size(answer, keep_none=keep_none) <= limit or not hint:
         return answer
     low, high = 0, len(hint)
     best = answer.model_copy(update={"hint": None})
     while low <= high:
         middle = (low + high) // 2
         candidate = answer.model_copy(update={"hint": hint[:middle]})
-        if _json_size(candidate) <= limit:
+        if _json_size(candidate, keep_none=keep_none) <= limit:
             best, low = candidate, middle + 1
         else:
             high = middle - 1
@@ -671,6 +675,7 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
 @router.post(
     "/tools/read_document",
     operation_id="read_document",
+    dependencies=[Depends(require_tool("read_document"))],
     summary="Read a file of this conversation as text",
     description=(
         "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
@@ -729,6 +734,7 @@ async def read_document(
 @router.post(
     "/tools/search_files",
     operation_id="search_files",
+    dependencies=[Depends(require_tool("search_files"))],
     summary="Search all files of this conversation",
     description=(
         "Search every file of this conversation for a text or, with regex true, a regular expression; case is "
@@ -818,9 +824,6 @@ async def search_files(
 #: The most characters of code one call runs.
 MAX_CODE: Final = 50_000
 
-#: The folder the code writes its outputs into; the executor gives the code no input below it.
-_OUT: Final = "out"
-
 
 class RunPythonRequest(BaseModel):
     """Body of ``run_python``.
@@ -839,7 +842,22 @@ class RunPythonRequest(BaseModel):
     )
 
 
-class _CodeRun(BaseModel):
+class NotCompleted(HTTPException):
+    """The code could not be completed: the job ran out of time, was stopped on a limit or left no result (422).
+
+    Its detail is ``the code could not be completed: <reason>``, the reason a fixed text of the executor's.
+    """
+
+    def __init__(self, reason: str) -> None:
+        """Say why.
+
+        Args:
+            reason: The executor's reason, cleaned.
+        """
+        super().__init__(status_code=422, detail=f"the code could not be completed: {reason}")
+
+
+class CodeRun(BaseModel):
     """What the runner answers; checked before anything of it is sent on.
 
     Attributes:
@@ -885,25 +903,70 @@ def _python_payload(result: JobResult) -> tuple[dict[str, Any], str | None]:
         result: The executor's answer.
 
     Returns:
-        The runner's answer, and the executor's note on the outputs, if it has one.
+        The runner's answer, and the executor's note on the outputs, cleaned, if it has one; each door says in its
+        own words what the note means for the files.
 
     Raises:
-        HTTPException: The job ran out of time, was stopped on a resource limit or left no result, as when the
-            code ended its own process (422, with the executor's reason, a fixed text of its own); the runner
-            failed with a code the api knows (its status), or in another way (500, with a fixed text: the
-            runner's own may hold a path).
+        NotCompleted: The job ran out of time, was stopped on a resource limit or left no result, as when the
+            code ended its own process (422, with the executor's reason, a fixed text of its own).
+        HTTPException: The runner failed with a code the api knows (its status), or in another way (500, with a
+            fixed text: the runner's own may hold a path).
     """
     note = _clean(result.message) if result.message else None
-    if result.status == "ok":
-        return result.result, None if note is None else f"Not every file in out/ was kept: {note}."
-    if result.status == "error" and "stdout" in result.result:
-        return result.result, f"No file in out/ was kept: {note or 'the outputs could not be kept'}."
+    if result.status == "ok" or (result.status == "error" and "stdout" in result.result):
+        return result.result, note
     if result.status == "error" and "error" in result.result:
         _payload(result, "code")  # raises, with the runner's code or the fixed text
     reason = _clean(result.message) or "the job failed"
     if result.status == "killed" and result.message == KILLED:  # the watchdog's own message names the limit
         reason += " (memory, CPU time, file size or processes)"
-    raise HTTPException(status_code=422, detail=f"the code could not be completed: {reason}")
+    raise NotCompleted(reason)
+
+
+def python_args(code: str, wall_s: int) -> dict[str, Any]:
+    """The runner's arguments: the code and its own time, 9/10 of the job's wall, so it can say it timed out.
+
+    Args:
+        code: The code.
+        wall_s: The job's wall time in seconds.
+
+    Returns:
+        ``code`` and ``budget_s``.
+    """
+    return {"code": code, "budget_s": max(1, wall_s * 9 // 10)}
+
+
+def read_code_run(result: JobResult) -> tuple[CodeRun, str | None]:
+    """Read the answer of a ``run_python`` job, or fail with what the model should be told.
+
+    Args:
+        result: The executor's answer.
+
+    Returns:
+        What the code printed, and the executor's bare note on the outputs, if it has one. The job is ``ok``, or an
+        ``error`` whose outputs broke the executor's limits, so that none of them is there.
+
+    Raises:
+        NotCompleted: The code could not be completed (:func:`_python_payload`).
+        HTTPException: The runner refused or failed, or its answer is not of the shape the api sends on (500).
+    """
+    payload, note = _python_payload(result)
+    return _parse(CodeRun, payload), note
+
+
+def _kept_note(result: JobResult, note: str | None) -> str | None:
+    """Say in the terminal's words what the executor's note means: which files in ``out/`` were not kept.
+
+    Args:
+        result: The executor's answer, as :func:`read_code_run` read it.
+        note: The executor's bare note, or ``None``.
+
+    Returns:
+        The sentence, or ``None`` for an ``ok`` job without a note.
+    """
+    if result.status == "ok":
+        return None if note is None else f"Not every file in out/ was kept: {note}."
+    return f"No file in out/ was kept: {note or 'the outputs could not be kept'}."
 
 
 def _readable(model: type[BaseModel], payload: object) -> bool:
@@ -940,42 +1003,46 @@ def _middle(text: str, keep: int) -> str:
     return f"{text[:front]}\n[… {len(text) - keep} characters cut …]\n{text[len(text) - back :]}"
 
 
-def _fit_python(answer: PythonRun, limit_kb: int) -> PythonRun:
+def fit_python[M: BaseModel](answer: M, limit_kb: int, *, keep_none: bool = False) -> M:
     """Cut stdout and stderr in the middle, each to the same most characters, until the answer fits.
 
     What one stream does not need goes to the other. The files are never cut: they are what the code made.
 
     Args:
-        answer: The answer.
+        answer: The answer: a model with ``stdout``, ``stderr`` and ``truncated``.
         limit_kb: The result limit in kilobytes.
+        keep_none: Whether the answer sends its ``None`` fields too (:func:`_json_size`).
 
     Returns:
         The answer, within the limit as sent unless its files alone are over it.
     """
     limit = limit_kb * 1024
-    if _json_size(answer) <= limit:
+    if _json_size(answer, keep_none=keep_none) <= limit:
         return answer
+    streams = answer.model_dump(include={"stdout", "stderr"})
+    stdout, stderr = str(streams["stdout"]), str(streams["stderr"])
 
-    def cut(keep: int) -> PythonRun:
+    def cut(keep: int) -> M:
         return answer.model_copy(
-            update={"stdout": _middle(answer.stdout, keep), "stderr": _middle(answer.stderr, keep), "truncated": True}
+            update={"stdout": _middle(stdout, keep), "stderr": _middle(stderr, keep), "truncated": True}
         )
 
     best = cut(0)
-    low, high = 0, max(len(answer.stdout), len(answer.stderr))
+    low, high = 0, max(len(stdout), len(stderr))
     while low <= high:
         keep = (low + high) // 2
         candidate = cut(keep)
-        if _json_size(candidate) <= limit:
+        if _json_size(candidate, keep_none=keep_none) <= limit:
             best, low = candidate, keep + 1
         else:
             high = keep - 1
-    return _within(best, limit)
+    return _within(best, limit, keep_none=keep_none)
 
 
 @router.post(
     "/tools/run_python",
     operation_id="run_python",
+    dependencies=[Depends(require_tool("run_python"))],
     summary="Run Python on the files of this conversation",
     description=(
         "Run Python code on this conversation's files and get back what it printed. The files are in the current "
@@ -1019,22 +1086,21 @@ async def run_python(
         What the code printed, the files it made and the job's id.
     """
     files = sorted(await run_in_threadpool(store.files_in_chat, p), key=lambda rec: (-rec.created_at, rec.name))
-    readable = [rec for rec in files if rec.name.split("/")[0] != _OUT]
+    readable = [rec for rec in files if rec.name.split("/")[0] != OUT_DIR]
     chosen = readable[:MAX_INPUT_FILES]
-    args = {"code": body.code, "budget_s": max(1, settings.job_wall_s * 9 // 10)}
+    args = python_args(body.code, settings.job_wall_s)
 
     def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
         # An answer the model cannot be given keeps no file: it would never learn of it.
-        usable = result.status == "ok" and _readable(_CodeRun, result.result)
+        usable = result.status == "ok" and _readable(CodeRun, result.result)
         keep = list(planned) if usable else []
         outcome, more = judged(result, usable)
         return keep, outcome, {"outputs": len(keep), **more}
 
     keeper = OutputKeeper(audit, p, "run_python", [rec.id for rec in chosen], decide)
     job, result, made = await jobs.submit(p, "run_python", args, [rec.name for rec in chosen], keeper)
-    payload, note = _python_payload(result)
-    run = _parse(_CodeRun, payload)
-    notes: list[str | None] = [run.hint, note]
+    run, note = read_code_run(result)
+    notes: list[str | None] = [run.hint, _kept_note(result, note)]
     if len(readable) > len(chosen):
         notes.append(
             f"The code was given the {len(chosen)} newest of {len(readable)} files; the "
@@ -1054,4 +1120,4 @@ async def run_python(
         job_id=job.id,
         hint=_capped(_join(*notes), MAX_HINT),
     )
-    return _fit_python(answer, settings.result_max_kb)
+    return fit_python(answer, settings.result_max_kb)

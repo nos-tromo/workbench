@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import hashlib
 import hmac
 import io
 import json
@@ -14,13 +15,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import KEY, unrecorded
+from tests.api.conftest import DOCINT_KEY, KEY, unrecorded
 from workbench.api import auth
 from workbench.api.audit import AuditLog
-from workbench.api.auth import ALL_TOOLS, CallerRegistry, KeyGate
+from workbench.api.auth import Caller, CallerRegistry, KeyGate
 from workbench.api.contract import system_prompt
 from workbench.api.main import app_factory, create_app
 from workbench.api.openapi import TOOL_TAG, tool_openapi
+from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, Store, TooLarge
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
@@ -156,7 +158,7 @@ def test_openapi_lists_only_tools(client: TestClient) -> None:
 
 
 def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: TestClient) -> None:
-    """An untagged route and a tagged one that is hidden from the schema stay out."""
+    """A tagged route off the caller's list stays out; an untagged one and one hidden from the schema, even on it."""
 
     def echo(text: str) -> dict[str, str]:
         return {"text": text}
@@ -166,8 +168,7 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
     app.add_api_route(
         "/hidden", echo, methods=["POST"], tags=[TOOL_TAG], include_in_schema=False, operation_id="hidden_op"
     )
-    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert set(doc["paths"]) == {
+    nine = {
         "/tools/list_files",
         "/tools/read_document",
         "/tools/search_files",
@@ -177,16 +178,34 @@ def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: 
         "/tools/write_table",
         "/tools/write_document",
         DISPLAY_TOOL,
-        "/tools/echo",
     }
+    assert set(client.get("/openapi.json", headers=KEY_ONLY).json()["paths"]) == nine
+    listed = Caller("every-tool", KEY, WORKSPACE_TOOLS | {"echo_tool", "untagged_op", "hidden_op"})
+    doc = tool_openapi(app, listed)
+    assert set(doc["paths"]) == nine | {"/tools/echo"}
     assert doc["paths"]["/tools/echo"]["post"]["operationId"] == "echo_tool"
 
 
 def test_openapi_is_built_once_and_served_from_memory(app: FastAPI, client: TestClient) -> None:
     """Open WebUI fetches the spec on every chat request."""
-    first = tool_openapi(app)
-    assert tool_openapi(app) is first
+    open_webui = app.state.callers.get("open-webui")
+    first = tool_openapi(app, open_webui)
+    assert tool_openapi(app, open_webui) is first
     assert client.get("/openapi.json", headers=KEY_ONLY).json() == first
+
+
+#: The sha256 of Open WebUI's tool document as v0.1.1 served it, ``info.version`` set to ``0.0.0``, written as compact
+#: JSON in the order it was served. Changing it changes Open WebUI's contract: the tools, schemas and texts its model is
+#: offered, and the order of the properties it sees.
+OPEN_WEBUI_CONTRACT_SHA256 = "deed2ba444061fd96135522296df371fcd3d7f5eed892a4964ff4a685b9397f2"
+
+
+def test_open_webuis_tool_document_is_its_contract_and_does_not_change(client: TestClient) -> None:
+    """Open WebUI's document is v0.1.1's apart from its version; a change here is a change to Open WebUI's contract."""
+    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
+    doc["info"]["version"] = "0.0.0"
+    written = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode()
+    assert hashlib.sha256(written).hexdigest() == OPEN_WEBUI_CONTRACT_SHA256
 
 
 @pytest.mark.parametrize(("method", "url"), KEYED_ROUTES)
@@ -215,7 +234,7 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     assert client.get("/api/config", headers=KEY_ONLY).status_code == 200
-    assert seen == [(KEY.encode(), KEY.encode())] * 2
+    assert seen == [(KEY.encode(), KEY.encode()), (KEY.encode(), DOCINT_KEY.encode())] * 2
 
 
 def test_the_key_is_checked_before_the_user(client: TestClient) -> None:
@@ -454,8 +473,8 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
     registry = CallerRegistry.from_settings(settings)
     caller = registry.authenticate(KEY)
     assert caller is not None
-    assert (caller.name, caller.key, caller.tools) == ("open-webui", KEY, ALL_TOOLS)
-    assert {"list_files", "read_document", "run_python", "fill_template", "display_file"} <= ALL_TOOLS
+    assert (caller.name, caller.key, caller.tools) == ("open-webui", KEY, WORKSPACE_TOOLS)
+    assert {"list_files", "read_document", "run_python", "fill_template", "display_file"} <= WORKSPACE_TOOLS
     assert registry.authenticate("wrong") is None
     assert registry.authenticate("") is None
     assert KEY not in repr(caller)
@@ -463,8 +482,8 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
 
 def test_the_registry_needs_a_key(settings: Settings) -> None:
     """The executor's settings carry no key, and the api refuses to build a registry from them."""
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY"):
-        CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None))
+    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY"):
+        CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None, docint_key=None))
 
 
 @pytest.mark.parametrize(
@@ -522,8 +541,14 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "job_wall_s": settings.job_wall_s,
         "upload_max_mb": settings.upload_max_mb,
         "workspace_max_mb": settings.workspace_max_mb,
+        "callers": [
+            {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
+            {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
+        ],
+        "require_purpose": [],
     }
     assert KEY not in audit_stream.getvalue()
+    assert DOCINT_KEY not in audit_stream.getvalue()
 
 
 def test_a_start_that_fails_after_the_chain_opened_closes_it(

@@ -22,11 +22,18 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 - A value exported in the shell that runs `make up` beats `.env`, since compose
   interpolates `${VAR:-default}` from the shell first.
 
-## Required
+## Callers
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPEN_WEBUI_WORKBENCH_KEY` | none | The bearer key Open WebUI presents on every call. At least 32 characters once surrounding spaces are stripped, or the api refuses to start. Generate it with `openssl rand -hex 32`. |
+| `OPEN_WEBUI_WORKBENCH_KEY` | none | The bearer key Open WebUI presents on every call. At least 32 characters once surrounding spaces are stripped. Unset, Open WebUI's door is off. Generate it with `openssl rand -hex 32`. |
+| `DOCINT_WORKBENCH_KEY` | none | The bearer key docint presents on its MCP door (`/mcp`). The same rules; unset, docint's door is off. |
+| `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
+| `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
+| `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
+
+The api needs at least one of the two keys, or it refuses to start; two callers
+with the same key stop the start too.
 
 ### The caller key
 
@@ -39,10 +46,11 @@ deploy's `env-sync.conf`, the `[shared: open-webui-service]` tag in
 `.env.example` names it, and `make env ENV_GENERATE=1` generates one where it
 is unset in both. From open-webui-service v0.14.0 the key also switches the
 connection on: its `ENABLE_TOOL_SERVERS` follows the key, so without it there
-Open WebUI runs without workbench.
+Open WebUI runs without workbench. `DOCINT_WORKBENCH_KEY` is shared the same
+way with docint, whose `WORKBENCH_API_KEY` holds the value.
 
-The key is compared in constant time (`workbench/api/auth.py`). It reaches only
-the api: the executor never reads it.
+The keys are compared in constant time (`workbench/api/auth.py`). They reach only
+the api: the executor never reads them.
 
 ## Network
 
@@ -51,8 +59,8 @@ the api: the executor never reads it.
 | `WORKBENCH_NET` | `workbench-net` | Name of the external network between the api and its callers; `make network` creates it. Change it only if you renamed the network. |
 
 The api joins it as `workbench-api` on port 8000, exposed and never published.
-Only callers (Open WebUI) and obs-plane's scraper join it. The executor has no
-network.
+Only callers (Open WebUI, docint) and obs-plane's scraper join it. The executor
+has no network.
 
 ## Jobs
 
@@ -72,6 +80,10 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   `WORKBENCH_QUEUE_MAX / WORKBENCH_EXECUTOR_SLOTS`, rounded down, at least 1
   (4 by default). A user past it gets `503` at once, and the other users are not
   affected: one user cannot fill every waiting place.
+- docint's calls wait at most 5 s for their turn (`MCP_QUEUE_WAIT_S`, fixed; not
+  `WORKBENCH_QUEUE_WAIT_S`), may fill 8 of the 16 waiting places by default
+  (`DOCINT_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
+  slot and that user's turn until its wall time.
 - An executor with no free slot, or one the api cannot reach, is a `503` too.
 - So is a job the executor stopped because the container held more than
   64 MiB of shared memory that no job's count showed (`hidden_memory`): it
@@ -165,6 +177,7 @@ The formulas, for other slot counts or job memory:
 |---|---|---|
 | `WORKBENCH_RETENTION_DAYS` | 7 | Days a workspace file or job record is kept after it was made. A changed value applies at once, with no notice ([retention.md](retention.md#a-changed-period-applies-at-once)). |
 | `WORKBENCH_RETENTION_INTERVAL_S` | 300 | Seconds between retention sweeps. |
+| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door only; Open WebUI cannot state one. An empty value set in `.env` requires none. An unknown action stops the start. |
 
 The period is shared with open-webui-service: from v0.14.0 a banner there tells
 every user how long workspace files are kept, and deploy's `make env` copies

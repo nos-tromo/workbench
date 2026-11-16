@@ -26,7 +26,7 @@ from tests.api.test_files import CHAT, ME, AuditLines, H, put, tick
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue, Keeper
+from workbench.api.jobs import CallLimits, JobQueue, Keeper
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.openapi import TOOL_TAG
@@ -213,6 +213,28 @@ def test_outputs_the_executor_refused_still_answer_with_what_the_code_printed(
     assert "too many outputs: at most 20" in body["hint"]
     (event,) = events(audit_lines)
     assert (event["outcome"], event["criteria"]["outputs"]) == ("error", 0)
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "hint"),
+    [
+        (
+            "ok",
+            "dropped 1 output: not the job's own file",
+            "Not every file in out/ was kept: dropped 1 output: not the job's own file.",
+        ),
+        ("error", "too many outputs: at most 20", "No file in out/ was kept: too many outputs: at most 20."),
+        ("error", "", "No file in out/ was kept: the outputs could not be kept."),
+    ],
+)
+def test_the_note_on_the_outputs_keeps_its_words(
+    client: TestClient, fake_executor: Scripted, status: str, message: str, hint: str
+) -> None:
+    """The executor's note on the outputs reaches Open WebUI in the words it always had, byte for byte."""
+    fake_executor.status = status
+    fake_executor.message = message
+    fake_executor.payload = ran("made files\n")
+    assert run(client).json()["hint"] == hint
 
 
 @pytest.mark.parametrize(
@@ -420,9 +442,11 @@ class CancelledOnReturn(JobQueue):
         args: dict[str, Any],
         input_files: Sequence[str],
         keeper: Keeper | None = None,
+        *,
+        call: CallLimits | None = None,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
-        answer = await super().submit(p, tool, args, input_files, keeper)
+        answer = await super().submit(p, tool, args, input_files, keeper, call=call)
         caller = asyncio.current_task()
         assert caller is not None
         caller.cancel()

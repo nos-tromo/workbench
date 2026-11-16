@@ -12,7 +12,8 @@ The job folder, ``<data_dir>/jobs/<job-id>/``:
   nobody else may, and the job can neither add a name to it nor open it to others;
   ``spec.json`` (root's, ``0444``) lies in it;
 - ``workspace/<chat-id>/``: root's, ``0755``, the job's working folder, holding root-owned ``0444``
-  copies of the inputs at their paths below the chat folder;
+  copies of the inputs at their paths below the chat folder, or the request's inline inputs as
+  root-owned ``0444`` files of their names;
 - ``workspace/<chat-id>/out/``: the slot's, ``0700``, where the job writes its outputs;
 - ``home/``: the slot's, ``0700``, the job's ``HOME``, where it writes ``result.json``; with
   ``home/tmp/``, the slot's, ``0700``, its ``TMPDIR``.
@@ -81,6 +82,7 @@ from workbench.protocol import (
     JOB_ID,
     KILLED,
     MAX_LINE,
+    OUT_DIR,
     JobRequest,
     JobResult,
     Limits,
@@ -92,7 +94,6 @@ from workbench.protocol import (
 
 MB = 1024 * 1024
 MAX_OUTPUTS = 20
-OUT = "out"
 #: Most entries a running job's folders may hold, files and folders together.
 MAX_JOB_ENTRIES = 10_000
 #: Deepest a running job's folders may nest.
@@ -1179,7 +1180,7 @@ class Supervisor:
         return jobs
 
     def _set_up(self, req: JobRequest, slot: Slot | None, limits: Limits) -> _Job:
-        """Make the job folder, copy the inputs and write the spec.
+        """Make the job folder, copy or write the inputs and write the spec.
 
         Args:
             req: The job.
@@ -1214,7 +1215,8 @@ class Supervisor:
             chat = make_dir(req.chat_id, workspace, root, 0o755)
             opened.append(chat)
             self._copy_inputs(req, chat)
-            out = make_dir(OUT, chat, runner, 0o700)
+            self._write_inline(req, chat)
+            out = make_dir(OUT_DIR, chat, runner, 0o700)
             opened.append(out)
             spec = {
                 "tool": req.tool,
@@ -1286,7 +1288,7 @@ class Supervisor:
         with closing(source):
             for path in dict.fromkeys(req.input_files):
                 parts = path.split("/")
-                if parts[0] == OUT:
+                if parts[0] == OUT_DIR:
                     continue
                 try:
                     fd = open_regular(source, parts)
@@ -1319,6 +1321,33 @@ class Supervisor:
         finally:
             for folder in folders:
                 os.close(folder)
+
+    def _write_inline(self, req: JobRequest, target: int) -> None:
+        """Write the request's inline inputs, root-owned and ``0444``, into the job's working folder.
+
+        Each entry is checked again where it becomes a file, whatever built the request.
+
+        Args:
+            req: The job.
+            target: The job's working folder, opened.
+
+        Raises:
+            _SetupError: A name is not one plain file name or is ``out``, or a text cannot be
+                encoded as UTF-8.
+            OSError: The job folder could not take a file, or one of that name is there already.
+        """
+        root = self._owners.root
+        for entry in req.inline_inputs:
+            try:
+                check_filename(entry.name)
+                data = entry.content.encode("utf-8")
+            except ValueError as exc:  # PathError, UnicodeEncodeError
+                raise _SetupError("an inline input is not a plain file name with UTF-8 text") from exc
+            if entry.name == OUT_DIR:
+                raise _SetupError("an inline input cannot be named out")
+            with closing(os.open(entry.name, CREATE_FLAGS, 0o444, dir_fd=target)) as fd:
+                write_all(fd, data)
+                settle(fd, root, 0o444)
 
     def _finish(
         self,

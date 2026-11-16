@@ -20,11 +20,12 @@ import posixpath
 from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Final, Literal
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from pydantic.json_schema import JsonDict
 
+from workbench.api.auth import require_tool
 from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
@@ -509,6 +510,7 @@ def _fit_fill(answer: FilledTemplate, limit_kb: int) -> FilledTemplate:
 @router.post(
     "/tools/inspect_template",
     operation_id="inspect_template",
+    dependencies=[Depends(require_tool("inspect_template"))],
     summary="List the fields of a report template",
     description=(
         "List the fields of a report template in this conversation, so you can plan the fill with the user before "
@@ -568,6 +570,7 @@ async def inspect_template(
 @router.post(
     "/tools/fill_template",
     operation_id="fill_template",
+    dependencies=[Depends(require_tool("fill_template"))],
     summary="Fill a report template into a new file",
     description=(
         "Fill a report template of this conversation into a new file; the template itself is not changed, and a "

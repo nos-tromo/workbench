@@ -4,11 +4,30 @@ What each tool and each file route of workbench may read and write, what it
 records in the audit log, and what it keeps. Then the boundaries that hold for
 all of them, and what the model is told.
 
-workbench serves one caller in version 1, Open WebUI. Open WebUI turns every
+workbench serves two callers, Open WebUI and docint (see [Callers and
+doors](#callers-and-doors)). Open WebUI turns every
 operation of `GET /openapi.json` into a tool for the model
 (`workbench/api/openapi.py:tool_openapi`). Its file browser calls the file
 routes through Open WebUI's terminal proxy, `/api/v1/terminals/<id>/…`. The
 file routes are not in the tool document, so the model cannot call them.
+
+## Callers and doors
+
+| Caller | Door | Files | Tools | Wall cap | Running jobs |
+|---|---|---|---|---|---|
+| `open-webui` | terminal | workspace | all nine | `WORKBENCH_JOB_WALL_S` | not capped |
+| `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
+
+- The door is checked right after the key, before any body is read
+  (`workbench/api/auth.py:KeyGate`). An MCP caller gets `404` on every path but
+  `/mcp`, `/healthz` and `/metrics`; a terminal caller gets `404` on `/mcp`,
+  and so on `/api/v1/terminals/<id>/mcp` through Open WebUI's proxy. Every such
+  `404` is `{"detail": "not found"}`.
+- The tool list is enforced on both doors: a terminal tool route depends on
+  `require_tool("<name>")`, which answers `404` for a tool not on the caller's
+  list, and `tools/call` on `/mcp` answers it `400`, `-32602`, "unknown tool".
+- A caller is a namespace: users are `(caller, user-id)`. docint has no folder
+  under `workspaces/`.
 
 ## The matrix
 
@@ -31,6 +50,7 @@ Every tool that runs in the executor also leaves a job record (see
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
 | `write_document` | nothing of the chat: the Markdown comes in the call | one new `.docx` or `.md` in the chat | `collect` / `tool.write_document` | the new file and a job record |
+| `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
 `read_document`, `search_files`, `run_python`),
@@ -137,11 +157,11 @@ no tool or terminal server is on (open-webui-service's `CLAUDE.md`, § Workbench
 
 The executor, where every file is opened, has no network at all
 (`network_mode: none` in `docker/compose.yaml`), and a job has no socket at all.
-A job sees only copies of its own chat's files, read-only, and can write only
-into its own `out/` folder and its private `home/` (with its `tmp/`); both are
-removed with the job, and only what is in `out/` can become a file of the
-workspace (see [sandbox.md](sandbox.md)). The api calls no model and joins only
-`workbench-net`.
+A job sees only copies of its own chat's files, read-only (a docint job, only
+the data its call brings), and can write only into its own `out/` folder and its
+private `home/` (with its `tmp/`); both are removed with the job, and only what
+is in `out/` can become a file of the workspace (see [sandbox.md](sandbox.md)).
+The api calls no model and joins only `workbench-net`.
 
 ### The agent deletes nothing
 
