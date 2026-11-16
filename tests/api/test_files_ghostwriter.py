@@ -6,6 +6,7 @@ The tools that take a path are held to the same chat by the store; here they are
 import asyncio
 import dataclasses
 import io
+import shutil
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -28,6 +29,7 @@ from workbench.api.tools_templates import InspectTemplateRequest, inspect_templa
 from workbench.config import Settings
 from workbench.layout import WORKSPACES
 from workbench.models import FileRecord, Principal
+from workbench.paths import Workspaces
 
 CSV = b"author,posts\nuser-a,12\n"
 P2 = Principal("ghostwriter", "user-a", "chat-2", confined=True)
@@ -113,6 +115,63 @@ def test_another_chats_file_is_not_found(client: TestClient, store: Store, audit
     assert (r.status_code, r.json()) == NOT_FOUND
     assert file_events(audit_lines) == []
     assert view(client, own.virtual_path).content == CSV
+
+
+@pytest.mark.parametrize("planted", ["file", "folder", "chat"])
+def test_a_link_in_its_chat_is_not_found_and_never_followed(
+    client: TestClient, store: Store, settings: Settings, audit_lines: AuditLines, planted: str
+) -> None:
+    """A link on a file, on a folder in the chat or as the chat folder itself is 404 for Ghostwriter.
+
+    Open WebUI meets such a link as a 400 (``tests/api/test_files.py``). Nothing behind the link is read or written.
+    """
+    rec = keep(store, PG)
+    outside = settings.data_dir / "outside"
+    outside.mkdir()
+    (outside / "q.csv").write_text("not yours")
+    real = Workspaces(settings.data_dir).resolve(PG, rec.virtual_path)
+    if planted == "file":
+        real.unlink()
+        real.symlink_to(outside / "q.csv")
+        paths = [rec.virtual_path]
+    elif planted == "folder":
+        (real.parent / "sub").symlink_to(outside, target_is_directory=True)
+        paths = [f"{CHAT}/sub", f"{CHAT}/sub/q.csv"]
+    else:
+        shutil.rmtree(real.parent)
+        real.parent.symlink_to(outside, target_is_directory=True)
+        paths = [CHAT, rec.virtual_path]
+    answers: list[Any] = [upload(client, "new.csv")] if planted == "chat" else []
+    for path in paths:
+        answers += [view(client, path), client.get("/files/list", params={"directory": path}, headers=HG)]
+    for r in answers:
+        assert (r.status_code, r.json()) == NOT_FOUND
+    assert sorted(entry.name for entry in outside.iterdir()) == ["q.csv"]
+    assert file_events(audit_lines) == []
+
+
+@pytest.mark.parametrize("session", [None, "default"])
+def test_a_missing_or_default_session_is_400_on_each_file_route(
+    client: TestClient, store: Store, settings: Settings, audit_lines: AuditLines, session: str | None
+) -> None:
+    """Ghostwriter's chat is never ``default``: without one of its own, upload, view and list answer 400.
+
+    Nothing is stored, no folder is made and nothing is recorded.
+    """
+    headers = {name: value for name, value in HG.items() if name != "X-Session-Id"}
+    if session is not None:
+        headers["X-Session-Id"] = session
+    answers: list[Any] = []
+    for chat in (CHAT, "/workspace/default"):
+        answers += [
+            upload(client, directory=chat, headers=headers),
+            view(client, f"{chat}/quarterly-figures.csv", headers),
+            client.get("/files/list", params={"directory": chat}, headers=headers),
+        ]
+    for r in answers:
+        assert (r.status_code, r.json()) == (400, {"detail": "invalid session"})
+    assert not (settings.data_dir / WORKSPACES / "ghostwriter").exists()
+    assert file_events(audit_lines) == []
 
 
 def test_list_is_the_chat_alone(client: TestClient, store: Store) -> None:

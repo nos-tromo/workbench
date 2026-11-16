@@ -282,6 +282,22 @@ def _is_chat_id(name: str) -> bool:
     return True
 
 
+def _names_chat(virtual: str, chat_id: str) -> bool:
+    """Tell from a virtual path's text alone whether it is a chat's folder or below it, looking nothing up.
+
+    Args:
+        virtual: Any virtual path.
+        chat_id: The chat.
+
+    Returns:
+        ``True`` if, normalised as :meth:`~workbench.paths.Workspaces.resolve` normalises it, its first segment below
+        ``/workspace`` is ``chat_id``, as a whole segment.
+    """
+    norm = posixpath.normpath(virtual)
+    below = VIRTUAL_ROOT + "/"
+    return norm.startswith(below) and norm[len(below) :].split("/", 1)[0] == chat_id
+
+
 def _is_full(exc: OSError) -> bool:
     """Tell whether an error means the volume or the user's disk quota is used up.
 
@@ -432,6 +448,8 @@ class Store:
 
         A confined principal finds only its own chat folder and what is below it; every other path, and every path
         :meth:`~workbench.paths.Workspaces.resolve` refuses, is not found for it, so nothing tells it what is there.
+        Its chat is read from the path's text before anything is looked up on disk, so a path into another chat
+        touches nothing of that chat's folder; the resolved path is checked again.
 
         Args:
             p: The caller and user.
@@ -444,6 +462,8 @@ class Store:
             PathError: If the path is not inside the user's root.
             NotFound: For a confined principal, if the path is not its chat folder or below it, or is refused.
         """
+        if p.confined and not _names_chat(virtual, p.chat_id):
+            raise NotFound("not in the chat")
         try:
             real = self._ws.resolve(p, virtual)
         except PathError:

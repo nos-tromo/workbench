@@ -131,7 +131,7 @@ class AuditLog:
     def check(self, key: str, p: Principal) -> None:
         """Refuse an action the call must state a purpose for and did not, after recording the refusal.
 
-        A log that is not :meth:`bound` checks nothing.
+        A log that is not :meth:`bound` checks nothing and returns before it looks ``key`` up.
 
         Args:
             key: The action, a key of :data:`OPERATIONS`.
@@ -140,7 +140,7 @@ class AuditLog:
         Raises:
             PurposeRequired: The key's audit action is one the call must state a purpose for, and it stated none.
                 The ``denied`` event is written first, with no target.
-            KeyError: If ``key`` is not in :data:`OPERATIONS`.
+            KeyError: On a bound log, if ``key`` is not in :data:`OPERATIONS`; a plain log raises none.
             AuditWriteError: If the ``denied`` event cannot be written.
         """
         binding = self._binding

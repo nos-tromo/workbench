@@ -484,6 +484,44 @@ def test_a_confined_principal_finds_nothing_outside_its_chat(store: Store, path:
         store.open_file(PG, path)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/workspace",
+        "/workspace/chat-2",
+        "/workspace/chat-2/q.csv",
+        "/workspace/chat-1/../chat-2/q.csv",
+        "/workspace/chat-1x/q.csv",
+        "workspace/chat-1/q.csv",
+        "/etc/passwd",
+    ],
+)
+def test_a_path_outside_the_confined_chat_is_refused_before_anything_is_looked_up(
+    store: Store, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The chat is read from the path's text first, as a whole segment: another chat's folder is never looked at."""
+    put(store, dataclasses.replace(PG, chat_id="chat-2"), "q.csv", directory="/workspace/chat-2")
+    resolved: list[str] = []
+    real_resolve = workspaces.resolve
+
+    def resolve(p: Principal, virtual: str) -> Path:
+        resolved.append(virtual)
+        return real_resolve(p, virtual)
+
+    monkeypatch.setattr(workspaces, "resolve", resolve)
+    with pytest.raises(NotFound):
+        store.get(PG, path)
+    with pytest.raises(NotFound):
+        store.open_file(PG, path)
+    with pytest.raises(NotFound):
+        store.list_dir(PG, path)
+    with pytest.raises(NotFound):
+        put(store, PG, "new.csv", directory=path)
+    assert resolved == []
+    assert store.list_dir(PG, "/workspace/chat-1") == []
+    assert resolved == ["/workspace/chat-1"]
+
+
 def test_a_confined_upload_goes_into_the_chat_folder_itself(store: Store) -> None:
     """A confined principal uploads into its chat folder, never into a folder below it, even one its user made."""
     store.mkdir(dataclasses.replace(PG, confined=False), "/workspace/chat-1/sub")
