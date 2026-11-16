@@ -102,7 +102,7 @@ PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 _CONTROL: Final = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 #: Why an output does not come back.
-SkipReason = Literal["type", "signature", "encoding", "count", "size", "total", "unreadable"]
+SkipReason = Literal["type", "signature", "encoding", "control", "count", "size", "total", "unreadable"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -978,7 +978,7 @@ class JobQueue:
             except UnicodeDecodeError:
                 raise _Skip("encoding") from None
             if _CONTROL.search(data):
-                raise _Skip("encoding")
+                raise _Skip("control")
         if len(data) > room:
             raise _Skip("total")
         return TakenFile(output.name, mime, data)

@@ -321,6 +321,10 @@ def _skip_hint(skipped: Sequence[SkippedOutput]) -> list[str]:
         "size-text": "{} over 256 KiB did not come back: a text comes back up to 256 KiB.",
         "signature": "{} named .png did not come back: a file that is not a PNG cannot be named .png.",
         "encoding": "{} did not come back, not being UTF-8: write text files as UTF-8.",
+        "control": (
+            "{} did not come back, holding control characters: write text without them, tab, line feed and carriage "
+            "return aside."
+        ),
         "total": "{} did not come back: the files that come back hold at most 1 MiB in all.",
         "unreadable": "{} could not be read and did not come back.",
     }

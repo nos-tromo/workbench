@@ -155,10 +155,11 @@ caller's paths. The api starts with either key.
 - **Files live only inside chat folders.** Nothing is ever a file directly
   under `/workspace`.
 - **No network** in the executor, and no socket in a job (a seccomp filter of
-  workbench's own). A job sees copies of its own chat's files, read-only, and
-  writes only its `out/` and its private `home/` (with its `tmp/`), both
-  removed with the job, inside a job folder no other slot can pass. A watchdog
-  holds each running job to its disk and memory.
+  workbench's own). A job sees copies of its own chat's files, read-only (an
+  inline job, docint's, sees only the data its call brought), and writes only
+  its `out/` and its private `home/` (with its `tmp/`), both removed with the
+  job, inside a job folder no other slot can pass. A watchdog holds each running
+  job to its disk and memory.
 - **The agent deletes nothing.** No tool deletes or overwrites a file; the user
   (file browser) and retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error

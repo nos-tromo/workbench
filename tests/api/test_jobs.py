@@ -1838,13 +1838,13 @@ async def test_a_png_needs_its_signature_and_text_must_be_strict_utf8(
 
 
 @pytest.mark.parametrize("char", ["\x00", "\x01", "\x08", "\x0b", "\x0c", "\x1b", "\x1f", "\x7f"])
-async def test_a_text_with_a_control_character_is_skipped_as_encoding(
+async def test_a_text_with_a_control_character_is_skipped_as_control(
     char: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A C0 control character other than tab, LF and CR, or DEL, keeps a text back: its JSON escape would grow it."""
     taken = await take_back({"t.csv": f"a,b\n1,x{char}y\n".encode()}, settings, store, executor, metrics)
     assert taken.files == ()
-    assert skipped(taken) == {("t.csv", "encoding")}
+    assert skipped(taken) == {("t.csv", "control")}
 
 
 async def test_a_text_with_tabs_and_line_ends_comes_back(

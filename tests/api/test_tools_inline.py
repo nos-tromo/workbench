@@ -307,7 +307,8 @@ def test_files_lists_what_did_not_come_back_too(client: TestClient, fake_executo
     [
         ({"x.xlsx": b"PK"}, "only .png, .csv, .txt, .md and .json come back"),
         ({"big.png": PNG + b"\x00" * (512 * 1024)}, "plt.savefig(..., dpi=100)"),
-        ({"t.csv": "Müller".encode("latin-1")}, "UTF-8"),
+        ({"t.csv": "Müller".encode("latin-1")}, "not being UTF-8"),
+        ({"t.csv": b"a,b\n1,x\x01y\n"}, "holding control characters"),
     ],
 )
 def test_the_hint_says_why_a_file_did_not_come_back(
@@ -328,7 +329,8 @@ def test_the_hint_says_why_a_file_did_not_come_back(
         ("size", "long.txt", "a text comes back up to 256 KiB"),
         ("count", "i.csv", "at most 8 files come back"),
         ("total", "c.csv", "1 MiB in all"),
-        ("encoding", "t.csv", "write text files as UTF-8"),
+        ("encoding", "t.csv", "not being UTF-8: write text files as UTF-8"),
+        ("control", "t.csv", "holding control characters: write text without them"),
         ("signature", "fake.png", "is not a PNG"),
         ("unreadable", "gone.csv", "could not be read"),
     ],
@@ -338,6 +340,15 @@ def test_each_skip_reason_has_one_sentence_with_its_count(reason: Any, name: str
     (sentence,) = _skip_hint([SkippedOutput(name, 1, reason), SkippedOutput("2-" + name, 1, reason)])
     assert sentence.startswith("2 ")
     assert phrase in sentence
+
+
+def test_a_control_character_is_not_blamed_on_the_encoding() -> None:
+    """Both kinds in one answer give two sentences, each with its own count; only the first names UTF-8."""
+    skipped = [SkippedOutput("a.csv", 1, "encoding"), SkippedOutput("b.csv", 1, "control")]
+    skipped.append(SkippedOutput("c.csv", 1, "control"))
+    encoding, control = _skip_hint(skipped)
+    assert (encoding.split()[0], control.split()[0]) == ("1", "2")
+    assert "UTF-8" in encoding and "UTF-8" not in control
 
 
 def test_the_hint_joins_the_runners_and_the_executors_notes(client: TestClient, fake_executor: Scripted) -> None:
