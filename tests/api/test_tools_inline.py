@@ -205,6 +205,7 @@ def test_the_schema_gives_time_limit_the_callers_range(settings: Settings) -> No
     assert schema["additionalProperties"] is False
     assert set(schema["properties"]) == {"code", "data", "time_limit_s"}
     assert f"at most {MAX_DATA} entries and {MAX_DATA_BYTES // 1024} KiB" in schema["properties"]["data"]["description"]
+    assert f"at most {MAX_CODE} characters" in schema["properties"]["code"]["description"]
     assert input_schema(dataclasses.replace(docint, wall_s=30))["properties"]["time_limit_s"]["maximum"] == 30
 
 

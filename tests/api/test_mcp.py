@@ -9,6 +9,7 @@ import base64
 import dataclasses
 import json
 import logging
+import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final
@@ -25,13 +26,14 @@ from tests.api.conftest import DOCINT_KEY, HD, KEY
 from tests.api.test_files import AuditLines
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
+from tests.conftest import scaled
 from workbench import __version__
 from workbench.api import mcp
 from workbench.api.audit import AuditLog
 from workbench.api.auth import MCP_PATH, KeyGate
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue
 from workbench.api.main import create_app
-from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, tools_list_result
+from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, WireError, check_media, tools_list_result
 from workbench.api.metrics import Metrics
 from workbench.api.registry import ToolSpec
 from workbench.api.routing import MAX_DEPTH, EncodableRequest, nested_deeper_than
@@ -296,6 +298,16 @@ def test_media_types_are_matched_as_http_says(
         assert [tool["name"] for tool in result(r)["tools"]] == ["run_python"]
     else:
         assert "id" not in error(r, status, -32600)
+
+
+def test_an_accept_of_8000_refused_ranges_is_answered_quickly() -> None:
+    """The check is linear in the ranges: 64 KB of ``*/*;q=0`` is refused within a generous bound."""
+    accept = ",".join(["*/*;q=0"] * 8000)
+    started = time.perf_counter()
+    with pytest.raises(WireError) as refused:
+        check_media("application/json", accept)
+    assert time.perf_counter() - started < scaled(0.2)
+    assert refused.value.status == 406
 
 
 def test_an_origin_header_is_403(client: TestClient) -> None:

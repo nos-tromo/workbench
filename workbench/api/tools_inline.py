@@ -91,8 +91,8 @@ class InlinePythonRequest(BaseModel):
         min_length=1,
         max_length=MAX_CODE,
         description=(
-            "The Python code to run, as a script; at most 50000 characters. Print what you need to see, and write "
-            "every result file directly into out/."
+            f"The Python code to run, as a script; at most {MAX_CODE} characters. Print what you need to see, and "
+            "write every result file directly into out/."
         ),
     )
     data: list[InlineData] = Field(

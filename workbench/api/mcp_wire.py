@@ -193,7 +193,8 @@ def check_media(content_type: str | None, accept: str | None) -> None:
         for item in accept.split(",")
         if _media_type(item) in _JSON_RANGES
     ]
-    if not covering or not any(allowed for rank, allowed in covering if rank == max(rank for rank, _ in covering)):
+    top = max((rank for rank, _ in covering), default=None)
+    if top is None or not any(allowed for rank, allowed in covering if rank == top):
         raise WireError(406, INVALID_REQUEST, "the answer is application/json")
 
 

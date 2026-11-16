@@ -106,23 +106,23 @@ workspace and no file is made.
 |---|---|---|
 | the api's memory | the request, the data, the outputs | the request; freed memory is not cleared |
 | the executor's memory | the request line with the data | the job; freed memory is not cleared |
-| `jobs/<job-id>/` | the data as root's `0444` files; the job's `out/` and `home/` | the job. A folder whose removal failed stays, root's alone, and is tried again every 5 minutes until it goes or the executor restarts |
+| `jobs/<job-id>/` | the data as root's `0444` files; the job's `out/` and `home/` | the job |
 | `staging/<job-id>/` | the outputs | until the job settles; retention removes a leftover after an hour |
 | free blocks of `workbench-data` | deleted job files | until overwritten; encrypting the host's disk is the operator's |
 | `workbench.db`, `jobs` | job id, caller, user pseudonym, session pseudonym, tool, status, times | `WORKBENCH_RETENTION_DAYS` |
 | the audit chain | [the inline event](audit.md#the-inline-event) | obs-plane's retention |
 
-No core dump holds the data ([sandbox.md](sandbox.md#limits)).
+No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks).
 
 ## What leaves
 
-- **Tool results go to Open WebUI**, the caller that asked. Open WebUI puts
-  them into the chat and sends them, in the model's context, to whatever model
-  the operator configured behind the federation's inference router. If that
-  model is run by an outside provider (a hosted API, or an Ollama `*-cloud`
-  model), the results leave the host and the federation to that provider. They
-  stay in the chat history for Open WebUI's chat retention, 365 days by default
-  (see the box at the top).
+- **Tool results go to the caller that asked**: Open WebUI, or docint, whose
+  data and outputs are not kept. Open WebUI puts them into the chat and sends
+  them, in the model's context, to whatever model the operator configured
+  behind the federation's inference router. If that model is run by an outside
+  provider (a hosted API, or an Ollama `*-cloud` model), the results leave the
+  host and the federation to that provider. They stay in the chat history for
+  Open WebUI's chat retention, 365 days by default (see the box at the top).
 - **Files go to the user's browser** through Open WebUI's proxy, when the user
   views or downloads them (`GET /files/view`), or when a card shows one
   (`display_file`). What a user downloads is outside workbench from then on.
@@ -184,13 +184,13 @@ writes into new files (table values, Markdown, template values) and their
 names. Besides: file names, the Open WebUI account id of each user, chat ids,
 and the time and tool of each run.
 
-**Categories of data subjects.** The users of Open WebUI, and every person named
-in the files they upload or in the values the model writes.
+**Categories of data subjects.** The users of Open WebUI and docint, and every
+person named in the files or data they send or in the values the model writes.
 
 **Where data flows.** These are the flows, as facts:
 
-- to the caller that asked, Open WebUI, for the same user: tool results and
-  files;
+- to the caller that asked, for the same user: tool results and files to Open
+  WebUI; results to docint, whose data and outputs are not kept;
 - through Open WebUI, to the federation's inference router and the model the
   operator configured behind it: tool results enter the model's context. When
   that model is run by an outside provider, they leave the host and the

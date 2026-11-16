@@ -92,16 +92,10 @@ recorded and which are not.
 
 ### The inline event
 
-docint's `run_python` is recorded as `combine` / `tool.run_python.inline`
-(`workbench/api/tools_inline.py:InlineTaker`). `target.kind` is `inline_data`,
-with the `count` of data entries and no ids. The `purpose` comes from
-`X-Audit-Purpose` and the `request_id` from `X-Request-ID`, both read from the
-headers. The event is written once the job has answered, before anything of the
-answer goes out, so in a rare cancellation it can name outputs that never
-reached docint, whose own `disclose` records whether an answer came. An answer
-that cannot be read records `outputs` 0 and every output as `dropped`. A call
-that must state a purpose and states none runs nothing and is recorded as
-`denied`, without a target.
+Written before the answer goes out, the event can, in a rare cancellation, name
+outputs that never reached docint, whose own `disclose` records whether an
+answer came. An answer that cannot be read records `outputs` 0 and every output
+as `dropped`.
 
 ### Not recorded
 

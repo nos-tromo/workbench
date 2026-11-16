@@ -29,12 +29,11 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `OPEN_WEBUI_WORKBENCH_KEY` | none | The bearer key Open WebUI presents on every call. At least 32 characters once surrounding spaces are stripped. Unset, Open WebUI's door is off. Generate it with `openssl rand -hex 32`. |
 | `DOCINT_WORKBENCH_KEY` | none | The bearer key docint presents on its MCP door (`/mcp`). The same rules; unset, docint's door is off. |
 | `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
-| `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused), and is never clamped. |
+| `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 
 The api needs at least one of the two keys, or it refuses to start; two callers
-with the same key stop the start too. docint's limits are checked only while its
-key is set, and the executor reads none of these variables.
+with the same key stop the start too.
 
 ### The caller key
 
@@ -174,7 +173,7 @@ The formulas, for other slot counts or job memory:
 |---|---|---|
 | `WORKBENCH_RETENTION_DAYS` | 7 | Days a workspace file or job record is kept after it was made. A changed value applies at once, with no notice ([retention.md](retention.md#a-changed-period-applies-at-once)). |
 | `WORKBENCH_RETENTION_INTERVAL_S` | 300 | Seconds between retention sweeps. |
-| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door only; Open WebUI cannot state one. Compose's default is colon-less, so an empty value set in `.env` requires none. An unknown action stops the start. |
+| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door only; Open WebUI cannot state one. An empty value set in `.env` requires none. An unknown action stops the start. |
 
 The period is shared with open-webui-service: from v0.14.0 a banner there tells
 every user how long workspace files are kept, and deploy's `make env` copies

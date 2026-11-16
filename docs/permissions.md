@@ -25,7 +25,7 @@ file routes are not in the tool document, so the model cannot call them.
   `404` is `{"detail": "not found"}`.
 - The tool list is enforced on both doors: a terminal tool route depends on
   `require_tool("<name>")`, which answers `404` for a tool not on the caller's
-  list, and `tools/call` on `/mcp` answers an unknown tool.
+  list, and `tools/call` on `/mcp` answers it `400`, `-32602`, "unknown tool".
 - A caller is a namespace: users are `(caller, user-id)`. docint has no folder
   under `workspaces/`.
 

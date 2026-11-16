@@ -57,6 +57,8 @@ FIXED_BY_THE_IMAGES = ("WORKBENCH_DATA_DIR", "WORKBENCH_EXECUTOR_SOCKET", "WORKB
 SERVICES = ("volume-permissions", "api", "executor")
 
 _DEFAULT = re.compile(r"\$\{([A-Z0-9_]+):-([^}]*)\}")
+#: Either form of a default: ``${VAR:-default}``, or the colon-less ``${VAR-default}``, which keeps a value set empty.
+_ANY_DEFAULT = re.compile(r"\$\{([A-Z0-9_]+):?-([^}]*)\}")
 
 
 def compose(name: str = "compose.yaml") -> dict[str, Any]:
@@ -116,10 +118,10 @@ def test_the_settings_tied_to_the_images_stay_out_of_compose() -> None:
 
 
 def test_every_compose_default_is_the_examples() -> None:
-    """Each ``${VAR:-default}`` in the production and dev shapes is the value ``.env.example`` shows."""
+    """Each default in the production and dev shapes, colon-less ones too, is the value ``.env.example`` shows."""
     example = example_values()
     for name in ("compose.yaml", "compose.override.yaml"):
-        for key, value in _DEFAULT.findall((DOCKER / name).read_text(encoding="utf-8")):
+        for key, value in _ANY_DEFAULT.findall((DOCKER / name).read_text(encoding="utf-8")):
             if not key.endswith("_VERSION"):
                 assert example.get(key) == value, (name, key)
 

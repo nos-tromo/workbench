@@ -207,7 +207,7 @@ supervisor caps whatever a request asks at its own settings
 | Free space on the volume | 1 GiB, or 5 % of the filesystem that holds `workbench-data` where that is more (`supervisor.py:free_space_floor`, a fixed rule, not a setting): below it every running job is stopped and no job starts |
 | `RLIMIT_NPROC` | 64 processes of the slot's uid |
 | `RLIMIT_NOFILE` | 256 open files |
-| `RLIMIT_CORE` | 0; compose also sets `ulimits: core: 0` on the api and the executor, so no core dump holds a call's data |
+| `RLIMIT_CORE` | 0; compose also sets `ulimits: core: 0` on the api and the executor, so no core dump holds a call's data, a host's core-dump handler aside ([Residual risks](#residual-risks)) |
 | Priority | niceness 10 or more, which a job cannot lower again (`sandbox.py:JOB_NICENESS`) |
 | OOM score | `oom_score_adj` 1000 (`sandbox.py:JOB_OOM_SCORE_ADJ`): the kernel's OOM killer picks a job's process first; a process of the slot below it is a broken limit (below) |
 
