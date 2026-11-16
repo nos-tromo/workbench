@@ -97,6 +97,23 @@ operator's.
 
 [retention.md](retention.md) has the rules in full.
 
+## What a docint call leaves
+
+docint's data comes with the call and its outputs go back in the answer; no
+workspace and no file is made.
+
+| Where | What | How long |
+|---|---|---|
+| the api's memory | the request, the data, the outputs | the request; freed memory is not cleared |
+| the executor's memory | the request line with the data | the job; freed memory is not cleared |
+| `jobs/<job-id>/` | the data as root's `0444` files; the job's `out/` and `home/` | the job. A folder whose removal failed stays, root's alone, and is tried again every 5 minutes until it goes or the executor restarts |
+| `staging/<job-id>/` | the outputs | until the job settles; retention removes a leftover after an hour |
+| free blocks of `workbench-data` | deleted job files | until overwritten; encrypting the host's disk is the operator's |
+| `workbench.db`, `jobs` | job id, caller, user pseudonym, session pseudonym, tool, status, times | `WORKBENCH_RETENTION_DAYS` |
+| the audit chain | [the inline event](audit.md#the-inline-event) | obs-plane's retention |
+
+No core dump holds the data ([sandbox.md](sandbox.md#limits)).
+
 ## What leaves
 
 - **Tool results go to Open WebUI**, the caller that asked. Open WebUI puts

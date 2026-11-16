@@ -36,6 +36,14 @@ SPEC_DEFAULTS = {
     "WORKBENCH_WORKSPACE_MAX_MB": "500",
 }
 
+#: docint's variables in the api's environment: the key, its tools and its two limits (the spec's §3.8).
+CALLER_DEFAULTS = {
+    "DOCINT_WORKBENCH_KEY": "",
+    "DOCINT_WORKBENCH_TOOLS": "run_python",
+    "DOCINT_WORKBENCH_WALL_S": "60",
+    "DOCINT_WORKBENCH_SLOTS": "2",
+}
+
 #: The executor supervisor's capabilities (docs/sandbox.md).
 EXECUTOR_CAPABILITIES = {"SETUID", "SETGID", "CHOWN", "FOWNER", "DAC_OVERRIDE", "KILL"}
 
@@ -85,6 +93,18 @@ def test_compose_defaults_match_the_spec() -> None:
     assert {key: str(getattr(code, key.removeprefix("WORKBENCH_").lower())) for key in SPEC_DEFAULTS} == SPEC_DEFAULTS
     example = example_values()
     assert {key: example.get(key) for key in SPEC_DEFAULTS} == SPEC_DEFAULTS
+
+
+def test_the_api_alone_gets_the_callers_variables() -> None:
+    """Docint's variables and the purpose rule reach the api, not the executor, which reads none of them."""
+    spec = compose()
+    api = spec["services"]["api"]["environment"]
+    assert {key: default_of(api[key]) for key in CALLER_DEFAULTS} == {
+        key: (key, value) for key, value in CALLER_DEFAULTS.items()
+    }
+    assert api["AUDIT_REQUIRE_PURPOSE"] == "${AUDIT_REQUIRE_PURPOSE-query,disclose,combine}"
+    names = {*CALLER_DEFAULTS, "AUDIT_REQUIRE_PURPOSE"}
+    assert names.isdisjoint(spec["services"]["executor"]["environment"]) and names.isdisjoint(spec["x-settings"])
 
 
 def test_the_settings_tied_to_the_images_stay_out_of_compose() -> None:
@@ -256,6 +276,15 @@ def test_every_service_is_hardened() -> None:
         assert service["cap_drop"] == ["ALL"], name
         assert any(str(entry).split(":", 1)[0] == "/tmp" for entry in service["tmpfs"]), name
     assert "cap_add" not in compose()["services"]["api"]
+
+
+def test_no_core_dumps() -> None:
+    """A core file of the api or the executor could hold a call's data: both services set the core limit to 0."""
+    services = compose()["services"]
+    assert {name: services[name]["ulimits"] for name in ("api", "executor")} == {
+        "api": {"core": 0},
+        "executor": {"core": 0},
+    }
 
 
 def test_volume_permissions_has_only_what_prepare_volume_needs() -> None:
@@ -580,6 +609,19 @@ def test_the_examples_workbench_settings_are_all_commented_out() -> None:
     settings = [match for match in found if match is not None]
     assert len(settings) >= len(SPEC_DEFAULTS)
     assert [match.group(2) for match in settings if match.group(1) is None] == []
+
+
+def test_open_webuis_key_is_no_longer_required() -> None:
+    """The api starts with either key: neither is ``[required]`` or active; each is a shared secret."""
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    assert [line for line in lines if line.startswith("# [") and "[required]" in line] == []
+    assert "# Required" not in lines
+    assert "OPEN_WEBUI_WORKBENCH_KEY=" not in lines and "DOCINT_WORKBENCH_KEY=" not in lines
+    for key, tags in (
+        ("OPEN_WEBUI_WORKBENCH_KEY", "# [secret] [shared: open-webui-service]"),
+        ("DOCINT_WORKBENCH_KEY", "# [secret] [shared: docint WORKBENCH_API_KEY]"),
+    ):
+        assert lines[lines.index(f"# {key}=") - 1] == tags, key
 
 
 def test_health_shows_the_containers_and_asks_the_api() -> None:

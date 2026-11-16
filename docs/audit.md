@@ -36,7 +36,7 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
 | `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
-| `criteria` | `caller` (`open-webui`), and the keys below |
+| `criteria` | `caller` (`open-webui` or `docint`), and the keys below |
 
 The `container` is the chat folder the files live in, never the chat the
 request named (`workbench/api/files.py:_in_folder_of`). Open WebUI's browser can
@@ -89,6 +89,19 @@ failed or its caller went away (`workbench/api/jobs.py:JobQueue`).
 
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.
+
+### The inline event
+
+docint's `run_python` is recorded as `combine` / `tool.run_python.inline`
+(`workbench/api/tools_inline.py:InlineTaker`). `target.kind` is `inline_data`,
+with the `count` of data entries and no ids. The `purpose` comes from
+`X-Audit-Purpose` and the `request_id` from `X-Request-ID`, both read from the
+headers. The event is written once the job has answered, before anything of the
+answer goes out, so in a rare cancellation it can name outputs that never
+reached docint, whose own `disclose` records whether an answer came. An answer
+that cannot be read records `outputs` 0 and every output as `dropped`. A call
+that must state a purpose and states none runs nothing and is recorded as
+`denied`, without a target.
 
 ### Not recorded
 
@@ -161,11 +174,11 @@ A retention record that cannot be written stops the api (see
 
 ## Who: the actor
 
-The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id,
-with `via: service`: Open WebUI acts for the user. While the account exists, an
-Open WebUI admin resolves the id in Open WebUI's user table, and Open WebUI's
-own per-request audit records carry the same id with the account. The caller,
-`open-webui`, is in every event's `criteria`.
+The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id
+or the id docint sends, with `via: service`: the caller acts for the user. While
+the account exists, an Open WebUI admin resolves the id in Open WebUI's user
+table, and Open WebUI's own per-request audit records carry the same id with the
+account. The caller, `open-webui` or `docint`, is in every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user
@@ -175,20 +188,20 @@ no test pins that (see
 [permissions.md](permissions.md#what-open-webui-v0133-sends)). workbench does
 not use it.
 
-## No purpose and no recipient in version 1
+## Purpose, recipient and request id
 
-- **No purpose.** Open WebUI cannot send a stated purpose with each call, so
-  version 1 records none and requires none. workbench does not read
-  `X-Audit-Purpose` or `AUDIT_REQUIRE_PURPOSE`. A caller that sends a purpose
-  (docint, in version 2) will have it recorded.
+- **Purpose.** On the MCP door a call states its purpose in `X-Audit-Purpose`,
+  and it is recorded. `AUDIT_REQUIRE_PURPOSE` (`query,disclose,combine` in
+  compose) makes a call without one `denied`. Open WebUI cannot send a purpose,
+  so the terminal door records none and requires none.
 - **No `recipient` on `disclose`.** A view, read or display goes to the user's
   own session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
-- **No request id, and no parent but a continuation's.** Open WebUI's tool calls
-  carry no message id workbench could tie together. The events of one agent turn
-  share their `container` and follow each other in the chain. Only a
-  continuation of a long id list names a parent (see
-  [Long lists of files](#long-lists-of-files)).
+- **Request id.** An MCP call's `X-Request-ID` is on its event, which ties it to
+  docint's `disclose`. Open WebUI's tool calls carry no message id workbench
+  could tie together: the events of one agent turn share their `container` and
+  follow each other in the chain. Only a continuation of a long id list names a
+  parent (see [Long lists of files](#long-lists-of-files)).
 
 ## The Open WebUI side
 
@@ -245,7 +258,8 @@ as `service_version`:
 - `lifecycle` / `start` opens it;
 - `admin` / `config.audit` (actor `via: system`) records the limits in force:
   `retention_days`, `executor_slots`, `queue_max`, `job_wall_s`,
-  `upload_max_mb`, `workspace_max_mb`. Never the key;
+  `upload_max_mb`, `workspace_max_mb`, `callers` (each by name, door, tools,
+  wall cap and slots) and `require_purpose`, sorted. Never a key;
 - `lifecycle` / `heartbeat` follows every 60 seconds;
 - `lifecycle` / `shutdown` closes it on a clean stop.
 
@@ -273,6 +287,7 @@ lock file is `/tmp/audit-stream.lock` on the api's `/tmp` tmpfs.
 | Variable | Default | Purpose |
 |---|---|---|
 | `AUDIT_OUTPUT` | `stdout` (compose sets `container`) | Where the chain goes: `stdout` for the process's stdout, `container` for the container's main stdout under the container-wide lock. Any other value stops the start. Not in `.env.example`: compose fixes it |
+| `AUDIT_REQUIRE_PURPOSE` | none in the code; compose sets `query,disclose,combine` | The actions a call must state a purpose for, on the MCP door only ([configuration.md](configuration.md#audit-and-retention)) |
 
-`AUDIT_REQUIRE_PURPOSE`, `AUDIT_CASE_REF`, `AUDIT_REASON` and `AUDIT_CLI_USER`
-are read by other members of the federation. workbench reads none of them.
+`AUDIT_CASE_REF`, `AUDIT_REASON` and `AUDIT_CLI_USER` are read by other members
+of the federation. workbench reads none of them.
