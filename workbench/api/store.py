@@ -86,7 +86,7 @@ UploadRecord = Callable[[str, str, str], object]
 #: or ``error`` when the deletion failed after that. It raises when the record cannot be written.
 ChatRecord = Callable[[Sequence[str], str], object]
 
-_OFFICE_TYPES = {
+_EXTRA_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -97,11 +97,13 @@ _OFFICE_TYPES = {
     ".ods": "application/vnd.oasis.opendocument.spreadsheet",
     ".odp": "application/vnd.oasis.opendocument.presentation",
     ".eml": "message/rfc822",
+    ".jsonl": "application/x-ndjson",
+    ".ndjson": "application/x-ndjson",
 }
 
 
 def _known_types() -> mimetypes.MimeTypes:
-    """Build the name-to-type table: the library's built-in one plus the office formats.
+    """Build the name-to-type table: the library's built-in one plus the office formats and JSON Lines.
 
     A private table, so the answer never depends on which ``mime.types`` files the host has
     (a slim image has none, and would call every Office file ``application/octet-stream``).
@@ -110,7 +112,7 @@ def _known_types() -> mimetypes.MimeTypes:
         The table.
     """
     types = mimetypes.MimeTypes()
-    for ext, mime in _OFFICE_TYPES.items():
+    for ext, mime in _EXTRA_TYPES.items():
         types.add_type(mime, ext)
     return types
 

@@ -127,6 +127,9 @@ def test_unknown_types_are_octet_stream(store: Store, alice: Principal) -> None:
     assert put(store, alice, "q.csv").mime == "text/csv"
     assert put(store, alice, "notes.md").mime == "text/markdown"
     assert put(store, alice, "mail.eml").mime == "message/rfc822"
+    assert put(store, alice, "orders.json").mime == "application/json"
+    assert put(store, alice, "orders.jsonl").mime == "application/x-ndjson"
+    assert put(store, alice, "events.ndjson").mime == "application/x-ndjson"
     assert put(store, alice, "Q.DOCX").mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 

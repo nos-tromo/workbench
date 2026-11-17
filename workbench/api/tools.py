@@ -247,7 +247,8 @@ class DocumentRead(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``, ``html`` or ``text``.
+        kind: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``, ``html``, ``json`` or
+            ``text``.
         parts: The text, in order, each piece with its reference.
         total_parts: How many pages, sheets, slides, paragraphs and tables or lines the file has.
         pages_without_text: Pages or slides looked at that have no text.
@@ -679,9 +680,10 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
     summary="Read a file of this conversation as text",
     description=(
         "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
-        "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, TXT and MD. Give the file's path "
-        "from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a "
-        "long file is read in several calls: when truncated is true, call again with part set to next_part. "
+        "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
+        "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
+        "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
+        "call again with part set to next_part. "
         "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table "
         "rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to "
         "200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's "
@@ -1051,8 +1053,10 @@ def fit_python[M: BaseModel](answer: M, limit_kb: int, *, keep_none: bool = Fals
         "new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image "
         "files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so show a file with "
         "display_file. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, "
-        "python-pptx, pypdf, odfpy, lxml, beautifulsoup4. There is no network and nothing can be installed. Use "
-        "threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a "
+        "python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, XLSX) into a table file, "
+        "load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or .csv; do not copy its rows "
+        "into write_table. There is no network and nothing can be installed. Use threads, not multiprocessing: "
+        "process pools and multiprocessing do not work here. The code runs as a "
         "script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when "
         "long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures "
         "the code computed."

@@ -138,6 +138,19 @@ def test_no_part_is_sent_as_none(client: TestClient, store: Store, executor: Scr
     assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 90}] * 2
 
 
+def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store, executor: Scripted) -> None:
+    """The file goes to the job as it is; its kind and the indented lines come back as the runner gave them."""
+    put(store, "orders.json", b'{"order":"A-0001","qty":2}')
+    executor.payload = reading("ignored", ("lines 1-4", '{\n  "order": "A-0001",\n  "qty": 2\n}'), kind="json")
+    r = read(client, f"{CHAT}/orders.json")
+    assert r.status_code == 200
+    (req,) = executor.requests
+    assert req.input_files == ["orders.json"]
+    assert req.args == {"path": "orders.json", "part": None, "budget_s": 90}
+    assert r.json()["kind"] == "json"
+    assert r.json()["parts"] == [{"label": "lines 1-4", "text": '{\n  "order": "A-0001",\n  "qty": 2\n}'}]
+
+
 def test_a_file_in_a_folder_and_in_another_chat_runs_in_its_own_chat_folder(
     client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
 ) -> None:
@@ -671,6 +684,16 @@ def test_the_tools_are_in_the_schema_with_typed_parameters(app: FastAPI, client:
     assert read_schema["required"] == ["path"]
     assert read_schema["properties"]["part"]["type"] == "string"
     assert doc["components"]["schemas"]["SearchFilesRequest"]["required"] == ["query"]
+
+
+def test_the_model_is_told_how_json_is_read_and_how_a_data_file_becomes_a_table(client: TestClient) -> None:
+    """``read_document`` names JSON among what it reads; ``run_python`` keeps a data file's rows out of write_table."""
+    paths = client.get("/openapi.json", headers={"Authorization": f"Bearer {KEY}"}).json()["paths"]
+    reading_text = paths["/tools/read_document"]["post"]["description"]
+    python_text = paths["/tools/run_python"]["post"]["description"]
+    assert "HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD" in reading_text
+    assert "load it in code (json, pandas.json_normalize)" in python_text
+    assert "do not copy its rows into write_table" in python_text
 
 
 @pytest.mark.parametrize(

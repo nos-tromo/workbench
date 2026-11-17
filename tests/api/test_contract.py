@@ -195,14 +195,15 @@ def test_openapi_is_built_once_and_served_from_memory(app: FastAPI, client: Test
     assert client.get("/openapi.json", headers=KEY_ONLY).json() == first
 
 
-#: The sha256 of Open WebUI's tool document as v0.1.1 served it, ``info.version`` set to ``0.0.0``, written as compact
-#: JSON in the order it was served. Changing it changes Open WebUI's contract: the tools, schemas and texts its model is
-#: offered, and the order of the properties it sees.
-OPEN_WEBUI_CONTRACT_SHA256 = "deed2ba444061fd96135522296df371fcd3d7f5eed892a4964ff4a685b9397f2"
+#: The sha256 of Open WebUI's tool document as v0.4.0 served it (v0.1.1's, with JSON readable and run_python's note on
+#: data files), ``info.version`` set to ``0.0.0``, written as compact JSON in the order it was served. Changing it
+#: changes Open WebUI's contract: the tools, schemas and texts its model is offered, and the order of the properties it
+#: sees.
+OPEN_WEBUI_CONTRACT_SHA256 = "9e7c195e5dac122be0091b82a0a377d04f3960da1fe386f6510e079be8c20f00"
 
 
 def test_open_webuis_tool_document_is_its_contract_and_does_not_change(client: TestClient) -> None:
-    """Open WebUI's document is v0.1.1's apart from its version; a change here is a change to Open WebUI's contract."""
+    """Open WebUI's document is v0.4.0's apart from its version; a change here is a change to Open WebUI's contract."""
     doc = client.get("/openapi.json", headers=KEY_ONLY).json()
     doc["info"]["version"] = "0.0.0"
     written = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode()

@@ -1,4 +1,4 @@
-"""Plain text, Markdown, CSV and TSV, by line; also the paging the HTML and e-mail readers use.
+"""Plain text, Markdown, JSON Lines, CSV and TSV, by line; also the paging the HTML, e-mail and JSON readers use.
 
 The text is decoded without being told its encoding: a byte order mark, strict UTF-8, then
 charset-normalizer's guess for non-Latin scripts, then Windows-1252 with replacement characters. A file is read by line
