@@ -15,7 +15,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import DOCINT_KEY, KEY, unrecorded
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY, unrecorded
+from tests.callers import EIGHT
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import Caller, CallerRegistry, KeyGate
@@ -234,7 +235,8 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     assert client.get("/api/config", headers=KEY_ONLY).status_code == 200
-    assert seen == [(KEY.encode(), KEY.encode()), (KEY.encode(), DOCINT_KEY.encode())] * 2
+    compared = [(KEY, KEY), (KEY, DOCINT_KEY), (KEY, GHOSTWRITER_KEY)]
+    assert seen == [(a.encode(), b.encode()) for a, b in compared] * 2
 
 
 def test_the_key_is_checked_before_the_user(client: TestClient) -> None:
@@ -482,8 +484,12 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
 
 def test_the_registry_needs_a_key(settings: Settings) -> None:
     """The executor's settings carry no key, and the api refuses to build a registry from them."""
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY"):
-        CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None, docint_key=None))
+    with pytest.raises(
+        ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY, DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY"
+    ):
+        CallerRegistry.from_settings(
+            dataclasses.replace(settings, open_webui_key=None, docint_key=None, ghostwriter_key=None)
+        )
 
 
 @pytest.mark.parametrize(
@@ -543,12 +549,14 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "workspace_max_mb": settings.workspace_max_mb,
         "callers": [
             {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
+            {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
             {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
         ],
         "require_purpose": [],
     }
     assert KEY not in audit_stream.getvalue()
     assert DOCINT_KEY not in audit_stream.getvalue()
+    assert GHOSTWRITER_KEY not in audit_stream.getvalue()
 
 
 def test_a_start_that_fails_after_the_chain_opened_closes_it(

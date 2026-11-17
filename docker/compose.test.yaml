@@ -25,8 +25,10 @@ services:
       # Synthetic, test-only; never real keys.
       OPEN_WEBUI_WORKBENCH_KEY: synthetic-isolation-test-key-not-a-secret
       DOCINT_WORKBENCH_KEY: synthetic-docint-test-key-not-a-secret-0000
-      # docint's cap may not pass the stack's wall time, or the api does not start.
+      GHOSTWRITER_WORKBENCH_KEY: synthetic-ghostwriter-test-key-not-a-secret
+      # docint's and Ghostwriter's caps may not pass the stack's wall time, or the api does not start.
       DOCINT_WORKBENCH_WALL_S: "20"
+      GHOSTWRITER_WORKBENCH_WALL_S: "20"
       WORKBENCH_JOB_WALL_S: "20"
 
   executor:

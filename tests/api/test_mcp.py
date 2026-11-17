@@ -33,9 +33,9 @@ from workbench.api.audit import AuditLog
 from workbench.api.auth import MCP_PATH, KeyGate
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue
 from workbench.api.main import create_app
-from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, WireError, check_media, tools_list_result
+from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, WireError, check_media, tool_result, tools_list_result
 from workbench.api.metrics import Metrics
-from workbench.api.registry import ToolSpec
+from workbench.api.registry import ToolOutcome, ToolSpec
 from workbench.api.routing import MAX_DEPTH, EncodableRequest, nested_deeper_than
 from workbench.api.store import Store
 from workbench.api.tools_inline import INLINE_SPECS
@@ -642,6 +642,29 @@ def test_a_spec_without_a_schema_or_an_output_model_cannot_be_listed(
     assert tools_list_result([spec], caller, era)["tools"]
     with pytest.raises(ValueError, match="run_python"):
         tools_list_result([lacking(spec)], caller, era)
+
+
+def test_a_specs_own_output_schema_is_listed_in_place_of_its_models(app: FastAPI) -> None:
+    """A spec that describes its output for the caller lists that, with or without an output model."""
+    caller = app.state.callers.get("docint")
+    (spec,) = INLINE_SPECS
+    own = dataclasses.replace(spec, output_schema=lambda _caller: {"type": "object", "title": "own"})
+    era = Era(MODERN, modern=True)
+    for listed in (own, dataclasses.replace(own, output_model=None)):
+        (tool,) = tools_list_result([listed], caller, era)["tools"]
+        assert tool["outputSchema"] == {"type": "object", "title": "own"}
+
+
+def test_a_tools_own_text_is_the_text_block() -> None:
+    """A tool that sets its text has it as the first block; without one, the text is the structured answer's JSON."""
+    image = {"type": "image", "data": "", "mimeType": "image/png"}
+    assert tool_result(ToolOutcome({"a": 1}, [image], "own text"))["content"] == [
+        {"type": "text", "text": "own text"},
+        image,
+    ]
+    assert tool_result(ToolOutcome({"a": 1, "b": None}, []))["content"] == [
+        {"type": "text", "text": '{"a":1,"b":null}'}
+    ]
 
 
 def test_a_tool_result_is_the_structured_answer_and_its_blocks(client: TestClient, fake_executor: Scripted) -> None:

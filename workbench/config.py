@@ -16,9 +16,12 @@ MAX_RESULT_KB = 256
 
 _OPEN_WEBUI_KEY: Final = "OPEN_WEBUI_WORKBENCH_KEY"
 _DOCINT_KEY: Final = "DOCINT_WORKBENCH_KEY"
+_GHOSTWRITER_KEY: Final = "GHOSTWRITER_WORKBENCH_KEY"
 
 #: Why the api does not start without a caller: each key is optional, but one of them is needed.
-NO_CALLER_KEY: Final = f"{_OPEN_WEBUI_KEY} or {_DOCINT_KEY} must be set to at least {MIN_KEY_LENGTH} characters"
+NO_CALLER_KEY: Final = (
+    f"{_OPEN_WEBUI_KEY}, {_DOCINT_KEY} or {_GHOSTWRITER_KEY} must be set to at least {MIN_KEY_LENGTH} characters"
+)
 
 #: docint's tools when ``DOCINT_WORKBENCH_TOOLS`` lists none, and its limits when they are not set.
 DOCINT_DEFAULT_TOOLS: Final = frozenset({"run_python"})
@@ -27,6 +30,25 @@ DOCINT_DEFAULT_SLOTS: Final = 2
 
 #: The least wall time docint's jobs may be given: the inline schema's lowest ``time_limit_s``.
 MIN_DOCINT_WALL_S: Final = 5
+
+#: Ghostwriter's tools when ``GHOSTWRITER_WORKBENCH_TOOLS`` lists none: the workspace tools but ``display_file``.
+GHOSTWRITER_DEFAULT_TOOLS: Final = frozenset(
+    {
+        "list_files",
+        "read_document",
+        "search_files",
+        "run_python",
+        "inspect_template",
+        "fill_template",
+        "write_table",
+        "write_document",
+    }
+)
+GHOSTWRITER_DEFAULT_WALL_S: Final = 120
+GHOSTWRITER_DEFAULT_SLOTS: Final = 2
+
+#: The least wall time Ghostwriter's jobs may be given, so the previews keep their time within it.
+MIN_GHOSTWRITER_WALL_S: Final = 10
 
 
 class ConfigError(ValueError):
@@ -59,7 +81,13 @@ class Settings:
         docint_tools: The tools docint may use.
         docint_wall_s: Wall-clock seconds one of docint's jobs may run; at most ``job_wall_s``.
         docint_slots: Jobs of docint's that may run at once; fewer than ``executor_slots``.
-        require_purpose: The audit actions a call through the MCP door must state a purpose for.
+        require_purpose: The audit actions a call through the MCP door, or one of Ghostwriter's file routes, must state
+            a purpose for.
+        ghostwriter_key: Bearer key Ghostwriter presents; ``None`` when unset, and always for the executor role.
+        ghostwriter_tools: The tools Ghostwriter may use.
+        ghostwriter_wall_s: Wall-clock seconds one of Ghostwriter's jobs may run; from ``MIN_GHOSTWRITER_WALL_S`` to
+            ``job_wall_s``.
+        ghostwriter_slots: Jobs of Ghostwriter's that may run at once; fewer than ``executor_slots``.
     """
 
     data_dir: Path
@@ -83,6 +111,10 @@ class Settings:
     docint_wall_s: int
     docint_slots: int
     require_purpose: frozenset[str]
+    ghostwriter_key: str | None = field(repr=False)
+    ghostwriter_tools: frozenset[str]
+    ghostwriter_wall_s: int
+    ghostwriter_slots: int
 
 
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -140,17 +172,19 @@ def _caller_key(env: Mapping[str, str], name: str) -> str | None:
     return key
 
 
-def _docint_tools(env: Mapping[str, str]) -> frozenset[str]:
-    """Read ``DOCINT_WORKBENCH_TOOLS``, a comma-separated list of tools.
+def _tool_list(env: Mapping[str, str], name: str, default: frozenset[str]) -> frozenset[str]:
+    """Read a caller's tools, a comma-separated list.
 
     Args:
         env: The environment to read.
+        name: Variable name.
+        default: The tools when the list names none.
 
     Returns:
-        The listed tools, each stripped, blank entries dropped; ``DOCINT_DEFAULT_TOOLS`` when none is listed.
+        The listed tools, each stripped, blank entries dropped; ``default`` when none is listed.
     """
-    listed = frozenset(part.strip() for part in env.get("DOCINT_WORKBENCH_TOOLS", "").split(",")) - {""}
-    return listed or DOCINT_DEFAULT_TOOLS
+    listed = frozenset(part.strip() for part in env.get(name, "").split(",")) - {""}
+    return listed or default
 
 
 def _required_purpose(env: Mapping[str, str]) -> frozenset[str]:
@@ -176,8 +210,9 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
 
     Args:
         env: The environment to read, normally ``os.environ``.
-        role: ``"api"`` requires a caller key, Open WebUI's or docint's, and reads docint's limits and
-            ``AUDIT_REQUIRE_PURPOSE``; ``"executor"`` reads none of these and keeps their defaults.
+        role: ``"api"`` requires a caller key, Open WebUI's, docint's or Ghostwriter's, and reads docint's and
+            Ghostwriter's limits and ``AUDIT_REQUIRE_PURPOSE``; ``"executor"`` reads none of these and keeps their
+            defaults.
 
     Returns:
         The validated settings.
@@ -196,12 +231,17 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
     docint_key: str | None = None
     docint_tools, docint_wall_s, docint_slots = DOCINT_DEFAULT_TOOLS, DOCINT_DEFAULT_WALL_S, DOCINT_DEFAULT_SLOTS
     require_purpose: frozenset[str] = frozenset()
+    ghostwriter_key: str | None = None
+    ghostwriter_tools = GHOSTWRITER_DEFAULT_TOOLS
+    ghostwriter_wall_s, ghostwriter_slots = GHOSTWRITER_DEFAULT_WALL_S, GHOSTWRITER_DEFAULT_SLOTS
     if role == "api":
         open_webui_key = _caller_key(env, _OPEN_WEBUI_KEY)
         docint_key = _caller_key(env, _DOCINT_KEY)
-        if open_webui_key is None and docint_key is None:
+        ghostwriter_key = _caller_key(env, _GHOSTWRITER_KEY)
+        if open_webui_key is None and docint_key is None and ghostwriter_key is None:
             raise ConfigError(NO_CALLER_KEY)
-        docint_tools = _docint_tools(env)
+        docint_tools = _tool_list(env, "DOCINT_WORKBENCH_TOOLS", DOCINT_DEFAULT_TOOLS)
+        ghostwriter_tools = _tool_list(env, "GHOSTWRITER_WORKBENCH_TOOLS", GHOSTWRITER_DEFAULT_TOOLS)
         require_purpose = _required_purpose(env)
         if docint_key is not None:
             docint_wall_s = _positive_int(env, "DOCINT_WORKBENCH_WALL_S", DOCINT_DEFAULT_WALL_S)
@@ -212,6 +252,16 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
                 )
             if docint_slots >= slots:
                 raise ConfigError(f"DOCINT_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS ({slots})")
+        if ghostwriter_key is not None:
+            ghostwriter_wall_s = _positive_int(env, "GHOSTWRITER_WORKBENCH_WALL_S", GHOSTWRITER_DEFAULT_WALL_S)
+            ghostwriter_slots = _positive_int(env, "GHOSTWRITER_WORKBENCH_SLOTS", GHOSTWRITER_DEFAULT_SLOTS)
+            if not MIN_GHOSTWRITER_WALL_S <= ghostwriter_wall_s <= job_wall_s:
+                raise ConfigError(
+                    f"GHOSTWRITER_WORKBENCH_WALL_S must be from {MIN_GHOSTWRITER_WALL_S} to WORKBENCH_JOB_WALL_S "
+                    f"({job_wall_s})"
+                )
+            if ghostwriter_slots >= slots:
+                raise ConfigError(f"GHOSTWRITER_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS ({slots})")
     return Settings(
         data_dir=Path(_text(env, "WORKBENCH_DATA_DIR") or "/data"),
         open_webui_key=open_webui_key,
@@ -234,4 +284,8 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
         docint_wall_s=docint_wall_s,
         docint_slots=docint_slots,
         require_purpose=require_purpose,
+        ghostwriter_key=ghostwriter_key,
+        ghostwriter_tools=ghostwriter_tools,
+        ghostwriter_wall_s=ghostwriter_wall_s,
+        ghostwriter_slots=ghostwriter_slots,
     )

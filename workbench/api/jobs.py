@@ -522,6 +522,7 @@ class JobQueue:
         keeper: Keeper | None = None,
         *,
         call: CallLimits | None = None,
+        previews: bool = False,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run a tool in the executor, when its turn comes, and keep what it makes.
 
@@ -534,6 +535,8 @@ class JobQueue:
                 and picks the outputs to keep. Without one, no output is kept: a tool that makes no file has none.
             call: The call's wall, wait and caller slots; without it, ``job_wall_s``, ``queue_wait_s`` and no cap of
                 the caller's own.
+            previews: Whether the executor reads a table preview of each csv and xlsx output the job writes. The
+                keeper sees each on its output (``OutputFile.preview``) when it records the answer.
 
         Returns:
             The job record with its final status, the executor's answer and the files the job
@@ -557,7 +560,7 @@ class JobQueue:
             raise ValueError("unknown tool")
         _check_inputs(input_files)
         async with self._turn(p, call):
-            return await self._run(p, tool, args, input_files, keeper, call)
+            return await self._run(p, tool, args, input_files, keeper, call, previews)
 
     async def submit_inline(
         self,
@@ -744,6 +747,7 @@ class JobQueue:
         *,
         input_files: Sequence[str] = (),
         inline_inputs: Sequence[InlineFile] = (),
+        previews: bool = False,
     ) -> JobRequest:
         """Build a job's request: the inputs it copies or the data it carries, within its limits.
 
@@ -755,6 +759,7 @@ class JobQueue:
             call: The call's wall; ``None`` for ``job_wall_s``.
             input_files: Paths relative to the chat folder.
             inline_inputs: The data.
+            previews: Whether the job reads its table outputs' previews.
 
         Returns:
             The request.
@@ -770,6 +775,7 @@ class JobQueue:
             inline_inputs=list(inline_inputs),
             limits=self._limits(call),
             max_chars=self._settings.result_max_kb * 1024,
+            previews=previews,
         )
 
     async def _run(
@@ -780,6 +786,7 @@ class JobQueue:
         input_files: Sequence[str],
         keeper: Keeper | None,
         call: CallLimits | None,
+        previews: bool,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Record the job, run it, keep its outputs and settle its record and staging folder.
 
@@ -790,6 +797,7 @@ class JobQueue:
             input_files: Paths relative to the chat folder.
             keeper: Records the answer and picks the outputs to keep; ``None`` keeps none.
             call: The call's wall; ``None`` for ``job_wall_s``.
+            previews: Whether the job reads its table outputs' previews.
 
         Returns:
             What :meth:`submit` returns.
@@ -803,7 +811,7 @@ class JobQueue:
         completed = False
         files: list[FileRecord] = []
         try:
-            req = self._request(job.id, p, tool, args, call, input_files=input_files)
+            req = self._request(job.id, p, tool, args, call, input_files=input_files, previews=previews)
             result = await self._execute(req)
             if keeper is not None:
                 result, files = await self._keep(p, job.id, result, keeper)

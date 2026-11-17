@@ -9,11 +9,12 @@ from typing import Any, override
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.api.conftest import HG
 from tests.api.conftest import KEY as CALLER_KEY
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_inline import body as inline_body
 from tests.api.test_tools_inline import call as inline_call
-from workbench.api.audit import OPERATIONS, SERVICE, AuditLog
+from workbench.api.audit import OPERATIONS, SERVICE, AuditLog, PurposeRequired
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
@@ -38,6 +39,7 @@ EXPECTED_OPERATIONS = {
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
     "write_document": ("collect", "tool.write_document"),
+    "chat_delete": ("delete", "chat.delete"),
 }
 
 
@@ -236,6 +238,37 @@ def test_a_denial_has_no_target(log: AuditLog, stream: Stream, alice: Principal)
     assert "request_id" not in last
 
 
+def test_a_bound_log_adds_purpose_and_request_id(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """A bound log writes its purpose and request id where a call gives none, on the same chain; the log stays plain."""
+    bound = log.bound(Purpose(reason="ghostwriter chat"), "req-1")
+    bound.record("view", alice, file_ids=["f" * 32])
+    bound.record("view", alice, file_ids=["f" * 32], purpose=Purpose(case_ref="case-0001"), request_id="req-2")
+    log.record("view", alice, file_ids=["f" * 32])
+
+    first, given, plain = stream.events()[-3:]
+    assert (first["purpose"], first["request_id"]) == ({"reason": "ghostwriter chat"}, "req-1")
+    assert (given["purpose"], given["request_id"]) == ({"case_ref": "case-0001"}, "req-2")
+    assert "purpose" not in plain and "request_id" not in plain
+
+
+def test_check_denies_only_a_required_action(log: AuditLog, stream: Stream, alice: Principal) -> None:
+    """A bound log refuses an action whose audit action needs a purpose it lacks, after recording the denial."""
+    strict = log.bound(None, "req-1", required=frozenset({"disclose"}))
+    with pytest.raises(PurposeRequired):
+        strict.check("view", alice)
+
+    denied = stream.events()[-1]
+    assert (denied["action"], denied["operation"], denied["outcome"]) == ("disclose", "file.view", "denied")
+    assert "target" not in denied and "purpose" not in denied
+    assert denied["criteria"] == {"caller": "open-webui", "refused": "purpose_required", "container": "chat:chat-1"}
+    assert denied["request_id"] == "req-1"
+    before = len(stream.events())
+    strict.check("upload", alice)
+    log.bound(Purpose(reason="ghostwriter chat"), None, required=frozenset({"disclose"})).check("view", alice)
+    log.check("view", alice)
+    assert len(stream.events()) == before
+
+
 def test_unknown_key_is_refused_and_writes_nothing(log: AuditLog, stream: Stream, alice: Principal) -> None:
     """A key outside ``OPERATIONS`` is a programming error, not an event."""
     before = len(stream.events())
@@ -320,6 +353,9 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
         assert len(inline_call(client, inline).blocks) == 1
         assert client.delete("/files/delete", params={"path": csv}, headers=h).status_code == 200
+        draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
+        assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 1}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

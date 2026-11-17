@@ -12,6 +12,9 @@ A job the queue refuses (``Busy``) is a 503 with one fixed text, whatever the re
 told to retry later, and which limit was hit is for the metrics, not for the model. A request too
 large for the executor's protocol (``RequestTooLarge``) is a 422: retrying it cannot help.
 
+A call that had to state a purpose and stated none (``PurposeRequired``) is a 428, its ``denied`` event already
+written.
+
 Both doors answer with the same texts: :func:`describe` gives an error's status and text, :func:`compact` the body of
 a request that does not validate.
 
@@ -38,6 +41,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from workbench.api.audit import PurposeRequired
 from workbench.api.jobs import Busy, RequestTooLarge
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, StoreError, TooLarge
 from workbench.paths import PathError
@@ -57,6 +61,12 @@ BUSY: Final = "busy, retry later"
 #: The detail of every 422 for a request the executor's protocol cannot carry.
 TOO_LARGE: Final = "request too large"
 
+#: The detail of every 428: the call had to state a purpose.
+PURPOSE_REQUIRED: Final = "a stated purpose is required"
+
+#: The detail of a refused ``X-Audit-Purpose``: malformed, never the value sent.
+INVALID_PURPOSE: Final = "invalid purpose"
+
 #: The most validation errors one 422 lists.
 MAX_ERRORS: Final = 20
 
@@ -75,6 +85,7 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
     (AuditWriteError, 500, "audit unavailable"),
     (Busy, 503, BUSY),
     (RequestTooLarge, 422, TOO_LARGE),
+    (PurposeRequired, 428, PURPOSE_REQUIRED),
 )
 
 
@@ -85,7 +96,7 @@ def describe(exc: Exception) -> tuple[int, str]:
         exc: The error.
 
     Returns:
-        For a path, store, audit, queue or request-size error, the status and text of :data:`_ANSWERS`, and
+        For a path, store, audit, queue, request-size or purpose error, the status and text of :data:`_ANSWERS`, and
         ``(500, "storage error")`` for any other store error. For an ``HTTPException`` with a string detail, its status
         and detail. For anything else, ``(500, INTERNAL)``: its message is never the answer.
     """
@@ -100,7 +111,7 @@ def describe(exc: Exception) -> tuple[int, str]:
 
 
 async def _answer(_request: Request, exc: Exception) -> JSONResponse:
-    """Turn a path, store, audit, queue or request-size error into its short answer, without logging it.
+    """Turn a path, store, audit, queue, request-size or purpose error into its short answer, without logging it.
 
     Args:
         _request: The request that failed.
@@ -237,4 +248,5 @@ def install(app: FastAPI) -> None:
     app.add_exception_handler(AuditWriteError, _answer)
     app.add_exception_handler(Busy, _answer)
     app.add_exception_handler(RequestTooLarge, _answer)
+    app.add_exception_handler(PurposeRequired, _answer)
     app.add_exception_handler(RequestValidationError, _invalid)

@@ -32,7 +32,7 @@ work without it; only its workbench tools need it.
 ## Quick start
 
 ```bash
-cp .env.example .env          # set OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY: openssl rand -hex 32
+cp .env.example .env          # set OPEN_WEBUI_WORKBENCH_KEY, DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY: openssl rand -hex 32
 make network volumes          # the external workbench-net and workbench-data
 make build && make up         # production shape: no host port
 make health                   # both services, then the api's /healthz

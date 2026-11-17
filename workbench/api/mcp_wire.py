@@ -49,10 +49,16 @@ INTERNAL_ERROR: Final = -32603
 HEADER_MISMATCH: Final = -32020
 UNSUPPORTED_VERSION: Final = -32022
 
-#: What ``server/discover`` tells the model about the server, in two sentences.
+#: What ``server/discover`` tells the model about the server, in two sentences, for a caller whose data comes inline.
 INSTRUCTIONS: Final = (
     "workbench runs Python on the data each call carries, in a sandbox with no network, and deletes that data with "
     "the job. Call run_python with the code and its data files; tables come back as CSV and charts as PNG."
+)
+#: The same for a caller whose files are kept in the chat's workspace.
+WORKSPACE_INSTRUCTIONS: Final = (
+    "workbench works on the files of this chat: it lists, reads and searches them, runs Python over them in a sandbox "
+    "with no network, fills report templates and writes tables and documents. Every file a tool writes comes back as "
+    "a reference with its path and id, never as bytes."
 )
 
 #: How long a client may keep ``server/discover``'s and ``tools/list``'s answers, in milliseconds.
@@ -349,35 +355,46 @@ def initialize_result(requested: object) -> dict[str, Any]:
     return {"protocolVersion": version, "capabilities": _capabilities(), "serverInfo": _server()}
 
 
-def discover_result() -> dict[str, Any]:
+def discover_result(caller: "Caller") -> dict[str, Any]:
     """Answer ``server/discover``.
 
+    Args:
+        caller: The caller; its file form picks the instructions.
+
     Returns:
-        The revisions served, the capabilities, the instructions and how long a client may keep the answer.
+        The revisions served, the capabilities, the instructions (:data:`WORKSPACE_INSTRUCTIONS` for a caller with
+        workspace files, :data:`INSTRUCTIONS` for an inline one) and how long a client may keep the answer.
     """
     return {
         "supportedVersions": list(SUPPORTED),
         "capabilities": _capabilities(),
-        "instructions": INSTRUCTIONS,
+        "instructions": WORKSPACE_INSTRUCTIONS if caller.files == "workspace" else INSTRUCTIONS,
         "ttlMs": DISCOVER_TTL_MS,
         "cacheScope": "private",
     }
 
 
 def _tool(spec: "ToolSpec", caller: "Caller") -> dict[str, Any]:
-    """One tool as ``tools/list`` names it.
+    """One tool as ``tools/list`` names it: its output schema is the spec's own for the caller, else its model's.
 
     Raises:
-        ValueError: The spec has no ``input_schema`` or no ``output_model``; every inline spec has both.
+        ValueError: The spec has no ``input_schema``, or neither an ``output_schema`` nor an ``output_model``; every
+            spec the MCP door serves has both.
     """
-    if spec.input_schema is None or spec.output_model is None:
+    if spec.output_schema is not None:
+        output = spec.output_schema(caller)
+    elif spec.output_model is not None:
+        output = spec.output_model.model_json_schema()
+    else:
+        output = None
+    if spec.input_schema is None or output is None:
         raise ValueError(f"{spec.name} cannot be listed: it has no input schema or no output model")
     return {
         "name": spec.name,
         "title": spec.title,
         "description": spec.description,
         "inputSchema": spec.input_schema(caller),
-        "outputSchema": spec.output_model.model_json_schema(),
+        "outputSchema": output,
     }
 
 
@@ -407,10 +424,10 @@ def tool_result(outcome: "ToolOutcome") -> dict[str, Any]:
         outcome: The tool's answer.
 
     Returns:
-        The structured answer, also as compact UTF-8 JSON text (with its ``None`` fields, as the tool measured it)
-        ahead of the tool's own blocks, and ``isError: false``.
+        The structured answer; ahead of the tool's own blocks, its text, or else the structured answer as compact UTF-8
+        JSON text (with its ``None`` fields, as the tool measured it); and ``isError: false``.
     """
-    text = {"type": "text", "text": _compact_json(outcome.structured)}
+    text = {"type": "text", "text": _compact_json(outcome.structured) if outcome.text is None else outcome.text}
     return {"content": [text, *outcome.blocks], "structuredContent": outcome.structured, "isError": False}
 
 

@@ -5,10 +5,12 @@ from typing import Literal
 
 import pytest
 
-from workbench.config import ConfigError, Settings, load_settings
+from tests.callers import EIGHT
+from workbench.config import GHOSTWRITER_DEFAULT_TOOLS, NO_CALLER_KEY, ConfigError, Settings, load_settings
 
 KEY = "k" * 32
 D = "d" * 32
+A = "a" * 32
 
 
 def test_defaults_match_the_spec() -> None:
@@ -26,6 +28,8 @@ def test_defaults_match_the_spec() -> None:
     assert s.docint_key is None
     assert (s.docint_tools, s.docint_wall_s, s.docint_slots) == (frozenset({"run_python"}), 60, 2)
     assert s.require_purpose == frozenset()
+    assert s.ghostwriter_key is None
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (EIGHT, 120, 2)
 
 
 def test_every_variable_is_read_by_its_exact_name() -> None:
@@ -53,6 +57,10 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
             "DOCINT_WORKBENCH_WALL_S": "9",
             "DOCINT_WORKBENCH_SLOTS": "1",
             "AUDIT_REQUIRE_PURPOSE": "query",
+            "GHOSTWRITER_WORKBENCH_KEY": A,
+            "GHOSTWRITER_WORKBENCH_TOOLS": "list_files,write_table",
+            "GHOSTWRITER_WORKBENCH_WALL_S": "10",
+            "GHOSTWRITER_WORKBENCH_SLOTS": "1",
         },
         role="api",
     )
@@ -78,6 +86,10 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
         docint_wall_s=9,
         docint_slots=1,
         require_purpose=frozenset({"query"}),
+        ghostwriter_key=A,
+        ghostwriter_tools=frozenset({"list_files", "write_table"}),
+        ghostwriter_wall_s=10,
+        ghostwriter_slots=1,
     )
 
 
@@ -130,7 +142,12 @@ def test_settings_are_frozen() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "field"), [("OPEN_WEBUI_WORKBENCH_KEY", "open_webui_key"), ("DOCINT_WORKBENCH_KEY", "docint_key")]
+    ("name", "field"),
+    [
+        ("OPEN_WEBUI_WORKBENCH_KEY", "open_webui_key"),
+        ("DOCINT_WORKBENCH_KEY", "docint_key"),
+        ("GHOSTWRITER_WORKBENCH_KEY", "ghostwriter_key"),
+    ],
 )
 def test_api_requires_a_long_key(name: str, field: str) -> None:
     """Whichever caller's it is, a key that is set has at least 32 characters, and the error names its variable."""
@@ -157,11 +174,16 @@ def test_the_error_never_carries_the_key() -> None:
     assert short not in str(info.value)
 
 
-def test_neither_key_is_in_the_settings_repr() -> None:
-    """Settings shown in a log line or a traceback name neither caller's key."""
-    shown = repr(load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY, "DOCINT_WORKBENCH_KEY": D}, role="api"))
+def test_no_key_is_in_the_settings_repr() -> None:
+    """Settings shown in a log line or a traceback name no caller's key."""
+    shown = repr(
+        load_settings(
+            {"OPEN_WEBUI_WORKBENCH_KEY": KEY, "DOCINT_WORKBENCH_KEY": D, "GHOSTWRITER_WORKBENCH_KEY": A}, role="api"
+        )
+    )
     assert KEY not in shown
     assert D not in shown
+    assert A not in shown
 
 
 def test_executor_needs_no_key() -> None:
@@ -254,6 +276,66 @@ def test_the_tool_list_is_a_comma_list() -> None:
     assert load_settings({**env, "DOCINT_WORKBENCH_TOOLS": ""}, role="api").docint_tools == frozenset({"run_python"})
 
 
+def test_the_ghostwriter_key_alone_starts_the_api() -> None:
+    """Ghostwriter's key is a third way to start the api; the other two are then ``None``."""
+    s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
+    assert (s.open_webui_key, s.docint_key, s.ghostwriter_key) == (None, None, A)
+
+
+def test_the_ghostwriter_defaults() -> None:
+    """With only Ghostwriter's key set, it may use the eight tools, for 120 seconds, two jobs at once."""
+    s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (EIGHT, 120, 2)
+    assert GHOSTWRITER_DEFAULT_TOOLS == EIGHT
+
+
+@pytest.mark.parametrize("env", [{}, {"GHOSTWRITER_WORKBENCH_KEY": "  "}, {"GHOSTWRITER_WORKBENCH_KEY": "a" * 31}])
+def test_no_usable_ghostwriter_key_stops_the_api(env: dict[str, str]) -> None:
+    """No key, a blank one or a short one: the api does not start; with none, the error names all three variables."""
+    with pytest.raises(ConfigError) as refused:
+        load_settings(env, role="api")
+    message = str(refused.value)
+    if not env:
+        assert message == NO_CALLER_KEY
+        assert all(
+            name in message
+            for name in ("OPEN_WEBUI_WORKBENCH_KEY", "DOCINT_WORKBENCH_KEY", "GHOSTWRITER_WORKBENCH_KEY")
+        )
+    assert [value for value in env.values() if value.strip() and value.strip() in message] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "named"),
+    [
+        ("GHOSTWRITER_WORKBENCH_WALL_S", "121", "GHOSTWRITER_WORKBENCH_WALL_S"),
+        ("GHOSTWRITER_WORKBENCH_WALL_S", "9", "GHOSTWRITER_WORKBENCH_WALL_S"),
+        ("GHOSTWRITER_WORKBENCH_SLOTS", "4", "GHOSTWRITER_WORKBENCH_SLOTS"),
+        ("WORKBENCH_EXECUTOR_SLOTS", "2", "GHOSTWRITER_WORKBENCH_SLOTS"),
+    ],
+)
+def test_the_ghostwriter_rules_stop_the_api_never_the_executor(name: str, value: str, named: str) -> None:
+    """Ghostwriter's wall cap is from 10 to the job wall, and it leaves a slot free; not for the executor."""
+    env = {"GHOSTWRITER_WORKBENCH_KEY": A, name: value}
+    with pytest.raises(ConfigError, match=named):
+        load_settings(env, role="api")
+    assert load_settings(env, role="executor").ghostwriter_key is None
+
+
+def test_the_ghostwriter_rules_wait_for_its_key() -> None:
+    """Without Ghostwriter's key, a wall cap it would refuse does not stop the api."""
+    env = {"OPEN_WEBUI_WORKBENCH_KEY": KEY, "GHOSTWRITER_WORKBENCH_WALL_S": "9"}
+    assert load_settings(env, role="api").ghostwriter_key is None
+
+
+def test_the_ghostwriter_tool_list_is_a_comma_list() -> None:
+    """Entries are stripped and blank ones dropped; a blank list means the eight tools."""
+    env = {"GHOSTWRITER_WORKBENCH_KEY": A}
+    assert load_settings({**env, "GHOSTWRITER_WORKBENCH_TOOLS": " list_files , ,"}, role="api").ghostwriter_tools == (
+        frozenset({"list_files"})
+    )
+    assert load_settings({**env, "GHOSTWRITER_WORKBENCH_TOOLS": ""}, role="api").ghostwriter_tools == EIGHT
+
+
 def test_require_purpose_is_parsed_and_checked() -> None:
     """The listed actions, lower-cased; a misspelt one stops the api, and the executor reads none."""
     env = {"OPEN_WEBUI_WORKBENCH_KEY": KEY}
@@ -264,6 +346,7 @@ def test_require_purpose_is_parsed_and_checked() -> None:
     with pytest.raises(ConfigError, match="AUDIT_REQUIRE_PURPOSE"):
         load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "lifecycle"}, role="api")
     assert load_settings({**env, "AUDIT_REQUIRE_PURPOSE": "quiery"}, role="executor").require_purpose == frozenset()
+    assert load_settings({**env, "AUDIT_REQUIRE_PURPOSE": ""}, role="api").require_purpose == frozenset()
 
 
 @pytest.mark.parametrize("name", ["WORKBENCH_EXECUTOR_SLOTS", "WORKBENCH_RETENTION_DAYS", "WORKBENCH_JOB_WALL_S"])

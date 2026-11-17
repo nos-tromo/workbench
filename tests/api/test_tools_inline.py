@@ -17,10 +17,11 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, KEY
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY
 from tests.api.test_files import AuditLines, H
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
+from tests.callers import EIGHT
 from workbench import protocol
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
@@ -644,9 +645,11 @@ def test_config_audit_lists_the_callers_and_the_purpose_rule(
     (config,) = [e for e in audit_lines() if e["operation"] == "config.audit"]
     assert config["criteria"]["callers"] == [
         {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
+        {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
         {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
     ]
     assert config["criteria"]["require_purpose"] == ["combine", "disclose", "query"]
     raw = json.dumps(audit_lines())
     assert KEY not in raw
     assert DOCINT_KEY not in raw
+    assert GHOSTWRITER_KEY not in raw

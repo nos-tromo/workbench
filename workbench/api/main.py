@@ -22,10 +22,11 @@ from workbench.api.body_limit import BodyLimit, upload_limit
 from workbench.api.hardening import ViewHardening
 from workbench.api.jobs import ExecutorClient, JobQueue
 from workbench.api.metrics import Metrics
-from workbench.api.registry import Registry, workspace_specs
+from workbench.api.registry import Registry
 from workbench.api.retention import Sweeper
 from workbench.api.store import Store
 from workbench.api.tools_inline import INLINE_SPECS
+from workbench.api.tools_mcp import workspace_tools
 from workbench.config import Settings, load_settings
 from workbench.layout import DATABASE
 from workbench.paths import Workspaces
@@ -150,7 +151,7 @@ def create_app(
     app.include_router(files.tool_router)
     app.include_router(tools.router)  # the template and output tools' routes are on it too
     app.include_router(metrics.router)
-    app.state.registry = Registry([*workspace_specs(app), *INLINE_SPECS])
+    app.state.registry = Registry([*workspace_tools(app), *INLINE_SPECS])
     return app
 
 

@@ -6,10 +6,12 @@ themselves are tested in ``tests/executor/test_templates.py``; here the api's pa
 checks of the sources the api can make, the output's name and record, the audit event and the caps.
 """
 
+import asyncio
 import dataclasses
 import io
 import json
 import shutil
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, override
@@ -20,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import KEY, unrecorded
 from tests.api.test_files import CHAT, ME, AuditLines, H, put
-from tests.api.test_jobs import FakeClient
+from tests.api.test_jobs import FakeClient, KeepAll
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import AuditLog
@@ -31,15 +33,27 @@ from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import MAX_DEPTH
 from workbench.api.store import Store
 from workbench.config import Settings
+from workbench.executor.preview import PREVIEW_TOTAL_S, previews_of
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.models import FileRecord, Principal
-from workbench.protocol import MAX_LINE, JobRequest, JobResult, Limits, OutputFile, decode_request, encode
+from workbench.protocol import (
+    MAX_LINE,
+    JobRequest,
+    JobResult,
+    Limits,
+    OutputFile,
+    TablePreview,
+    decode_request,
+    encode,
+)
 
 ASSISTANT: dict[str, Any] = {"kind": "assistant"}
 
 
 class Local(FakeClient):
     """An executor that runs the real runner in this process, over a copy of the files a job names.
+
+    A job that asks for previews (``req.previews``) gets those the executor's own reader gives of its outputs.
 
     Attributes:
         payload: When set, the answer instead of the runner's, with the fake's ``status`` and ``files``.
@@ -71,12 +85,17 @@ class Local(FakeClient):
         result = json.loads(json.dumps(RUNNERS[req.tool](json.loads(json.dumps(req.args)), ctx)))
         if set(result) == {"error"}:
             return JobResult(job_id=req.job_id, status="error", result=result, outputs=[], message="the tool failed")
+        found = previews_of(work / "out", time.monotonic() + PREVIEW_TOTAL_S) if req.previews else {}
         outputs = []
         for made in sorted((work / "out").iterdir()):
             staged = self.staged(req.job_id, made.name)
             staged.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(made, staged)
-            outputs.append(OutputFile(name=made.name, staged_path=str(staged), size=staged.stat().st_size))
+            outputs.append(
+                OutputFile(
+                    name=made.name, staged_path=str(staged), size=staged.stat().st_size, preview=found.get(made.name)
+                )
+            )
         return JobResult(job_id=req.job_id, status="ok", result=result, outputs=outputs)
 
 
@@ -134,6 +153,28 @@ def events(audit_lines: AuditLines, tool: str) -> list[dict[str, Any]]:
 def outputs(store: Store) -> list[FileRecord]:
     """The files tools made in the chat."""
     return [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
+
+
+def test_the_local_executor_reads_the_previews_a_job_asks_for(
+    settings: Settings, store: Store, fake_executor: Local
+) -> None:
+    """The real reader fills the previews of the outputs of a job that asked, and only of that one."""
+    queue = JobQueue(settings, fake_executor, store, Metrics(settings.data_dir))
+    args = {"name": "counts.csv", "format": "csv", "columns": ["author", "posts"], "rows": [["user-a", 12]]}
+    asked, unasked = KeepAll(), KeepAll()
+
+    async def run() -> None:
+        await queue.submit(ME, "write_table", args, [], asked, previews=True)
+        await queue.submit(ME, "write_table", {**args, "name": "other.csv"}, [], unasked)
+
+    asyncio.run(run())
+
+    (result,) = asked.results
+    assert [(o.name, o.preview) for o in result.outputs] == [
+        ("counts.csv", TablePreview(columns=["author", "posts"], rows=[["user-a", "12"]], row_count=1, truncated=False))
+    ]
+    (result,) = unasked.results
+    assert [(o.name, o.preview) for o in result.outputs] == [("other.csv", None)]
 
 
 # --- inspect_template ---------------------------------------------------------------------------------------------

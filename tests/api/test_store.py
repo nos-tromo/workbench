@@ -1,17 +1,20 @@
 """The store keeps files on disk and their metadata in SQLite, and never crosses the user's own root."""
 
+import dataclasses
 import errno
 import io
 import os
+import shutil
 import sqlite3
 import stat
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import override
 
 import pytest
 
-from tests.api.conftest import unrecorded
+from tests.api.conftest import PG, unrecorded
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
@@ -464,6 +467,72 @@ def test_two_users_may_hold_the_same_name(store: Store, alice: Principal, bob: P
     assert put(store, bob).name == "q.xlsx"
 
 
+# --- a confined principal ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/workspace", "/workspace/chat-2", "/workspace/chat-2/q.csv", "/workspace/chat-1/../chat-2/q.csv", "/etc"],
+)
+def test_a_confined_principal_finds_nothing_outside_its_chat(store: Store, path: str) -> None:
+    """The user's other chat, the root and a path outside the workspace are all not found for a confined principal."""
+    other = put(store, dataclasses.replace(PG, chat_id="chat-2"), "q.csv", directory="/workspace/chat-2")
+    assert store.get(dataclasses.replace(PG, confined=False), other.virtual_path) == other
+    with pytest.raises(NotFound):
+        store.list_dir(PG, path)
+    with pytest.raises(NotFound):
+        store.get(PG, path)
+    with pytest.raises(NotFound):
+        store.open_file(PG, path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/workspace",
+        "/workspace/chat-2",
+        "/workspace/chat-2/q.csv",
+        "/workspace/chat-1/../chat-2/q.csv",
+        "/workspace/chat-1x/q.csv",
+        "workspace/chat-1/q.csv",
+        "/etc/passwd",
+    ],
+)
+def test_a_path_outside_the_confined_chat_is_refused_before_anything_is_looked_up(
+    store: Store, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The chat is read from the path's text first, as a whole segment: another chat's folder is never looked at."""
+    put(store, dataclasses.replace(PG, chat_id="chat-2"), "q.csv", directory="/workspace/chat-2")
+    resolved: list[str] = []
+    real_resolve = workspaces.resolve
+
+    def resolve(p: Principal, virtual: str) -> Path:
+        resolved.append(virtual)
+        return real_resolve(p, virtual)
+
+    monkeypatch.setattr(workspaces, "resolve", resolve)
+    with pytest.raises(NotFound):
+        store.get(PG, path)
+    with pytest.raises(NotFound):
+        store.open_file(PG, path)
+    with pytest.raises(NotFound):
+        store.list_dir(PG, path)
+    with pytest.raises(NotFound):
+        put(store, PG, "new.csv", directory=path)
+    assert resolved == []
+    assert store.list_dir(PG, "/workspace/chat-1") == []
+    assert resolved == ["/workspace/chat-1"]
+
+
+def test_a_confined_upload_goes_into_the_chat_folder_itself(store: Store) -> None:
+    """A confined principal uploads into its chat folder, never into a folder below it, even one its user made."""
+    store.mkdir(dataclasses.replace(PG, confined=False), "/workspace/chat-1/sub")
+    with pytest.raises(NotFound):
+        put(store, PG, "q.csv", directory="/workspace/chat-1/sub")
+    assert put(store, PG, "q.csv", directory="/workspace/chat-1").virtual_path == "/workspace/chat-1/q.csv"
+    assert [rec.name for rec in store.files_in_chat(PG)] == ["q.csv"]
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -864,6 +933,19 @@ def test_register_output_of_a_missing_staged_file_is_not_found(store: Store, ali
         store.register_output(alice, tmp_path / "gone.csv", "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
 
 
+def test_register_output_refuses_a_job_whose_row_is_gone(store: Store, workspaces: Workspaces, tmp_path: Path) -> None:
+    """An output of a job whose chat was deleted while it ran is not found; the chat folder is not made again."""
+    put(store, PG, "q.csv")
+    job = store.add_job(PG, "run_python")
+    store.delete_chat(PG, unrecorded)
+    staged = stage(tmp_path, job.id, "r.csv")
+    with pytest.raises(NotFound):
+        store.register_output(PG, staged, "r.csv", job.id, file_id=new_file_id(), quota_bytes=10**12)
+    assert not (workspaces.user_root(PG) / "chat-1").exists()
+    assert staged.exists()
+    assert store.files_in_chat(PG) == []
+
+
 def test_register_output_lands_in_the_principals_chat_only(
     store: Store, alice: Principal, bob: Principal, tmp_path: Path
 ) -> None:
@@ -1120,6 +1202,149 @@ def test_find_job_looks_a_job_up_by_its_id_alone(store: Store, alice: Principal)
     job = store.add_job(alice, "run_python")
     assert store.find_job(job.id) == job
     assert store.find_job("0" * 32) is None
+
+
+# --- deleting a chat -----------------------------------------------------------
+
+
+def test_delete_chat_records_first_then_rows_jobs_and_folder(store: Store, workspaces: Workspaces) -> None:
+    """The record sees every file of the chat, a folder's too, still there; then the rows, jobs and folder go.
+
+    Another chat of the user keeps its file, its job and its folder.
+    """
+    p2 = dataclasses.replace(PG, chat_id="chat-2")
+    store.mkdir(dataclasses.replace(PG, confined=False), "/workspace/chat-1/sub")
+    files = [
+        put(store, PG, "q.csv"),
+        put(store, PG, "r.csv"),
+        put(store, dataclasses.replace(PG, confined=False), "s.csv", directory="/workspace/chat-1/sub"),
+    ]
+    other = put(store, p2, "q.csv", directory="/workspace/chat-2")
+    job, theirs = store.add_job(PG, "run_python"), store.add_job(p2, "run_python")
+    folder = workspaces.user_root(PG) / "chat-1"
+    seen: list[tuple[list[str], str, list[str], bool, bool]] = []
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        names = [rec.name for rec in store.files_in_chat(PG)]
+        seen.append((sorted(ids), outcome, names, store.find_job(job.id) is not None, folder.is_dir()))
+
+    assert store.delete_chat(PG, record) == 3
+    assert seen == [(sorted(rec.id for rec in files), "ok", ["q.csv", "r.csv", "sub/s.csv"], True, True)]
+    assert store.files_in_chat(PG) == []
+    assert store.find_job(job.id) is None
+    assert not folder.exists()
+    assert store.files_in_chat(p2) == [other]
+    assert store.find_job(theirs.id) == theirs
+    assert disk_names(workspaces.user_root(PG) / "chat-2") == ["q.csv"]
+
+
+def test_a_record_that_raises_deletes_nothing(store: Store, workspaces: Workspaces) -> None:
+    """A chat delete whose record cannot be written leaves the files, their rows, the job row and the folder."""
+    files = [put(store, PG, "q.csv")]
+    job = store.add_job(PG, "run_python")
+
+    def refuse(*_: object) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    with pytest.raises(RuntimeError):
+        store.delete_chat(PG, refuse)
+    assert store.files_in_chat(PG) == files
+    assert store.find_job(job.id) == job
+    assert disk_names(workspaces.user_root(PG) / "chat-1") == ["q.csv"]
+
+
+def test_a_deleted_chat_takes_no_new_job_and_no_upload(store: Store, workspaces: Workspaces) -> None:
+    """Work that reaches the store after its chat went is refused: no job row, nothing recorded, written or made."""
+    put(store, PG, "q.csv")
+    store.delete_chat(PG, unrecorded)
+    recorded: list[tuple[object, ...]] = []
+    with pytest.raises(NotFound):
+        store.add_job(PG, "run_python")
+    with pytest.raises(NotFound):
+        store.add_upload(
+            PG,
+            "/workspace/chat-1",
+            "r.csv",
+            io.BytesIO(b"x"),
+            max_bytes=MAX,
+            quota_bytes=QUOTA,
+            record=lambda *args: recorded.append(args),
+        )
+    assert recorded == []
+    assert store.due_jobs(float("inf")) == []
+    assert not (workspaces.user_root(PG) / "chat-1").exists()
+
+
+def test_a_chat_delete_never_slips_between_a_jobs_check_and_its_row(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete that starts right after a new job's check waits for its row, and deletes it with the chat."""
+    check = store._refuse_deleted
+    deleting: list[threading.Thread] = []
+
+    def then_delete(*args: str) -> None:
+        check(*args)
+        thread = threading.Thread(target=store.delete_chat, args=(PG, unrecorded))
+        thread.start()
+        deleting.append(thread)
+        thread.join(0.2)  # it waits for the lock the check holds; without that, it would be done by now
+
+    monkeypatch.setattr(store, "_refuse_deleted", then_delete)
+    job = store.add_job(PG, "run_python")
+    deleting[0].join(5)
+    assert not deleting[0].is_alive()
+    assert store.find_job(job.id) is None
+
+
+def test_the_hold_is_the_deleted_chats_alone(store: Store) -> None:
+    """Another chat of the user, and Open WebUI's chat of the same user id and chat id, still take jobs and uploads."""
+    store.delete_chat(PG, unrecorded)
+    for p in (Principal("open-webui", "user-a", "chat-1"), dataclasses.replace(PG, chat_id="chat-2")):
+        assert store.add_job(p, "run_python").chat_id == p.chat_id
+        assert put(store, p, "q.csv", directory=f"/workspace/{p.chat_id}").chat_id == p.chat_id
+
+
+def test_a_hold_past_its_deadline_is_pruned(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hold refuses until its deadline and no longer after; the next chat delete prunes it."""
+    now = [1000.0]
+    monkeypatch.setattr(store, "_monotonic", lambda: now[0])
+    store.delete_chat(PG, unrecorded)
+    now[0] += store_module.DELETED_CHAT_HOLD_S - 1
+    with pytest.raises(NotFound):
+        store.add_job(PG, "run_python")
+    now[0] += 1
+    assert store.add_job(PG, "run_python").chat_id == "chat-1"
+    store.delete_chat(dataclasses.replace(PG, chat_id="chat-2"), unrecorded)
+    assert list(store._deleted) == [("ghostwriter", "user-a", "chat-2")]
+
+
+def test_a_chat_delete_that_fails_after_its_record_is_recorded_again(
+    store: Store, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The removal's error is raised and the same ids are recorded as ``error``; a failure of that is only logged.
+
+    The rows are gone; the files left on disk have none, so retention's orphan sweep records and removes them.
+    """
+    rec = put(store, PG, "q.csv")
+    seen: list[tuple[list[str], str]] = []
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        seen.append((list(ids), outcome))
+        if outcome == "error":
+            raise RuntimeError("synthetic audit failure")
+
+    def refuse(*_: object, **__: object) -> None:
+        raise OSError("synthetic removal failure")
+
+    monkeypatch.setattr(shutil, "rmtree", refuse)
+    with pytest.raises(OSError, match="synthetic removal failure"):
+        store.delete_chat(PG, record)
+    assert seen == [([rec.id], "ok"), ([rec.id], "error")]
+    assert [entry.getMessage() for entry in caplog.records] == [
+        "could not record a chat delete that failed (RuntimeError)"
+    ]
+    assert store.files_in_chat(PG) == []
+    assert disk_names(workspaces.user_root(PG) / "chat-1") == ["q.csv"]
 
 
 # --- persistence and storage ------------------------------------------------------

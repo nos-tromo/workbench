@@ -7,9 +7,17 @@ paths that stay below the chat folder, and inline inputs that are each one plain
 
 import re
 from collections.abc import Sequence
-from typing import Any, Final, Literal, Protocol, Self
+from typing import Annotated, Any, Final, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from workbench.paths import check_filename, check_id
 
@@ -21,6 +29,19 @@ MAX_INLINE_FILES: Final = 8
 MAX_INLINE_BYTES: Final = 512 * 1024
 #: The job's own output folder in its working folder: no input may take its name.
 OUT_DIR: Final = "out"
+
+#: Most rows below the header, columns, and characters of a cell, that a table preview holds.
+PREVIEW_ROWS: Final = 5
+PREVIEW_COLUMNS: Final = 20
+PREVIEW_CELL: Final = 100
+#: Most bytes of UTF-8 the table previews of one answer hold together; a job reads no more, the supervisor attaches no
+#: more.
+PREVIEW_BUDGET: Final = 256 * 1024
+#: Most rows below the header that a job counts for a preview; a table with more has no count.
+PREVIEW_COUNT_MAX: Final = 100_000
+
+#: One cell of a table preview.
+Cell = Annotated[str, StringConstraints(max_length=PREVIEW_CELL)]
 
 #: The message of a job the kernel stopped on one of its limits (memory, CPU time, file size, processes); a job the
 #: executor's watchdog stopped has a message that names the limit instead.
@@ -184,6 +205,7 @@ class JobRequest(_Message):
             working folder. Never together with ``input_files``.
         limits: Resource limits for this job.
         max_chars: Largest result the runner may return, in characters (``result_max_kb * 1024``).
+        previews: Whether the job reads a table preview of each csv and xlsx output once its runner has answered.
     """
 
     job_id: str
@@ -196,6 +218,7 @@ class JobRequest(_Message):
     inline_inputs: list[InlineFile] = Field(default_factory=list, max_length=MAX_INLINE_FILES)
     limits: Limits
     max_chars: int = Field(gt=0)
+    previews: bool = False
 
     @field_validator("job_id")
     @classmethod
@@ -268,6 +291,37 @@ class JobRequest(_Message):
         return self
 
 
+class TablePreview(_Message):
+    """The start of a table a job wrote: its header and first rows, cut short, read inside the job.
+
+    The job's own code could have written it, so only its shape and its caps are trusted.
+
+    Attributes:
+        columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.
+        rows: The rows below the header, at most ``PREVIEW_ROWS``.
+        row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not
+            counted to the end.
+        truncated: Whether a row, a column or a cell was left out or cut.
+    """
+
+    columns: list[Cell] = Field(max_length=PREVIEW_COLUMNS)
+    rows: list[Annotated[list[Cell], Field(max_length=PREVIEW_COLUMNS)]] = Field(max_length=PREVIEW_ROWS)
+    row_count: int | None = Field(ge=0, le=PREVIEW_COUNT_MAX)
+    truncated: bool
+
+
+def preview_size(preview: TablePreview) -> int:
+    """Measure a preview as the budget counts it.
+
+    Args:
+        preview: The preview.
+
+    Returns:
+        Its JSON in UTF-8 bytes, the way it travels in a job's answer.
+    """
+    return len(preview.model_dump_json().encode())
+
+
 class OutputFile(_Message):
     """A file a job wrote, staged for the api to move into the workspace.
 
@@ -275,11 +329,13 @@ class OutputFile(_Message):
         name: Name the file had in the job's ``out/``.
         staged_path: Where the executor left it for the api.
         size: Size in bytes.
+        preview: The table preview of a csv or xlsx output, when the request asked for previews and one was read.
     """
 
     name: str
     staged_path: str
     size: int = Field(ge=0)
+    preview: TablePreview | None = None
 
 
 class JobResult(_Message):

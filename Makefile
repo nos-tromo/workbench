@@ -23,7 +23,7 @@ help:
 	@echo "workbench — FastAPI tool API + sandboxed executor."
 	@echo
 	@echo "Setup (first time):"
-	@echo "  cp .env.example .env   # then set OPEN_WEBUI_WORKBENCH_KEY or DOCINT_WORKBENCH_KEY (at least 32 characters)"
+	@echo "  cp .env.example .env   # then set OPEN_WEBUI_WORKBENCH_KEY, DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY (at least 32 characters)"
 	@echo
 	@echo "Lifecycle:"
 	@echo "  make help       this list"

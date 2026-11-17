@@ -53,6 +53,7 @@ TERMINAL_PATHS: Final = (
     "/files/view",
     "/files/read",
     "/files/display",
+    "/files/chat",
     "/openapi.json",
     "/system",
     "/tools/list_files",
@@ -320,6 +321,19 @@ def test_mcp_through_the_proxy_is_not_found(admin: Account, method: str) -> None
     body: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
     r = admin.terminal(method, "/mcp", headers=headers, json=body if method == "POST" else None)
     assert (r.status_code, r.json()) == (404, {"detail": "not found"})
+
+
+def test_chat_delete_through_the_proxy_is_not_found(admin: Account, chat: str) -> None:
+    """Open WebUI's key never deletes a chat: ``DELETE /files/chat`` through the proxy is workbench's own 404.
+
+    The route is Ghostwriter's alone, and Ghostwriter is a caller of this stack too; the chat keeps its file.
+    """
+    admin.upload(chat, "quarterly-figures.csv", CSV)
+    r = admin.terminal("DELETE", "/files/chat", chat=chat)
+    assert (r.status_code, r.json()) == (404, {"detail": "not found"})
+    path = f"/workspace/{chat}/quarterly-figures.csv"
+    viewed = admin.terminal("GET", "/files/view", chat=chat, params={"path": path})
+    assert (viewed.status_code, viewed.content) == (200, CSV)
 
 
 # --- files and tools through the proxy ----------------------------------------------------------------------------

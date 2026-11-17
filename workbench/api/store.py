@@ -15,7 +15,8 @@ ever stored without its record. A job's output is registered under an id the
 caller chose and recorded before it called, for the same reason.
 
 The store never deletes a file of its own accord; :meth:`Store.remove` is called
-only once its deletion is recorded.
+only once its deletion is recorded, and :meth:`Store.delete_chat` records a chat's
+deletion itself before anything of it goes.
 """
 
 import dataclasses
@@ -26,6 +27,7 @@ import mimetypes
 import os
 import posixpath
 import re
+import shutil
 import sqlite3
 import stat
 import threading
@@ -52,6 +54,10 @@ _FULL = frozenset({errno.ENOSPC, errno.EDQUOT})
 _BUSY_TIMEOUT_S = 30
 _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 
+#: Seconds a deleted chat takes no new job and no upload (:meth:`Store.delete_chat`): longer than any call waits for its
+#: turn or any upload takes to arrive. A deleted chat's id never comes back, so the hold costs nothing.
+DELETED_CHAT_HOLD_S: Final = 3600
+
 #: A file id: 32 lowercase hex digits (``uuid4().hex``).
 _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 
@@ -75,6 +81,10 @@ OrphanRecord = Callable[[str, Sequence[str], int, str], object]
 #: Records an upload: called with the chat id of its folder, its file id and the outcome, ``ok`` before the file
 #: becomes visible or ``error`` when it could not be stored after all. It raises when the record cannot be written.
 UploadRecord = Callable[[str, str, str], object]
+
+#: Records a chat's deletion: called with the file ids of the chat's files and the outcome, ``ok`` before anything goes
+#: or ``error`` when the deletion failed after that. It raises when the record cannot be written.
+ChatRecord = Callable[[Sequence[str], str], object]
 
 _OFFICE_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -282,6 +292,22 @@ def _is_chat_id(name: str) -> bool:
     return True
 
 
+def _names_chat(virtual: str, chat_id: str) -> bool:
+    """Tell from a virtual path's text alone whether it is a chat's folder or below it, looking nothing up.
+
+    Args:
+        virtual: Any virtual path.
+        chat_id: The chat.
+
+    Returns:
+        ``True`` if, normalised as :meth:`~workbench.paths.Workspaces.resolve` normalises it, its first segment below
+        ``/workspace`` is ``chat_id``, as a whole segment.
+    """
+    norm = posixpath.normpath(virtual)
+    below = VIRTUAL_ROOT + "/"
+    return norm.startswith(below) and norm[len(below) :].split("/", 1)[0] == chat_id
+
+
 def _is_full(exc: OSError) -> bool:
     """Tell whether an error means the volume or the user's disk quota is used up.
 
@@ -400,6 +426,8 @@ class Store:
         self._ws = workspaces
         self._clock = clock
         self._lock = threading.Lock()
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._deleted: dict[tuple[str, str, str], float] = {}
         db_path.parent.mkdir(mode=_PRIVATE_DIR, parents=True, exist_ok=True)
         fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, _PRIVATE_FILE)
         try:
@@ -430,6 +458,11 @@ class Store:
     def _locate(self, p: Principal, virtual: str) -> tuple[Path, list[str]]:
         """Resolve a virtual path and split it into its segments below ``/workspace``.
 
+        A confined principal finds only its own chat folder and what is below it; every other path, and every path
+        :meth:`~workbench.paths.Workspaces.resolve` refuses, is not found for it, so nothing tells it what is there.
+        Its chat is read from the path's text before anything is looked up on disk, so a path into another chat
+        touches nothing of that chat's folder; the resolved path is checked again.
+
         Args:
             p: The caller and user.
             virtual: Any virtual path.
@@ -439,9 +472,20 @@ class Store:
 
         Raises:
             PathError: If the path is not inside the user's root.
+            NotFound: For a confined principal, if the path is not its chat folder or below it, or is refused.
         """
-        real = self._ws.resolve(p, virtual)
-        return real, self._ws.to_virtual(p, real).split("/")[2:]
+        if p.confined and not _names_chat(virtual, p.chat_id):
+            raise NotFound("not in the chat")
+        try:
+            real = self._ws.resolve(p, virtual)
+        except PathError:
+            if p.confined:
+                raise NotFound("not in the chat") from None
+            raise
+        segments = self._ws.to_virtual(p, real).split("/")[2:]
+        if p.confined and segments[:1] != [p.chat_id]:
+            raise NotFound("not in the chat")
+        return real, segments
 
     def _file_target(self, p: Principal, virtual: str) -> tuple[Path, str, str]:
         """Resolve the path of a file, which must be inside a chat folder.
@@ -460,6 +504,23 @@ class Store:
         if len(segments) < 2:
             raise PathError("a file is inside a chat folder")
         return real, segments[0], "/".join(segments[1:])
+
+    def _refuse_deleted(self, caller: str, user_id: str, chat_id: str) -> None:
+        """Refuse new work in a chat :meth:`delete_chat` deleted less than :data:`DELETED_CHAT_HOLD_S` ago.
+
+        Call it under the store's lock, which the chat delete holds as it adds the chat.
+
+        Args:
+            caller: The caller's name.
+            user_id: The user's id.
+            chat_id: The chat's id.
+
+        Raises:
+            NotFound: If the chat is held.
+        """
+        deadline = self._deleted.get((caller, user_id, chat_id))
+        if deadline is not None and deadline > self._monotonic():
+            raise NotFound("chat deleted")
 
     def _require_folder(self, real: Path, segments: list[str]) -> None:
         """Make sure a folder exists; a chat folder is made on first use, a deeper one must exist.
@@ -631,7 +692,7 @@ class Store:
 
         Args:
             p: The caller and user; the chat comes from ``directory``.
-            directory: ``/workspace/<chat-id>`` or a folder inside it.
+            directory: ``/workspace/<chat-id>`` or a folder inside it; for a confined principal, its chat folder alone.
             filename: The file's name.
             src: The bytes; read in chunks until empty.
             max_bytes: Largest file allowed.
@@ -644,7 +705,8 @@ class Store:
         Raises:
             PathError: If the directory is outside the user's root or is ``/workspace`` itself,
                 or the name is invalid.
-            NotFound: If a folder below the chat folder is missing.
+            NotFound: If a folder below the chat folder is missing, or the chat was deleted within
+                :data:`DELETED_CHAT_HOLD_S`; for a confined principal, if the directory is not its chat folder.
             TooLarge: If the file is over ``max_bytes``.
             QuotaExceeded: If it would take the user over ``quota_bytes``.
             StorageFull: If the volume is full.
@@ -654,10 +716,13 @@ class Store:
         folder, segments = self._locate(p, directory)
         if not segments:
             raise PathError("files live inside a chat folder")
+        if p.confined and len(segments) > 1:
+            raise NotFound("not in the chat")
         file_id = uuid.uuid4().hex
         part = folder / f"{file_id}{_PART}"
         room = quota_bytes - self.usage(p)
         with self._lock:  # the folder is found or made and the part is in it before retention may look at the folder
+            self._refuse_deleted(p.caller, p.user_id, segments[0])
             self._require_folder(folder, segments)
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
         size = self._write_part(fd, part, src, max_bytes=max_bytes, room=room)
@@ -768,6 +833,9 @@ class Store:
         The caller records the output by ``file_id`` before it calls, so that the file is never visible without its
         event, and records it again as ``error`` if this raises.
 
+        An output whose job row is gone, because :meth:`delete_chat` deleted the job's chat while it ran, is refused
+        before the chat folder is made, under the lock the chat delete holds too.
+
         Args:
             p: The caller, user and chat that ran the job.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
@@ -781,7 +849,7 @@ class Store:
 
         Raises:
             PathError: If the name is invalid, or ``staged`` is not a regular file.
-            NotFound: If ``staged`` does not exist.
+            NotFound: If ``staged`` does not exist, or the job's row is gone; ``staged`` stays.
             QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
@@ -804,6 +872,8 @@ class Store:
         if _FILE_ID.fullmatch(file_id) is None:
             raise ValueError("a file id is 32 lowercase hex digits")
         with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
+            if self.find_job(job_id) is None:
+                raise NotFound("job gone")
             if self.usage(p) + st.st_size > quota_bytes:
                 raise QuotaExceeded("workspace quota exceeded")
             folder = self._ws.chat_dir(p)
@@ -1082,6 +1152,61 @@ class Store:
         with self._db() as db:
             db.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
+    def delete_chat(self, p: Principal, record: ChatRecord) -> int:
+        """Delete a chat, once its deletion is recorded: its files' rows, its job rows, and its folder with the files.
+
+        All of it holds the store's lock, which every file holds on its way into a chat folder. The ids of the chat's
+        files are read, ``record`` writes the deletion by them, the file rows and the job rows go in one transaction,
+        and then the chat folder; a folder that is not there is fine. A job of the chat that is still running finds its
+        row gone, so none of its outputs lands in the chat (:meth:`register_output`). Work that reaches the store later,
+        a call that waited for its turn or an upload whose body was still coming in, finds the chat held for
+        :data:`DELETED_CHAT_HOLD_S` and is refused (:meth:`add_job`, :meth:`add_upload`). The hold lives in this
+        process, as the queue and the uploads in transfer do, and goes with them on a restart.
+
+        A record that cannot be written deletes nothing. A failure after the record is recorded again as ``error``, by
+        the same ids, and raised; a failure of that second record is logged by its type, never raised. What a failed
+        removal leaves on disk has no rows, so retention's orphan sweep records and removes it.
+
+        Args:
+            p: The caller, user and chat to delete.
+            record: Writes the deletion's event (:data:`ChatRecord`), under the store's lock.
+
+        Returns:
+            How many files the chat held.
+
+        Raises:
+            PathError: If an id is unsafe, or the chat folder is a link; the rows are gone by then.
+            Exception: What ``record`` raised, with nothing deleted; or what the deletion raised after the record.
+        """
+        owner = (p.caller, p.user_id, p.chat_id)
+        with self._lock:
+            with self._db() as db:
+                rows = db.execute(
+                    "SELECT id FROM files WHERE caller = ? AND user_id = ? AND chat_id = ? ORDER BY created_at, id",
+                    owner,
+                ).fetchall()
+            ids = [row[0] for row in rows]
+            record(ids, "ok")
+            now = self._monotonic()
+            self._deleted = {chat: deadline for chat, deadline in self._deleted.items() if deadline > now}
+            self._deleted[owner] = now + DELETED_CHAT_HOLD_S
+            try:
+                with self._db() as db:
+                    db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                    db.execute("DELETE FROM jobs WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                folder = self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}")
+                try:
+                    shutil.rmtree(folder)
+                except FileNotFoundError:
+                    pass
+            except BaseException:
+                try:
+                    record(ids, "error")
+                except Exception as exc:  # the deletion's error is the answer; this one is only logged
+                    _log.warning("could not record a chat delete that failed (%s)", type(exc).__name__)
+                raise
+        return len(ids)
+
     def checkpoint(self) -> bool:
         """Copy the write-ahead log into the database file and empty it.
 
@@ -1213,6 +1338,8 @@ class Store:
 
         Raises:
             PathError: If the caller, user or chat id is not a safe id.
+            NotFound: If the chat was deleted within :data:`DELETED_CHAT_HOLD_S`: a call that waited for its turn
+                while its chat went never runs. The check and the row hold the lock the chat delete holds.
         """
         self._ws.user_root(p)
         job = JobRecord(
@@ -1224,11 +1351,13 @@ class Store:
             created_at=self._clock(),
             status="running",
         )
-        with self._db() as db:
-            db.execute(
-                f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (job.id, job.caller, job.user_id, job.chat_id, job.tool, job.created_at, job.status),
-            )
+        with self._lock:
+            self._refuse_deleted(job.caller, job.user_id, job.chat_id)
+            with self._db() as db:
+                db.execute(
+                    f"INSERT INTO jobs ({_JOB_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (job.id, job.caller, job.user_id, job.chat_id, job.tool, job.created_at, job.status),
+                )
         return job
 
     def finish_job(self, job_id: str, status: str) -> None:
