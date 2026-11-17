@@ -176,8 +176,10 @@ caller acts for the user. While the account exists, an Open WebUI admin
 resolves the id in Open WebUI's user table, and Open WebUI's own per-request
 audit records carry the same id with the account. A docint pseudonym resolves
 through docint's own `disclose` event for the call (same request id and job),
-which names the user. The caller, `open-webui`, `docint` or `ghostwriter`, is in
-every event's `criteria`.
+which names the user. A Ghostwriter pseudonym is an HMAC keyed with
+Ghostwriter's own workbench key, so it resolves only in Ghostwriter's own audit,
+through the event with the same request id. The caller, `open-webui`, `docint`
+or `ghostwriter`, is in every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
 (`workbench/api/auth.py`). Open WebUI can sign a token naming the user
@@ -198,9 +200,10 @@ not use it.
   own session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
 - **Request id.** The `X-Request-ID` of an MCP call, or of a Ghostwriter file
-  route, is on its event, which ties it to docint's `disclose`. Open WebUI's
-  tool calls carry no message id workbench could tie together: the events of one
-  agent turn share their `container` and follow each other in the chain. Only a
+  route, is on its event, which ties it to the caller's own event (docint's
+  `disclose`, Ghostwriter's `disclose` / `chat.tool`). Open WebUI's tool calls
+  carry no message id workbench could tie together: the events of one agent turn
+  share their `container` and follow each other in the chain. Only a
   continuation of a long id list names a parent (see [Long lists of
   files](#long-lists-of-files)).
 

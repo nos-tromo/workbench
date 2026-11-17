@@ -89,7 +89,11 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   (`MCP_QUEUE_WAIT_S`, fixed; not `WORKBENCH_QUEUE_WAIT_S`), may fill 8 of the 16
   waiting places by default (`DOCINT_WORKBENCH_SLOTS` or
   `GHOSTWRITER_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
-  slot and that user's turn until its wall time.
+  slot and that user's turn until its wall time. Each is held to its own share
+  only, so at the defaults docint and Ghostwriter together can hold all 4 slots
+  and all 16 waiting places, and Open WebUI then gets `503`: where all three
+  run, lower `DOCINT_WORKBENCH_SLOTS` or `GHOSTWRITER_WORKBENCH_SLOTS`, or raise
+  `WORKBENCH_EXECUTOR_SLOTS`.
 - An executor with no free slot, or one the api cannot reach, is a `503` too.
 - So is a job the executor stopped because the container held more than
   64 MiB of shared memory that no job's count showed (`hidden_memory`): it

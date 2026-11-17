@@ -20,7 +20,7 @@ file routes are not in the tool document, so the model cannot call them.
 | `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the eight, never `display_file`) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
-  (`workbench/api/auth.py:KeyGate`). An MCP caller gets `404` on every path but
+  (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`; a terminal caller gets `404` on `/mcp`,
   and so on `/api/v1/terminals/<id>/mcp` through Open WebUI's proxy. Every such
   `404` is `{"detail": "not found"}`.
