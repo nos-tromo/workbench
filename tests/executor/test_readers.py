@@ -1,5 +1,7 @@
 """The document readers: every format, paging, caps, and files that are broken, encrypted or hostile."""
 
+import codecs
+import json
 import re
 import signal
 import subprocess
@@ -8,7 +10,7 @@ import time
 import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import pytest
 
@@ -16,6 +18,7 @@ from tests.conftest import scaled
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers
 from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat, sheet
+from workbench.executor.readers import text as txt
 
 BUDGET = 16384
 
@@ -502,6 +505,136 @@ def test_an_html_only_mail_is_read_as_text(tmp_path: Path) -> None:
     assert "The quay is open." in texts(read(path))
 
 
+# --- JSON ------------------------------------------------------------------------------------------------------
+
+
+def orders(count: int) -> list[dict[str, Any]]:
+    """Invented orders, each with a nested customer whose name is not plain ASCII."""
+    return [
+        {
+            "order": f"A-{n:04d}",
+            "customer": {"name": f"Kundin Müller {n}", "city": "Nordhafen"},
+            "items": [{"sku": f"P-{n}", "qty": n % 5 + 1, "price": 9.5}],
+        }
+        for n in range(1, count + 1)
+    ]
+
+
+def minified(tmp_path: Path, data: Any, *, bom: bytes = b"") -> Path:
+    """Write ``data`` as one line of JSON, every character outside ASCII escaped, the way a program exports it."""
+    path = tmp_path / "orders.json"
+    path.write_bytes(bom + json.dumps(data, separators=(",", ":")).encode())
+    return path
+
+
+@pytest.mark.parametrize("bom", [b"", codecs.BOM_UTF8])
+def test_a_minified_json_file_is_read_indented_whole(tmp_path: Path, bom: bytes) -> None:
+    """One line longer than a line may be is shown indented, every value of it, in its own characters."""
+    data = orders(20)
+    path = minified(tmp_path, data, bom=bom)
+    assert path.stat().st_size > txt.LINE_CAP
+    doc = read(path)
+    assert doc.kind == "json"
+    assert doc.parts[0].text.splitlines() == json.dumps(data, indent=2, ensure_ascii=False).splitlines()
+    assert '      "name": "Kundin Müller 1",' in doc.parts[0].text
+    assert "characters]" not in doc.parts[0].text
+    assert (doc.truncated, doc.next_part) == (False, None)
+
+
+def test_a_json_file_longer_than_the_budget_is_read_to_its_end_by_following_next_part(tmp_path: Path) -> None:
+    """Paged by line numbers of the indented text, the parts put back together are the data."""
+    data = orders(200)
+    path = minified(tmp_path, data)
+    lines: list[str] = []
+    part: str | None = None
+    calls = 0
+    while True:
+        doc = read(path, part, max_chars=2048)
+        calls += 1
+        assert doc.parts[0].label.startswith(f"lines {len(lines) + 1}-")
+        lines += doc.parts[0].text.splitlines()
+        if doc.next_part is None:
+            break
+        assert doc.truncated is True
+        part = doc.next_part
+    assert calls > 10
+    assert doc.total_parts == len(lines)
+    assert json.loads("\n".join(lines)) == data
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{\n  // the invented depot\n  "depot": "Nordhafen",\n}\n',
+        '{"depot": "Nordhafen", "bays": [1, 2,\n',
+    ],
+    ids=["comments", "cut short"],
+)
+def test_json_that_does_not_parse_is_read_as_its_own_lines(tmp_path: Path, raw: str) -> None:
+    """JSON with comments or a file cut short is still readable, as it is."""
+    path = tmp_path / "depot.json"
+    path.write_text(raw, encoding="utf-8")
+    doc = read(path)
+    assert doc.kind == "json"
+    assert doc.parts[0].text.splitlines() == raw.splitlines()
+    assert [unit.text for unit in readers.units(path)] == raw.splitlines()
+
+
+@pytest.mark.parametrize("depth", [2_000, 100_000])
+def test_json_nested_too_deeply_is_read_as_its_own_line(tmp_path: Path, depth: int) -> None:
+    """Too deep to be written out indented, or to be parsed at all: the file's one line, cut, and no error."""
+    path = tmp_path / "deep.json"
+    path.write_text("[" * depth + "]" * depth + "\n", encoding="utf-8")
+    doc = read(path)
+    assert doc.kind == "json"
+    assert labels(doc) == ["line 1"]
+    assert doc.parts[0].text.endswith(f"… [+{2 * depth - txt.LINE_CAP} characters]")
+    assert [unit.label for unit in readers.units(path)] == ["line 1"]
+
+
+def test_json_too_big_for_the_memory_limit_is_refused_like_any_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running out of memory while indenting is the readers' fixed answer, not a fallback to the raw text."""
+    from workbench.executor.readers import jsondoc
+
+    class Exhausted(json.JSONEncoder):
+        @override
+        def iterencode(self, o: Any, _one_shot: bool = False) -> Iterator[str]:
+            raise MemoryError
+
+    monkeypatch.setattr(jsondoc, "_ENCODER", Exhausted())
+    path = minified(tmp_path, orders(3))
+    with pytest.raises(UnreadableFile, match=readers.TOO_BIG):
+        read(path)
+    with pytest.raises(UnreadableFile, match=readers.TOO_BIG):
+        list(readers.units(path))
+
+
+def test_json_units_are_the_lines_a_read_shows(tmp_path: Path) -> None:
+    """A search's ``line N`` is the line ``read_document`` shows under that number, and opens there."""
+    path = minified(tmp_path, orders(20))
+    shown = read(path).parts[0].text.splitlines()
+    pieces = [(unit.label, unit.text) for unit in readers.units(path)]
+    assert pieces == [(f"line {n}", line) for n, line in enumerate(shown, 1) if line.strip()]
+    hit = next(label for label, text in pieces if "Kundin Müller 7" in text)
+    assert read(path, hit).parts[0].text.splitlines()[0] == '      "name": "Kundin Müller 7",'
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", ".ndjson"])
+def test_json_lines_are_read_as_text_one_record_per_line(tmp_path: Path, suffix: str) -> None:
+    """JSON Lines is not indented: each line is a record, and each record keeps its line number."""
+    records = orders(3)
+    path = tmp_path / f"orders{suffix}"
+    path.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+    assert readers.supported(path) is True
+    doc = read(path)
+    assert doc.kind == "text"
+    assert labels(doc) == ["lines 1-3"]
+    assert [json.loads(line) for line in doc.parts[0].text.splitlines()] == records
+    assert [unit.label for unit in readers.units(path)] == ["line 1", "line 2", "line 3"]
+
+
 # --- unsupported types -----------------------------------------------------------------------------------------
 
 
@@ -519,6 +652,7 @@ def test_msg_is_unsupported_with_a_hint(tmp_path: Path) -> None:
         ("old.doc", ".docx or PDF"),
         ("old.xls", ".xlsx or .csv"),
         ("picture.png", "readable are PDF"),
+        ("settings.yaml", "HTML, JSON, JSONL, TXT and MD"),
         ("noext", "readable"),
     ],
 )

@@ -8,6 +8,10 @@ Every reader turns one file into text with a reference for each piece of it (``p
 - :func:`units` walks the document in the finest pieces it has (a page, a cell, a paragraph, a
   table row, a line), which is what a search matches against.
 
+A JSON file is read by line, indented (:mod:`~workbench.executor.readers.jsondoc`), so that one written
+on a single line is not cut at the longest line shown; JSON Lines (``.jsonl``, ``.ndjson``) is read as
+text, one record per line.
+
 :func:`count_pages` and :func:`sheet_extents` tell, under the same guards, what a template's source may
 cite: the pages of a PDF or the slides of a deck, the sheets of a workbook and the cells of each that
 hold something.
@@ -82,6 +86,9 @@ _FAMILIES: Final = {
     ".eml": "eml",
     ".html": "html",
     ".htm": "html",
+    ".json": "json",
+    ".jsonl": "text",
+    ".ndjson": "text",
     ".txt": "text",
     ".md": "text",
 }
@@ -184,7 +191,7 @@ class DocumentText:
 
     Attributes:
         kind: The reader family: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``,
-            ``html`` or ``text``.
+            ``html``, ``json`` or ``text``.
         parts: The parts read, in order. A page or slide without text is never in here.
         pages_without_text: Numbers of the pages or slides looked at that hold no text (a scan, a picture).
         total_parts: How many pages, sheets, slides, paragraphs and tables or lines the document has.
@@ -236,7 +243,10 @@ def _family(path: Path) -> str:
         if hint:
             text += f"; {hint}"
         else:
-            text += "; readable are PDF (text layer only), DOCX, XLSX, CSV, PPTX, ODT, ODS, EML, HTML, TXT and MD"
+            text += (
+                "; readable are PDF (text layer only), DOCX, XLSX, CSV, PPTX, ODT, ODS, EML, HTML, JSON, JSONL, "
+                "TXT and MD"
+            )
         raise UnsupportedFormat(text)
     return family
 
@@ -344,6 +354,10 @@ def _reader(family: str) -> _Reader:
         from workbench.executor.readers import html
 
         return html
+    if family == "json":
+        from workbench.executor.readers import jsondoc
+
+        return jsondoc
     from workbench.executor.readers import text
 
     return text
