@@ -235,6 +235,10 @@ matter to users:
   a CSV file by the computer's regional settings: German Excel splits it on `;`
   and may read `1.5` as text or a date. CSV, comma-separated unless the call
   asks for `;` or a tab, is for other programs.
+- A data file (JSON, CSV, XLSX) becomes a table file through `run_python`,
+  which loads it in code and writes `out/` as `.xlsx` or `.csv`; its rows are
+  not copied into `write_table`. `read_document` shows a JSON file indented,
+  one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table with a `422` that points to `write_table`.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
