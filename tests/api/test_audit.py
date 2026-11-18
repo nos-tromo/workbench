@@ -30,7 +30,6 @@ EXPECTED_OPERATIONS = {
     "upload": ("collect", "file.upload"),
     "view": ("disclose", "file.view"),
     "read": ("disclose", "file.read"),
-    "display": ("disclose", "file.display"),
     "delete": ("delete", "file.delete"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
@@ -325,8 +324,7 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
                 uploaded = client.post("/files/upload", params=where, headers=headers, files={"file": (name, data)})
                 assert uploaded.status_code == 200
         csv, form = f"/workspace/chat-1/{word}-of-user-b.csv", f"/workspace/chat-1/{word}-form.docx"
-        for route in ("read", "display"):
-            assert client.get(f"/files/{route}", params={"path": csv}, headers=h).status_code == 200
+        assert client.get("/files/read", params={"path": csv}, headers=h).status_code == 200
         assert client.get("/files/view", params={"path": csv}, headers=HG).status_code == 200
         executor.payload = {"path": csv, "kind": "csv", "parts": [], "total_parts": 0, "pages_without_text": []}
         executor.payload["truncated"] = False

@@ -12,7 +12,8 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HD, KEY, PG, put
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HD, HG, KEY, PG, put
+from tests.api.mcp_calls import acall, error, result, rpc
 from tests.callers import EIGHT
 from workbench.api import auth
 from workbench.api.audit import AuditLog
@@ -28,8 +29,7 @@ from workbench.api.auth import (
     require_caller,
 )
 from workbench.api.main import create_app
-from workbench.api.openapi import tool_openapi, tool_routes
-from workbench.api.registry import MCP_WORKSPACE_TOOLS, WORKSPACE_TOOLS
+from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
@@ -228,7 +228,7 @@ def test_the_routes_own_key_check_refuses_a_caller_off_the_terminal_door(app: Fa
 
 
 def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) -> None:
-    """Were :class:`KeyGate` bypassed, every keyed terminal route still refuses docint's key: files, handshake, tools.
+    """Were :class:`KeyGate` bypassed, every keyed terminal route still refuses docint's key: files and handshake.
 
     The MCP door's own routes refuse Open WebUI's key the same way (``tests/api/test_mcp.py``).
     """
@@ -239,7 +239,7 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
         if (path := route.path) is not None and path not in OPEN_PATHS | {MCP_PATH}
         for method in route.methods or ()
     )
-    assert ("POST", "/tools/run_python") in routes and ("GET", "/openapi.json") in routes
+    assert ("GET", "/files/list") in routes and ("GET", "/api/config") in routes
     with TestClient(app) as client:
         assert client.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
         for method, path in routes:
@@ -263,11 +263,7 @@ def test_an_open_webui_user_id_with_docints_key_reaches_nothing(client: TestClie
     """Sending Open WebUI's user and chat ids, docint still sees none of that user's files."""
     put(store, "q.csv")
     path = f"{CHAT}/q.csv"
-    for route, params in (
-        ("/files/list", {"directory": CHAT}),
-        ("/files/view", {"path": path}),
-        ("/files/display", {"path": path}),
-    ):
+    for route, params in (("/files/list", {"directory": CHAT}), ("/files/view", {"path": path})):
         r = client.get(route, params=params, headers=HD)
         assert (r.status_code, r.json()) == NOT_FOUND, route
     listing = client.get("/files/list", params={"directory": CHAT}, headers=H).json()
@@ -384,13 +380,13 @@ def test_ghostwriters_key_must_be_its_own(settings: Settings, other: str) -> Non
 
 @pytest.mark.parametrize("tools", [frozenset({"display_file"}), frozenset({"list_files", "nowhere"})])
 def test_a_tool_ghostwriters_door_cannot_serve_stops_the_start(settings: Settings, tools: frozenset[str]) -> None:
-    """``display_file``, Open WebUI's card, or a name no tool has on Ghostwriter's list stops the start.
+    """``display_file``, no tool any more, or another name no tool has on Ghostwriter's list stops the start.
 
     The message names the variable and the tools it may list, never a name the variable was set to.
     """
     with pytest.raises(ConfigError, match="GHOSTWRITER_WORKBENCH_TOOLS") as refused:
         CallerRegistry.from_settings(dataclasses.replace(settings, ghostwriter_tools=tools))
-    assert [name for name in tools - MCP_WORKSPACE_TOOLS if name in str(refused.value)] == []
+    assert [name for name in tools - WORKSPACE_TOOLS if name in str(refused.value)] == []
 
 
 @pytest.mark.parametrize(
@@ -465,42 +461,17 @@ def test_ghostwriters_principal_is_confined() -> None:
 
 
 @pytest.mark.parametrize("full", [False, True], ids=["reduced", "full"])
-@pytest.mark.parametrize("tool", sorted(WORKSPACE_TOOLS))
-def test_a_reduced_list_is_refused_by_require_tool(
-    settings: Settings, store: Store, audit: AuditLog, monkeypatch: pytest.MonkeyPatch, tool: str, full: bool
+@pytest.mark.parametrize("tool", sorted(EIGHT))
+def test_a_reduced_list_is_refused_on_the_mcp_door(
+    settings: Settings, store: Store, audit: AuditLog, tool: str, full: bool
 ) -> None:
-    """Each tool route answers the door's 404 to a list without it, never to one with it; the document follows."""
-    listed = WORKSPACE_TOOLS if full else WORKSPACE_TOOLS - {tool}
-
-    def registry(_settings: Settings) -> CallerRegistry:
-        return CallerRegistry([Caller("open-webui", KEY, listed)])
-
-    monkeypatch.setattr(CallerRegistry, "from_settings", registry)
-    app = create_app(settings, store=store, audit=audit)
-    ((method, path),) = [
-        (method, route.path or "")
-        for route in tool_routes(app)
-        if route.operation_id == tool
-        for method in route.methods or ()
-    ]
+    """Each tool is an unknown tool to a list without it, never to one with it; the tool list follows the list."""
+    listed = EIGHT if full else EIGHT - {tool}
+    app = create_app(dataclasses.replace(settings, ghostwriter_tools=listed), store=store, audit=audit)
     with TestClient(app) as client:
-        r = client.request(method, path, headers=H, json={} if method == "POST" else None)
+        r = acall(client, tool, {})
         if full:
-            assert r.status_code != 404, r.json()
+            assert "error" not in r.json(), r.json()
         else:
-            assert (r.status_code, r.json()) == NOT_FOUND
-        doc = client.get("/openapi.json", headers=H).json()
-        assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == listed
-
-
-def test_each_caller_gets_its_own_document(app: FastAPI) -> None:
-    """Open WebUI's holds the nine tools and no header parameter; docint's holds no path; each is built once."""
-    callers: CallerRegistry = app.state.callers
-    open_webui, docint = callers.get("open-webui"), callers.get("docint")
-    doc = tool_openapi(app, open_webui)
-    operations = [op for item in doc["paths"].values() for op in item.values()]
-    assert len(operations) == 9 and {op["operationId"] for op in operations} == WORKSPACE_TOOLS
-    assert [param for op in operations for param in op.get("parameters", []) if param["in"] == "header"] == []
-    assert tool_openapi(app, docint)["paths"] == {}
-    assert tool_openapi(app, open_webui) is doc
-    assert tool_openapi(app, docint) is tool_openapi(app, docint)
+            assert error(r, 400, -32602)["error"]["message"] == "unknown tool"
+        assert {t["name"] for t in result(rpc(client, "tools/list", headers=HG))["tools"]} == listed

@@ -1,37 +1,18 @@
-"""The terminal handshake Open WebUI runs, the key and header checks, and the tool-only OpenAPI document."""
+"""The terminal handshake Open WebUI runs, and the key and header checks."""
 
 import dataclasses
-import hashlib
 import io
-import json
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api.conftest import KEY, KEY_ONLY, H, unrecorded
-from workbench.api.auth import Caller, CallerRegistry
+from workbench.api.auth import CallerRegistry
 from workbench.api.contract import system_prompt
-from workbench.api.openapi import TOOL_TAG, tool_openapi
 from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
 from workbench.config import ConfigError, Settings
 from workbench.models import Principal
-
-#: The one route below ``/files/`` that is a tool: ``display_file``.
-DISPLAY_TOOL = "/files/display"
-
-HIDDEN_FROM_THE_SPEC = (
-    "/files/cwd",
-    "/files/read",
-    "/api/config",
-    "/system",
-    "/skills",
-    "/skills/read",
-    "/healthz",
-    "/metrics",
-    "/openapi.json",
-)
 
 
 def _without(headers: dict[str, str], name: str) -> dict[str, str]:
@@ -100,78 +81,6 @@ def test_system_prompt_says_who_sees_the_files_without_promising_nobody(settings
     assert "shared with nobody" not in prompt
     for phrase in ("only this user", "part of this chat", "the operator configured"):
         assert phrase in prompt, phrase
-
-
-def test_openapi_needs_only_the_key(client: TestClient) -> None:
-    """Open WebUI fetches the spec with ``Authorization`` alone."""
-    assert client.get("/openapi.json", headers=KEY_ONLY).status_code == 200
-    assert client.get("/openapi.json").status_code == 401
-
-
-def test_openapi_lists_only_tools(client: TestClient) -> None:
-    """The document has paths, none of them a handshake or browser route, each operation a tagged tool."""
-    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert "openapi" in doc
-    assert "paths" in doc
-    for path in doc["paths"]:
-        assert path not in HIDDEN_FROM_THE_SPEC
-        assert path == DISPLAY_TOOL or not path.startswith(("/files/", "/api/"))
-    for path, item in doc["paths"].items():
-        for operation in item.values():
-            assert TOOL_TAG in operation["tags"], path
-            assert operation["operationId"], path
-
-
-def test_openapi_holds_exactly_the_routes_tagged_as_tools(app: FastAPI, client: TestClient) -> None:
-    """A tagged route off the caller's list stays out; an untagged one and one hidden from the schema, even on it."""
-
-    def echo(text: str) -> dict[str, str]:
-        return {"text": text}
-
-    app.add_api_route("/tools/echo", echo, methods=["POST"], tags=[TOOL_TAG], operation_id="echo_tool")
-    app.add_api_route("/untagged", echo, methods=["POST"], operation_id="untagged_op")
-    app.add_api_route(
-        "/hidden", echo, methods=["POST"], tags=[TOOL_TAG], include_in_schema=False, operation_id="hidden_op"
-    )
-    nine = {
-        "/tools/list_files",
-        "/tools/read_document",
-        "/tools/search_files",
-        "/tools/run_python",
-        "/tools/inspect_template",
-        "/tools/fill_template",
-        "/tools/write_table",
-        "/tools/write_document",
-        DISPLAY_TOOL,
-    }
-    assert set(client.get("/openapi.json", headers=KEY_ONLY).json()["paths"]) == nine
-    listed = Caller("every-tool", KEY, WORKSPACE_TOOLS | {"echo_tool", "untagged_op", "hidden_op"})
-    doc = tool_openapi(app, listed)
-    assert set(doc["paths"]) == nine | {"/tools/echo"}
-    assert doc["paths"]["/tools/echo"]["post"]["operationId"] == "echo_tool"
-
-
-def test_openapi_is_built_once_and_served_from_memory(app: FastAPI, client: TestClient) -> None:
-    """Open WebUI fetches the spec on every chat request."""
-    open_webui = app.state.callers.get("open-webui")
-    first = tool_openapi(app, open_webui)
-    assert tool_openapi(app, open_webui) is first
-    assert client.get("/openapi.json", headers=KEY_ONLY).json() == first
-
-
-#: The sha256 of Open WebUI's tool document as v0.4.0 served it (v0.1.1's, with JSON readable and run_python's note on
-#: data files), ``info.version`` set to ``0.0.0``, written as compact JSON in the order it was served. Changing it
-#: changes Open WebUI's contract: the tools, schemas and texts its model is offered, and the order of the properties it
-#: sees.
-OPEN_WEBUI_CONTRACT_SHA256 = "9e7c195e5dac122be0091b82a0a377d04f3960da1fe386f6510e079be8c20f00"
-
-
-def test_open_webuis_tool_document_is_its_contract_and_does_not_change(client: TestClient) -> None:
-    """Open WebUI's document is v0.4.0's apart from its version; a change here is a change to Open WebUI's contract."""
-    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    doc["info"]["version"] = "0.0.0"
-    written = json.dumps(doc, separators=(",", ":"), ensure_ascii=False).encode()
-    assert hashlib.sha256(written).hexdigest() == OPEN_WEBUI_CONTRACT_SHA256
 
 
 @pytest.mark.parametrize("user", ["../x", "", " ", "a b", "x/y", ".hidden", "a" * 129])
@@ -291,7 +200,7 @@ def test_callers_are_a_registry_with_open_webui_first(settings: Settings) -> Non
     caller = registry.authenticate(KEY)
     assert caller is not None
     assert (caller.name, caller.key, caller.tools) == ("open-webui", KEY, WORKSPACE_TOOLS)
-    assert {"list_files", "read_document", "run_python", "fill_template", "display_file"} <= WORKSPACE_TOOLS
+    assert {"list_files", "read_document", "run_python", "fill_template"} <= WORKSPACE_TOOLS
     assert registry.authenticate("wrong") is None
     assert registry.authenticate("") is None
     assert KEY not in repr(caller)

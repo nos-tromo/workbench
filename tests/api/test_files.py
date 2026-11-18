@@ -1,4 +1,4 @@
-"""The file browser Open WebUI calls through its proxy, the ``display_file`` tool, and ``list_files`` on the MCP door.
+"""The file browser Open WebUI calls through its proxy, and the ``list_files`` tool on the MCP door.
 
 Every read or change of content is one audit event naming the file by id; no answer and no log line carries a
 file name, a path or a user id.
@@ -66,7 +66,7 @@ def limited_client(settings: Settings, store: Store, audit: AuditLog) -> Iterato
 # --- the happy path ------------------------------------------------------------------------------------------------
 
 
-def test_upload_then_list_view_display(client: TestClient, audit_lines: AuditLines) -> None:
+def test_upload_then_list_and_view(client: TestClient, audit_lines: AuditLines) -> None:
     """One file goes in and comes out of every route, and each disclosure is one audit event."""
     r = client.post("/files/upload", params={"directory": CHAT}, headers=H, files={"file": ("q.csv", b"a,b\n1,2\n")})
     assert r.status_code == 200
@@ -78,9 +78,7 @@ def test_upload_then_list_view_display(client: TestClient, audit_lines: AuditLin
     assert (listing["entries"][0]["type"], listing["entries"][0]["size"]) == ("file", 8)
     assert isinstance(listing["entries"][0]["modified"], float)
     assert client.get("/files/view", params={"path": f"{CHAT}/q.csv"}, headers=H).content == b"a,b\n1,2\n"
-    display = client.get("/files/display", params={"path": f"{CHAT}/q.csv"}, headers=H).json()
-    assert display == {"path": f"{CHAT}/q.csv", "exists": True, "name": "q.csv", "mime_type": "text/csv"}
-    assert [line["operation"] for line in audit_lines()][-3:] == ["file.upload", "file.view", "file.display"]
+    assert [line["operation"] for line in audit_lines()][-2:] == ["file.upload", "file.view"]
 
 
 def test_the_root_lists_the_chat_folders(client: TestClient) -> None:
@@ -444,27 +442,16 @@ def test_the_hardening_headers_are_only_for_view(client: TestClient) -> None:
     upload(client, "q.csv")
     for r in (
         client.get("/files/list", params={"directory": CHAT}, headers=H),
-        client.get("/files/display", params={"path": f"{CHAT}/q.csv"}, headers=H),
         client.get("/files/read", params={"path": f"{CHAT}/q.csv"}, headers=H),
     ):
         assert "content-security-policy" not in r.headers
-
-
-def test_display_reports_the_type_that_view_will_serve(client: TestClient) -> None:
-    """Open WebUI shows a file by what display says it is, so an active file is plain text there too."""
-    upload(client, "page.html", b"<script>alert(1)</script>")
-    upload(client, "report.pdf", b"%PDF")
-    page = client.get("/files/display", params={"path": f"{CHAT}/page.html"}, headers=H).json()
-    pdf = client.get("/files/display", params={"path": f"{CHAT}/report.pdf"}, headers=H).json()
-    assert page["mime_type"] == "text/plain"
-    assert pdf["mime_type"] == "application/pdf"
 
 
 # --- file names in real life -------------------------------------------------------------------------------------
 
 
 def test_unicode_names_round_trip(client: TestClient) -> None:
-    """Umlauts and spaces survive upload, list, view and display exactly, and the header is RFC 5987."""
+    """Umlauts and spaces survive upload, list and view exactly, and the header is RFC 5987."""
     name = "Übersicht März.xlsx"
     assert upload(client, name, b"data").json() == {"path": f"{CHAT}/{name}", "size": 4}
     names = [e["name"] for e in client.get("/files/list", params={"directory": CHAT}, headers=H).json()["entries"]]
@@ -472,8 +459,6 @@ def test_unicode_names_round_trip(client: TestClient) -> None:
     view = client.get("/files/view", params={"path": f"{CHAT}/{name}"}, headers=H)
     assert view.content == b"data"
     assert view.headers["content-disposition"] == "inline; filename*=UTF-8''%C3%9Cbersicht%20M%C3%A4rz.xlsx"
-    display = client.get("/files/display", params={"path": f"{CHAT}/{name}"}, headers=H).json()
-    assert (display["path"], display["name"], display["exists"]) == (f"{CHAT}/{name}", name, True)
 
 
 def _case_sensitive(folder: Path) -> bool:
@@ -505,13 +490,12 @@ def test_names_differing_only_by_case_are_both_kept(client: TestClient, tmp_path
 def test_no_audit_line_contains_a_file_name(
     client: TestClient, store: Store, audit_stream: io.StringIO, audit_lines: AuditLines
 ) -> None:
-    """Upload, view, read, display and delete are all recorded, by file id and never by name."""
+    """Upload, view, read and delete are all recorded, by file id and never by name."""
     upload(client, "secret-name.xlsx", b"PK")
     upload(client, "secret-notes.txt", b"hello")
     sheet, notes = store.get(ME, f"{CHAT}/secret-name.xlsx"), store.get(ME, f"{CHAT}/secret-notes.txt")
     client.get("/files/view", params={"path": sheet.virtual_path}, headers=H)
     client.get("/files/read", params={"path": notes.virtual_path}, headers=H)
-    client.get("/files/display", params={"path": sheet.virtual_path}, headers=H)
     client.delete("/files/delete", params={"path": sheet.virtual_path}, headers=H)
     events = [line for line in audit_lines() if line["operation"].startswith("file.")]
     assert [(e["operation"], e["target"]["ids"]) for e in events] == [
@@ -519,7 +503,6 @@ def test_no_audit_line_contains_a_file_name(
         ("file.upload", [notes.id]),
         ("file.view", [sheet.id]),
         ("file.read", [notes.id]),
-        ("file.display", [sheet.id]),
         ("file.delete", [sheet.id]),
     ]
     assert all(e["criteria"] == {"caller": "open-webui"} for e in events)
@@ -538,7 +521,6 @@ def test_the_audit_container_is_the_files_chat_folder_not_the_session_chat(
     assert path == "/workspace/chat-2/x.txt"
     client.get("/files/view", params={"path": path}, headers=H)
     client.get("/files/read", params={"path": path}, headers=H)
-    client.get("/files/display", params={"path": path}, headers=H)
     client.post("/files/mkdir", json={"path": "/workspace/chat-3/reports"}, headers=H)
     nested = upload(client, "y.txt", b"hi", directory="/workspace/chat-3/reports").json()["path"]
     client.get("/files/view", params={"path": nested}, headers=H)
@@ -549,7 +531,6 @@ def test_the_audit_container_is_the_files_chat_folder_not_the_session_chat(
         ("file.upload", "chat:chat-2"),
         ("file.view", "chat:chat-2"),
         ("file.read", "chat:chat-2"),
-        ("file.display", "chat:chat-2"),
         ("file.upload", "chat:chat-3"),
         ("file.view", "chat:chat-3"),
         ("file.delete", "chat:chat-2"),
@@ -564,7 +545,6 @@ def test_list_mkdir_and_move_are_not_recorded_and_absent_files_leave_no_event(
     client.get("/files/list", params={"directory": CHAT}, headers=H)
     client.get("/files/view", params={"path": f"{CHAT}/none.txt"}, headers=H)
     client.get("/files/read", params={"path": f"{CHAT}/none.txt"}, headers=H)
-    client.get("/files/display", params={"path": f"{CHAT}/none.txt"}, headers=H)
     client.delete("/files/delete", params={"path": f"{CHAT}/none.txt"}, headers=H)
     assert file_operations(audit_lines) == []
 
@@ -604,7 +584,7 @@ def test_delete_is_recorded_before_the_file_goes(client: TestClient, broken_audi
     ]
 
 
-@pytest.mark.parametrize("route", ["view", "read", "display"])
+@pytest.mark.parametrize("route", ["view", "read"])
 def test_a_read_that_cannot_be_recorded_returns_nothing(
     client: TestClient, broken_audit: None, store: Store, route: str
 ) -> None:
@@ -806,8 +786,6 @@ def test_other_user_cannot_list_view_or_delete(client: TestClient, store: Store)
         "/files/move", json={"source": rec.virtual_path, "destination": f"{CHAT}/stolen.csv"}, headers=H_B
     )
     assert moved.status_code == 404
-    display = client.get("/files/display", params={"path": rec.virtual_path}, headers=H_B).json()
-    assert display["exists"] is False
     assert client.get("/files/view", params={"path": rec.virtual_path}, headers=H).content == b"mine"
 
 
@@ -1043,7 +1021,7 @@ def test_a_declared_length_that_lies_is_caught_by_the_count() -> None:
 
 @pytest.mark.parametrize(
     ("method", "path"),
-    [("POST", "/files/mkdir"), ("GET", "/files/upload"), ("POST", "/files/upload/x"), ("POST", "/tools/run_python")],
+    [("POST", "/files/mkdir"), ("GET", "/files/upload"), ("POST", "/files/upload/x"), ("POST", "/mcp")],
 )
 def test_every_other_request_has_the_request_bound_not_the_uploads(method: str, path: str) -> None:
     """Up to the request bound a body passes, whatever the upload's bound; past it, 413 ``request too large``."""
@@ -1185,7 +1163,6 @@ ROUTES: dict[str, Callable[[TestClient, str], Any]] = {
     "upload": lambda c, bad: upload(c, "a.txt", directory=bad),
     "view": lambda c, bad: c.get("/files/view", params={"path": bad}, headers=H),
     "read": lambda c, bad: c.get("/files/read", params={"path": bad}, headers=H),
-    "display": lambda c, bad: c.get("/files/display", params={"path": bad}, headers=H),
     "delete": lambda c, bad: c.delete("/files/delete", params={"path": bad}, headers=H),
     "mkdir": lambda c, bad: c.post("/files/mkdir", json={"path": bad}, headers=H),
     "move-source": lambda c, bad: c.post(
@@ -1217,7 +1194,7 @@ def test_a_symlink_planted_in_a_folder_is_never_followed(client: TestClient, sto
     real = Workspaces(settings.data_dir).resolve(ME, rec.virtual_path)
     real.unlink()
     real.symlink_to(outside)
-    for route in ("view", "read", "display"):
+    for route in ("view", "read"):
         r = client.get(f"/files/{route}", params={"path": rec.virtual_path}, headers=H)
         assert r.status_code == 400, route
         assert "not yours" not in r.text
@@ -1265,7 +1242,6 @@ BROWSER_ROUTES: list[tuple[str, str, dict[str, Any]]] = [
     ("POST", "/files/upload?directory=/workspace/chat-1", {"files": {"file": ("a.txt", b"x")}}),
     ("GET", "/files/view?path=/workspace/chat-1/a.txt", {}),
     ("GET", "/files/read?path=/workspace/chat-1/a.txt", {}),
-    ("GET", "/files/display?path=/workspace/chat-1/a.txt", {}),
     ("DELETE", "/files/delete?path=/workspace/chat-1/a.txt", {}),
     ("POST", "/files/mkdir", {"json": {"path": "/workspace/chat-1/x"}}),
     ("POST", "/files/move", {"json": {"source": "/workspace/chat-1/a.txt", "destination": "/workspace/chat-1/b.txt"}}),
@@ -1284,30 +1260,6 @@ def test_every_route_needs_the_key_and_a_user(
     assert no_user.status_code == 400
     assert no_user.json() == {"detail": "missing or invalid user"}
     assert client.get("/files/view", params={"path": f"{CHAT}/a.txt"}, headers=H).content == b"x"
-
-
-# --- the display_file tool ---------------------------------------------------------------------------------------
-
-
-def test_display_of_a_missing_file_says_so(client: TestClient, audit_lines: AuditLines) -> None:
-    """Not an error for the model: ``exists`` is false, and no event is written for a file that is not there."""
-    r = client.get("/files/display", params={"path": f"{CHAT}/none.xlsx"}, headers=H)
-    assert r.status_code == 200
-    assert r.json() == {"path": f"{CHAT}/none.xlsx", "exists": False, "name": None, "mime_type": None}
-    assert file_operations(audit_lines) == []
-
-
-def test_display_of_a_file_in_a_folder_gives_its_base_name(client: TestClient) -> None:
-    """``name`` is the file's own name; ``path`` is the whole path."""
-    client.post("/files/mkdir", json={"path": f"{CHAT}/reports"}, headers=H)
-    upload(client, "q.xlsx", b"PK", directory=f"{CHAT}/reports")
-    r = client.get("/files/display", params={"path": f"{CHAT}/reports/q.xlsx"}, headers=H).json()
-    assert r == {
-        "path": f"{CHAT}/reports/q.xlsx",
-        "exists": True,
-        "name": "q.xlsx",
-        "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }
 
 
 # --- the list_files tool ----------------------------------------------------------------------------------------

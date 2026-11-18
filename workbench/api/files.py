@@ -1,8 +1,7 @@
-"""The file browser Open WebUI shows beside the chat, and the ``display_file`` tool.
+"""The file browser Open WebUI shows beside the chat.
 
 Open WebUI's browser calls these routes through its proxy: list, upload, view, read,
-delete, mkdir and move, all hidden from the tool document. Only ``GET /files/display`` is in
-it, as the ``display_file`` tool.
+delete, mkdir and move.
 
 Ghostwriter calls three of them, list, upload and view, held to the request's chat: any other
 path is ``404`` for it. Its calls state a purpose and a request id, which its events carry, and
@@ -25,16 +24,16 @@ import logging
 import os
 import posixpath
 from collections.abc import Iterator, Sequence
-from typing import Annotated, BinaryIO, Final
+from typing import BinaryIO, Final
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import CHAT_PATH, require_tool
+from workbench.api.auth import CHAT_PATH
 from workbench.api.deps import (
     AuditDep,
     CallAuditDep,
@@ -45,9 +44,8 @@ from workbench.api.deps import (
     StoreDep,
 )
 from workbench.api.errors import NOT_FOUND
-from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import EncodableRoute
-from workbench.api.store import NotFound, Store
+from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.models import VIRTUAL_ROOT, FileRecord, Principal
 
@@ -55,9 +53,6 @@ _log = logging.getLogger(__name__)
 
 #: The browser's routes; none of them is a tool.
 router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
-
-#: Routes that are tools, and so the only ones in the tool document.
-tool_router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
 
 _MIB: Final = 1024 * 1024
 _CHUNK: Final = _MIB
@@ -103,22 +98,6 @@ class MoveRequest(BaseModel):
 
     source: str
     destination: str
-
-
-class DisplayedFile(BaseModel):
-    """What ``display_file`` answers.
-
-    Attributes:
-        path: The file's path.
-        exists: Whether the user has such a file.
-        name: The file's own name, without its folder; ``None`` if there is no such file.
-        mime_type: The media type the file is served as; ``None`` if there is no such file.
-    """
-
-    path: str = Field(description="The file's absolute path.")
-    exists: bool = Field(description="False if the user has no such file; then there is nothing to show.")
-    name: str | None = Field(description="The file's own name, without its folder.")
-    mime_type: str | None = Field(description="The media type the file is shown as; active content is plain text.")
 
 
 def _chunks(src: BinaryIO) -> Iterator[bytes]:
@@ -179,18 +158,6 @@ def _is_active(rec: FileRecord) -> bool:
     """
     media_type = rec.mime.partition(";")[0].strip().lower()
     return media_type in _ACTIVE_TYPES or rec.name.lower().endswith(_ACTIVE_SUFFIXES)
-
-
-def _media_type(rec: FileRecord) -> str:
-    """Return the media type a file is shown as: its own, or plain text if it is active content.
-
-    Args:
-        rec: The file's record.
-
-    Returns:
-        The media type, without parameters.
-    """
-    return _PLAIN if _is_active(rec) else rec.mime
 
 
 def _is_archive(rec: FileRecord) -> bool:
@@ -454,41 +421,3 @@ def move_file(body: MoveRequest, p: PrincipalDep, store: StoreDep) -> dict[str, 
         The file's new path.
     """
     return {"path": store.move(p, body.source, body.destination).virtual_path}
-
-
-@tool_router.get(
-    "/files/display",
-    operation_id="display_file",
-    dependencies=[Depends(require_tool("display_file"))],
-    summary="Show a file to the user",
-    description=(
-        "Show one of the user's files in the chat as a card with a preview and a download. "
-        "Use it for a file you made or the user uploaded, once it exists, to hand it over. "
-        "It answers exists=false if there is no such file."
-    ),
-)
-def display_file(
-    path: Annotated[str, Query(description="The file's absolute path, for example /workspace/<chat>/report.xlsx.")],
-    p: PrincipalDep,
-    store: StoreDep,
-    audit: AuditDep,
-) -> DisplayedFile:
-    """Say whether a file exists and what it is called, so Open WebUI can show it.
-
-    Args:
-        path: The file's virtual path.
-        p: The caller, user and chat.
-        store: The file store.
-        audit: The audit log.
-
-    Returns:
-        The file's path, whether it exists, and its name and media type.
-    """
-    try:
-        rec = store.get(p, path)
-    except NotFound:
-        return DisplayedFile(path=path, exists=False, name=None, mime_type=None)
-    audit.record("display", _in_folder_of(p, rec), file_ids=[rec.id])
-    return DisplayedFile(
-        path=rec.virtual_path, exists=True, name=posixpath.basename(rec.name), mime_type=_media_type(rec)
-    )

@@ -3,18 +3,11 @@
 Each name is looked for in backticks, as the documents write code, so a word in a sentence does not count.
 """
 
-import io
 import re
 from pathlib import Path
 
-from workbench import __version__
-from workbench.api.audit import CONTINUATION, OPERATIONS, SERVICE, AuditLog
-from workbench.api.main import create_app
-from workbench.api.openapi import tool_openapi
-from workbench.api.store import Store
-from workbench.config import load_settings
-from workbench.paths import Workspaces
-from workbench.utils.audit_event import AuditEmitter
+from workbench.api.audit import CONTINUATION, OPERATIONS
+from workbench.api.tool_table import WORKSPACE_TABLE
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,15 +34,10 @@ def test_every_env_variable_is_documented() -> None:
     assert [name for name in names if f"`{name}`" not in text] == []
 
 
-def test_every_tool_is_in_the_permission_matrix(tmp_path: Path) -> None:
-    """Each ``operationId`` the model is offered has its row in the matrix of ``docs/permissions.md``."""
-    settings = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "k" * 32, "WORKBENCH_DATA_DIR": str(tmp_path)}, role="api")
-    store = Store(tmp_path / "workbench.db", Workspaces(tmp_path))
-    audit = AuditLog(AuditEmitter(SERVICE, __version__, stream=io.StringIO(), heartbeat_interval_s=0))
-    app = create_app(settings, store=store, audit=audit)
-    spec = tool_openapi(app, app.state.callers.get("open-webui"))
-    tools = [op["operationId"] for item in spec["paths"].values() for op in item.values() if "operationId" in op]
-    assert len(tools) == 9
+def test_every_tool_is_in_the_permission_matrix() -> None:
+    """Each workspace tool, a row of the table, has its row in the matrix of ``docs/permissions.md``."""
+    tools = [tool.name for tool in WORKSPACE_TABLE]
+    assert len(tools) == 8
     rows = {line.split("|")[1].strip() for line in doc("permissions.md").splitlines() if line.startswith("| `")}
     assert [tool for tool in tools if f"`{tool}`" not in rows] == []
 

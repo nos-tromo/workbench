@@ -1,50 +1,70 @@
 """One tool core: the specs of each form, the start check of each caller's list, and the answers both doors give."""
 
 import dataclasses
-from typing import Any, cast
+import inspect
+from typing import Any, Final, cast
 
 import pytest
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 
 from tests.api.conftest import DOCINT_KEY, KEY
-from workbench.api.auth import Caller, CallerRegistry, require_tool
+from tests.callers import EIGHT
+from workbench.api.auth import Caller, CallerRegistry
 from workbench.api.errors import MAX_ERRORS, compact, describe
-from workbench.api.files import DisplayedFile
 from workbench.api.jobs import Busy, RequestTooLarge
-from workbench.api.openapi import TOOL_TAG
 from workbench.api.registry import (
     FORM_TOOLS,
     INLINE_TOOLS,
-    MCP_WORKSPACE_TOOLS,
     WORKSPACE_TOOLS,
     Files,
     Registry,
     ToolSpec,
     allowed_tools,
-    workspace_specs,
 )
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StoreError
+from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.api.tools import FileList, PythonRun, RunPythonRequest
+from workbench.api.tools_mcp import NoArguments, workspace_tools
 from workbench.config import ConfigError, Settings
 from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
 
+#: Every parameter a tool function may take: what the MCP door's adapter passes by name.
+KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs"})
+
+# --- the table ------------------------------------------------------------------------------------------------------
+
+
+def test_the_table_holds_the_eight_tools_in_name_order() -> None:
+    """The workspace tools are the table's rows, one per tool Ghostwriter may call, by name."""
+    assert [tool.name for tool in WORKSPACE_TABLE] == sorted(EIGHT)
+
+
+def test_each_function_takes_only_known_parameters() -> None:
+    """The adapter passes each parameter by its name, so a tool's function may take no other."""
+    for tool in WORKSPACE_TABLE:
+        assert set(inspect.signature(tool.function).parameters) <= KNOWN, tool.name
+
+
 # --- the specs ------------------------------------------------------------------------------------------------------
 
 
-def test_the_registry_equals_the_tool_routes(app: FastAPI) -> None:
-    """The nine workspace specs are the routes tagged as tools, each titled and described, none served on MCP."""
-    specs = workspace_specs(app)
-    assert len(specs) == 9 and {s.name for s in specs} == WORKSPACE_TOOLS
-    assert all(s.form == "workspace" and s.run is None and s.title and s.description for s in specs)
-    assert all(s.input_schema is None for s in specs)
-    by_name = {s.name: s for s in specs}
+def test_the_workspace_specs_are_the_tables_rows(app: FastAPI) -> None:
+    """One spec per row, titled and described as the row, run on the MCP door, its models the row's."""
+    specs = workspace_tools()
+    assert [s.name for s in specs] == [tool.name for tool in WORKSPACE_TABLE]
+    assert {s.name for s in specs} == WORKSPACE_TOOLS
+    for spec, tool in zip(specs, WORKSPACE_TABLE, strict=True):
+        assert (spec.title, spec.description, spec.form) == (tool.title, tool.description, "workspace")
+        assert spec.run is not None and spec.input_schema is not None and spec.output_schema is not None
+        assert spec.output_model is not None and spec.output_model.__bases__ == (tool.output_model,)
+    by_name = {tool.name: tool for tool in WORKSPACE_TABLE}
     assert (by_name["run_python"].input_model, by_name["run_python"].output_model) == (RunPythonRequest, PythonRun)
     assert (by_name["list_files"].input_model, by_name["list_files"].output_model) == (None, FileList)
-    assert (by_name["display_file"].input_model, by_name["display_file"].output_model) == (None, DisplayedFile)
+    assert {s.name: s.input_model for s in specs}["list_files"] is NoArguments
     registry: Registry = app.state.registry
-    open_webui = cast(CallerRegistry, app.state.callers).get("open-webui")
-    assert [s.name for s in registry.for_caller(open_webui)] == sorted(WORKSPACE_TOOLS)
+    ghostwriter = cast(CallerRegistry, app.state.callers).get("ghostwriter")
+    assert [s.name for s in registry.for_caller(ghostwriter)] == sorted(WORKSPACE_TOOLS)
 
 
 def _spec(name: str, form: Files) -> ToolSpec:
@@ -79,43 +99,16 @@ def test_a_tool_without_the_callers_form_stops_the_start(settings: Settings, too
     assert [name for name in tools - INLINE_TOOLS if name in str(refused.value)] == []
 
 
-def test_allowed_tools_by_door_and_form() -> None:
-    """The terminal door serves every workspace tool; the MCP door all but ``display_file``, or the inline tools."""
-    assert allowed_tools("terminal", "workspace") == WORKSPACE_TOOLS
-    assert allowed_tools("mcp", "workspace") == WORKSPACE_TOOLS - {"display_file"} == MCP_WORKSPACE_TOOLS
-    assert allowed_tools("mcp", "inline") == INLINE_TOOLS
+def test_allowed_tools_by_form() -> None:
+    """A caller with workspace files may list the eight workspace tools; one whose data comes inline, the inline."""
+    assert allowed_tools("workspace") == WORKSPACE_TOOLS == EIGHT
+    assert allowed_tools("inline") == INLINE_TOOLS
 
 
 def test_the_tools_of_each_form_are_read_only() -> None:
     """The start check's sets cannot be changed while the api runs."""
     with pytest.raises(TypeError):
         cast(dict[str, frozenset[str]], FORM_TOOLS)["inline"] = WORKSPACE_TOOLS
-
-
-def _write_table() -> dict[str, str]:
-    """A synthetic tool route's endpoint."""
-    return {}
-
-
-@pytest.mark.parametrize(("guard", "starts"), [(None, False), ("write_document", False), ("write_table", True)])
-def test_a_tool_route_without_its_own_guard_stops_the_start(guard: str | None, starts: bool) -> None:
-    """A tool route must enforce the caller's list under its own name: no guard, or another tool's, stops the start."""
-    app = FastAPI()
-    app.add_api_route(
-        "/tools/write_table",
-        _write_table,
-        methods=["POST"],
-        tags=[TOOL_TAG],
-        operation_id="write_table",
-        summary="Write a table",
-        description="Write a table into a new file of this conversation.",
-        dependencies=[] if guard is None else [Depends(require_tool(guard))],
-    )
-    if starts:
-        assert [spec.name for spec in workspace_specs(app)] == ["write_table"]
-        return
-    with pytest.raises(ValueError, match="write_table"):
-        workspace_specs(app)
 
 
 # --- the answers ----------------------------------------------------------------------------------------------------

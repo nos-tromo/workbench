@@ -3,10 +3,9 @@
 Open WebUI connects a "terminal server" by calling, in this order: a policy
 probe that must *not* succeed (a 2xx makes it treat the server as an
 orchestrator, so no route exists for it), ``/api/config``, ``/system``,
-``/openapi.json``, ``/files/cwd``, ``/files/read`` for ``AGENTS.md`` (the file
-browser's route, :mod:`workbench.api.files`) and ``/skills``. They all answer from
-memory or the metadata store, never from a queue and never by parsing a file. None
-of them is in the tool document.
+``/files/cwd``, ``/files/read`` for ``AGENTS.md`` (the file browser's route,
+:mod:`workbench.api.files`) and ``/skills``. They all answer from memory or the
+metadata store, never from a queue and never by parsing a file.
 
 Everything not registered answers 404; that allow-list is workbench's own,
 because Open WebUI's proxy forwards every method and path the browser sends.
@@ -22,14 +21,11 @@ from importlib import resources
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.requests import Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from workbench.api.auth import Caller, require_caller, require_principal
+from workbench.api.auth import require_caller, require_principal
 from workbench.api.deps import get_settings, get_store
 from workbench.api.errors import NOT_FOUND
-from workbench.api.openapi import tool_openapi
 from workbench.api.routing import EncodableRoute
 from workbench.api.store import Store
 from workbench.config import Settings
@@ -106,20 +102,6 @@ async def system(settings: Annotated[Settings, Depends(get_settings)]) -> dict[s
         ``{"prompt": ...}``.
     """
     return {"prompt": system_prompt(settings)}
-
-
-@router.get("/openapi.json")
-async def openapi(request: Request, caller: Annotated[Caller, Depends(require_caller)]) -> JSONResponse:
-    """Serve the caller's tool document, from memory.
-
-    Args:
-        request: The request.
-        caller: The authenticated caller, whose list the document holds.
-
-    Returns:
-        The OpenAPI document of the caller's tools. It needs the key only; Open WebUI sends no user headers here.
-    """
-    return JSONResponse(tool_openapi(request.app, caller))
 
 
 @router.get("/files/cwd")

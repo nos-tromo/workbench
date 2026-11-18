@@ -27,7 +27,6 @@ from workbench.paths import PathError
 KEYED_ROUTES = [
     ("GET", "/api/config"),
     ("GET", "/system"),
-    ("GET", "/openapi.json"),
     ("GET", "/skills"),
     ("GET", "/skills/read?name=x"),
     ("GET", "/files/cwd"),
@@ -119,7 +118,7 @@ GATED = [
     ("GET", "/files/archive"),
     ("PUT", "/files/mkdir"),
     ("POST", "/files/mkdir"),
-    ("POST", "/tools/run_python"),
+    ("POST", "/mcp"),
     ("POST", "/files/upload"),
 ]
 
@@ -153,7 +152,7 @@ def test_the_gate_reads_no_body_without_a_key(settings: Settings) -> None:
     scope: Scope = {
         "type": "http",
         "method": "POST",
-        "path": "/tools/run_python",
+        "path": "/mcp",
         "headers": [(b"content-length", str(40 * 1024 * 1024).encode())],
     }
     asyncio.run(KeyGate(inner, callers=CallerRegistry.from_settings(settings))(scope, receive, send))

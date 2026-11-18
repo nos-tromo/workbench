@@ -23,7 +23,7 @@ check the same again for themselves (:func:`require_file_caller`).
 """
 
 import hmac
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Final, Literal, Self
 
@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.api.errors import INVALID_PURPOSE, NOT_FOUND
-from workbench.api.registry import WORKSPACE_TOOLS, Files, ToolGuard, allowed_tools
+from workbench.api.registry import WORKSPACE_TOOLS, Files, allowed_tools
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
@@ -117,7 +117,7 @@ class CallerRegistry:
         each job within the job wall. docint comes in through the MCP door, brings its data with each call and may use
         its listed tools, within its own wall cap and slot cap; each of them must be an inline tool. Ghostwriter comes
         in through the MCP door too, keeps its files in workspaces, confined to the request's chat, and may use its
-        listed tools within its own caps; each must be a workspace tool the MCP door serves.
+        listed tools within its own caps; each must be a workspace tool.
 
         Args:
             settings: The api's settings.
@@ -127,7 +127,7 @@ class CallerRegistry:
 
         Raises:
             ConfigError: If the settings hold no caller key, two callers hold the same key, or docint's or
-                Ghostwriter's list names a tool its door and file form do not allow.
+                Ghostwriter's list names a tool that is not of its file form.
         """
         callers: list[Caller] = []
         if settings.open_webui_key is not None:
@@ -200,7 +200,7 @@ class CallerRegistry:
 
 
 def _within_form(caller: Caller, variable: str) -> Caller:
-    """Check that every tool on a caller's list is one its door serves in its file form.
+    """Check that every tool on a caller's list is a tool of its file form.
 
     Args:
         caller: The caller.
@@ -210,10 +210,10 @@ def _within_form(caller: Caller, variable: str) -> Caller:
         The caller.
 
     Raises:
-        ConfigError: If the list names a tool of another form, one its door does not serve, or a name no tool has. The
-            message names the variable and the tools it may list, never the value.
+        ConfigError: If the list names a tool of another form or a name no tool has. The message names the variable
+            and the tools it may list, never the value.
     """
-    allowed = allowed_tools(caller.door, caller.files)
+    allowed = allowed_tools(caller.files)
     if not caller.tools <= allowed:
         raise ConfigError(f"{variable} may list only {caller.files} tools: {', '.join(sorted(allowed))}")
     return caller
@@ -362,43 +362,6 @@ async def require_mcp_caller(request: Request) -> Caller:
     if caller.door != "mcp" or request.scope.get("root_path"):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     return caller
-
-
-class _ToolOnList(ToolGuard):
-    """The guard :func:`require_tool` makes: the caller's key, its door, and the tool on its list."""
-
-    async def __call__(self, caller: Annotated[Caller, Depends(require_caller)]) -> Caller:
-        """Let the caller through if the guarded tool is on its list.
-
-        Args:
-            caller: The authenticated caller of the terminal door.
-
-        Returns:
-            The caller.
-
-        Raises:
-            HTTPException: 404 with :data:`~workbench.api.errors.NOT_FOUND` if the tool is not on the caller's list.
-        """
-        if self.tool not in caller.tools:
-            raise HTTPException(status_code=404, detail=NOT_FOUND)
-        return caller
-
-
-def require_tool(name: str) -> Callable[..., Awaitable[Caller]]:
-    """Make the dependency of the tool route ``name``.
-
-    Like :func:`require_caller`, it reads the request itself and declares no parameter, so the route's
-    OpenAPI operation gains none. It is a :class:`~workbench.api.registry.ToolGuard` tagged with ``name``, which
-    :func:`~workbench.api.registry.workspace_specs` looks for on the route of that name.
-
-    Args:
-        name: The tool's ``operationId``.
-
-    Returns:
-        A dependency that gives the caller :func:`require_caller` authenticated, and answers 404 with
-        :data:`~workbench.api.errors.NOT_FOUND` when ``name`` is not on that caller's list.
-    """
-    return _ToolOnList(name)
 
 
 class KeyGate:

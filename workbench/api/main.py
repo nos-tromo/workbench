@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, mcp, metrics, tools, tools_output, tools_templates  # noqa: F401
+from workbench.api import contract, errors, files, mcp, metrics
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
 from workbench.api.body_limit import BodyLimit, upload_limit
@@ -148,10 +148,8 @@ def create_app(
     app.include_router(contract.router)
     app.include_router(mcp.router)
     app.include_router(files.router)
-    app.include_router(files.tool_router)
-    app.include_router(tools.router)  # the template and output tools' routes are on it too
     app.include_router(metrics.router)
-    app.state.registry = Registry([*workspace_tools(app), *INLINE_SPECS])
+    app.state.registry = Registry([*workspace_tools(), *INLINE_SPECS])
     return app
 
 

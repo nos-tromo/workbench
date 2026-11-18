@@ -44,7 +44,6 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "upload": ("collect", "file.upload"),
     "view": ("disclose", "file.view"),
     "read": ("disclose", "file.read"),
-    "display": ("disclose", "file.display"),
     "delete": ("delete", "file.delete"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),

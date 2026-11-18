@@ -6,14 +6,13 @@ another answer scripts it. The wire is ``tests/api/mcp_calls.py``'s, sent with G
 
 import concurrent.futures
 import dataclasses
-import inspect
 import io
 import json
 import logging
 import sqlite3
 from functools import partial
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final
 
 import httpx2
 import jsonschema
@@ -22,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
-from tests.api.conftest import HD, HG, PG, AuditLines, H, put, unrecorded
+from tests.api.conftest import HD, HG, PG, AuditLines, put, unrecorded
 from tests.api.mcp_calls import acall, error, refused, result, rpc
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import call as inline_call
@@ -33,12 +32,10 @@ from tests.callers import EIGHT
 from tests.conftest import scaled
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import OPERATIONS, AuditLog
-from workbench.api.auth import CallerRegistry
 from workbench.api.jobs import Busy, CallLimits, JobQueue
 from workbench.api.main import create_app
 from workbench.api.mcp_wire import INSTRUCTIONS, WORKSPACE_INSTRUCTIONS
 from workbench.api.metrics import Metrics
-from workbench.api.openapi import tool_openapi, tool_routes
 from workbench.api.store import Store
 from workbench.api.tools_mcp import PREVIEW_RESERVE_S
 from workbench.config import Settings
@@ -65,8 +62,6 @@ PREVIEW: Final[dict[str, Any]] = {
 }
 CSV: Final = b"author,posts\nuser-a,12\nuser-b,7\n"
 PNG: Final = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-#: Every parameter a tool route may take: what the MCP door's adapter passes by name.
-KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs"})
 #: Ghostwriter's headers when it states a purpose and a request id.
 PURPOSE: Final = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request-ID": "req-1"}
 #: Valid arguments for each tool the purpose rule covers, with the action its event is recorded under.
@@ -128,7 +123,7 @@ def spy_submit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, 
 
 
 def test_the_ghostwriter_lists_its_eight_tools_in_name_order(client: TestClient) -> None:
-    """The eight workspace tools, by name; each takes an object and answers its REST model plus ``outputs``."""
+    """The eight workspace tools, by name; each takes an object and answers its own model plus ``outputs``."""
     tools = result(rpc(client, "tools/list", headers=HG))["tools"]
     assert [t["name"] for t in tools] == sorted(EIGHT)
     for tool in tools:
@@ -168,7 +163,7 @@ def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> No
 
 
 def test_a_call_answers_the_rest_model_plus_outputs(client: TestClient, store: Store) -> None:
-    """The REST answer with its null fields, and the new file by reference: id, path, name, type, size, preview."""
+    """The tool's answer with its null fields, and the new file by reference: id, path, name, type, size, preview."""
     answer = result(acall(client, "write_table", TABLE))
     rec = store.get(PG, f"{CHAT}/counts.csv")
     assert answer["isError"] is False and [b["type"] for b in answer["content"]] == ["text"]
@@ -446,19 +441,6 @@ def test_ghostwriters_waiting_calls_are_capped_across_many_users(
     assert sorted(req.caller for req in executor.requests) == ["docint"] + ["ghostwriter"] * 10
 
 
-def test_the_terminal_door_asks_for_no_previews_and_no_caller_cap(
-    client: TestClient, app: FastAPI, store: Store, fake_executor: Local, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Open WebUI's write_table submits with neither a call's limits nor previews, and answers no outputs."""
-    seen = spy_submit(app, monkeypatch)
-    r = client.post("/tools/write_table", json=TABLE, headers=H)
-    assert r.status_code == 200, r.text
-    assert seen == [{}]
-    (req,) = fake_executor.requests
-    assert (req.previews, req.limits.wall_s) == (False, 120)
-    assert r.json() == {"path": f"{CHAT}/counts.csv", "rows": 2}
-
-
 @pytest.mark.parametrize("reason", ["queue_full", "wait_timeout", "executor_busy"])
 def test_a_queue_refusal_is_an_error_result_with_its_token(
     client: TestClient, app: FastAPI, monkeypatch: pytest.MonkeyPatch, reason: Any
@@ -602,35 +584,3 @@ def test_list_files_needs_no_purpose(settings: Settings, store: Store, audit: Au
         answer = result(acall(client, "list_files"))
     assert answer["isError"] is False
     assert [f["path"] for f in answer["structuredContent"]["files"]] == [rec.virtual_path]
-
-
-def test_the_terminal_door_keeps_its_rule(
-    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, fake_executor: Local
-) -> None:
-    """Open WebUI states no purpose: its read_document answers 200 whatever the rule says, and nothing is denied."""
-    put(store, "q.csv", CSV)
-    with strict_client(settings, store, audit, fake_executor, "query") as client:
-        r = client.post("/tools/read_document", json={"path": f"{CHAT}/q.csv"}, headers=H)
-    assert r.status_code == 200, r.text
-    assert [e for e in audit_lines() if e["outcome"] == "denied"] == []
-
-
-# --- the routes both doors run -------------------------------------------------------------------------------------
-
-
-def test_every_mcp_tool_route_takes_only_known_parameters(app: FastAPI) -> None:
-    """The adapter passes each parameter by its name, so a route of the eight may take no other."""
-    endpoints = {route.operation_id: route.endpoint for route in tool_routes(app)}
-    for name in EIGHT:
-        endpoint = endpoints[name]
-        assert endpoint is not None and set(inspect.signature(endpoint).parameters) <= KNOWN, name
-
-
-def test_the_terminal_document_is_unchanged(app: FastAPI) -> None:
-    """Open WebUI's nine operations keep their texts: the MCP door's wording is a copy."""
-    doc = tool_openapi(app, cast(CallerRegistry, app.state.callers).get("open-webui"))
-    operations = [operation for path in doc["paths"].values() for operation in path.values()]
-    assert len(operations) == 9
-    assert doc["paths"]["/tools/write_table"]["post"]["description"].endswith("Show the result with display_file.")
-    path = doc["components"]["schemas"]["WrittenTable"]["properties"]["path"]
-    assert path["description"].endswith("show it with display_file.")

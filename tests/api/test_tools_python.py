@@ -453,7 +453,7 @@ class CancelledOnReturn(JobQueue):
         return answer
 
 
-#: Each route that makes files: its function, its body and an answer of its runner that keeps the file.
+#: Each tool that makes files: its function, its arguments and an answer of its runner that keeps the file.
 MAKERS: dict[str, tuple[Callable[..., Coroutine[Any, Any, Any]], BaseModel, dict[str, Any]]] = {
     "run_python": (tools.run_python, tools.RunPythonRequest(code="print(1)"), ran()),
     "fill_template": (
@@ -481,7 +481,7 @@ def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
     settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines, tool: str
 ) -> None:
     """The job's file is recorded before it is in the workspace: a cancellation as ``submit`` returns finds it named."""
-    route, body, payload = MAKERS[tool]
+    function, body, payload = MAKERS[tool]
     put(store, "form.docx", b"PK", p=PG)
     executor = Scripted(settings.data_dir)
     executor.files = {"made.docx": b"PK"}
@@ -491,7 +491,7 @@ def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
 
     async def call() -> None:
         given = {"body": body, "p": PG, "settings": settings, "store": store, "audit": audit, "jobs": queue}
-        await route(**{name: given[name] for name in inspect.signature(route).parameters})
+        await function(**{name: given[name] for name in inspect.signature(function).parameters})
 
     with contextlib.suppress(asyncio.CancelledError):
         asyncio.run(call())

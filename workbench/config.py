@@ -31,7 +31,7 @@ DOCINT_DEFAULT_SLOTS: Final = 2
 #: The least wall time docint's jobs may be given: the inline schema's lowest ``time_limit_s``.
 MIN_DOCINT_WALL_S: Final = 5
 
-#: Ghostwriter's tools when ``GHOSTWRITER_WORKBENCH_TOOLS`` lists none: the workspace tools but ``display_file``.
+#: Ghostwriter's tools when ``GHOSTWRITER_WORKBENCH_TOOLS`` lists none: every workspace tool.
 GHOSTWRITER_DEFAULT_TOOLS: Final = frozenset(
     {
         "list_files",

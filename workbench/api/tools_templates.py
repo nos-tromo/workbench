@@ -1,4 +1,4 @@
-"""The template tools, ``inspect_template`` and ``fill_template``, on the router of :mod:`workbench.api.tools`.
+"""The template tools, ``inspect_template`` and ``fill_template``, two rows of :mod:`workbench.api.tool_table`.
 
 A template is a file of the chat: a Word ``.docx`` or ``.dotx`` (content controls, legacy form fields, ``{{ }}``
 placeholders) or an Excel ``.xlsx`` (``{{ }}`` cells and ``{{ table:<name> }}`` anchors). The runners
@@ -20,13 +20,13 @@ import posixpath
 from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Final, Literal
 
-from fastapi import Depends, HTTPException
+from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from pydantic.json_schema import JsonDict
 
-from workbench.api.auth import require_tool
-from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
+from workbench.api.audit import AuditLog
+from workbench.api.jobs import JobQueue
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
     MAX_HINT,
@@ -41,8 +41,8 @@ from workbench.api.tools import (
     _within,
     judged,
     record_answer,
-    router,
 )
+from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import MAX_FILENAME, MAX_FILENAME_BYTES, PathError, check_filename
 from workbench.protocol import MAX_INPUT_FILES, JobResult
@@ -295,7 +295,7 @@ class FilledTemplate(BaseModel):
         warnings: What the model should tell the user.
     """
 
-    path: str = Field(description="The new file's path; show it with display_file.")
+    path: str = Field(description="The new file's path; the user sees it as a card in the chat.")
     filled: int = Field(description="How many fields were filled.")
     unfilled: list[str] = Field(
         description=(
@@ -507,29 +507,13 @@ def _fit_fill(answer: FilledTemplate, limit_kb: int) -> FilledTemplate:
     return cut()
 
 
-@router.post(
-    "/tools/inspect_template",
-    operation_id="inspect_template",
-    dependencies=[Depends(require_tool("inspect_template"))],
-    summary="List the fields of a report template",
-    description=(
-        "List the fields of a report template in this conversation, so you can plan the fill with the user before "
-        "you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form "
-        "fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files "
-        "with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name "
-        "(give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) "
-        "and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as "
-        "hint says. A very long list is cut: truncated is then true."
-    ),
-    response_model_exclude_none=True,
-)
 async def inspect_template(
     body: InspectTemplateRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    store: StoreDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: JobQueue,
 ) -> TemplateInfo:
     """List a template's fields in the executor and answer with them, cut to the result limit.
 
@@ -567,32 +551,13 @@ async def inspect_template(
     return _fit_inspection(answer, max(found.total, len(found.fields)), settings.result_max_kb)
 
 
-@router.post(
-    "/tools/fill_template",
-    operation_id="fill_template",
-    dependencies=[Depends(require_tool("fill_template"))],
-    summary="Fill a report template into a new file",
-    description=(
-        "Fill a report template of this conversation into a new file; the template itself is not changed, and a "
-        ".dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each "
-        "field's name to its value and its source, and every value needs a source: kind file (the path of a file of "
-        "this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as "
-        "B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites "
-        "its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and "
-        "rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, "
-        "table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. "
-        "The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; "
-        "include_sources false leaves it out. Show the result with display_file."
-    ),
-    response_model_exclude_none=True,
-)
 async def fill_template(
     body: FillTemplateRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    store: StoreDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: JobQueue,
 ) -> FilledTemplate:
     """Fill a template in the executor into a new file of its chat, and answer with the file and what was filled.
 
