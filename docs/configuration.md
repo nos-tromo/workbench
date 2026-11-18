@@ -26,33 +26,30 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPEN_WEBUI_WORKBENCH_KEY` | none | The bearer key Open WebUI presents on every call. At least 32 characters once surrounding spaces are stripped. Unset, Open WebUI's door is off. Generate it with `openssl rand -hex 32`. |
-| `DOCINT_WORKBENCH_KEY` | none | The bearer key docint presents on its MCP door (`/mcp`). The same rules; unset, docint's door is off. |
+| `DOCINT_WORKBENCH_KEY` | none | The bearer key docint presents on its MCP door (`/mcp`). At least 32 characters once surrounding spaces are stripped. Unset, docint's door is off. Generate it with `openssl rand -hex 32`. |
 | `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
 | `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 | `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and four file routes. The same rules; unset, Ghostwriter's door is off. |
-| `GHOSTWRITER_WORKBENCH_TOOLS` | the eight workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool, never `display_file`. |
+| `GHOSTWRITER_WORKBENCH_TOOLS` | the eight workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
 | `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 
-The api needs at least one of the three keys, or it refuses to start; two
-callers with the same key stop the start too.
+The api needs at least one of the two keys, or it refuses to start; two
+callers with the same key stop the start too. A host whose `.env` sets only
+`OPEN_WEBUI_WORKBENCH_KEY` must set `GHOSTWRITER_WORKBENCH_KEY`: the old key is
+ignored (deploy's `docs/runbooks/retire-open-webui.md`).
 
 ### The caller key
 
-`OPEN_WEBUI_WORKBENCH_KEY` is shared with open-webui-service, which presents
-the same value on its terminal-server connection. Both `.env` files must hold
-it; change it in both and restart both stacks. It is not Open WebUI's
-forwarding secret and not the inference router's key. deploy's `make env`
-copies it between the two files: the key has its row (`workbench-key`) in
-deploy's `env-sync.conf`, the `[shared: open-webui-service]` tag in
+`DOCINT_WORKBENCH_KEY` is shared with docint, and `GHOSTWRITER_WORKBENCH_KEY`
+with Ghostwriter; each holds the value as its `WORKBENCH_API_KEY`. Both `.env`
+files must hold it; change it in both and restart both stacks. It is not the
+inference router's key. deploy's `make env` copies it between the two files:
+each key has its row (`workbench-docint-key`, `workbench-ghostwriter-key`) in
+deploy's `env-sync.conf`, the `[shared: … WORKBENCH_API_KEY]` tag in
 `.env.example` names it, and `make env ENV_GENERATE=1` generates one where it
-is unset in both. From open-webui-service v0.14.0 the key also switches the
-connection on: its `ENABLE_TOOL_SERVERS` follows the key, so without it there
-Open WebUI runs without workbench. `DOCINT_WORKBENCH_KEY` is shared the same
-way with docint, and `GHOSTWRITER_WORKBENCH_KEY` with Ghostwriter; each holds
-the value as its `WORKBENCH_API_KEY`.
+is unset in both.
 
 The keys are compared in constant time (`workbench/api/auth.py`). They reach only
 the api: the executor never reads them.
@@ -64,7 +61,7 @@ the api: the executor never reads them.
 | `WORKBENCH_NET` | `workbench-net` | Name of the external network between the api and its callers; `make network` creates it. Change it only if you renamed the network. |
 
 The api joins it as `workbench-api` on port 8000, exposed and never published.
-Only callers (Open WebUI, docint, Ghostwriter) and obs-plane's scraper join it.
+Only callers (docint, Ghostwriter) and obs-plane's scraper join it.
 The executor has no network.
 
 ## Jobs
@@ -77,7 +74,7 @@ The executor has no network.
 | `WORKBENCH_JOBS_PER_USER` | 1 | Jobs one user may have **running** at once. Their further calls wait, and hold no slot while they wait. |
 | `WORKBENCH_JOB_WALL_S` | 120 | Wall-clock seconds a job may run; also its CPU-time limit. |
 | `WORKBENCH_JOB_MEMORY_MB` | 1536 | Address space one job may map, in MB. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots times this. |
-| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. Also the largest text file `/files/read` sends. |
+| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. |
 
 How the queue decides (`workbench/api/jobs.py:JobQueue`):
 
@@ -91,9 +88,7 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
   `GHOSTWRITER_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
   slot and that user's turn until its wall time. Each is held to its own share
   only, so at the defaults docint and Ghostwriter together can hold all 4 slots
-  and all 16 waiting places, and Open WebUI then gets `503`: where all three
-  run, lower `DOCINT_WORKBENCH_SLOTS` or `GHOSTWRITER_WORKBENCH_SLOTS`, or raise
-  `WORKBENCH_EXECUTOR_SLOTS`.
+  and all 16 waiting places.
 - An executor with no free slot, or one the api cannot reach, is a `503` too.
 - So is a job the executor stopped because the container held more than
   64 MiB of shared memory that no job's count showed (`hidden_memory`): it
@@ -105,16 +100,6 @@ How the queue decides (`workbench/api/jobs.py:JobQueue`):
 - The api waits for a job's answer up to the wall time plus 300 seconds
   (`workbench/api/jobs.py:_READ_GRACE_S`): the executor's cleanup of a killed
   job can take that long.
-- Open WebUI sets no timeout on a tool call by default. From open-webui-service
-  v0.14.0 its `docker/compose.yaml` sets one,
-  `AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER: "480"`. It must be longer than a call can
-  take in workbench: `WORKBENCH_QUEUE_WAIT_S` + `WORKBENCH_JOB_WALL_S` + 300
-  seconds, 480 seconds with the defaults (60 + 120 + 300). The 480 there is a
-  fixed value, not derived from workbench's settings: raising either of the two
-  here means raising it there too. With a shorter one, Open WebUI gives up on
-  a call whose job is slow to be cleaned up before workbench answers it, and the
-  model never gets the answer, although workbench may still finish the job,
-  record it and keep its files.
 
 ## Files
 
@@ -187,14 +172,12 @@ The formulas, for other slot counts or job memory:
 |---|---|---|
 | `WORKBENCH_RETENTION_DAYS` | 7 | Days a workspace file or job record is kept after it was made. A changed value applies at once, with no notice ([retention.md](retention.md#a-changed-period-applies-at-once)). |
 | `WORKBENCH_RETENTION_INTERVAL_S` | 300 | Seconds between retention sweeps. |
-| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine,modify,collect` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door and Ghostwriter's file routes; Open WebUI cannot state one. An empty value set in `.env` requires none. An unknown action stops the start. |
+| `AUDIT_REQUIRE_PURPOSE` | `query,disclose,combine,modify,collect` | Actions a call must state a purpose for (`X-Audit-Purpose`), on the MCP door and Ghostwriter's file routes. An empty value set in `.env` requires none. An unknown action stops the start. |
 
-The period is shared with open-webui-service and Ghostwriter, which keeps tool
-previews until it: from v0.14.0 a banner in open-webui-service tells every user
-how long workspace files are kept, and deploy's `make env` copies
-`WORKBENCH_RETENTION_DAYS` from workbench's `.env` to both
-(`[shared: open-webui-service, ghostwriter]` in `.env.example`). Set it in
-workbench's `.env`: a value set only in a partner's would be copied into
+The period is shared with Ghostwriter, which keeps tool previews until it:
+deploy's `make env` copies `WORKBENCH_RETENTION_DAYS` from workbench's `.env` to
+Ghostwriter's (`[shared: ghostwriter]` in `.env.example`). Set it in
+workbench's `.env`: a value set only in Ghostwriter's would be copied into
 workbench's, and workbench would delete by it, with no notice.
 
 `AUDIT_OUTPUT` is set by compose (`container`) and is not in `.env.example`

@@ -1,4 +1,4 @@
-"""Each caller is a row: its key, its door, its file form, its tools and its limits; the gate keeps it to its door."""
+"""Each caller is a row: its key, its file form, its tools and its limits; the gate keeps it to its paths."""
 
 import asyncio
 import dataclasses

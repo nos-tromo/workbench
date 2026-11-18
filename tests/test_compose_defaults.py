@@ -563,7 +563,7 @@ def test_the_ghostwriter_lines_of_env_example() -> None:
     assert (
         lines[lines.index("# GHOSTWRITER_WORKBENCH_KEY=") - 1] == "# [secret] [shared: ghostwriter WORKBENCH_API_KEY]"
     )
-    assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: open-webui-service, ghostwriter]"
+    assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: ghostwriter]"
     assert not any(line.startswith("GHOSTWRITER_WORKBENCH_KEY=") for line in lines)
     assert not any("[required]" in line for line in lines if not line.startswith("#   "))
     assert f"# GHOSTWRITER_WORKBENCH_TOOLS={EIGHT_LIST}" in lines

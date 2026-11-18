@@ -143,9 +143,9 @@ services:
       executor:
         condition: service_healthy
     healthcheck:
-      # /healthz needs no key. urllib without
-      # proxies, so a proxy set for the container never sees the probe;
-      # start_interval marks it healthy ~5s after boot (Docker >=25).
+      # /healthz needs no key. urllib without proxies, so a proxy set for the
+      # container never sees the probe; start_interval marks it healthy ~5s
+      # after boot (Docker >=25).
       test:
         - CMD
         - python

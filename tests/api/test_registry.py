@@ -1,4 +1,4 @@
-"""One tool core: the specs of each form, the start check of each caller's list, and the answers both doors give."""
+"""One tool core: the specs of each form, the start check of each caller's list, and the answers the MCP door gives."""
 
 import dataclasses
 import inspect
