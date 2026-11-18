@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
 
 from tests.fixtures import make_templates as mt
 from workbench import decks
-from workbench.executor.presentations import master
+from workbench.executor.presentations import master, text
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.executor.templates import Refusal
 
@@ -291,3 +292,227 @@ def test_fill_template_refuses_a_slide_master(job: Job, name: str) -> None:
     assert error.startswith("unsupported_template: ")
     assert "write_presentation" in error
     assert list(job.ctx.out_dir.iterdir()) == []
+
+
+# --- write_markdown -----------------------------------------------------------------------------------------------
+
+
+def text_frame() -> Any:
+    """The text frame of the body placeholder of a slide of python-pptx's default presentation."""
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[TITLE_AND_CONTENT - 1])
+    body: Any = slide.placeholders[1]
+    return body.text_frame
+
+
+def properties(paragraph: Any) -> list[str]:
+    """The tags, without namespace, of the children of a paragraph's ``a:pPr``."""
+    pPr = paragraph._p.find(qn("a:pPr"))
+    return [] if pPr is None else [child.tag.split("}")[1] for child in pPr]
+
+
+def test_bullets_keep_their_levels() -> None:
+    """Nested bullets are levels 0, 1 and 2, and a deeper one stays at 2; a bullet takes the master's own."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "- a\n  - b\n    - c\n      - d")
+    assert [paragraph.level for paragraph in frame.paragraphs] == [0, 1, 2, 2]
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["a", "b", "c", "d"]
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [[]] * 4
+    assert written.lines == ((0, 1), (1, 1), (2, 1), (2, 1))
+    assert written.replaced == 0
+
+
+def test_a_plain_paragraph_has_no_bullet() -> None:
+    """A paragraph that is not a list item says so with ``a:buNone``; the list item after it does not."""
+    frame = text_frame()
+    text.write_markdown(frame, "Intro\n\n- a")
+    first, second = frame.paragraphs
+    assert properties(first) == ["buNone"]
+    assert properties(second) == []
+    assert (first.text, second.text) == ("Intro", "a")
+
+
+def test_a_numbered_list_counts_from_its_start() -> None:
+    """A list that starts at 3 says so on each item; one that starts at 1 says no start."""
+    frame = text_frame()
+    text.write_markdown(frame, "3. x\n4. y")
+    for paragraph in frame.paragraphs:
+        numbering = paragraph._p.find(f"{qn('a:pPr')}/{qn('a:buAutoNum')}")
+        assert numbering is not None
+        assert dict(numbering.attrib) == {"type": "arabicPeriod", "startAt": "3"}
+    frame = text_frame()
+    text.write_markdown(frame, "1. x\n2. y")
+    for paragraph in frame.paragraphs:
+        numbering = paragraph._p.find(f"{qn('a:pPr')}/{qn('a:buAutoNum')}")
+        assert dict(numbering.attrib) == {"type": "arabicPeriod"}
+
+
+def test_a_list_nested_in_a_numbered_item_is_a_level_deeper() -> None:
+    """A bullet under a numbered item is level 1 and keeps the master's bullet; the numbers go on after it."""
+    frame = text_frame()
+    text.write_markdown(frame, "1. a\n   - b\n2. c")
+    assert [paragraph.level for paragraph in frame.paragraphs] == [0, 1, 0]
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [["buAutoNum"], [], ["buAutoNum"]]
+
+
+def test_a_second_paragraph_of_an_item_has_no_bullet() -> None:
+    """The first paragraph of a list item takes its bullet and the next ones, at the same level, none."""
+    frame = text_frame()
+    text.write_markdown(frame, "- a\n\n  more\n- b")
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [[], ["buNone"], []]
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["a", "more", "b"]
+
+
+def runs(frame: Any) -> list[tuple[str, bool | None, bool | None]]:
+    """Every run of a frame as its text, bold and italic."""
+    return [(run.text, run.font.bold, run.font.italic) for paragraph in frame.paragraphs for run in paragraph.runs]
+
+
+def test_bold_and_italic_are_runs() -> None:
+    """Bold and italic text are runs of their own; the rest is a run with neither."""
+    frame = text_frame()
+    text.write_markdown(frame, "**Fix** it *now*")
+    assert runs(frame) == [("Fix", True, None), (" it ", None, None), ("now", None, True)]
+
+
+def test_bold_and_italic_nest() -> None:
+    """Text in both is bold and italic."""
+    frame = text_frame()
+    text.write_markdown(frame, "***both*** and **bold *and italic***")
+    assert runs(frame) == [
+        ("both", True, True),
+        (" and ", None, None),
+        ("bold ", True, None),
+        ("and italic", True, True),
+    ]
+
+
+def test_a_link_is_its_text_and_address() -> None:
+    """A link is its text and its address in parentheses; a link that is its own address is not said twice."""
+    frame = text_frame()
+    text.write_markdown(frame, "[docs](https://example.invalid)")
+    assert frame.paragraphs[0].text == "docs (https://example.invalid)"
+    frame = text_frame()
+    text.write_markdown(frame, "<https://example.invalid> and <me@example.invalid> and [me](mailto:me@example.invalid)")
+    assert (
+        frame.paragraphs[0].text == "https://example.invalid and me@example.invalid and me (mailto:me@example.invalid)"
+    )
+
+
+def test_a_heading_is_a_plain_bold_paragraph() -> None:
+    """A heading of any depth is a paragraph without a bullet, bold, and the text after it is its own paragraph."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "# Plan\n\n###### Small\n\nText")
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [["buNone"]] * 3
+    assert runs(frame) == [("Plan", True, None), ("Small", True, None), ("Text", None, None)]
+    assert written.lines == ((0, 4), (0, 5), (0, 4))
+
+
+def test_inline_code_and_images_are_text() -> None:
+    """Inline code is its text, an image its alternative text, a soft line break a space."""
+    frame = text_frame()
+    text.write_markdown(frame, "use `make up`\nnow ![a chart](chart.png)")
+    assert frame.paragraphs[0].text == "use make up now a chart"
+    assert len(frame.paragraphs) == 1
+
+
+def test_a_hard_break_is_a_line_break_that_counts_as_a_line() -> None:
+    """A hard break stays in its paragraph as a line break, and each line it makes counts on its own."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "one\\\ntwo three")
+    assert len(frame.paragraphs) == 1
+    assert frame.paragraphs[0].text == "one\x0btwo three"
+    assert written.lines == ((0, 3), (0, 9))
+    assert text.estimate_lines(written, 100) == 2
+
+
+def test_code_is_its_lines_as_paragraphs() -> None:
+    """A code block is one plain paragraph per line, blank lines kept; an empty one writes nothing."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "```\nx = 1\n\n  y = 2\n```\n\n```\n```")
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["x = 1", "", "  y = 2"]
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [["buNone"]] * 3
+    assert written.lines == ((0, 5), (0, 0), (0, 7))
+
+
+def test_a_quote_and_a_rule_are_plain_paragraphs() -> None:
+    """A quote is its text, without its mark; a thematic break is a plain paragraph of dashes."""
+    frame = text_frame()
+    text.write_markdown(frame, "> quoted\n\n---\n\nafter")
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["quoted", text.RULE, "after"]
+    assert [properties(paragraph) for paragraph in frame.paragraphs] == [["buNone"]] * 3
+
+
+def test_a_table_is_its_text() -> None:
+    """A table is not a table here (it goes to a table place): its lines are one paragraph of text."""
+    frame = text_frame()
+    text.write_markdown(frame, "| a | b |\n| - | - |\n| 1 | 2 |")
+    assert len(frame.paragraphs) == 1
+    assert frame.paragraphs[0].text == "| a | b | | - | - | | 1 | 2 |"
+
+
+def test_html_is_text() -> None:
+    """HTML is not interpreted: it is written as the text it is."""
+    frame = text_frame()
+    text.write_markdown(frame, "a <b>b</b>\n\n<div>c</div>")
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["a <b>b</b>", "<div>c</div>"]
+
+
+def test_characters_xml_cannot_hold_are_replaced() -> None:
+    """A control character becomes U+FFFD and is counted, in a paragraph, a link's text and a code block."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "a\x01b")
+    assert written.replaced == 1
+    assert frame.paragraphs[0].text == "a\ufffdb"
+    frame = text_frame()
+    written = text.write_markdown(frame, "[x\x02](https://example.invalid)\n\n```\n\x04\x05\n```")
+    assert written.replaced == 3
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["x\ufffd (https://example.invalid)", "\ufffd\ufffd"]
+    assert written.lines == ((0, 28), (0, 2))
+
+
+def test_the_frame_is_cleared_first() -> None:
+    """What the frame held goes, its first paragraph's level and bullet too; a second write replaces the first."""
+    frame = text_frame()
+    text.write_markdown(frame, "- a\n  - b\n\nplain")
+    text.write_markdown(frame, "- c")
+    assert [paragraph.text for paragraph in frame.paragraphs] == ["c"]
+    assert frame.paragraphs[0].level == 0
+    assert properties(frame.paragraphs[0]) == []
+    frame.paragraphs[0].text = "old"
+    frame.add_paragraph().text = "older"
+    assert text.write_markdown(frame, "").lines == ()
+    assert [paragraph.text for paragraph in frame.paragraphs] == [""]
+
+
+def test_the_first_paragraph_is_the_frames_own() -> None:
+    """The frame's first paragraph is reused, not a new one added before it."""
+    frame = text_frame()
+    first = frame.paragraphs[0]._p
+    text.write_markdown(frame, "a\n\nb")
+    assert frame.paragraphs[0]._p is first
+    assert len(frame.paragraphs) == 2
+
+
+def test_the_lines_are_the_levels_and_lengths() -> None:
+    """Each paragraph is its level and its characters, a link's address and a bullet's text included."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "Intro\n\n- [ab](x)\n  - cde")
+    assert written.lines == ((0, 5), (0, 6), (1, 3))
+
+
+def test_a_long_word_counts_as_several_lines() -> None:
+    """One 300-character word on lines of 60 characters takes 5 lines, though it is one paragraph."""
+    frame = text_frame()
+    written = text.write_markdown(frame, "x" * 300)
+    assert written.lines == ((0, 300),)
+    assert text.estimate_lines(written, 60) == 5
+
+
+def test_a_level_narrows_the_line_and_an_empty_paragraph_counts() -> None:
+    """Each level takes four characters of the line; a paragraph with no characters is a line; a line is at least 1."""
+    written = text.Written(lines=((0, 60), (1, 60), (2, 0), (0, 61)), replaced=0)
+    assert text.estimate_lines(written, 60) == 1 + 2 + 1 + 2
+    assert text.estimate_lines(text.Written(lines=((2, 5),), replaced=0), 8) == 5
+    assert text.estimate_lines(text.Written(lines=((2, 5),), replaced=0), 1) == 5
+    assert text.estimate_lines(text.Written(lines=(), replaced=0), 60) == 0
