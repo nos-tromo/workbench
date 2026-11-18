@@ -29,7 +29,7 @@ def test_every_env_variable_is_documented() -> None:
     """Each setting of ``.env.example``, set or shown commented out, is in ``docs/configuration.md``."""
     lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
     names = [found.group(1) for line in lines if (found := _SETTING.match(line))]
-    assert "OPEN_WEBUI_WORKBENCH_KEY" in names and "WORKBENCH_RETENTION_DAYS" in names
+    assert "GHOSTWRITER_WORKBENCH_KEY" in names and "WORKBENCH_RETENTION_DAYS" in names
     text = doc("configuration.md")
     assert [name for name in names if f"`{name}`" not in text] == []
 
@@ -56,7 +56,7 @@ def test_every_audit_key_is_documented() -> None:
     The system's operations are found in the api's code, so a new one fails here until it is documented.
     """
     text = doc("audit.md")
-    assert len(OPERATIONS) >= 12
+    assert len(OPERATIONS) >= 11
     assert [operation for _, operation in OPERATIONS.values() if f"`{operation}`" not in text] == []
     system = system_operations()
     assert {"retention.sweep", "config.audit"} <= system

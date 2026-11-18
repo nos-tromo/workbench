@@ -1,7 +1,7 @@
 """Browser hardening for the one route that sends a user's file to a browser.
 
-A file Open WebUI's browser opens from ``GET /files/view`` must not be able to run script at
-Open WebUI's origin, whatever the file holds. ``files.py`` turns active content into a text
+A file a browser opens from ``GET /files/view`` must not be able to run script at the origin
+of the page that shows it, whatever the file holds. ``files.py`` turns active content into a text
 attachment; this adds the headers that sandbox the rest. They go on **every** answer of the
 route, refusals included, so a middleware sets them on the response start rather than the
 route on its own success: a 400, 401, 404, 422 or 500 written by an error handler carries

@@ -14,14 +14,11 @@ MIN_KEY_LENGTH = 32
 #: The largest result limit, in kilobytes: cutting an answer to its limit grows with the square of the limit.
 MAX_RESULT_KB = 256
 
-_OPEN_WEBUI_KEY: Final = "OPEN_WEBUI_WORKBENCH_KEY"
 _DOCINT_KEY: Final = "DOCINT_WORKBENCH_KEY"
 _GHOSTWRITER_KEY: Final = "GHOSTWRITER_WORKBENCH_KEY"
 
 #: Why the api does not start without a caller: each key is optional, but one of them is needed.
-NO_CALLER_KEY: Final = (
-    f"{_OPEN_WEBUI_KEY}, {_DOCINT_KEY} or {_GHOSTWRITER_KEY} must be set to at least {MIN_KEY_LENGTH} characters"
-)
+NO_CALLER_KEY: Final = f"{_DOCINT_KEY} or {_GHOSTWRITER_KEY} must be set to at least {MIN_KEY_LENGTH} characters"
 
 #: docint's tools when ``DOCINT_WORKBENCH_TOOLS`` lists none, and its limits when they are not set.
 DOCINT_DEFAULT_TOOLS: Final = frozenset({"run_python"})
@@ -61,8 +58,6 @@ class Settings:
 
     Attributes:
         data_dir: Root of the workbench-data volume.
-        open_webui_key: Bearer key Open WebUI presents; ``None`` when unset, and always for the executor role. Like
-            ``docint_key``, it is left out of ``repr``, so no log line or traceback shows it.
         retention_days: Days a file or job record is kept after it was created.
         retention_interval_s: Seconds between retention sweeps.
         executor_slots: Jobs the executor runs at once; at most the uid pool.
@@ -77,7 +72,8 @@ class Settings:
         executor_socket: Unix socket the api reaches the executor on.
         slot_uid_base: Uid of the first job slot; slot ``n`` runs as ``slot_uid_base + n``.
         audit_output: Audit sink from ``AUDIT_OUTPUT``, or ``None`` when unset.
-        docint_key: Bearer key docint presents; ``None`` when unset, and always for the executor role.
+        docint_key: Bearer key docint presents; ``None`` when unset, and always for the executor role. Like
+            ``ghostwriter_key``, it is left out of ``repr``, so no log line or traceback shows it.
         docint_tools: The tools docint may use.
         docint_wall_s: Wall-clock seconds one of docint's jobs may run; at most ``job_wall_s``.
         docint_slots: Jobs of docint's that may run at once; fewer than ``executor_slots``.
@@ -91,7 +87,6 @@ class Settings:
     """
 
     data_dir: Path
-    open_webui_key: str | None = field(repr=False)
     retention_days: int
     retention_interval_s: int
     executor_slots: int
@@ -210,9 +205,8 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
 
     Args:
         env: The environment to read, normally ``os.environ``.
-        role: ``"api"`` requires a caller key, Open WebUI's, docint's or Ghostwriter's, and reads docint's and
-            Ghostwriter's limits and ``AUDIT_REQUIRE_PURPOSE``; ``"executor"`` reads none of these and keeps their
-            defaults.
+        role: ``"api"`` requires a caller key, docint's or Ghostwriter's, and reads their limits and
+            ``AUDIT_REQUIRE_PURPOSE``; ``"executor"`` reads none of these and keeps their defaults.
 
     Returns:
         The validated settings.
@@ -227,7 +221,6 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
     if result_max_kb > MAX_RESULT_KB:
         raise ConfigError(f"WORKBENCH_RESULT_MAX_KB must be at most {MAX_RESULT_KB}")
     job_wall_s = _positive_int(env, "WORKBENCH_JOB_WALL_S", 120)
-    open_webui_key: str | None = None
     docint_key: str | None = None
     docint_tools, docint_wall_s, docint_slots = DOCINT_DEFAULT_TOOLS, DOCINT_DEFAULT_WALL_S, DOCINT_DEFAULT_SLOTS
     require_purpose: frozenset[str] = frozenset()
@@ -235,10 +228,9 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
     ghostwriter_tools = GHOSTWRITER_DEFAULT_TOOLS
     ghostwriter_wall_s, ghostwriter_slots = GHOSTWRITER_DEFAULT_WALL_S, GHOSTWRITER_DEFAULT_SLOTS
     if role == "api":
-        open_webui_key = _caller_key(env, _OPEN_WEBUI_KEY)
         docint_key = _caller_key(env, _DOCINT_KEY)
         ghostwriter_key = _caller_key(env, _GHOSTWRITER_KEY)
-        if open_webui_key is None and docint_key is None and ghostwriter_key is None:
+        if docint_key is None and ghostwriter_key is None:
             raise ConfigError(NO_CALLER_KEY)
         docint_tools = _tool_list(env, "DOCINT_WORKBENCH_TOOLS", DOCINT_DEFAULT_TOOLS)
         ghostwriter_tools = _tool_list(env, "GHOSTWRITER_WORKBENCH_TOOLS", GHOSTWRITER_DEFAULT_TOOLS)
@@ -264,7 +256,6 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
                 raise ConfigError(f"GHOSTWRITER_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS ({slots})")
     return Settings(
         data_dir=Path(_text(env, "WORKBENCH_DATA_DIR") or "/data"),
-        open_webui_key=open_webui_key,
         retention_days=_positive_int(env, "WORKBENCH_RETENTION_DAYS", 7),
         retention_interval_s=_positive_int(env, "WORKBENCH_RETENTION_INTERVAL_S", 300),
         executor_slots=slots,

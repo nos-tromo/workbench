@@ -168,6 +168,24 @@ def test_due_files_are_recorded_then_deleted(
     assert "quarterly-figures" not in json_text(audit_lines)
 
 
+def test_a_workspace_left_by_open_webui_still_ages_out(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """A file under the open-webui caller's folder past the period is swept like any other.
+
+    No key opens that folder any more; retention still records the file by its id, then deletes it and its row.
+    """
+    left = Principal("open-webui", "user-a", "chat-1")
+    rec = put(store, "quarterly-figures.xlsx", left)
+    clock.now = T0 + 7 * DAY + 1
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    (event,) = sweeps(audit_lines)
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("delete", "ok", [rec.id])
+    assert (event["criteria"]["caller"], event["criteria"]["owner"]) == ("open-webui", "user-a")
+    assert store.files_in_chat(left) == []
+    assert not on_disk(settings, rec).exists()
+
+
 def json_text(audit_lines: AuditLines) -> str:
     """Every audit line, as one text."""
     return "\n".join(str(event) for event in audit_lines())

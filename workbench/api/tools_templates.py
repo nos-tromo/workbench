@@ -15,7 +15,6 @@ is never kept. Both record a job that refused, by the refusal's code: a template
 be in its message.
 """
 
-import dataclasses
 import posixpath
 from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Final, Literal
@@ -399,7 +398,7 @@ def _sources(
         appendix), the job's input files (the template first) and the ids of the source files.
 
     Raises:
-        HTTPException: A file source is not a file of the template's chat, or a job source is not a finished
+        HTTPException: A file source is not a file of the request's chat, or a job source is not a finished
             ``run_python`` run of the user in that chat (422, naming the field and never whether a job exists for
             someone else); or the sources name more files than a job takes.
     """
@@ -413,7 +412,7 @@ def _sources(
                 rec = store.get(p, source.path)
             except (NotFound, PathError):
                 rec = None
-            if rec is None or rec.chat_id != template.chat_id:
+            if rec is None:
                 raise _refused(name, f"{source.path} is not a file of this conversation")
             inputs[rec.name] = None
             ids[rec.id] = None
@@ -534,11 +533,10 @@ async def inspect_template(
     """
     rec = await run_in_threadpool(store.get, p, body.path)
     _output_extension(rec.name)
-    in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     args = {"path": rec.name, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
-    _, result, _ = await jobs.submit(in_chat, "inspect_template", args, [rec.name])
+    _, result, _ = await jobs.submit(p, "inspect_template", args, [rec.name])
     await run_in_threadpool(
-        record_answer, audit, "inspect_template", in_chat, [rec.id], {}, result, _Inspected, result.result
+        record_answer, audit, "inspect_template", p, [rec.id], {}, result, _Inspected, result.result
     )
     found = _parse(_Inspected, _payload(result, "file"))
     answer = TemplateInfo(
@@ -579,7 +577,6 @@ async def fill_template(
     rec = await run_in_threadpool(store.get, p, body.path)
     ext = _output_extension(rec.name)
     output = _output_name(rec.name, ext, body.output_name)
-    in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     values, inputs, source_ids = await run_in_threadpool(_sources, store, p, rec, body.values)
     args = {
         "path": rec.name,
@@ -604,8 +601,8 @@ async def fill_template(
         outcome, more = judged(result, False)
         return [], outcome, {"outputs": 0, **more}
 
-    keeper = OutputKeeper(audit, in_chat, "fill_template", used, decide)
-    _, result, made = await jobs.submit(in_chat, "fill_template", args, inputs, keeper)
+    keeper = OutputKeeper(audit, p, "fill_template", used, decide)
+    _, result, made = await jobs.submit(p, "fill_template", args, inputs, keeper)
     done = _parse(_Filled, _payload(result, "file"))
     if len(made) != 1:
         note = _clean(result.message) or "the job made no file"

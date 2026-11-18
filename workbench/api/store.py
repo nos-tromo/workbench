@@ -1,7 +1,7 @@
 """Workspace files on disk and their metadata in SQLite.
 
 The ``files`` table is the source of truth for the files the store manages: the
-file browser, the tools and the retention sweep all go through it. The bytes live
+file routes, the tools and the retention sweep all go through it. The bytes live
 under the user's own root (``paths.Workspaces``); a file is only ever inside a
 chat folder, ``/workspace/<chat-id>/…``. Folders have no record, they are plain
 directories. Nothing here follows a symlink.

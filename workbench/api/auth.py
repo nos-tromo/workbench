@@ -1,4 +1,4 @@
-"""Who may call: the caller registry, the bearer-key check, the doors and the user and chat headers.
+"""Who may call: the caller registry, the bearer-key check, the door and the user and chat headers.
 
 The caller is authenticated by its key. The user id and the chat id are the
 caller's own claims, trusted only because only a caller holding a key can reach
@@ -14,25 +14,25 @@ body is read, and again by each route's dependency. Without a valid key a reques
 answers ``401`` whatever its path, method or body, so a peer without the key can
 neither map the routes nor make the api read a body.
 
-Each caller comes in through one door. :class:`KeyGate` checks it right after the key,
-still before any body is read: an MCP caller finds :data:`MCP_PATH` alone, a confined one
-:data:`FILE_PATHS` too, a terminal caller every path but :data:`MCP_PATH` and :data:`CHAT_PATH`,
-and a path outside the door answers ``404`` with :data:`~workbench.api.errors.NOT_FOUND`. Only
-:data:`OPEN_PATHS` stay open to every caller. The file routes a confined caller shares with the terminal door
-check the same again for themselves (:func:`require_file_caller`).
+Every caller comes in through the MCP door. :class:`KeyGate` checks the paths it may reach right
+after the key, still before any body is read: a caller with inline data finds :data:`MCP_PATH`
+alone, a confined one :data:`FILE_PATHS` too, and a path outside them answers ``404`` with
+:data:`~workbench.api.errors.NOT_FOUND`. Only :data:`OPEN_PATHS` stay open to every caller. The
+file routes check the same again for themselves (:func:`require_file_caller`), as the MCP door
+does (:func:`require_mcp_caller`).
 """
 
 import hmac
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Final, Literal, Self
+from typing import Annotated, Final, Self
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from workbench.api.errors import INVALID_PURPOSE, NOT_FOUND
-from workbench.api.registry import WORKSPACE_TOOLS, Files, allowed_tools
+from workbench.api.registry import Files, allowed_tools
 from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 from workbench.paths import DEFAULT_CHAT, PathError, check_id
@@ -56,12 +56,9 @@ CHAT_PATH: Final = "/files/chat"
 #: The file routes a confined caller reaches besides the MCP door.
 FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", CHAT_PATH})
 
-#: The texts of the two refusals of the user and chat headers, on both doors.
+#: The texts of the two refusals of the user and chat headers, on the MCP door and the file routes.
 INVALID_USER: Final = "missing or invalid user"
 INVALID_SESSION: Final = "invalid session"
-
-#: How a caller comes in: Open WebUI's terminal-server HTTP, or the MCP door.
-Door = Literal["terminal", "mcp"]
 
 
 @dataclass(frozen=True)
@@ -73,7 +70,6 @@ class Caller:
             ``caller`` of every audit event, so it is a safe id.
         key: The bearer key the caller presents; left out of ``repr`` so no log line shows it.
         tools: The name of every tool the caller may use, each of its file form.
-        door: The door the caller comes in through; every other path is a 404 for it.
         files: Whether the caller's files are kept in workspaces or come with each call.
         wall_s: The most wall-clock seconds one of its jobs may run; ``None`` leaves only the job wall.
         slots: The most jobs of its that may run at once; ``None`` for no cap of its own.
@@ -82,19 +78,18 @@ class Caller:
     name: str
     key: str = field(repr=False)
     tools: frozenset[str]
-    door: Door = "terminal"
     files: Files = "workspace"
     wall_s: int | None = None
     slots: int | None = None
 
     @property
     def confined(self) -> bool:
-        """Whether every path the caller names is held to the request's chat: an MCP caller with workspace files."""
-        return self.door == "mcp" and self.files == "workspace"
+        """Whether every path the caller names is held to the request's chat: a caller with workspace files."""
+        return self.files == "workspace"
 
 
 class CallerRegistry:
-    """The callers the api knows, by name and by key: Open WebUI, docint and Ghostwriter, each when its key is set."""
+    """The callers the api knows, by name and by key: docint and Ghostwriter, each when its key is set."""
 
     def __init__(self, callers: Iterable[Caller]) -> None:
         """Remember ``callers``.
@@ -113,11 +108,10 @@ class CallerRegistry:
     def from_settings(cls, settings: Settings) -> Self:
         """Build the registry the settings describe: a row for each caller whose key is set.
 
-        Open WebUI comes in through the terminal door, keeps its files in workspaces and may use every workspace tool,
-        each job within the job wall. docint comes in through the MCP door, brings its data with each call and may use
-        its listed tools, within its own wall cap and slot cap; each of them must be an inline tool. Ghostwriter comes
-        in through the MCP door too, keeps its files in workspaces, confined to the request's chat, and may use its
-        listed tools within its own caps; each must be a workspace tool.
+        Both come in through the MCP door. docint brings its data with each call and may use its listed tools, within
+        its own wall cap and slot cap; each of them must be an inline tool. Ghostwriter keeps its files in workspaces,
+        confined to the request's chat, and may use its listed tools within its own caps; each must be a workspace
+        tool.
 
         Args:
             settings: The api's settings.
@@ -130,14 +124,11 @@ class CallerRegistry:
                 Ghostwriter's list names a tool that is not of its file form.
         """
         callers: list[Caller] = []
-        if settings.open_webui_key is not None:
-            callers.append(Caller("open-webui", settings.open_webui_key, WORKSPACE_TOOLS, wall_s=settings.job_wall_s))
         if settings.docint_key is not None:
             docint = Caller(
                 "docint",
                 settings.docint_key,
                 settings.docint_tools,
-                door="mcp",
                 files="inline",
                 wall_s=settings.docint_wall_s,
                 slots=settings.docint_slots,
@@ -148,7 +139,6 @@ class CallerRegistry:
                 "ghostwriter",
                 settings.ghostwriter_key,
                 settings.ghostwriter_tools,
-                door="mcp",
                 files="workspace",
                 wall_s=settings.ghostwriter_wall_s,
                 slots=settings.ghostwriter_slots,
@@ -220,22 +210,17 @@ def _within_form(caller: Caller, variable: str) -> Caller:
 
 
 def door_allows(caller: Caller, path: str) -> bool:
-    """Say whether ``path`` is behind the caller's door.
+    """Say whether ``path`` is one the caller may reach.
 
     Args:
         caller: The authenticated caller.
         path: The request's path, as routing sees it.
 
     Returns:
-        For a confined caller, whether the path is :data:`MCP_PATH` or one of :data:`FILE_PATHS`; for another MCP
-        caller, whether it is :data:`MCP_PATH`; for a terminal caller, whether it is neither that nor
-        :data:`CHAT_PATH`.
+        For a confined caller, whether the path is :data:`MCP_PATH` or one of :data:`FILE_PATHS`; for a caller with
+        inline data, whether it is :data:`MCP_PATH`.
     """
-    if caller.confined:
-        return path == MCP_PATH or path in FILE_PATHS
-    if caller.door == "mcp":
-        return path == MCP_PATH
-    return path not in (MCP_PATH, CHAT_PATH)
+    return path == MCP_PATH or (caller.confined and path in FILE_PATHS)
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -292,35 +277,11 @@ def _authenticated(request: Request) -> Caller:
     return caller
 
 
-async def require_caller(request: Request) -> Caller:
-    """Authenticate the request by its bearer key, for a route of the terminal door.
-
-    Every route that depends on it is the terminal door's, so a caller of another door is refused here as
-    :class:`KeyGate` refuses it, should a request ever pass the gate.
-
-    Args:
-        request: The request.
-
-    Returns:
-        The caller that holds the key.
-
-    Raises:
-        HTTPException: 401 if the key is missing, malformed or not held by any caller; the answer is the same for all
-            three. 404 with :data:`~workbench.api.errors.NOT_FOUND` if the caller does not come in through the terminal
-            door.
-    """
-    caller = _authenticated(request)
-    if caller.door != "terminal":
-        raise HTTPException(status_code=404, detail=NOT_FOUND)
-    return caller
-
-
 async def require_file_caller(request: Request) -> Caller:
-    """Authenticate the request by its bearer key, for a file route a confined caller shares with the terminal door.
+    """Authenticate the request by its bearer key, for a file route: a confined caller's alone.
 
-    A terminal caller passes, as :func:`require_caller` lets it. A confined caller passes on :data:`FILE_PATHS` alone,
-    and never under a ``root_path``, where routing would see another path than :class:`KeyGate` judged. Any other
-    caller is refused here as the gate refuses it.
+    A confined caller passes on :data:`FILE_PATHS` alone, and never under a ``root_path``, where routing would see
+    another path than :class:`KeyGate` judged. Any other caller is refused here as the gate refuses it.
 
     Args:
         request: The request.
@@ -330,22 +291,20 @@ async def require_file_caller(request: Request) -> Caller:
 
     Raises:
         HTTPException: 401 if the key is missing, malformed or not held by any caller. 404 with
-            :data:`~workbench.api.errors.NOT_FOUND` for a caller that is neither of the terminal door nor confined, and
-            for a confined one off :data:`FILE_PATHS` or under a ``root_path``.
+            :data:`~workbench.api.errors.NOT_FOUND` for a caller that is not confined, and for a confined one off
+            :data:`FILE_PATHS` or under a ``root_path``.
     """
     caller = _authenticated(request)
-    if caller.door == "terminal":
-        return caller
     if caller.confined and request.scope["path"] in FILE_PATHS and not request.scope.get("root_path"):
         return caller
     raise HTTPException(status_code=404, detail=NOT_FOUND)
 
 
 async def require_mcp_caller(request: Request) -> Caller:
-    """Authenticate the request by its bearer key, for a route of the MCP door.
+    """Authenticate the request by its bearer key, for the MCP door.
 
-    Like :func:`require_caller` for the terminal door: a caller of another door is refused here as :class:`KeyGate`
-    refuses it. So is every request under a ``root_path``, where routing would see another path than the gate judged.
+    Every caller comes in through it, but never under a ``root_path``, where routing would see another path than
+    :class:`KeyGate` judged: such a request is refused here as the gate would refuse a path outside the door.
 
     Args:
         request: The request.
@@ -355,11 +314,10 @@ async def require_mcp_caller(request: Request) -> Caller:
 
     Raises:
         HTTPException: 401 if the key is missing, malformed or not held by any caller. 404 with
-            :data:`~workbench.api.errors.NOT_FOUND` if the caller does not come in through the MCP door, or the request
-            has a ``root_path``.
+            :data:`~workbench.api.errors.NOT_FOUND` if the request has a ``root_path``.
     """
     caller = _authenticated(request)
-    if caller.door != "mcp" or request.scope.get("root_path"):
+    if request.scope.get("root_path"):
         raise HTTPException(status_code=404, detail=NOT_FOUND)
     return caller
 
@@ -369,8 +327,8 @@ class KeyGate:
 
     It reads no body. Every path but :data:`OPEN_PATHS` needs the key, a path no route serves included, so a peer
     without it learns nothing of the routes: neither a 404, nor a 405, nor a 422 that names a body's fields. The key
-    is the ``Authorization`` header's, read as the routes read it. A caller with a key finds only its door's paths
-    (:func:`door_allows`); any other answers ``404`` with :data:`~workbench.api.errors.NOT_FOUND`.
+    is the ``Authorization`` header's, read as the routes read it. A caller with a key finds only the paths it may
+    reach (:func:`door_allows`); any other answers ``404`` with :data:`~workbench.api.errors.NOT_FOUND`.
     """
 
     def __init__(self, app: ASGIApp, *, callers: CallerRegistry) -> None:
@@ -384,7 +342,7 @@ class KeyGate:
         self.callers = callers
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Answer 401 without a valid key and 404 outside the caller's door, before the body is read; pass the rest on.
+        """Answer 401 without a valid key and 404 off the caller's paths, before the body is read; pass the rest on.
 
         Args:
             scope: The ASGI scope.
@@ -435,7 +393,7 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def principal_from_headers(caller: Caller, headers: Mapping[str, str]) -> Principal:
-    """Say whose files a request is about, from the headers both doors read.
+    """Say whose files a request is about, from the headers the MCP door and the file routes read.
 
     Args:
         caller: The authenticated caller; the key, not a header, names it.
@@ -501,47 +459,10 @@ def _principal(request: Request, caller: Caller) -> Principal:
         raise HTTPException(status_code=400, detail=str(refused)) from None
 
 
-async def require_principal(request: Request, caller: Annotated[Caller, Depends(require_caller)]) -> Principal:
-    """Authenticate the request and say whose files it is about.
-
-    Args:
-        request: The request.
-        caller: The authenticated caller; the key is checked before any other header.
-
-    Returns:
-        The caller, the user from ``X-User-Id`` and the chat from ``X-Session-Id``
-        (``default`` when the request has none).
-
-    Raises:
-        HTTPException: 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or not a plain id, or
-            ``X-Session-Id`` is present but not a plain id.
-    """
-    return _principal(request, caller)
-
-
 async def require_file_principal(
     request: Request, caller: Annotated[Caller, Depends(require_file_caller)]
 ) -> Principal:
-    """Authenticate the request for a file route a confined caller shares, and say whose files it is about.
-
-    Args:
-        request: The request.
-        caller: The caller :func:`require_file_caller` let through; the key is checked before any other header.
-
-    Returns:
-        The caller, the user and the chat, confined to that chat for a confined caller.
-
-    Raises:
-        HTTPException: 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or not a plain id, or
-            ``X-Session-Id`` is not a plain id; for a confined caller, also if it is missing or ``default``.
-    """
-    return _principal(request, caller)
-
-
-async def require_chat_principal(
-    request: Request, caller: Annotated[Caller, Depends(require_file_caller)]
-) -> Principal:
-    """Authenticate the request for the chat delete, a confined caller's alone, and say whose chat it deletes.
+    """Authenticate the request for a file route, and say whose files, or whose chat, it is about.
 
     Args:
         request: The request.
@@ -551,10 +472,7 @@ async def require_chat_principal(
         The caller, the user and the chat, confined to that chat.
 
     Raises:
-        HTTPException: 404 with :data:`~workbench.api.errors.NOT_FOUND` for a caller that is not confined, as
-            :class:`KeyGate` answers it. 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or
-            not a plain id, or ``X-Session-Id`` is missing, ``default`` or not a plain id.
+        HTTPException: 400 with the text of :class:`InvalidPrincipal` if ``X-User-Id`` is missing or not a plain id, or
+            ``X-Session-Id`` is missing, ``default`` or not a plain id.
     """
-    if not caller.confined:
-        raise HTTPException(status_code=404, detail=NOT_FOUND)
     return _principal(request, caller)

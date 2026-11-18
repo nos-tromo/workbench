@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workbench import __version__
-from workbench.api import contract, errors, files, mcp, metrics
+from workbench.api import errors, files, health, mcp, metrics
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
 from workbench.api.body_limit import BodyLimit, upload_limit
@@ -40,8 +40,9 @@ def _audit_config(settings: Settings, callers: CallerRegistry) -> dict[str, obje
         callers: The callers the api serves.
 
     Returns:
-        The values to record: each caller by its name, door, tools, wall cap and slots, in name order, and the
-        actions that need a stated purpose, sorted. It never holds a key or any other secret.
+        The values to record: each caller by its name, its door (every caller's is the MCP door), tools, wall cap and
+        slots, in name order, and the actions that need a stated purpose, sorted. It never holds a key or any other
+        secret.
     """
     return {
         "retention_days": settings.retention_days,
@@ -53,7 +54,7 @@ def _audit_config(settings: Settings, callers: CallerRegistry) -> dict[str, obje
         "callers": [
             {
                 "name": caller.name,
-                "door": caller.door,
+                "door": "mcp",
                 "tools": sorted(caller.tools),
                 "wall_s": caller.wall_s,
                 "slots": caller.slots,
@@ -121,7 +122,7 @@ def create_app(
         finally:
             audit.close()
 
-    # No slash redirects: a 307 from /mcp/ would point a terminal caller at the MCP door.
+    # No slash redirects: a trailing slash is a 404, never a 307 that sends a caller on to another path.
     app = FastAPI(
         title="workbench",
         version=__version__,
@@ -145,7 +146,7 @@ def create_app(
     app.add_middleware(KeyGate, callers=callers)
     app.add_middleware(errors.QuietErrors)
     app.add_middleware(ViewHardening)
-    app.include_router(contract.router)
+    app.include_router(health.router)
     app.include_router(mcp.router)
     app.include_router(files.router)
     app.include_router(metrics.router)

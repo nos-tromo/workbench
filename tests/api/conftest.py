@@ -20,22 +20,20 @@ from workbench.models import FileRecord, Principal
 from workbench.paths import Workspaces
 from workbench.utils.audit_event import AuditEmitter
 
-KEY = "k" * 32
 DOCINT_KEY = "d" * 32
 HD = {"Authorization": f"Bearer {DOCINT_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 GHOSTWRITER_KEY = "a" * 32
 HG = {"Authorization": f"Bearer {GHOSTWRITER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 HG_B = {**HG, "X-User-Id": "user-b"}
+#: Ghostwriter's key alone, without the user and chat headers.
+HG_KEY_ONLY = {"Authorization": f"Bearer {GHOSTWRITER_KEY}"}
 PG = Principal("ghostwriter", "user-a", "chat-1", confined=True)
-#: Ghostwriter's user and chat, unconfined: to lay out folders below its chat, which no call of its can make.
+#: Ghostwriter's user and chat, unconfined: for the store's own calls in a test, such as laying out folders below the
+#: chat, which no call of Ghostwriter's can make.
 PG_SETUP = Principal("ghostwriter", "user-a", "chat-1")
 #: A caller no key names, whose files are still on the volume under its own folder: none of them is Ghostwriter's.
 FORMER = Principal("former-caller", "user-a", "chat-1")
-H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
-H_B = {**H, "X-User-Id": "user-b"}
-KEY_ONLY = {"Authorization": f"Bearer {KEY}"}
 CHAT = "/workspace/chat-1"
-ME = Principal("open-webui", "user-a", "chat-1")
 MIB = 1024 * 1024
 
 AuditLines = Callable[[], list[dict[str, Any]]]
@@ -45,8 +43,8 @@ def unrecorded(*_: object) -> None:
     """Record nothing: for files a test puts in the store directly, where no event is under test."""
 
 
-def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT, p: Principal = ME) -> FileRecord:
-    """Store ``data`` as ``name`` for the synthetic user, by Open WebUI unless ``p`` names another caller."""
+def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT, p: Principal = PG_SETUP) -> FileRecord:
+    """Store ``data`` as ``name`` for the synthetic user, as Ghostwriter's unless ``p`` names another caller."""
     return store.add_upload(
         p, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
     )
@@ -60,10 +58,9 @@ def tick(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    """Settings for the api with the three synthetic caller keys, on a throwaway data volume."""
+    """Settings for the api with the two synthetic caller keys, on a throwaway data volume."""
     return load_settings(
         {
-            "OPEN_WEBUI_WORKBENCH_KEY": KEY,
             "DOCINT_WORKBENCH_KEY": DOCINT_KEY,
             "GHOSTWRITER_WORKBENCH_KEY": GHOSTWRITER_KEY,
             "WORKBENCH_DATA_DIR": str(tmp_path / "data"),

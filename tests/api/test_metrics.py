@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute, iter_route_contexts
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import GHOSTWRITER_KEY, KEY, unrecorded
+from tests.api.conftest import GHOSTWRITER_KEY, unrecorded
 from workbench.api.audit import AuditLog
+from workbench.api.auth import KeyGate
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue, Reason, RequestTooLarge
 from workbench.api.main import app_factory, create_app
 from workbench.api.metrics import Metrics
@@ -153,22 +154,27 @@ def test_a_volume_that_cannot_be_measured_leaves_the_gauges_alone(
         assert "workbench_disk_capacity_bytes 0.0" in client.get("/metrics").text
 
 
+def _without_the_gate(app: FastAPI) -> FastAPI:
+    """The app without :class:`KeyGate`, so a route a test adds is reached: no caller may reach a path off its door."""
+    app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
+    return app
+
+
 @pytest.mark.parametrize("reason", ["queue_full", "wait_timeout", "executor_busy"])
-def test_busy_is_a_503_the_caller_can_retry(client: TestClient, app: FastAPI, reason: Reason) -> None:
+def test_busy_is_a_503_the_caller_can_retry(app: FastAPI, reason: Reason) -> None:
     """Whatever the reason, the model is told the same short thing."""
 
     async def refuse() -> None:
         raise Busy(reason)
 
     app.add_api_route("/refuse", refuse)
-    response = client.get("/refuse", headers={"Authorization": f"Bearer {KEY}"})
+    with TestClient(_without_the_gate(app)) as client:
+        response = client.get("/refuse")
     assert response.status_code == 503
     assert response.json() == {"detail": "busy, retry later"}
 
 
-def test_a_request_too_large_is_a_422_and_not_a_busy(
-    client: TestClient, app: FastAPI, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_a_request_too_large_is_a_422_and_not_a_busy(app: FastAPI, caplog: pytest.LogCaptureFixture) -> None:
     """The caller is told the request is too large, not to retry; nothing about it is logged."""
 
     async def refuse() -> None:
@@ -176,7 +182,8 @@ def test_a_request_too_large_is_a_422_and_not_a_busy(
 
     app.add_api_route("/refuse", refuse)
     caplog.set_level(logging.DEBUG)
-    response = client.get("/refuse", headers={"Authorization": f"Bearer {KEY}"})
+    with TestClient(_without_the_gate(app)) as client:
+        response = client.get("/refuse")
     assert response.status_code == 422
     assert response.json() == {"detail": "request too large"}
     assert "secret-path" not in caplog.text

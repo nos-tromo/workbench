@@ -7,12 +7,12 @@ import json
 from urllib.parse import unquote
 
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HD, HG, KEY, PG, put
+from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HD, HG, PG, AuditLines, put
 from tests.api.mcp_calls import acall, error, result, rpc
 from tests.callers import EIGHT
 from workbench.api import auth
@@ -26,19 +26,15 @@ from workbench.api.auth import (
     KeyGate,
     door_allows,
     principal_from_headers,
-    require_caller,
 )
 from workbench.api.main import create_app
 from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
-from workbench.config import ConfigError, Settings
+from workbench.config import NO_CALLER_KEY, ConfigError, Settings, load_settings
 from workbench.models import Principal
 
-H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
-CHAT = "/workspace/chat-1"
-OPEN_WEBUI = Caller("open-webui", KEY, WORKSPACE_TOOLS)
-DOCINT = Caller("docint", DOCINT_KEY, frozenset({"run_python"}), door="mcp", files="inline", wall_s=60, slots=2)
-GHOSTWRITER = Caller("ghostwriter", GHOSTWRITER_KEY, EIGHT, door="mcp", files="workspace", wall_s=120, slots=2)
+DOCINT = Caller("docint", DOCINT_KEY, frozenset({"run_python"}), files="inline", wall_s=60, slots=2)
+GHOSTWRITER = Caller("ghostwriter", GHOSTWRITER_KEY, EIGHT, files="workspace", wall_s=120, slots=2)
 NOT_FOUND = (404, {"detail": "not found"})
 
 
@@ -58,22 +54,75 @@ NOT_FOUND = (404, {"detail": "not found"})
     ],
 )
 def test_an_mcp_caller_finds_nothing_but_its_door(client: TestClient, method: str, path: str) -> None:
-    """With docint's key, no terminal route, no handshake route and no path Open WebUI's proxy forwards is found."""
+    """With docint's key, no file route, no route that went and no path a proxy might forward is found."""
     r = client.request(method, path, headers=HD)
     assert (r.status_code, r.json()) == NOT_FOUND
+
+
+#: A key set in ``OPEN_WEBUI_WORKBENCH_KEY``, which no caller holds any more.
+OLD_KEY = "o" * 43
+
+#: Every route a caller's key opened, and a path none serves: each answers the old key 401.
+KEYED = [
+    ("POST", "/mcp"),
+    ("GET", f"/files/list?directory={CHAT}"),
+    ("POST", f"/files/upload?directory={CHAT}"),
+    ("GET", f"/files/view?path={CHAT}/q.csv"),
+    ("DELETE", "/files/chat"),
+    ("GET", "/api/config"),
+    ("GET", "/files/cwd"),
+    ("GET", "/nowhere"),
+]
+
+
+def test_the_old_key_beside_ghostwriters_is_a_stranger(
+    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines
+) -> None:
+    """OPEN_WEBUI_WORKBENCH_KEY set beside Ghostwriter's: presenting it is 401 on /mcp and /files/list.
+
+    It is 401 on every path but ``/healthz`` and ``/metrics``, and nothing is recorded; Ghostwriter's key still opens
+    its door, and the registry holds Ghostwriter alone.
+    """
+    env = {
+        "OPEN_WEBUI_WORKBENCH_KEY": OLD_KEY,
+        "GHOSTWRITER_WORKBENCH_KEY": GHOSTWRITER_KEY,
+        "WORKBENCH_DATA_DIR": str(settings.data_dir),
+    }
+    both = load_settings(env, role="api")
+    assert [caller.name for caller in CallerRegistry.from_settings(both).callers] == ["ghostwriter"]
+    put(store, "q.csv", p=PG)
+    old = {**HG, "Authorization": f"Bearer {OLD_KEY}"}
+    with TestClient(create_app(both, store=store, audit=audit)) as client:
+        started = audit_lines()
+        for method, target in KEYED:
+            r = client.request(method, target, headers=old)
+            assert (r.status_code, r.json()) == (401, {"detail": "missing or invalid key"}), (method, target)
+        for path in ("/healthz", "/metrics"):
+            assert client.get(path, headers=old).status_code == 200, path
+        assert audit_lines() == started
+        assert client.get("/files/list", params={"directory": CHAT}, headers=HG).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/openapi.json", "/api/config", "/files/read", "/tools/run_python"])
+def test_a_removed_path_is_404_for_ghostwriter(
+    app: FastAPI, client: TestClient, audit_lines: AuditLines, path: str
+) -> None:
+    """A removed route answers 404 to Ghostwriter's key, and no tool event is written.
+
+    No route of the app serves the path any more, whichever caller's key comes with the request.
+    """
+    started = audit_lines()
+    for method in ("GET", "POST"):
+        r = client.request(method, path, params={"path": f"{CHAT}/q.csv"}, json={"code": "print(1)"}, headers=HG)
+        assert (r.status_code, r.json()) == NOT_FOUND, method
+    assert audit_lines() == started
+    assert path not in {route.path for route in iter_route_contexts(app.routes)}
 
 
 @pytest.mark.parametrize("path", ["/healthz", "/metrics"])
 def test_the_service_routes_stay_open_to_every_caller(client: TestClient, path: str) -> None:
     """The healthcheck and the scraper's route answer whatever key comes with the request."""
     assert client.get(path, headers=HD).status_code == 200
-
-
-@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
-def test_a_terminal_caller_finds_no_mcp(client: TestClient, method: str) -> None:
-    """Open WebUI's key does not open the MCP door, whatever the method."""
-    r = client.request(method, "/mcp", headers=H)
-    assert (r.status_code, r.json()) == NOT_FOUND
 
 
 def _through_the_gate(settings: Settings, key: str, path: str) -> tuple[list[str], list[Message]]:
@@ -114,8 +163,7 @@ def _through_the_gate(settings: Settings, key: str, path: str) -> tuple[list[str
     [
         (DOCINT_KEY, "/files/upload", False),
         (DOCINT_KEY, "/mcp", True),
-        (KEY, "/mcp", False),
-        (KEY, "/files/upload", True),
+        (GHOSTWRITER_KEY, "/mcp", True),
     ],
 )
 def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, path: str, passes: bool) -> None:
@@ -132,7 +180,6 @@ def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, 
         (GHOSTWRITER_KEY, "/files/upload", True),
         (GHOSTWRITER_KEY, "/files/read", False),
         (GHOSTWRITER_KEY, "/tools/run_python", False),
-        (KEY, "/files/chat", False),
         (DOCINT_KEY, "/files/chat", False),
     ],
 )
@@ -177,60 +224,39 @@ def _passes_the_gate(callers: CallerRegistry, method: str, target: str, key: str
 
 
 @pytest.mark.parametrize(
-    ("method", "target", "docint", "open_webui", "ghostwriter"),
+    ("method", "target", "docint", "ghostwriter"),
     [
-        ("POST", "/MCP", False, True, False),
-        ("POST", "//mcp", False, True, False),
-        ("POST", "/%6Dcp", True, False, True),
-        ("POST", "/mcp?x=1", True, False, True),
-        ("POST", "/mcp/", False, True, False),
-        ("HEAD", "/mcp", True, False, True),
-        ("OPTIONS", "/mcp", True, False, True),
-        ("HEAD", "/files/list", False, True, True),
-        ("OPTIONS", "/files/list", False, True, True),
-        ("POST", "/Files/upload", False, True, False),
-        ("POST", "//files/upload", False, True, False),
-        ("POST", "/files/upload/", False, True, False),
-        ("POST", "/files/./upload", False, True, False),
-        ("POST", "/files/upload%2F", False, True, False),
-        ("POST", "/files/%75pload", False, True, True),
-        ("DELETE", "/files/%63hat", False, False, True),
+        ("POST", "/MCP", False, False),
+        ("POST", "//mcp", False, False),
+        ("POST", "/%6Dcp", True, True),
+        ("POST", "/mcp?x=1", True, True),
+        ("POST", "/mcp/", False, False),
+        ("HEAD", "/mcp", True, True),
+        ("OPTIONS", "/mcp", True, True),
+        ("HEAD", "/files/list", False, True),
+        ("OPTIONS", "/files/list", False, True),
+        ("POST", "/Files/upload", False, False),
+        ("POST", "//files/upload", False, False),
+        ("POST", "/files/upload/", False, False),
+        ("POST", "/files/./upload", False, False),
+        ("POST", "/files/upload%2F", False, False),
+        ("POST", "/files/%75pload", False, True),
+        ("DELETE", "/files/%63hat", False, True),
     ],
 )
 def test_the_gate_judges_the_path_routing_will_see(
-    settings: Settings, method: str, target: str, docint: bool, open_webui: bool, ghostwriter: bool
+    settings: Settings, method: str, target: str, docint: bool, ghostwriter: bool
 ) -> None:
-    """Each form of a path reaches the app for the caller whose door it is, whatever the method, and for no other."""
+    """Each form of a path reaches the app for the caller who may reach it, whatever the method, and for no other."""
     callers = CallerRegistry.from_settings(settings)
     assert _passes_the_gate(callers, method, target, DOCINT_KEY) is docint
-    assert _passes_the_gate(callers, method, target, KEY) is open_webui
     assert _passes_the_gate(callers, method, target, GHOSTWRITER_KEY) is ghostwriter
 
 
-def test_the_routes_own_key_check_refuses_a_caller_off_the_terminal_door(app: FastAPI) -> None:
-    """The check every terminal route depends on answers docint's key with the gate's 404 and lets Open WebUI's by."""
-
-    def request(key: str) -> Request:
-        return Request(
-            {
-                "type": "http",
-                "method": "GET",
-                "path": "/files/list",
-                "headers": [(b"authorization", f"Bearer {key}".encode())],
-                "app": app,
-            }
-        )
-
-    with pytest.raises(HTTPException) as refused:
-        asyncio.run(require_caller(request(DOCINT_KEY)))
-    assert (refused.value.status_code, refused.value.detail) == (404, "not found")
-    assert asyncio.run(require_caller(request(KEY))).name == "open-webui"
-
-
 def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) -> None:
-    """Were :class:`KeyGate` bypassed, every keyed terminal route still refuses docint's key: files and handshake.
+    """Were :class:`KeyGate` bypassed, every file route still refuses docint's key, the chat delete included.
 
-    The MCP door's own routes refuse Open WebUI's key the same way (``tests/api/test_mcp.py``).
+    The MCP door's own route refuses a request under a root path the same way (``tests/api/test_mcp.py``).
     """
     app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
     routes = sorted(
@@ -239,7 +265,7 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
         if (path := route.path) is not None and path not in OPEN_PATHS | {MCP_PATH}
         for method in route.methods or ()
     )
-    assert ("GET", "/files/list") in routes and ("GET", "/api/config") in routes
+    assert ("GET", "/files/list") in routes and ("DELETE", "/files/chat") in routes
     with TestClient(app) as client:
         assert client.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
         for method, path in routes:
@@ -247,7 +273,7 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
             assert (r.status_code, r.json()) == NOT_FOUND, (method, path)
 
 
-@pytest.mark.parametrize("headers", [H, HD], ids=["open-webui", "docint"])
+@pytest.mark.parametrize("headers", [HG, HD], ids=["ghostwriter", "docint"])
 @pytest.mark.parametrize(
     ("method", "path"), [("GET", "/nowhere"), ("POST", "/tools/nothing"), ("GET", "/api/v1/policies")]
 )
@@ -259,14 +285,14 @@ def test_an_unrouted_path_answers_one_404_body_with_either_key(
     assert (r.status_code, r.json()) == NOT_FOUND
 
 
-def test_an_open_webui_user_id_with_docints_key_reaches_nothing(client: TestClient, store: Store) -> None:
-    """Sending Open WebUI's user and chat ids, docint still sees none of that user's files."""
-    put(store, "q.csv")
+def test_ghostwriters_user_id_with_docints_key_reaches_nothing(client: TestClient, store: Store) -> None:
+    """Sending Ghostwriter's user and chat ids, docint still sees none of that user's files."""
+    put(store, "q.csv", p=PG)
     path = f"{CHAT}/q.csv"
     for route, params in (("/files/list", {"directory": CHAT}), ("/files/view", {"path": path})):
         r = client.get(route, params=params, headers=HD)
         assert (r.status_code, r.json()) == NOT_FOUND, route
-    listing = client.get("/files/list", params={"directory": CHAT}, headers=H).json()
+    listing = client.get("/files/list", params={"directory": CHAT}, headers=HG).json()
     assert [entry["name"] for entry in listing["entries"]] == ["q.csv"]
 
 
@@ -277,13 +303,11 @@ def test_an_open_webui_user_id_with_docints_key_reaches_nothing(client: TestClie
         (DOCINT, "/mcp/", False),
         (DOCINT, "/files/list", False),
         (DOCINT, "/", False),
-        (OPEN_WEBUI, "/mcp", False),
-        (OPEN_WEBUI, "/files/list", True),
-        (OPEN_WEBUI, "/api/v1/terminals/t/mcp", True),
+        (DOCINT, "/api/v1/terminals/t/mcp", False),
     ],
 )
-def test_door_allows_one_path_to_mcp_and_every_other_to_terminal(caller: Caller, path: str, allowed: bool) -> None:
-    """An MCP caller with inline data has ``/mcp`` alone; a terminal caller every path but that one and the chat's."""
+def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: str, allowed: bool) -> None:
+    """A caller with inline data has ``/mcp`` alone."""
     assert door_allows(caller, path) is allowed
 
 
@@ -305,8 +329,6 @@ def test_door_allows_one_path_to_mcp_and_every_other_to_terminal(caller: Caller,
                 "/api/config",
             ]
         ],
-        (OPEN_WEBUI, "/files/chat", False),
-        (OPEN_WEBUI, "/files/upload", True),
         (DOCINT, "/files/chat", False),
         (DOCINT, "/files/upload", False),
     ],
@@ -320,20 +342,19 @@ def test_door_allows_the_ghostwriter_its_door_and_four_file_routes(caller: Calle
 
 
 def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
-    """Open WebUI on the terminal door with every tool; docint on the MCP door, inline; Ghostwriter on it with files."""
+    """Two rows, both on the MCP door: docint with inline data, Ghostwriter with files; each with its own caps."""
     registry = CallerRegistry.from_settings(settings)
 
     def row(caller: Caller) -> tuple[object, ...]:
-        return (caller.door, caller.files, caller.tools, caller.wall_s, caller.slots)
+        return (caller.files, caller.tools, caller.wall_s, caller.slots)
 
-    assert [caller.name for caller in registry.callers] == ["open-webui", "docint", "ghostwriter"]
-    assert row(registry.get("open-webui")) == ("terminal", "workspace", WORKSPACE_TOOLS, 120, None)
-    assert row(registry.get("docint")) == ("mcp", "inline", frozenset({"run_python"}), 60, 2)
-    assert row(registry.get("ghostwriter")) == ("mcp", "workspace", EIGHT, 120, 2)
-    assert registry.get("open-webui").key == KEY
+    assert [caller.name for caller in registry.callers] == ["docint", "ghostwriter"]
+    assert row(registry.get("docint")) == ("inline", frozenset({"run_python"}), 60, 2)
+    assert row(registry.get("ghostwriter")) == ("workspace", EIGHT, 120, 2)
     assert registry.get("docint").key == DOCINT_KEY
     assert registry.get("ghostwriter").key == GHOSTWRITER_KEY
-    assert KEY not in repr(registry.callers)
+    assert registry.authenticate("wrong") is None
+    assert registry.authenticate("") is None
     assert DOCINT_KEY not in repr(registry.callers)
     assert GHOSTWRITER_KEY not in repr(registry.callers)
     with pytest.raises(KeyError):
@@ -341,41 +362,39 @@ def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
 
 
 def test_only_the_ghostwriter_is_confined(settings: Settings) -> None:
-    """The one caller of the MCP door with workspace files is held to its chat; the other two are not."""
+    """The one caller with workspace files is held to its chat; docint, with inline data, is not."""
     assert [c.name for c in CallerRegistry.from_settings(settings).callers if c.confined] == ["ghostwriter"]
 
 
 def test_each_key_alone_makes_its_one_row(settings: Settings) -> None:
-    """A host with one caller's key has that caller alone; with none the registry is not built."""
-    only_docint = CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None, ghostwriter_key=None))
+    """A host with one caller's key has that caller alone; with none the registry is not built, naming both keys.
+
+    The executor's settings carry no key, so the api refuses to build a registry from them.
+    """
+    only_docint = CallerRegistry.from_settings(dataclasses.replace(settings, ghostwriter_key=None))
     assert [caller.name for caller in only_docint.callers] == ["docint"]
-    only_open_webui = CallerRegistry.from_settings(dataclasses.replace(settings, docint_key=None, ghostwriter_key=None))
-    assert [caller.name for caller in only_open_webui.callers] == ["open-webui"]
-    only_ghostwriter = CallerRegistry.from_settings(dataclasses.replace(settings, open_webui_key=None, docint_key=None))
+    only_ghostwriter = CallerRegistry.from_settings(dataclasses.replace(settings, docint_key=None))
     assert [caller.name for caller in only_ghostwriter.callers] == ["ghostwriter"]
-    with pytest.raises(
-        ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY, DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY"
-    ):
-        CallerRegistry.from_settings(
-            dataclasses.replace(settings, open_webui_key=None, docint_key=None, ghostwriter_key=None)
-        )
-
-
-def test_two_callers_with_one_key_stop_the_start(settings: Settings) -> None:
-    """A key held twice would make the caller depend on the order of the rows: the start stops, naming no key."""
     with pytest.raises(ConfigError) as refused:
-        CallerRegistry.from_settings(dataclasses.replace(settings, docint_key=KEY))
-    assert str(refused.value) == "two callers hold the same key"
-    assert KEY not in str(refused.value)
+        CallerRegistry.from_settings(dataclasses.replace(settings, docint_key=None, ghostwriter_key=None))
+    assert str(refused.value) == NO_CALLER_KEY
+    assert "DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY" in NO_CALLER_KEY
 
 
-@pytest.mark.parametrize("other", [KEY, DOCINT_KEY])
-def test_ghostwriters_key_must_be_its_own(settings: Settings, other: str) -> None:
-    """Ghostwriter's key is never Open WebUI's or docint's: the start stops, naming no key."""
+@pytest.mark.parametrize("taken", ["docint", "ghostwriter"])
+def test_two_callers_with_one_key_stop_the_start(settings: Settings, taken: str) -> None:
+    """A key held twice would make the caller depend on the order of the rows: the start stops, naming no key.
+
+    Either caller may be the one whose key the other's variable was set to.
+    """
+    if taken == "docint":
+        twice, key = dataclasses.replace(settings, ghostwriter_key=DOCINT_KEY), DOCINT_KEY
+    else:
+        twice, key = dataclasses.replace(settings, docint_key=GHOSTWRITER_KEY), GHOSTWRITER_KEY
     with pytest.raises(ConfigError) as refused:
-        CallerRegistry.from_settings(dataclasses.replace(settings, ghostwriter_key=other))
+        CallerRegistry.from_settings(twice)
     assert str(refused.value) == "two callers hold the same key"
-    assert other not in str(refused.value)
+    assert key not in str(refused.value)
 
 
 @pytest.mark.parametrize("tools", [frozenset({"display_file"}), frozenset({"list_files", "nowhere"})])
@@ -391,7 +410,7 @@ def test_a_tool_ghostwriters_door_cannot_serve_stops_the_start(settings: Setting
 
 @pytest.mark.parametrize(
     ("key", "name"),
-    [(KEY, "open-webui"), (DOCINT_KEY, "docint"), (GHOSTWRITER_KEY, "ghostwriter"), ("w" * 32, None)],
+    [(DOCINT_KEY, "docint"), (GHOSTWRITER_KEY, "ghostwriter"), ("w" * 32, None)],
 )
 def test_authentication_compares_every_caller(
     settings: Settings, monkeypatch: pytest.MonkeyPatch, key: str, name: str | None
@@ -407,7 +426,7 @@ def test_authentication_compares_every_caller(
     registry = CallerRegistry.from_settings(settings)
     monkeypatch.setattr(auth.hmac, "compare_digest", counted)
     found = registry.authenticate(key)
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert (found.name if found is not None else None) == name
 
 
@@ -423,7 +442,7 @@ def test_authentication_compares_every_caller(
     ],
 )
 def test_principal_from_headers_refuses_with_the_doors_texts(headers: dict[str, str], message: str) -> None:
-    """The terminal door's two texts, for both doors."""
+    """The two texts, whichever caller sent the headers."""
     with pytest.raises(InvalidPrincipal) as refused:
         principal_from_headers(DOCINT, headers)
     assert str(refused.value) == message
@@ -455,6 +474,41 @@ def test_the_ghostwriter_needs_a_chat_of_its_own(headers: dict[str, str], messag
 def test_ghostwriters_principal_is_confined() -> None:
     """Its principal carries the confinement to the chat it names."""
     assert principal_from_headers(GHOSTWRITER, {"X-User-Id": "user-a", "X-Session-Id": "chat-1"}) == PG
+
+
+def _refused_on_ghostwriters_routes(
+    client: TestClient, audit_lines: AuditLines, headers: dict[str, str], message: str
+) -> None:
+    """The file routes answer 400 with ``message``, the MCP door ``-32600`` with it, and nothing is recorded."""
+    started = audit_lines()
+    r = client.get("/files/list", params={"directory": CHAT}, headers=headers)
+    assert (r.status_code, r.json()) == (400, {"detail": message})
+    r = client.get("/files/view", params={"path": f"{CHAT}/q.csv"}, headers=headers)
+    assert (r.status_code, r.json()) == (400, {"detail": message})
+    assert error(acall(client, "list_files", headers=headers), 400, -32600)["error"]["message"] == message
+    assert audit_lines() == started
+
+
+@pytest.mark.parametrize("user", ["../x", "", " ", "a b", "x/y", ".hidden", "a" * 129])
+def test_a_user_header_that_is_not_a_plain_id_is_refused(
+    client: TestClient, audit_lines: AuditLines, user: str
+) -> None:
+    """The user id becomes a folder name, so anything that is not a plain id is refused, on Ghostwriter's paths."""
+    _refused_on_ghostwriters_routes(client, audit_lines, {**HG, "X-User-Id": user}, "missing or invalid user")
+
+
+def test_the_user_header_is_required(client: TestClient, audit_lines: AuditLines) -> None:
+    """Every route but ``/healthz`` and ``/metrics`` needs a user."""
+    headers = {name: value for name, value in HG.items() if name != "X-User-Id"}
+    _refused_on_ghostwriters_routes(client, audit_lines, headers, "missing or invalid user")
+
+
+@pytest.mark.parametrize("session", ["../x", "", "a b", "a/b", "a" * 129])
+def test_a_session_header_that_is_not_a_plain_id_is_refused(
+    client: TestClient, audit_lines: AuditLines, session: str
+) -> None:
+    """The chat id becomes a folder name too."""
+    _refused_on_ghostwriters_routes(client, audit_lines, {**HG, "X-Session-Id": session}, "invalid session")
 
 
 # --- the tool list -------------------------------------------------------------------------------------------------

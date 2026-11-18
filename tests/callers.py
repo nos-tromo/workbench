@@ -1,6 +1,6 @@
 """Values the tests of several callers share."""
 
-#: Ghostwriter's tools by default: the workspace tools without ``display_file``.
+#: Ghostwriter's tools by default: every workspace tool.
 EIGHT = frozenset(
     {
         "list_files",

@@ -13,14 +13,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HG, KEY
+from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HG
 from tests.api.mcp_calls import send
 from tests.callers import EIGHT
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
 from workbench.api.main import app_factory, create_app
-from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Conflict, NotFound, QuotaExceeded, StorageFull, Store, TooLarge
 from workbench.config import ConfigError, Settings
 from workbench.paths import PathError
@@ -73,7 +72,7 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
     assert client.get("/files/list", params={"directory": CHAT}, headers=HG).status_code == 200
-    compared = [(GHOSTWRITER_KEY, KEY), (GHOSTWRITER_KEY, DOCINT_KEY), (GHOSTWRITER_KEY, GHOSTWRITER_KEY)]
+    compared = [(GHOSTWRITER_KEY, DOCINT_KEY), (GHOSTWRITER_KEY, GHOSTWRITER_KEY)]
     assert seen == [(a.encode(), b.encode()) for a, b in compared] * 2
 
 
@@ -269,11 +268,9 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "callers": [
             {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
             {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
-            {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
         ],
         "require_purpose": [],
     }
-    assert KEY not in audit_stream.getvalue()
     assert DOCINT_KEY not in audit_stream.getvalue()
     assert GHOSTWRITER_KEY not in audit_stream.getvalue()
 
@@ -321,6 +318,6 @@ def test_app_factory_refuses_a_short_key(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 
 def test_create_app_has_no_builtin_documentation_routes(settings: Settings, store: Store, audit: AuditLog) -> None:
-    """FastAPI's own spec and docs would list every route, handshake ones included."""
+    """FastAPI's own spec and docs would list every route, the file routes and the MCP door's included."""
     app = create_app(settings, store=store, audit=audit)
     assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)

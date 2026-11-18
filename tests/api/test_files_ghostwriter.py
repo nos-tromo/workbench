@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HG, KEY, PG, H, put, unrecorded
+from tests.api.conftest import DOCINT_KEY, FORMER, GHOSTWRITER_KEY, HG, PG, put, unrecorded
 from tests.api.test_tools_documents import Scripted
 from workbench.api.audit import AuditLog
 from workbench.api.auth import require_file_caller
@@ -122,7 +122,7 @@ def test_a_link_in_its_chat_is_not_found_and_never_followed(
 ) -> None:
     """A link on a file, on a folder in the chat or as the chat folder itself is 404 for Ghostwriter.
 
-    Open WebUI meets such a link as a 400 (``tests/api/test_files.py``). Nothing behind the link is read or written.
+    Nothing behind the link is read or written.
     """
     rec = keep(store, PG)
     outside = settings.data_dir / "outside"
@@ -186,22 +186,15 @@ def test_list_is_the_chat_alone(client: TestClient, store: Store) -> None:
 
 
 def test_ghostwriters_files_are_its_own(client: TestClient, store: Store) -> None:
-    """Open WebUI's file is not Ghostwriter's, nor Ghostwriter's Open WebUI's, for the same user id and chat."""
-    theirs = put(store, "x.csv", CSV)
+    """A former caller's file is not Ghostwriter's, for the same user id and chat."""
+    theirs = put(store, "x.csv", CSV, p=FORMER)
     mine = keep(store, PG, "y.csv")
-    for r in (view(client, theirs.virtual_path), view(client, mine.virtual_path, H)):
-        assert (r.status_code, r.json()) == NOT_FOUND
+    r = view(client, theirs.virtual_path)
+    assert (r.status_code, r.json()) == NOT_FOUND
     assert view(client, mine.virtual_path).content == CSV
-    assert view(client, theirs.virtual_path, H).content == CSV
-
-
-def test_open_webui_keeps_version_2(client: TestClient) -> None:
-    """Open WebUI's upload answers the path and the size alone, and it still views a file of any chat of the user."""
-    r = upload(client, "x.csv", headers=H)
-    assert r.status_code == 200
-    assert set(r.json()) == {"path", "size"}
-    viewed = view(client, f"{CHAT}/x.csv", {**H, "X-Session-Id": "chat-2"})
-    assert (viewed.status_code, viewed.content) == (200, CSV)
+    assert [
+        entry["name"] for entry in client.get("/files/list", params={"directory": CHAT}, headers=HG).json()["entries"]
+    ] == ["y.csv"]
 
 
 # --- purpose and request id ----------------------------------------------------------------------------------------
@@ -246,8 +239,7 @@ def test_a_required_purpose_is_428_and_recorded_denied(
 ) -> None:
     """With ``collect`` and ``disclose`` requiring one, Ghostwriter's upload and view without a purpose are refused.
 
-    Each refusal is recorded as denied, by the chat, with no target; a stated purpose passes, and Open WebUI, on the
-    terminal door, is never asked for one.
+    Each refusal is recorded as denied, by the chat, with no target; a stated purpose passes.
     """
     required = dataclasses.replace(settings, require_purpose=frozenset({"collect", "disclose"}))
     own = keep(store, PG)
@@ -270,7 +262,6 @@ def test_a_required_purpose_is_428_and_recorded_denied(
 
         assert upload(strict, "new.csv", headers={**HG, **PURPOSE}).status_code == 200
         assert view(strict, own.virtual_path, {**HG, **PURPOSE}).content == CSV
-        assert upload(strict, "x.csv", headers=H).status_code == 200
 
 
 # --- the door's own check ------------------------------------------------------------------------------------------
@@ -285,7 +276,6 @@ def _request(app: FastAPI, key: str, path: str = "/files/list", root_path: str =
 def test_the_file_caller_check_keeps_ghostwriter_to_its_four_paths(app: FastAPI) -> None:
     """Should a request pass the gate, the routes' own check refuses Ghostwriter off its paths and under a root path."""
     assert asyncio.run(require_file_caller(_request(app, GHOSTWRITER_KEY))).name == "ghostwriter"
-    assert asyncio.run(require_file_caller(_request(app, KEY))).name == "open-webui"
     for refused in (
         _request(app, GHOSTWRITER_KEY, root_path="/prefix"),
         _request(app, GHOSTWRITER_KEY, path="/files/read"),

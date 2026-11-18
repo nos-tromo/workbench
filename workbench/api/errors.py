@@ -15,8 +15,8 @@ large for the executor's protocol (``RequestTooLarge``) is a 422: retrying it ca
 A call that had to state a purpose and stated none (``PurposeRequired``) is a 428, its ``denied`` event already
 written.
 
-Both doors answer with the same texts: :func:`describe` gives an error's status and text, :func:`compact` the body of
-a request that does not validate.
+The MCP door and the file routes answer with the same texts: :func:`describe` gives an error's status and text,
+:func:`compact` the body of a request that does not validate.
 
 A request that does not validate is FastAPI's 422, but smaller: each error keeps its ``type``, ``loc`` and ``msg``,
 never the ``input`` that failed or its ``ctx``, so a 200 000-character document or a 100 000-row table never goes back

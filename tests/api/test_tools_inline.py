@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY, AuditLines
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, AuditLines
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.callers import EIGHT
@@ -27,7 +27,7 @@ from workbench.api.auth import CallerRegistry
 from workbench.api.jobs import Busy, CallLimits, ExecutorClient, JobQueue, RequestTooLarge, SkippedOutput
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.registry import INLINE_TOOLS, WORKSPACE_TOOLS, PurposeRequired, Registry, ToolEnv, ToolOutcome
+from workbench.api.registry import INLINE_TOOLS, PurposeRequired, Registry, ToolEnv, ToolOutcome
 from workbench.api.store import Store
 from workbench.api.tools import MAX_CODE, NotCompleted
 from workbench.api.tools_inline import (
@@ -408,7 +408,7 @@ def test_stdout_and_stderr_stay_within_the_result_limit(client: TestClient, fake
 def test_code_that_could_not_complete_raises_not_completed(
     client: TestClient, fake_executor: Scripted, audit_lines: AuditLines
 ) -> None:
-    """A job past its wall time is the 422 the terminal answers too, and its event says ``not_completed``."""
+    """A job past its wall time is the 422 the workspace tool raises too, and its event says ``not_completed``."""
     fake_executor.status = "timeout"
     fake_executor.message = "the job ran past its wall time of 60 s"
     with pytest.raises(NotCompleted) as refused:
@@ -614,7 +614,7 @@ def test_an_empty_purpose_is_none(client: TestClient, fake_executor: Scripted, s
 def test_config_audit_lists_the_callers_and_the_purpose_rule(
     settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines
 ) -> None:
-    """Each caller's name, door, tools, wall cap and slots, and the purpose rule, sorted; never a key."""
+    """Each caller's name, door (the MCP door, every caller's), tools, wall cap and slots, and the purpose rule."""
     required = dataclasses.replace(settings, require_purpose=frozenset({"query", "disclose", "combine"}))
     with TestClient(create_app(required, store=store, audit=audit)):
         pass
@@ -622,10 +622,8 @@ def test_config_audit_lists_the_callers_and_the_purpose_rule(
     assert config["criteria"]["callers"] == [
         {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
         {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
-        {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
     ]
     assert config["criteria"]["require_purpose"] == ["combine", "disclose", "query"]
     raw = json.dumps(audit_lines())
-    assert KEY not in raw
     assert DOCINT_KEY not in raw
     assert GHOSTWRITER_KEY not in raw

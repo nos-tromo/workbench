@@ -664,10 +664,9 @@ async def read_document(
 ) -> DocumentRead:
     """Read one of the user's files in the executor and answer with its text, cut to the result limit.
 
-    The job runs in the chat folder the file lives in, whatever chat the request came from, with that one
-    file as its input. The job is recorded by the file's id once it has answered and before anything of
-    the answer goes out, a refusal as ``error`` with its code; neither the name, the part nor the text is
-    recorded.
+    The job runs in the request's chat folder, where the file lives, with that one file as its input. The job
+    is recorded by the file's id once it has answered and before anything of the answer goes out, a refusal as
+    ``error`` with its code; neither the name, the part nor the text is recorded.
 
     Args:
         body: The path and where to start.
@@ -681,14 +680,11 @@ async def read_document(
         The parts read, the pages without text and how to go on.
     """
     rec = await run_in_threadpool(store.get, p, body.path)
-    in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     args = {"path": rec.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
-    _, result, _ = await jobs.submit(in_chat, "read_document", args, [rec.name])
+    _, result, _ = await jobs.submit(p, "read_document", args, [rec.name])
     shown = {**result.result, "path": rec.virtual_path} if isinstance(result.result, dict) else None
     criteria = {"paged": body.part is not None}
-    await run_in_threadpool(
-        record_answer, audit, "read_document", in_chat, [rec.id], criteria, result, DocumentRead, shown
-    )
+    await run_in_threadpool(record_answer, audit, "read_document", p, [rec.id], criteria, result, DocumentRead, shown)
     _payload(result, "file")
     return _fit_read(_parse(DocumentRead, shown), settings.result_max_kb)
 
@@ -902,7 +898,7 @@ def read_code_run(result: JobResult) -> tuple[CodeRun, str | None]:
 
 
 def _kept_note(result: JobResult, note: str | None) -> str | None:
-    """Say in the terminal's words what the executor's note means: which files in ``out/`` were not kept.
+    """Say what the executor's note means for a call whose outputs are kept: which files in ``out/`` were not.
 
     Args:
         result: The executor's answer, as :func:`read_code_run` read it.

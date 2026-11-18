@@ -7,7 +7,7 @@ from typing import Any, Final, cast
 import pytest
 from fastapi import FastAPI, HTTPException
 
-from tests.api.conftest import DOCINT_KEY, KEY
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY
 from tests.callers import EIGHT
 from workbench.api.auth import Caller, CallerRegistry
 from workbench.api.errors import MAX_ERRORS, compact, describe
@@ -76,14 +76,14 @@ def test_a_caller_sees_the_tools_of_its_form_in_name_order() -> None:
     """A caller finds the specs of its own file form that its list names, in the order of their names."""
     b, a, c = _spec("b", "workspace"), _spec("a", "workspace"), _spec("c", "inline")
     registry = Registry([b, a, c])
-    terminal = Caller("open-webui", KEY, frozenset({"a", "b", "c"}))
-    inline = Caller("docint", DOCINT_KEY, frozenset({"c"}), door="mcp", files="inline")
-    assert registry.for_caller(terminal) == [a, b]
+    workspace = Caller("ghostwriter", GHOSTWRITER_KEY, frozenset({"a", "b", "c"}))
+    inline = Caller("docint", DOCINT_KEY, frozenset({"c"}), files="inline")
+    assert registry.for_caller(workspace) == [a, b]
     assert registry.for_caller(inline) == [c]
     assert registry.find(inline, "a") is None
     assert registry.find(inline, "c") is c
-    assert registry.find(terminal, "c") is None
-    assert registry.find(dataclasses.replace(terminal, tools=frozenset({"b"})), "a") is None
+    assert registry.find(workspace, "c") is None
+    assert registry.find(dataclasses.replace(workspace, tools=frozenset({"b"})), "a") is None
     with pytest.raises(ValueError, match="two tools"):
         Registry([a, _spec("a", "workspace")])
 
@@ -130,7 +130,7 @@ def test_the_tools_of_each_form_are_read_only() -> None:
     ],
 )
 def test_describe_is_what_the_handlers_answer(exc: Exception, answer: tuple[int, str]) -> None:
-    """Each error gets the status and the short fixed text the terminal door answers it with."""
+    """Each error gets the status and the short fixed text the file routes answer it with, and the MCP door's text."""
     assert describe(exc) == answer
 
 

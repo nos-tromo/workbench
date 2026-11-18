@@ -735,14 +735,14 @@ def test_a_record_whose_file_is_gone_is_not_found_but_can_be_deleted(
 
 
 def deleted(store: Store, p: Principal, path: str) -> FileRecord:
-    """Delete a file as ``/files/delete`` does, with no event under test: ``get``, then ``remove`` by the record."""
+    """Delete a file by its path, with no event under test: ``get``, then ``remove`` by the record."""
     rec = store.get(p, path)
     store.remove(rec)
     return rec
 
 
 def test_get_then_remove_deletes_file_and_row(store: Store, alice: Principal, workspaces: Workspaces) -> None:
-    """The route's delete, ``get`` then ``remove``: the file and the row are gone; the usage drops."""
+    """``get`` then ``remove``: the file and the row are gone; the usage drops."""
     rec = put(store, alice)
     real = workspaces.resolve(alice, rec.virtual_path)
     assert real.exists()

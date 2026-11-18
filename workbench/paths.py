@@ -1,6 +1,6 @@
 """Virtual ``/workspace`` paths, confined to one user's own root on the data volume.
 
-Open WebUI sends ``/workspace/<chat-id>/<name>``. Every such path maps to
+A caller sends ``/workspace/<chat-id>/<name>``. Every such path maps to
 ``<data_dir>/workspaces/<caller>/<user-id>/<chat-id>/<name>`` and to nothing
 else: the caller and the user id name the root, so no path reaches another
 user's files. Symlinks are never followed; an existing one in the way is

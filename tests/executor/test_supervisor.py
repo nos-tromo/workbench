@@ -3985,7 +3985,7 @@ def test_the_executor_image_has_no_setuid_or_setgid_program() -> None:
         ["find", "/", "-xdev", "-perm", "/6000", "-type", "f"], capture_output=True, text=True, check=False
     )
     assert found.stdout.split() == []
-    assert not Path("/app/contract").exists() and not Path("/app/docs").exists()  # R1 M-10: .dockerignore
+    assert not Path("/app/docs").exists()  # R1 M-10: .dockerignore
 
 
 class _Limits:

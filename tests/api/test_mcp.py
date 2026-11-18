@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, HD, KEY, AuditLines
+from tests.api.conftest import DOCINT_KEY, HD, HG, AuditLines
 from tests.api.mcp_calls import NONE, NOTIFICATION, error, refused, result, rpc, send
 from tests.api.mcp_calls import Headers as Headers
 from tests.api.test_tools_documents import Scripted
@@ -46,8 +46,6 @@ from workbench.config import Settings
 app = python_tests.app
 fake_executor = python_tests.fake_executor
 
-#: Open WebUI's headers, its key on the terminal door.
-OW: Final = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 SERVER_INFO: Final = {"name": "workbench", "version": __version__}
 PASSAGES: Final = {
     "name": "passages.json",
@@ -302,14 +300,7 @@ def test_a_message_of_another_shape_is_an_invalid_request(client: TestClient, me
 # --- the door's own caller -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
-def test_open_webuis_key_on_mcp_is_not_found(client: TestClient, method: str) -> None:
-    """The terminal caller finds no MCP door: the gate's 404, never a 405 or an answer of the door."""
-    r = client.request(method, MCP_PATH, headers={**OW, "Content-Type": "application/json"}, content=b"{}")
-    assert (r.status_code, r.json()) == (404, {"detail": "not found"})
-
-
-@pytest.mark.parametrize("headers", [HD, OW], ids=["docint", "open-webui"])
+@pytest.mark.parametrize("headers", [HD, HG], ids=["docint", "ghostwriter"])
 @pytest.mark.parametrize("method", ["POST", "GET"])
 def test_mcp_with_a_trailing_slash_is_not_found_never_a_redirect(
     client: TestClient, headers: dict[str, str], method: str
@@ -324,15 +315,15 @@ def test_the_door_refuses_to_run_under_a_root_path(app: FastAPI) -> None:
     """Behind a proxy that sets a root path, the door is not there: the gate judged a path routing does not use."""
     with TestClient(app, root_path="/prefix") as prefixed:
         for path in (MCP_PATH, "/prefix" + MCP_PATH):
-            for headers in (HD, OW):
+            for headers in (HD, HG):
                 r = prefixed.post(path, headers={**headers, "Content-Type": "application/json"}, content=b"{}")
                 assert (r.status_code, r.json()) == (404, {"detail": "not found"}), (path, headers is HD)
             r = prefixed.get(path, headers=HD)
             assert (r.status_code, r.json()) == (404, {"detail": "not found"})
 
 
-def test_without_the_gate_the_door_still_refuses_open_webuis_key(app: FastAPI) -> None:
-    """Were the gate bypassed, every method of ``/mcp`` still answers Open WebUI's key with the gate's 404."""
+def test_without_the_gate_the_door_still_checks_the_key(app: FastAPI) -> None:
+    """Were the gate bypassed, every method of ``/mcp`` still answers a key no caller holds with the gate's 401."""
     app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
     methods = sorted(
         method for route in iter_route_contexts(app.routes) if route.path == MCP_PATH for method in route.methods or ()
@@ -341,9 +332,10 @@ def test_without_the_gate_the_door_still_refuses_open_webuis_key(app: FastAPI) -
     with TestClient(app) as bypassed:
         assert bypassed.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
         for method in methods:
-            r = bypassed.request(method, MCP_PATH, headers={**OW, "Content-Type": "application/json"}, content=b"{}")
-            assert r.status_code == 404, method
-            assert method == "HEAD" or r.json() == {"detail": "not found"}, method
+            wrong = {**HD, "Authorization": "Bearer wrong", "Content-Type": "application/json"}
+            r = bypassed.request(method, MCP_PATH, headers=wrong, content=b"{}")
+            assert r.status_code == 401, method
+            assert method == "HEAD" or r.json() == {"detail": "missing or invalid key"}, method
         assert bypassed.post(MCP_PATH, content=b"{}").status_code == 401
 
 
