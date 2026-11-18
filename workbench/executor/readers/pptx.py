@@ -1,8 +1,10 @@
-"""PowerPoint presentations (``.pptx``), by slide: shape text, table cells, then the speaker notes.
+"""PowerPoint presentations (``.pptx``, ``.potx``), by slide: shape text, table cells, then the speaker notes.
 
-A slide without any text (pictures only) is reported in ``pages_without_text`` and never returned empty.
+A slide without any text (pictures only) is reported in ``pages_without_text`` and never returned empty. A ``.potx`` is
+a presentation under the content type of a template; it is opened as the presentation it is (:func:`open_presentation`).
 """
 
+import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final
@@ -10,11 +12,36 @@ from typing import Any, Final
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-from workbench.executor.readers import DocumentText, Part, check
+from workbench.executor.readers import DocumentText, Part, UnsupportedFormat, check, ooxml
 from workbench.executor.readers import paging as pg
 
 #: Most slides one read looks at.
 MAX_SLIDES_LOOKED_AT: Final = 200
+
+#: The main parts python-pptx does not open as a presentation and that are refused with the reason below.
+_REFUSED: Final = frozenset({ooxml.PML_MACRO_MAIN, ooxml.PML_SLIDESHOW_MAIN})
+_NOT_A_PRESENTATION: Final = "a macro-enabled presentation or a slide show; save it as .pptx or .potx"
+
+
+def open_presentation(path: Path) -> Any:
+    """Open a presentation, a ``.potx`` as the presentation it is.
+
+    Args:
+        path: The ``.pptx`` or ``.potx`` file.
+
+    Returns:
+        The python-pptx presentation.
+
+    Raises:
+        UnsupportedFormat: Its main part is a macro-enabled presentation or a slide show.
+    """
+    data = path.read_bytes()
+    main = ooxml.main_type(data)
+    if main in _REFUSED:
+        raise UnsupportedFormat(_NOT_A_PRESENTATION)
+    if main == ooxml.PML_TEMPLATE_MAIN:
+        data = ooxml.retyped(data, ooxml.PML_TEMPLATE_MAIN, ooxml.PML_PRESENTATION_MAIN)
+    return Presentation(io.BytesIO(data))
 
 
 def _shape_lines(shape: Any) -> Iterator[str]:
@@ -65,7 +92,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
     """Read slides from ``part`` on.
 
     Args:
-        path: The ``.pptx`` file.
+        path: The ``.pptx`` or ``.potx`` file.
         part: ``None``, ``slide N`` or ``slides N-M``.
         max_chars: The budget in bytes of JSON.
 
@@ -73,7 +100,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The slides that have text, whole, the numbers of the slides looked at that have none, and where to
         continue.
     """
-    slides = list(Presentation(str(path)).slides)
+    slides = list(open_presentation(path).slides)
     total = len(slides)
     first, last = pg.numbered_window(part, total, "slide")
     collector = pg.Collector(max_chars)
@@ -103,11 +130,11 @@ def units(path: Path) -> Iterator[Part]:
     """Walk the slides.
 
     Args:
-        path: The ``.pptx`` file.
+        path: The ``.pptx`` or ``.potx`` file.
 
     Yields:
         Each slide as ``slide N`` with all its text; a slide without text has empty text.
     """
-    for number, slide in enumerate(Presentation(str(path)).slides, 1):
+    for number, slide in enumerate(open_presentation(path).slides, 1):
         check()
         yield Part(f"slide {number}", _slide_text(slide))

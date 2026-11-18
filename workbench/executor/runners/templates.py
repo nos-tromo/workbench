@@ -18,7 +18,6 @@ import json
 import re
 import time
 import warnings
-import zipfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +26,7 @@ from typing import Any, Final
 from workbench import protocol
 from workbench.executor import readers
 from workbench.executor.context import JobContext
+from workbench.executor.readers import ooxml
 from workbench.executor.runners.documents import error
 from workbench.executor.templates import Field, Refusal, merge
 from workbench.executor.timer import limit_until
@@ -55,9 +55,6 @@ _DEFAULT_BUDGET_S: Final = 60.0
 _LOST: Final = re.compile(
     r"will be (?:removed|lost|discarded|treated as an error|ignored)|is being dropped|cannot be (?:set|located)"
 )
-_TYPES: Final = "{http://schemas.openxmlformats.org/package/2006/content-types}"
-_TEMPLATE_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml"
-_DOCUMENT_MAIN: Final = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
 _KINDS: Final = {"content_control": "content_controls", "form_field": "form_fields", "placeholder": "placeholders"}
 
 #: What version 1 fills; the answer for a template with no fields says it.
@@ -164,36 +161,6 @@ def _library(work: Callable[[], Any]) -> Any:
         raise readers.UnreadableFile(readers.DAMAGED) from None
 
 
-def _as_document(data: bytes) -> bytes:
-    """Give a Word package whose main part is a template the content type of a document.
-
-    Args:
-        data: The package.
-
-    Returns:
-        The package as it is, or a copy whose ``[Content_Types].xml`` names the main part a document.
-    """
-    from lxml import etree  # loaded here, like every library a runner needs: a job pays only for its own
-
-    from workbench.executor.readers.docx import parser
-
-    with zipfile.ZipFile(io.BytesIO(data)) as source:
-        types = etree.fromstring(source.read("[Content_Types].xml"), parser())
-        overrides = [o for o in types.iter(f"{_TYPES}Override") if o.get("ContentType") == _TEMPLATE_MAIN]
-        if not overrides:
-            return data
-        for override in overrides:
-            override.set("ContentType", _DOCUMENT_MAIN)
-        copied = io.BytesIO()
-        with zipfile.ZipFile(copied, "w", zipfile.ZIP_DEFLATED) as target:
-            for item in source.infolist():
-                content = source.read(item.filename)
-                if item.filename == "[Content_Types].xml":
-                    content = etree.tostring(types, xml_declaration=True, encoding="UTF-8", standalone=True)
-                target.writestr(item, content)
-        return copied.getvalue()
-
-
 def _open_docx(path: Path, ctx: JobContext) -> Any:
     """Open a Word template: the zip guard, then the package, as a document even if it is a template.
 
@@ -213,7 +180,9 @@ def _open_docx(path: Path, ctx: JobContext) -> Any:
     readers.check_zip(path, ctx.file_mb)
 
     def opened() -> Any:
-        template = DocxTemplate(io.BytesIO(_as_document(path.read_bytes())))
+        template = DocxTemplate(
+            io.BytesIO(ooxml.retyped(path.read_bytes(), ooxml.WML_TEMPLATE_MAIN, ooxml.WML_DOCUMENT_MAIN))
+        )
         try:
             template.init_docx()
         except ValueError:

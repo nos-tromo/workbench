@@ -91,7 +91,7 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         title="Read a file of this conversation as text",
         description=(
             "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
-            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
+            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
             "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
             "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
             "call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "

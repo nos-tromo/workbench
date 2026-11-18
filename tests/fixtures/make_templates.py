@@ -273,6 +273,58 @@ def as_dotx(docx: Path, target: Path) -> Path:
     return target
 
 
+def _retyped(source: Path, target: Path, old: bytes, new: bytes) -> Path:
+    """Copy an Office package with one content type replaced in ``[Content_Types].xml``.
+
+    Args:
+        source: The package.
+        target: Where to write the copy.
+        old: The content type to replace.
+        new: What it becomes.
+
+    Returns:
+        ``target``.
+    """
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(old, new)
+            out.writestr(item, data)
+    return target
+
+
+def as_potx(pptx: Path, target: Path) -> Path:
+    """Copy a presentation as a ``.potx`` template: the same parts under the template content type.
+
+    Args:
+        pptx: A presentation.
+        target: Where to write the template.
+
+    Returns:
+        ``target``.
+    """
+    return _retyped(pptx, target, b"presentationml.presentation.main+xml", b"presentationml.template.main+xml")
+
+
+def as_macro_pptx(pptx: Path, target: Path) -> Path:
+    """Copy a presentation under the content type of a macro-enabled one, as a ``.pptx`` that cannot be opened as such.
+
+    Args:
+        pptx: A presentation.
+        target: Where to write the copy.
+
+    Returns:
+        ``target``.
+    """
+    return _retyped(
+        pptx,
+        target,
+        b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+        b"application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+    )
+
+
 def make_jinja_docx(path: Path, *, extra: str | None = None) -> Path:
     """Write a Word document with ``{{ }}`` placeholders.
 

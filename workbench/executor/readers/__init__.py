@@ -81,6 +81,7 @@ _FAMILIES: Final = {
     ".csv": "csv",
     ".tsv": "csv",
     ".pptx": "pptx",
+    ".potx": "pptx",
     ".odt": "odt",
     ".ods": "ods",
     ".eml": "eml",
@@ -94,7 +95,7 @@ _FAMILIES: Final = {
 }
 
 #: Extensions that are zip files; they pass :func:`check_zip` first.
-_ZIPPED: Final = frozenset({".docx", ".dotx", ".xlsx", ".xlsm", ".pptx", ".odt", ".ods"})
+_ZIPPED: Final = frozenset({".docx", ".dotx", ".xlsx", ".xlsm", ".pptx", ".potx", ".odt", ".ods"})
 
 _HINTS: Final = {
     ".msg": "save it as .eml or PDF",
@@ -411,7 +412,7 @@ def count_pages(path: Path, *, file_mb: int = 50) -> int:
     """Count the pages of a PDF or the slides of a presentation, under the same guards as :func:`read`.
 
     Args:
-        path: A ``.pdf`` or ``.pptx`` file.
+        path: A ``.pdf``, ``.pptx`` or ``.potx`` file.
         file_mb: The largest file a job may write, in megabytes.
 
     Returns:
@@ -422,7 +423,7 @@ def count_pages(path: Path, *, file_mb: int = 50) -> int:
         UnreadableFile: It is encrypted, damaged, truncated, a decompression bomb, or too big to read.
         ReadTimeout: The deadline (:func:`set_deadline`) passed while counting.
     """
-    if path.suffix.lower() not in {".pdf", ".pptx"}:
+    if path.suffix.lower() not in {".pdf", ".pptx", ".potx"}:
         raise UnsupportedFormat("only a PDF has pages and only a presentation has slides")
     with _backstop():
         family = _prepare(path, file_mb)
@@ -431,9 +432,9 @@ def count_pages(path: Path, *, file_mb: int = 50) -> int:
                 from workbench.executor.readers import pdf
 
                 return len(pdf._open(path).pages)
-            from pptx import Presentation
+            from workbench.executor.readers import pptx
 
-            return len(Presentation(str(path)).slides)
+            return len(pptx.open_presentation(path).slides)
         except (UnsupportedFormat, UnreadableFile):
             raise
         except MemoryError:
