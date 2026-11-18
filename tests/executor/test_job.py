@@ -389,6 +389,7 @@ def test_the_registered_runners() -> None:
         "fill_template",
         "write_table",
         "write_document",
+        "write_presentation",
     }
 
 

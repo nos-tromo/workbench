@@ -581,12 +581,13 @@ async def test_valid_input_paths_pass(settings: Settings, store: Store, executor
         "fill_template",
         "write_table",
         "write_document",
+        "write_presentation",
     ],
 )
 async def test_the_known_tools_are_accepted(
     tool: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """The allow-list is the seven tools of version 1."""
+    """The allow-list is the tools that run in the executor."""
     queue = queue_for(settings, executor, store, metrics)
     job, _, _ = await queue.submit(user("user-a"), tool, ARGS, [], call=CALL)
     assert job.tool == tool

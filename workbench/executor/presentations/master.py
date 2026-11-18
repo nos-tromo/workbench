@@ -1,9 +1,10 @@
 """A slide master: its layouts, each layout's places in reading order, what fits in each, and the inspection of it.
 
 The layouts are numbered 1..N across the file's slide masters, in their order. A layout's title and subtitle are flags,
-not places, and its date, footer and slide number set ``footer``. A place is a body, object, picture, table or chart
-placeholder, with a role and a capacity: about how many lines, and characters a line, fit at the font size it inherits.
-Other placeholders (SmartArt, media, headers) are not places.
+not places, and its date, footer and slide number set ``footer``, unless ``p:hf`` turns them all off
+(:func:`shown_footers`). A place is a body, object, picture, table or chart placeholder, with a role and a capacity:
+about how many lines, and characters a line, fit at the font size it inherits. Other placeholders (SmartArt, media,
+headers) are not places.
 
 The file is untrusted. It goes through the zip guard first, and whatever python-pptx fails with while it opens or reads
 the file is the file's damage (:func:`~workbench.executor.runners.templates.library`). The inspection names no path,
@@ -38,6 +39,10 @@ ROLES: Final[dict[PP_PLACEHOLDER, Role]] = {
 }
 _TITLES: Final = frozenset({PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE})
 _FOOTERS: Final = frozenset({PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER})
+
+#: The attribute of ``p:hf`` that turns each footer kind off with ``0`` or ``false``; one that is left out means on.
+_HF: Final = {PP_PLACEHOLDER.DATE: "dt", PP_PLACEHOLDER.FOOTER: "ftr", PP_PLACEHOLDER.SLIDE_NUMBER: "sldNum"}
+_OFF: Final = frozenset({"0", "false"})
 
 #: The font size when none is set, in hundredths of a point (``sz``), and the EMU in one of those.
 DEFAULT_SIZE: Final = 1800
@@ -85,7 +90,7 @@ class Layout:
         title: Whether it has a title or centre title placeholder.
         subtitle: Whether it has a subtitle placeholder.
         places: Its places in reading order: top, then left.
-        footer: Whether it has a date, footer or slide number placeholder.
+        footer: Whether it has a date, footer or slide number placeholder that ``p:hf`` leaves on.
     """
 
     number: int
@@ -169,8 +174,30 @@ def _layout(number: int, layout: Any, slide_master: Any) -> Layout:
         title=bool(types & _TITLES),
         subtitle=PP_PLACEHOLDER.SUBTITLE in types,
         places=tuple(places),
-        footer=bool(types & _FOOTERS),
+        footer=bool(types & shown_footers(layout, slide_master)),
     )
+
+
+def shown_footers(layout: Any, slide_master: Any) -> frozenset[PP_PLACEHOLDER]:
+    """Tell which footer kinds a layout's slides show: those its ``p:hf`` leaves on, or its master's if it has none.
+
+    A layout's ``p:hf`` stands for the whole of it, as the master's does when the layout has none; an attribute left
+    out means on, and with no ``p:hf`` at all every kind is on. A deck copies only these (:mod:`.deck`), and the
+    inspection's ``footer`` flag is set only by these, so the two say the same.
+
+    Args:
+        layout: The python-pptx slide layout.
+        slide_master: Its slide master.
+
+    Returns:
+        The kinds of date, footer and slide number that are on.
+    """
+    flags = layout._element.find(qn("p:hf"))
+    if flags is None:
+        flags = slide_master._element.find(qn("p:hf"))
+    if flags is None:
+        return _FOOTERS
+    return frozenset(kind for kind, attribute in _HF.items() if flags.get(attribute) not in _OFF)
 
 
 def capacity(shape: Any, layout: Any, master: Any) -> tuple[int, int]:

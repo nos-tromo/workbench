@@ -1,24 +1,30 @@
-"""Slide masters in a folder laid out as a job's: their layouts, places and capacity, and ``inspect_template`` on one.
+"""Slide masters in a folder laid out as a job's: their layouts, ``inspect_template`` and ``write_presentation``.
 
-Every master is built at test time from python-pptx's default presentation (``tests/fixtures/make_templates.py``), all
-its text invented.
+A master's layouts, places and capacity are read, ``inspect_template`` lists them, and ``write_presentation`` builds
+decks in it. Every master is built at test time from python-pptx's default presentation
+(``tests/fixtures/make_templates.py``), all its text invented.
 """
 
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+from lxml import etree
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
 
+from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
 from workbench import decks
-from workbench.executor.presentations import master, text
+from workbench.executor.presentations import deck, master, text
 from workbench.executor.runners import RUNNERS, JobContext
+from workbench.executor.runners.templates import LISTED
 from workbench.executor.templates import Refusal
 
 JOB_ID = "0123456789abcdef0123456789abcdef"
@@ -55,6 +61,17 @@ class Job:
     def with_max_chars(self, max_chars: int) -> "Job":
         """The same folder with another result limit."""
         return Job(JobContext(self.ctx.work_dir, self.ctx.out_dir, CHAT, max_chars, self.ctx.file_mb))
+
+    def write(
+        self, slides: list[dict[str, Any]], *, path: str = "master.pptx", name: str = "deck.pptx", **extra: Any
+    ) -> dict[str, Any]:
+        """Run ``write_presentation`` on a master of the job."""
+        args = {"path": path, "name": name, "slides": slides, "budget_s": 30, **extra}
+        return RUNNERS["write_presentation"](args, self.ctx)
+
+    def deck(self, name: str = "deck.pptx") -> Any:
+        """Open a deck the job wrote."""
+        return Presentation(str(self.ctx.out_dir / name))
 
 
 @pytest.fixture
@@ -558,3 +575,375 @@ def test_a_level_narrows_the_line_and_an_empty_paragraph_counts() -> None:
     assert text.estimate_lines(text.Written(lines=((2, 5),), replaced=0), 8) == 5
     assert text.estimate_lines(text.Written(lines=((2, 5),), replaced=0), 1) == 5
     assert text.estimate_lines(text.Written(lines=(), replaced=0), 60) == 0
+
+
+# --- write_presentation -------------------------------------------------------------------------------------------
+
+TITLE_SLIDE = 1
+TITLE_ONLY = 6
+PRESENTATION_MAIN = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+FOOTERS = frozenset({PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER})
+REPORT = {"kind": "file", "path": "harbour-report.pdf", "virtual": f"/workspace/{CHAT}/harbour-report.pdf", "page": 2}
+
+
+def kinds(slide: Any) -> dict[PP_PLACEHOLDER, Any]:
+    """A slide's placeholders by type."""
+    return {shape.placeholder_format.type: shape for shape in slide.placeholders}
+
+
+def slide_targets(path: Path) -> list[str]:
+    """The slide parts of a deck in the order its presentation part lists them."""
+    with zipfile.ZipFile(path) as package:
+        presentation = etree.fromstring(package.read("ppt/presentation.xml"))
+        relationships = etree.fromstring(package.read("ppt/_rels/presentation.xml.rels"))
+    targets = {relationship.get("Id"): relationship.get("Target") for relationship in relationships}
+    return [targets[entry.get(qn("r:id"))] for entry in presentation.find(qn("p:sldIdLst"))]
+
+
+def autofit(shape: Any) -> Any:
+    """The ``a:normAutofit`` of a shape's text, or ``None``."""
+    return shape._element.find(f"{qn('p:txBody')}/{qn('a:bodyPr')}/{qn('a:normAutofit')}")
+
+
+def resaved(path: Path, change: Any) -> Path:
+    """Open a master, change it and save it where it was."""
+    prs = Presentation(str(path))
+    change(prs)
+    prs.save(str(path))
+    return path
+
+
+def test_a_deck_has_the_slides_asked_for(job: Job) -> None:
+    """A layout by number, by name in another case, or as digits that name none: the slides in order, as asked."""
+    mt.make_master(job.path("master.pptx"))
+    answer = job.write(
+        [
+            {"layout": TITLE_SLIDE, "title": "Invented harbour review", "subtitle": "A synthetic year"},
+            {"layout": "titel und inhalt", "title": "Invented tonnage", "content": ["- North pier\n- South pier"]},
+            {"layout": str(TITLE_ONLY), "title": "Invented outlook"},
+        ]
+    )
+    assert answer == {"slides": 3, "warnings": []}
+    slides = list(job.deck().slides)
+    assert len(slides) == 3
+    titles = [slide.shapes.title.text for slide in slides]
+    assert titles == ["Invented harbour review", "Invented tonnage", "Invented outlook"]
+    assert [slide.slide_layout.name for slide in slides] == ["Title Slide", "Titel und Inhalt", "Title Only"]
+    assert kinds(slides[0])[PP_PLACEHOLDER.SUBTITLE].text_frame.text == "A synthetic year"
+    body = slides[1].placeholders[1]
+    assert [paragraph.text for paragraph in body.text_frame.paragraphs] == ["North pier", "South pier"]
+
+
+def test_the_example_slides_are_gone(job: Job) -> None:
+    """No example slide is left, nor its chart, picture, notes, custom show or section; the slides are numbered anew."""
+    mt.make_master(job.path("master.pptx"))
+    titles = ["Invented first", "Invented second", "Invented third"]
+    job.write([{"layout": TITLE_AND_CONTENT, "title": title} for title in titles])
+    out = job.ctx.out_dir / "deck.pptx"
+    with zipfile.ZipFile(out) as package:
+        names = package.namelist()
+        parts = {name: package.read(name) for name in names}
+    assert len(names) == len(set(names))
+    examples = ("ppt/charts/", "ppt/media/", "ppt/embeddings/", "ppt/notesSlides/")
+    assert [name for name in names if name.startswith(examples)] == []
+    said = (mt.EXAMPLE_TITLE.encode(), b"Invented example", b"of the example", b"Invented short show")
+    assert [name for name, data in parts.items() if any(text in data for text in said)] == []
+    assert b"custShowLst" not in parts["ppt/presentation.xml"]
+    assert b"sectionLst" not in parts["ppt/presentation.xml"]
+    assert slide_targets(out) == ["slides/slide1.xml", "slides/slide2.xml", "slides/slide3.xml"]
+    slide_parts = sorted(name for name in names if name.startswith("ppt/slides/slide"))
+    assert slide_parts == ["ppt/slides/slide1.xml", "ppt/slides/slide2.xml", "ppt/slides/slide3.xml"]
+    for number, title in enumerate(titles, 1):
+        assert title.encode() in parts[f"ppt/slides/slide{number}.xml"]
+
+
+def test_a_potx_master_gives_a_pptx(job: Job, tmp_path: Path) -> None:
+    """A deck built in a ``.potx`` is a presentation, not a template."""
+    mt.as_potx(mt.make_master(tmp_path / "built.pptx"), job.path("master.potx"))
+    assert job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}], path="master.potx")["slides"] == 1
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        types = etree.fromstring(package.read("[Content_Types].xml"))
+    overrides = {entry.get("PartName"): entry.get("ContentType") for entry in types if entry.tag.endswith("Override")}
+    assert overrides["/ppt/presentation.xml"] == PRESENTATION_MAIN
+
+
+def test_footer_and_slide_number_are_copied(job: Job) -> None:
+    """The layout's footer with its text and its slide number with the slide's, where the layout has them; no date."""
+    mt.make_master(job.path("master.pptx"))
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented one"}, {"layout": TITLE_AND_CONTENT, "title": "Two"}])
+    slide = job.deck().slides[1]
+    found = kinds(slide)
+    assert found[PP_PLACEHOLDER.FOOTER].text_frame.text == mt.MASTER_FOOTER
+    number = found[PP_PLACEHOLDER.SLIDE_NUMBER]
+    field = number._element.find(f".//{qn('a:fld')}")
+    assert (field.get("type"), field.find(qn("a:t")).text) == ("slidenum", "2")
+    assert PP_PLACEHOLDER.DATE not in found
+    on_layout = kinds(slide.slide_layout)
+    for kind in (PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER):
+        assert len(found[kind]._element.find(qn("p:spPr"))) == 0
+        assert (found[kind].left, found[kind].top) == (on_layout[kind].left, on_layout[kind].top)
+    ids = [shape.shape_id for shape in slide.shapes]
+    assert len(ids) == len(set(ids))
+
+
+def test_a_fixed_date_is_copied_and_an_empty_footer_is_not(job: Job) -> None:
+    """A date of fixed text is copied; a footer with no text is not; a footer's link is left out and its text kept."""
+
+    def change(prs: Any) -> None:
+        found = kinds(prs.slide_layouts[TITLE_AND_CONTENT - 1])
+        found[PP_PLACEHOLDER.DATE].text_frame.text = "Invented day"
+        found[PP_PLACEHOLDER.FOOTER].text_frame.text = ""
+        footer = kinds(prs.slide_layouts[TITLE_ONLY - 1])[PP_PLACEHOLDER.FOOTER]
+        footer.text_frame.paragraphs[0].runs[0].hyperlink.address = "https://example.invalid/"
+
+    resaved(mt.make_master(job.path("master.pptx")), change)
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}, {"layout": TITLE_ONLY, "title": "Invented"}])
+    first, second = job.deck().slides
+    assert kinds(first)[PP_PLACEHOLDER.DATE].text_frame.text == "Invented day"
+    assert PP_PLACEHOLDER.FOOTER not in kinds(first)
+    footer = kinds(second)[PP_PLACEHOLDER.FOOTER]
+    assert footer.text_frame.text == mt.MASTER_FOOTER
+    assert footer._element.xpath(".//a:hlinkClick") == []
+    assert footer._element.xpath(".//@r:id") == []
+
+
+def test_a_hidden_footer_stays_hidden(job: Job) -> None:
+    """The master's ``p:hf`` turns the footer, number and date off: none is copied, and no layout reports one."""
+    mt.make_master(job.path("master.pptx"), hidden_footer=True)
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}])
+    assert set(kinds(job.deck().slides[0])) == {PP_PLACEHOLDER.TITLE}
+    assert not any(layout["footer"] for layout in job.inspect("master.pptx")["layouts"])
+
+
+def test_a_layouts_own_hf_decides_for_it(job: Job) -> None:
+    """A layout's ``p:hf`` overrides its master's, an attribute left out meaning on: its footer shows, no number."""
+
+    def change(prs: Any) -> None:
+        layout = prs.slide_layouts[TITLE_AND_CONTENT - 1]._element
+        layout.find(qn("p:clrMapOvr")).addnext(parse_xml(f'<p:hf {nsdecls("p")} sldNum="0" dt="0"/>'))
+
+    resaved(mt.make_master(job.path("master.pptx"), hidden_footer=True), change)
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}, {"layout": TITLE_ONLY, "title": "Invented"}])
+    first, second = job.deck().slides
+    assert set(kinds(first)) == {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.FOOTER}
+    assert set(kinds(second)) == {PP_PLACEHOLDER.TITLE}
+    flags = [layout["footer"] for layout in job.inspect("master.pptx")["layouts"]]
+    assert flags == [number == TITLE_AND_CONTENT for number in range(1, 12)]
+
+
+def test_unknown_and_shared_layout_names_are_refused(job: Job) -> None:
+    """An unknown layout lists the layouts; a name two layouts share asks for the number; a number always works."""
+    mt.make_master(job.path("master.pptx"), duplicate_name=True)
+    found = master.layouts(master.open_master(job.path("master.pptx"), job.ctx))
+    with pytest.raises(Refusal) as caught:
+        deck.resolve(found, "Invented layout", 3)
+    assert caught.value.code == "invalid_value"
+    listed = "the layouts are 1 Title Slide, 2 Titel und Inhalt, 3 Zwei Inhalte, 4 Zwei Inhalte, 5 Comparison, "
+    assert caught.value.message.startswith(f"slide 3: no layout 'Invented layout'; {listed}")
+    assert caught.value.message.endswith("11 Vertical Title and Text")
+    with pytest.raises(Refusal) as caught:
+        deck.resolve(found, 12, 3)
+    assert caught.value.message.startswith(f"slide 3: no layout 12; {listed}")
+    with pytest.raises(Refusal) as caught:
+        deck.resolve(found, "zwei inhalte", 3)
+    shared = "slide 3: two layouts are named 'Zwei Inhalte'; give its number: 3 or 4"
+    assert (caught.value.code, caught.value.message) == ("invalid_value", shared)
+    assert deck.resolve(found, 3, 1).number == 3
+    assert deck.resolve(found, "4", 1).number == 4
+    error = job.write([{"layout": "Zwei Inhalte", "title": "Invented"}])["error"]
+    assert error == "invalid_value: slide 1: two layouts are named 'Zwei Inhalte'; give its number: 3 or 4"
+    assert job.write([{"layout": 3, "title": "Invented"}])["slides"] == 1
+
+
+def test_a_name_of_digits_is_a_name_before_a_number(job: Job) -> None:
+    """A layout named "2" is found by that name; the number 2 is still layout 2."""
+    resaved(mt.make_master(job.path("master.pptx")), lambda prs: setattr(prs.slide_layouts[6], "name", "2"))
+    found = master.layouts(master.open_master(job.path("master.pptx"), job.ctx))
+    assert deck.resolve(found, "2", 1).number == 7
+    assert deck.resolve(found, 2, 1).number == 2
+
+
+def test_notes_end_with_the_sources(job: Job) -> None:
+    """The notes, a blank line, then each source as kind and reference; a source's page is checked in its file."""
+    mt.make_master(job.path("master.pptx"))
+    mk.make_pdf(job.path("harbour-report.pdf"), ["Invented page one", "Invented page two"])
+    slide = {
+        "layout": TITLE_AND_CONTENT,
+        "title": "Invented",
+        "notes": "Invented speaker notes.",
+        "sources": [REPORT, {"kind": "user"}],
+    }
+    job.write([slide])
+    notes = job.deck().slides[0].notes_slide.notes_text_frame.text
+    assert notes.endswith("Sources:\nfile: /workspace/chat-1/harbour-report.pdf, page 2\nuser")
+    assert notes.startswith("Invented speaker notes.\n\nSources:\n")
+
+    job.write([slide], name="plain.pptx", include_sources=False)
+    assert job.deck("plain.pptx").slides[0].notes_slide.notes_text_frame.text == "Invented speaker notes."
+
+    others = [{"kind": "user", "note": "Invented remark"}, {"kind": "assistant"}, {"kind": "job", "job_id": JOB_ID}]
+    job.write([{"layout": TITLE_ONLY, "title": "Invented", "sources": others}], name="others.pptx")
+    wanted = f"Sources:\nuser: Invented remark\nassistant\njob: {JOB_ID}"
+    assert job.deck("others.pptx").slides[0].notes_slide.notes_text_frame.text == wanted
+
+    error = job.write([{**slide, "sources": [{**REPORT, "page": 9}]}], name="bad.pptx")["error"]
+    assert error.startswith("invalid_source: slide 1, source 1: ")
+    assert not (job.ctx.out_dir / "bad.pptx").exists()
+
+
+def test_a_slide_without_notes_has_no_notes_page(job: Job) -> None:
+    """Neither notes nor sources: no notes page is made."""
+    mt.make_master(job.path("master.pptx"))
+    job.write([{"layout": TITLE_ONLY, "title": "Invented"}])
+    assert not job.deck().slides[0].has_notes_slide
+
+
+def test_empty_places_are_removed(job: Job) -> None:
+    """A place no block fills does not stay to say "Click to add text"; block i fills place i in reading order."""
+    mt.make_master(job.path("master.pptx"))
+    job.write(
+        [
+            {"layout": TITLE_AND_CONTENT, "title": "Invented title only"},
+            {"layout": COMPARISON, "content": ["Invented A", "", "Invented C"]},
+        ]
+    )
+    first, second = job.deck().slides
+    assert set(kinds(first)) == {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER}
+    left = {
+        shape.placeholder_format.idx: shape.text_frame.text
+        for shape in second.placeholders
+        if shape.placeholder_format.type not in FOOTERS
+    }
+    assert left == {1: "Invented A", 2: "Invented C"}
+
+
+def test_overflowing_text_is_scaled_and_warned(job: Job) -> None:
+    """Bullets of 80 characters, as many as a block holds, shrink to 60 % and are warned of; three short ones do not."""
+    mt.make_master(job.path("master.pptx"))
+    long = "\n".join(f"- {'Invented harbour figure, ' * 4}"[:82] for _ in range(24))
+    assert len(long) <= decks.MAX_TEXT
+    short = "- Invented one\n- Invented two\n- Invented three"
+    answer = job.write(
+        [{"layout": TITLE_AND_CONTENT, "content": [long]}, {"layout": TITLE_AND_CONTENT, "content": [short]}]
+    )
+    assert len(answer["warnings"]) == 1
+    assert answer["warnings"][0].startswith("slide 1: the text may not fit")
+    first, second = job.deck().slides
+    fitted = autofit(first.placeholders[1])
+    assert (fitted.get("fontScale"), fitted.get("lnSpcReduction")) == ("60000", "10000")
+    assert autofit(second.placeholders[1]) is None
+
+
+def test_fit_scales_the_font_to_the_place() -> None:
+    """The scale is the place's lines over those needed, at least 60 %; another autofit is replaced, in schema order."""
+    frame = text_frame()
+    body = frame._txBody.bodyPr
+    body.append(parse_xml(f"<a:noAutofit {nsdecls('a')}/>"))
+    body.append(parse_xml(f"<a:extLst {nsdecls('a')}/>"))
+    place = master.Place(role="text", lines=10, chars=40, idx=1, shape=None)
+    assert deck.fit(frame, 10, place) is True
+    assert [child.tag.split("}")[1] for child in body] == ["noAutofit", "extLst"]
+    assert deck.fit(frame, 12, place) is True
+    assert [child.tag.split("}")[1] for child in body] == ["normAutofit", "extLst"]
+    assert (body[0].get("fontScale"), body[0].get("lnSpcReduction")) == ("83333", "10000")
+    assert deck.fit(frame, 30, place) is False
+    assert body[0].get("fontScale") == "60000"
+
+
+def test_the_answer_names_no_path(job: Job) -> None:
+    """The answer is the count and the warnings: no path of the chat or the job, no file name."""
+    mt.make_master(job.path("master.pptx"))
+    mk.make_pdf(job.path("harbour-report.pdf"), ["Invented page one", "Invented page two"])
+    answer = job.write(
+        [{"layout": TITLE_AND_CONTENT, "title": "Invented", "subtitle": "Invented", "sources": [REPORT]}]
+    )
+    assert answer == {"slides": 1, "warnings": ["slide 1: the layout has no place for a subtitle; it was left out"]}
+    said = json.dumps(answer)
+    for name in ("/workspace", str(job.ctx.work_dir), JOB_ID, "master.pptx", "deck.pptx", "harbour-report"):
+        assert name not in said
+
+
+def test_a_title_without_a_place_is_left_out_with_a_warning(job: Job) -> None:
+    """A title for a layout with no title place is not written, and the answer says so."""
+    mt.make_master(job.path("master.pptx"))
+    answer = job.write([{"layout": 7, "title": "Invented"}])
+    assert answer["warnings"] == ["slide 1: the layout has no place for a title; it was left out"]
+    assert set(kinds(job.deck().slides[0])) == {PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER}
+
+
+def test_many_warnings_are_cut_to_the_listed(job: Job) -> None:
+    """At most ``LISTED`` warnings, the last saying how many more there are."""
+    mt.make_master(job.path("master.pptx"))
+    slides = [{"layout": TITLE_AND_CONTENT, "title": "Invented", "subtitle": "Invented"} for _ in range(25)]
+    warnings = job.write(slides)["warnings"]
+    assert len(warnings) == LISTED
+    assert warnings[-1] == "6 more warnings are not shown."
+
+
+def test_characters_a_deck_cannot_hold_are_replaced_with_a_warning(job: Job) -> None:
+    """A control character in a title, a text or the notes becomes U+FFFD, and each place is warned of once."""
+    mt.make_master(job.path("master.pptx"))
+    slide = {"layout": TITLE_AND_CONTENT, "title": "A\x01b", "content": ["C\x02d"], "notes": "E\x03f"}
+    warnings = job.write([slide])["warnings"]
+    assert warnings == [
+        f"slide 1, {place}: characters a document cannot hold were replaced with �"
+        for place in ("title", "block 1", "notes")
+    ]
+    written = job.deck().slides[0]
+    assert written.shapes.title.text == "A�b"
+    assert written.placeholders[1].text_frame.text == "C�d"
+    assert written.notes_slide.notes_text_frame.text == "E�f"
+
+
+def test_a_master_whose_parts_would_clash_is_refused(job: Job) -> None:
+    """An example slide another part still relates to would share its part name with a new slide: no deck is written."""
+
+    def change(prs: Any) -> None:
+        prs.slide_layouts[TITLE_AND_CONTENT - 1].part.relate_to(prs.slides[0].part, RT.SLIDE)
+
+    resaved(mt.make_master(job.path("master.pptx")), change)
+    prs = master.open_master(job.path("master.pptx"), job.ctx)
+    deck.remove_slides(prs)
+    prs.slides.add_slide(prs.slide_layouts[0])
+    with pytest.raises(Refusal) as caught:
+        deck.check_parts(prs)
+    refused = ("invalid_template", "the master cannot be written as a new deck")
+    assert (caught.value.code, caught.value.message) == refused
+    assert job.write([{"layout": TITLE_SLIDE, "title": "Invented"}])["error"] == ": ".join(refused)
+    assert list(job.ctx.out_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "wanted"),
+    [
+        ({"name": "deck.docx"}, "invalid_value: the name is not a plain file name ending in .pptx"),
+        ({"name": "out/deck.pptx"}, "invalid_value: the name is not a plain file name ending in .pptx"),
+        ({"slides": []}, "invalid_value: a deck has 1 to 30 slides"),
+        ({"slides": [{"layout": 0}]}, "invalid_value: slide 1: layout is a number from 1"),
+        ({"path": "missing.pptx"}, "file_not_found: /workspace/chat-1/missing.pptx is not in"),
+        ({"path": "report.docx"}, "unsupported_template: a deck is built in a .pptx or .potx slide master"),
+        (
+            {"slides": [{"layout": TITLE_AND_CONTENT, "content": ["Invented", "Invented"]}]},
+            "invalid_value: slide 1: 2 blocks, but layout 2 has 1 place",
+        ),
+        (
+            {"slides": [{"layout": TITLE_SLIDE, "content": ["Invented"]}]},
+            "invalid_value: slide 1: 1 block, but layout 1 has no place for one",
+        ),
+        (
+            {"slides": [{"layout": PICTURE_WITH_CAPTION, "content": ["Invented"]}]},
+            "invalid_value: slide 1, block 1: text goes into a text or content place, and place 1 takes a picture",
+        ),
+        (
+            {"slides": [{"layout": TITLE_AND_CONTENT, "content": [{"table": [["Invented"]]}]}]},
+            "invalid_value: slide 1, block 1: ",
+        ),
+    ],
+)
+def test_a_deck_that_cannot_be_written_is_refused(job: Job, change: dict[str, Any], wanted: str) -> None:
+    """A bad name, deck, master or block is refused with what is wrong, and no file is written."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("report.docx").write_bytes(b"Invented")
+    args = {"path": "master.pptx", "name": "deck.pptx", "slides": [{"layout": 2}], "budget_s": 30, **change}
+    assert RUNNERS["write_presentation"](args, job.ctx)["error"].startswith(wanted)
+    assert list(job.ctx.out_dir.iterdir()) == []
