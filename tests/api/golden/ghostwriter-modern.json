@@ -1,0 +1,1987 @@
+{
+  "tools": [
+    {
+      "name": "fill_template",
+      "title": "Fill a report template into a new file",
+      "description": "Fill a report template of this conversation into a new file; the template itself is not changed, and a .dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each field's name to its value and its source, and every value needs a source: kind file (the path of a file of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; include_sources false leaves it out. The user sees the new file as a card in the chat.",
+      "inputSchema": {
+        "$defs": {
+          "AssistantSource": {
+            "description": "A value the model wrote itself.\n\nAttributes:\n    kind: ``assistant``.",
+            "properties": {
+              "kind": {
+                "const": "assistant",
+                "description": "assistant: you wrote the value yourself.",
+                "title": "Kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "AssistantSource",
+            "type": "object"
+          },
+          "FieldValue": {
+            "description": "A field's value and where it comes from.\n\nAttributes:\n    value: The value.\n    source: Its source.",
+            "properties": {
+              "value": {
+                "description": "The value, in the field's type: a string or a number, YYYY-MM-DD, one of a dropdown's options, true or false, or a list of rows for a table.",
+                "title": "Value",
+                "type": [
+                  "string",
+                  "number",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "source": {
+                "description": "Where the value comes from: kind file, job, user or assistant.",
+                "discriminator": {
+                  "mapping": {
+                    "assistant": "#/$defs/AssistantSource",
+                    "file": "#/$defs/FileSource",
+                    "job": "#/$defs/JobSource",
+                    "user": "#/$defs/UserSource"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/FileSource"
+                  },
+                  {
+                    "$ref": "#/$defs/JobSource"
+                  },
+                  {
+                    "$ref": "#/$defs/UserSource"
+                  },
+                  {
+                    "$ref": "#/$defs/AssistantSource"
+                  }
+                ],
+                "title": "Source",
+                "type": "object"
+              }
+            },
+            "required": [
+              "value",
+              "source"
+            ],
+            "title": "FieldValue",
+            "type": "object"
+          },
+          "FileSource": {
+            "description": "A value read in a file of the conversation.\n\nAttributes:\n    kind: ``file``.\n    path: The file's absolute path.\n    page: The page of a PDF, or the slide of a presentation.\n    sheet: The sheet of a workbook.\n    cell: The cell of that sheet, such as ``B7``.",
+            "properties": {
+              "kind": {
+                "const": "file",
+                "description": "file: the value was read in a file of this conversation.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "title": "Path",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The page of a PDF or the slide of a PPTX it is on.",
+                "title": "Page",
+                "type": "integer"
+              },
+              "sheet": {
+                "anyOf": [
+                  {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The sheet of an XLSX or ODS it is on.",
+                "title": "Sheet",
+                "type": "string"
+              },
+              "cell": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The cell of that sheet, such as B7.",
+                "title": "Cell",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "title": "FileSource",
+            "type": "object"
+          },
+          "JobSource": {
+            "description": "A value a ``run_python`` run computed.\n\nAttributes:\n    kind: ``job``.\n    job_id: The run's ``job_id``.",
+            "properties": {
+              "kind": {
+                "const": "job",
+                "description": "job: the value was computed by a run_python run.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "The job_id run_python answered with.",
+                "maxLength": 64,
+                "minLength": 1,
+                "title": "Job Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "job_id"
+            ],
+            "title": "JobSource",
+            "type": "object"
+          },
+          "UserSource": {
+            "description": "A value the user stated.\n\nAttributes:\n    kind: ``user``.\n    note: Where or how the user said it.",
+            "properties": {
+              "kind": {
+                "const": "user",
+                "description": "user: the user stated the value in the chat.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "note": {
+                "anyOf": [
+                  {
+                    "maxLength": 1000,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Where or how the user said it.",
+                "title": "Note",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "UserSource",
+            "type": "object"
+          }
+        },
+        "description": "Body of ``fill_template``.\n\nAttributes:\n    path: The template's absolute path.\n    values: The values by field name.\n    output_name: The new file's name.\n    include_sources: Whether the new file ends with its sources.",
+        "properties": {
+          "path": {
+            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "values": {
+            "additionalProperties": {
+              "$ref": "#/$defs/FieldValue"
+            },
+            "description": "Each field's name, as inspect_template lists it, with its value and source; at most 1000.",
+            "maxProperties": 1000,
+            "minProperties": 1,
+            "propertyNames": {
+              "maxLength": 255,
+              "minLength": 1
+            },
+            "title": "Values",
+            "type": "object"
+          },
+          "output_name": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The new file's name, ending in .docx (for a .docx or .dotx) or .xlsx; <name>-filled by default.",
+            "title": "Output Name",
+            "type": "string"
+          },
+          "include_sources": {
+            "default": true,
+            "description": "End the new file with a Sources table or sheet.",
+            "title": "Include Sources",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "values"
+        ],
+        "title": "FillTemplateRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The new file's path; the user sees it as a card in the chat.",
+            "title": "Path",
+            "type": "string"
+          },
+          "filled": {
+            "description": "How many fields were filled.",
+            "title": "Filled",
+            "type": "integer"
+          },
+          "unfilled": {
+            "description": "The fields left without a value: given none (they are empty, or keep their placeholder), or one that could not be written where the field is (a warning says why).",
+            "items": {
+              "type": "string"
+            },
+            "title": "Unfilled",
+            "type": "array"
+          },
+          "warnings": {
+            "description": "What to tell the user about the fill.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "filled",
+          "unfilled",
+          "warnings"
+        ],
+        "title": "FilledTemplateWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "inspect_template",
+      "title": "List the fields of a report template",
+      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. A very long list is cut: truncated is then true.",
+      "inputSchema": {
+        "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path.",
+        "properties": {
+          "path": {
+            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "InspectTemplateRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          },
+          "TemplateField": {
+            "description": "One field of a template.\n\nAttributes:\n    name: What ``fill_template`` takes its value under.\n    kind: ``content_control``, ``form_field``, ``placeholder`` or ``table``.\n    type: What it takes.\n    options: A drop-down's entries.\n    location: Where it sits.",
+            "properties": {
+              "name": {
+                "description": "The field's name: give its value under it.",
+                "maxLength": 255,
+                "title": "Name",
+                "type": "string"
+              },
+              "kind": {
+                "description": "What it is.",
+                "enum": [
+                  "content_control",
+                  "form_field",
+                  "placeholder",
+                  "table"
+                ],
+                "title": "Kind",
+                "type": "string"
+              },
+              "type": {
+                "description": "What it takes: text and rich_text a string or a number, date YYYY-MM-DD, dropdown one of options, checkbox true or false, table a list of rows.",
+                "enum": [
+                  "text",
+                  "rich_text",
+                  "date",
+                  "dropdown",
+                  "checkbox",
+                  "table"
+                ],
+                "title": "Type",
+                "type": "string"
+              },
+              "options": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "A dropdown's entries, exactly as the value must be written.",
+                "title": "Options"
+              },
+              "location": {
+                "description": "Where it sits: body, paragraph 3; body, table 2, row 4; B7.",
+                "maxLength": 300,
+                "title": "Location",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "kind",
+              "type",
+              "options",
+              "location"
+            ],
+            "title": "TemplateField",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The template's path.",
+            "title": "Path",
+            "type": "string"
+          },
+          "template_kind": {
+            "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs.",
+            "enum": [
+              "content_controls",
+              "form_fields",
+              "placeholders",
+              "mixed",
+              "none"
+            ],
+            "title": "Template Kind",
+            "type": "string"
+          },
+          "fields": {
+            "description": "Its fields, in document order, each name once.",
+            "items": {
+              "$ref": "#/$defs/TemplateField"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True if some fields are not listed.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user, or how to go on.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "template_kind",
+          "fields"
+        ],
+        "title": "TemplateInfoWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "list_files",
+      "title": "List the files of this conversation",
+      "description": "List every file in this conversation's workspace, the user's uploads and the files tools made, newest first, with path, size, date and kind. Takes no arguments. Call it first to see what there is to work with. A very long list is cut: truncated is then true, and hint says how many older files are not listed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "The arguments of a tool whose route takes no body, ``list_files``: none.",
+        "properties": {},
+        "title": "NoArguments",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "FileInfo": {
+            "description": "One file in the chat's workspace.\n\nAttributes:\n    path: The file's absolute path.\n    size: Size in bytes.\n    modified: When the file was made, ISO 8601 in UTC.\n    kind: ``upload`` for a file the user put there, ``output`` for one a tool made.",
+            "properties": {
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "size": {
+                "description": "Size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "modified": {
+                "description": "When the file was made, ISO 8601 in UTC.",
+                "title": "Modified",
+                "type": "string"
+              },
+              "kind": {
+                "description": "upload: the user put it there. output: a tool made it.",
+                "enum": [
+                  "upload",
+                  "output"
+                ],
+                "title": "Kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "size",
+              "modified",
+              "kind"
+            ],
+            "title": "FileInfo",
+            "type": "object"
+          },
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/$defs/FileInfo"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True if older files exist than are listed here.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "When truncated, how many older files are not listed.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "title": "FileListWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "read_document",
+      "title": "Read a file of this conversation as text",
+      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
+      "inputSchema": {
+        "description": "Body of ``read_document``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Where to start reading, or ``None`` for the start.",
+        "properties": {
+          "path": {
+            "description": "The file's absolute path, for example /workspace/<chat>/report.pdf, as list_files gives it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "part": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Where to start reading; leave it out for the start. Use the next_part of an earlier answer to go on. A page: 'page 3' or 'pages 3-9'. A slide: 'slide 2'. A paragraph: 'paragraph 40'. A table or some of its rows: 'table 2', 'table 2, row 350' or 'table 2, rows 30-60'. A sheet: its name, or a range of rows: 'Sheet1!A201:F400'. Lines of a text: 'lines 100-200'.",
+            "title": "Part",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "ReadDocumentRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "DocumentPart": {
+            "description": "One piece of a document.\n\nAttributes:\n    label: Where the text is, such as ``page 3`` or ``Sheet1!A1:F200``; give it as ``part`` to start there.\n    text: The text.",
+            "properties": {
+              "label": {
+                "description": "Where the text is; give it as part to start reading there.",
+                "maxLength": 300,
+                "title": "Label",
+                "type": "string"
+              },
+              "text": {
+                "description": "The text.",
+                "title": "Text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "text"
+            ],
+            "title": "DocumentPart",
+            "type": "object"
+          },
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The file's path.",
+            "title": "Path",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The kind of file that was read.",
+            "maxLength": 20,
+            "title": "Kind",
+            "type": "string"
+          },
+          "parts": {
+            "description": "The text in order, each piece with its reference.",
+            "items": {
+              "$ref": "#/$defs/DocumentPart"
+            },
+            "title": "Parts",
+            "type": "array"
+          },
+          "total_parts": {
+            "description": "How many pages, sheets, slides, paragraphs and tables or lines there are.",
+            "title": "Total Parts",
+            "type": "integer"
+          },
+          "pages_without_text": {
+            "description": "Pages or slides looked at that hold no text (scans or pictures): this tool does no OCR.",
+            "items": {
+              "type": "integer"
+            },
+            "title": "Pages Without Text",
+            "type": "array"
+          },
+          "truncated": {
+            "description": "True if text was left out; then call again with part set to next_part.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "next_part": {
+            "anyOf": [
+              {
+                "maxLength": 300,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Where to continue when truncated.",
+            "title": "Next Part"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user, or how to go on.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "kind",
+          "parts",
+          "total_parts",
+          "pages_without_text",
+          "truncated"
+        ],
+        "title": "DocumentReadWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_python",
+      "title": "Run Python on the files of this conversation",
+      "description": "Run Python code on this conversation's files and get back what it printed. The files are in the current folder, under their names as list_files gives them (also at their /workspace/<chat>/<name> paths), read-only. Write every result file directly into the out/ folder, not into a subfolder: each becomes a new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so the user sees each file in out/ as a card in the chat. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, XLSX) into a table file, load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or .csv; do not copy its rows into write_table. There is no network and nothing can be installed. Use threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures the code computed.",
+      "inputSchema": {
+        "description": "Body of ``run_python``.\n\nAttributes:\n    code: The Python to run, as a script.",
+        "properties": {
+          "code": {
+            "description": "The Python code to run, as a script; at most 50000 characters. Print what you need to see, and write every result file into out/.",
+            "maxLength": 50000,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "RunPythonRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "stdout": {
+            "description": "What the code printed.",
+            "title": "Stdout",
+            "type": "string"
+          },
+          "stderr": {
+            "description": "Its warnings and errors; a traceback ends with the error.",
+            "title": "Stderr",
+            "type": "string"
+          },
+          "files": {
+            "description": "The files it wrote into out/, now in the workspace: their paths.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "truncated": {
+            "description": "True if stdout or stderr was cut in the middle to fit the result limit.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "job_id": {
+            "description": "The id of this run; cite it as the source of what the code computed.",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user, or how to go on.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "files",
+          "truncated",
+          "job_id"
+        ],
+        "title": "PythonRunWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "search_files",
+      "title": "Search all files of this conversation",
+      "description": "Search every file of this conversation for a text or, with regex true, a regular expression; case is ignored. Each hit has the file's path, the location in it (page 3, Sheet1!B7, paragraph 12, line 40) and a snippet of at most 200 characters; read the place with read_document. max_hits is 50 by default and at most 200. Files that cannot be searched are named in skipped (no text layer, encrypted, damaged) or counted in unsupported_files (images and other types): never tell the user something is not in the files without saying what could not be searched.",
+      "inputSchema": {
+        "description": "Body of ``search_files``.\n\nAttributes:\n    query: The text to find, or a regular expression.\n    regex: Whether ``query`` is a regular expression.\n    max_hits: How many hits to return, at most 200.",
+        "properties": {
+          "query": {
+            "description": "The text to find, or a regular expression.",
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "regex": {
+            "default": false,
+            "description": "True if query is a regular expression; false for plain text.",
+            "title": "Regex",
+            "type": "boolean"
+          },
+          "max_hits": {
+            "default": 50,
+            "description": "The most hits to return, 50 by default and at most 200.",
+            "title": "Max Hits",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchFilesRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "SearchHit": {
+            "description": "One place a search matched.\n\nAttributes:\n    path: The file's path.\n    location: Where in the file: ``page 3``, ``Sheet1!B7``, ``paragraph 12``, ``line 40``.\n    snippet: The text around the match, at most 200 characters.",
+            "properties": {
+              "path": {
+                "description": "The file's path.",
+                "title": "Path",
+                "type": "string"
+              },
+              "location": {
+                "description": "Where in the file: page 3, Sheet1!B7, paragraph 12, line 40.",
+                "maxLength": 300,
+                "title": "Location",
+                "type": "string"
+              },
+              "snippet": {
+                "description": "The text around the match, at most 200 characters.",
+                "maxLength": 400,
+                "title": "Snippet",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "location",
+              "snippet"
+            ],
+            "title": "SearchHit",
+            "type": "object"
+          },
+          "SkippedFile": {
+            "description": "A file a search could not look into.\n\nAttributes:\n    path: The file's path.\n    reason: Why, in a few words.",
+            "properties": {
+              "path": {
+                "description": "The file's path.",
+                "title": "Path",
+                "type": "string"
+              },
+              "reason": {
+                "description": "Why it could not be searched.",
+                "maxLength": 400,
+                "title": "Reason",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "reason"
+            ],
+            "title": "SkippedFile",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "hits": {
+            "description": "The matches, file by file.",
+            "items": {
+              "$ref": "#/$defs/SearchHit"
+            },
+            "title": "Hits",
+            "type": "array"
+          },
+          "truncated": {
+            "description": "True if there are more hits than shown or not every file was searched.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "files_searched": {
+            "description": "How many files were searched.",
+            "title": "Files Searched",
+            "type": "integer"
+          },
+          "unsupported_files": {
+            "description": "How many files are of a type that cannot be searched.",
+            "title": "Unsupported Files",
+            "type": "integer"
+          },
+          "skipped": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/SkippedFile"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Files that could not be searched, and why.",
+            "title": "Skipped"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user, or how to go on.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hits",
+          "truncated",
+          "files_searched",
+          "unsupported_files"
+        ],
+        "title": "SearchResultWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "write_document",
+      "title": "Write a document into a new Word or Markdown file",
+      "description": "Write a document into a new file of this conversation from Markdown: a Word document (format docx) or the Markdown itself (format md). A Word document takes headings # to #### (##### and ###### become level 4), paragraphs, **bold** and *italic*, bullet and numbered lists nested up to three levels (each numbered list counts from its own first number), tables of up to 63 columns (| a | b | over a |---|---| line; Word holds no wider one, so write that with write_table) and code, in blocks or `inline`, in a monospace font. A link is written as its text with the address in parentheses, an image as its alt text: nothing is fetched. Raw HTML and other syntax stay plain text. At most 200000 characters. The user sees the new file as a card in the chat.",
+      "inputSchema": {
+        "description": "Body of ``write_document``.\n\nAttributes:\n    name: The new file's name.\n    format: ``docx`` or ``md``.\n    markdown: The document, in Markdown.",
+        "properties": {
+          "name": {
+            "description": "The new file's name. The extension is added if it is missing (report.txt becomes report.txt.docx); a name that is taken gets a number.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "format": {
+            "description": "docx: a Word document. md: the Markdown itself, as given.",
+            "enum": [
+              "docx",
+              "md"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "markdown": {
+            "description": "The document in Markdown; at most 200000 characters.",
+            "maxLength": 200000,
+            "title": "Markdown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "format",
+          "markdown"
+        ],
+        "title": "WriteDocumentRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The new file's path; the user sees it as a card in the chat.",
+            "title": "Path",
+            "type": "string"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user about the file.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "WrittenDocumentWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "write_table",
+      "title": "Write a table into a new Excel or CSV file",
+      "description": "Write a table into a new file of this conversation: an Excel workbook (format xlsx, a bold header row that stays in view) or a CSV file (format csv, UTF-8, comma-separated unless delimiter is ; or a tab). For people who will open the file in Excel, use xlsx: Excel reads a CSV file by the computer's regional settings (German Excel splits it on ; and may read 1.5 as text or a date), so CSV is for exchanging data with other programs. columns are the header's names; rows are lists of values in the columns' order, each a string, a number, true, false or null; a shorter row is filled with empty cells. At most 100000 rows, 16384 columns and 32767 characters a cell. Values are data, never formulas: =SUM(A1:A3), 0042 or a web address stay text; a number keeps 15 significant digits in Excel, so write long identifiers as strings. In a CSV a text that starts with =, +, -, @, a tab or a carriage return gets a leading ' so that a spreadsheet does not run it, and hint says how many. sheet names the workbook's sheet. One request is at most 1 MB: for a large table, write the file with run_python into out/ instead. The user sees the new file as a card in the chat.",
+      "inputSchema": {
+        "description": "Body of ``write_table``.\n\nAttributes:\n    name: The new file's name.\n    format: ``xlsx`` or ``csv``.\n    columns: The header's names.\n    rows: The rows, each a list of values in the columns' order.\n    sheet: The workbook's sheet.\n    delimiter: What separates a CSV file's cells.",
+        "properties": {
+          "name": {
+            "description": "The new file's name. The extension is added if it is missing (report.txt becomes report.txt.docx); a name that is taken gets a number.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "format": {
+            "description": "xlsx: an Excel workbook. csv: a CSV file, UTF-8.",
+            "enum": [
+              "xlsx",
+              "csv"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "columns": {
+            "description": "The header's names, one per column; 1 to 16384 columns.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16384,
+            "minItems": 1,
+            "title": "Columns",
+            "type": "array"
+          },
+          "rows": {
+            "description": "The rows, at most 100000, each a list of values in the columns' order: a string, a number, true, false or null. A row shorter than columns is filled with empty cells; a cell holds at most 32767 characters.",
+            "items": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "maxItems": 100000,
+            "title": "Rows",
+            "type": "array"
+          },
+          "sheet": {
+            "default": "Sheet1",
+            "description": "The sheet's name in a workbook: 1 to 31 characters, none of [ ] : * ? / \\, not History.",
+            "maxLength": 31,
+            "minLength": 1,
+            "title": "Sheet",
+            "type": "string"
+          },
+          "delimiter": {
+            "default": ",",
+            "description": "What separates a CSV file's cells: a comma (the default), a semicolon or a tab. Not for xlsx.",
+            "enum": [
+              ",",
+              ";",
+              "\t"
+            ],
+            "title": "Delimiter",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "format",
+          "columns",
+          "rows"
+        ],
+        "title": "WriteTableRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The new file's path; the user sees it as a card in the chat.",
+            "title": "Path",
+            "type": "string"
+          },
+          "rows": {
+            "description": "How many rows were written below the header.",
+            "title": "Rows",
+            "type": "integer"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What to tell the user about the file.",
+            "title": "Hint"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "rows"
+        ],
+        "title": "WrittenTableWithOutputs",
+        "type": "object"
+      }
+    }
+  ],
+  "ttlMs": 300000,
+  "cacheScope": "private",
+  "resultType": "complete",
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "workbench",
+      "version": "<version>"
+    }
+  }
+}

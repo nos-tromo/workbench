@@ -1,0 +1,173 @@
+{
+  "tools": [
+    {
+      "name": "run_python",
+      "title": "Run Python on inline data",
+      "description": "Run Python code on the data given with this call and get back what it printed and the files it wrote. Each data entry is a file in the current folder, under its name, read-only. Write every result file directly into the out/ folder: tables as CSV, for example df.to_csv('out/counts.csv', index=False), and charts as PNG, for example plt.savefig('out/chart.png', dpi=100). Only .png, .csv, .txt, .md and .json files come back, at most 8: an image up to 512 KiB, a text up to 256 KiB, 1 MiB in all. files lists every file written, with returned false and a hint for one that did not come back; nothing is kept after the call. Installed: pandas, numpy, scipy, matplotlib. There is no network and nothing can be installed. Use threads, not multiprocessing. The code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures the code computed.",
+      "inputSchema": {
+        "$defs": {
+          "InlineData": {
+            "additionalProperties": false,
+            "description": "One data entry: a text the call brings, written as a read-only file of the job's folder.\n\nAttributes:\n    name: The file's name.\n    content: Its text, written as UTF-8.",
+            "properties": {
+              "name": {
+                "description": "The file's name in the current folder, such as passages.json: ending .json, .csv, .txt or .md.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\\.(json|csv|txt|md)$",
+                "title": "Name",
+                "type": "string"
+              },
+              "content": {
+                "description": "The file's text.",
+                "title": "Content",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "content"
+            ],
+            "title": "InlineData",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Arguments of inline ``run_python``, validated with the caller's wall cap as ``context={\"wall_cap\": ...}``.\n\nAttributes:\n    code: The Python to run, as a script.\n    data: The data, each entry a file of the current folder.\n    time_limit_s: Seconds the job may run, or ``None`` for the caller's cap.",
+        "properties": {
+          "code": {
+            "description": "The Python code to run, as a script; at most 50000 characters. Print what you need to see, and write every result file directly into out/.",
+            "maxLength": 50000,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "data": {
+            "description": "The data, at most 8 entries and 512 KiB in all: each is a read-only file of the current folder.",
+            "items": {
+              "$ref": "#/$defs/InlineData"
+            },
+            "maxItems": 8,
+            "title": "Data",
+            "type": "array"
+          },
+          "time_limit_s": {
+            "type": "integer",
+            "minimum": 5,
+            "maximum": 60,
+            "description": "Seconds the code may run, from 5 to the most this service allows; leave it out for that most. The code gets 9/10 of it, so that stderr can say it timed out."
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "InlinePythonRequest",
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputInfo": {
+            "description": "One file the code wrote into ``out/``, and whether it came back.\n\nAttributes:\n    name: Its name, as the code wrote it.\n    mime: Its media type.\n    bytes: Its size in bytes.\n    returned: Whether it came back with this answer.",
+            "properties": {
+              "name": {
+                "description": "Its name in out/, as the code wrote it.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "bytes": {
+                "description": "Its size in bytes.",
+                "title": "Bytes",
+                "type": "integer"
+              },
+              "returned": {
+                "description": "True if it came back with this answer; the hint says why one did not.",
+                "title": "Returned",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "mime",
+              "bytes",
+              "returned"
+            ],
+            "title": "OutputInfo",
+            "type": "object"
+          }
+        },
+        "description": "What inline ``run_python`` answers; sent with its ``None`` fields.\n\nAttributes:\n    stdout: What the code printed.\n    stderr: Its warnings and errors.\n    truncated: Whether stdout or stderr was cut in the middle.\n    job_id: The id of the run.\n    files: Every file the code wrote: those that came back, then those that did not.\n    hint: What to tell the user, or how to go on.\n    reason: Always ``None`` on a result; an error result names its reason there.",
+        "properties": {
+          "stdout": {
+            "description": "What the code printed.",
+            "title": "Stdout",
+            "type": "string"
+          },
+          "stderr": {
+            "description": "Its warnings and errors; a traceback ends with the error.",
+            "title": "Stderr",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "True if stdout or stderr was cut in the middle to fit the result limit.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "job_id": {
+            "description": "The id of this run; cite it as the source of what the code computed.",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "files": {
+            "description": "Every file written into out/: those that came back first.",
+            "items": {
+              "$ref": "#/$defs/OutputInfo"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What to tell the user, or how to go on.",
+            "title": "Hint"
+          },
+          "reason": {
+            "default": null,
+            "description": "None on a result; an error result names its reason here.",
+            "title": "Reason",
+            "type": "null"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "truncated",
+          "job_id",
+          "files",
+          "hint"
+        ],
+        "title": "InlinePythonResult",
+        "type": "object"
+      }
+    }
+  ],
+  "ttlMs": 300000,
+  "cacheScope": "private",
+  "resultType": "complete",
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "workbench",
+      "version": "<version>"
+    }
+  }
+}
