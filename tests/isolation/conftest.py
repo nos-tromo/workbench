@@ -142,26 +142,10 @@ def api_info() -> dict[str, Any]:
 
 
 @pytest.fixture(scope="session")
-def api(api_info: dict[str, Any]) -> Iterator[httpx.Client]:
-    """A client of the api on its published test port, holding Open WebUI's synthetic key of the test stack."""
-    key = environment(api_info)["OPEN_WEBUI_WORKBENCH_KEY"]
-    with httpx.Client(base_url=API_URL, headers={"Authorization": f"Bearer {key}"}, timeout=300) as client:
+def api() -> Iterator[httpx.Client]:
+    """A client of the api on its published test port; it holds no key, as the healthcheck and the scraper hold none."""
+    with httpx.Client(base_url=API_URL, timeout=300) as client:
         yield client
-
-
-def run_python(api: httpx.Client, code: str, *, user: str = "user-a", chat: str = "chat-1") -> httpx.Response:
-    """Run ``code`` through the ``run_python`` tool as a synthetic user.
-
-    Args:
-        api: The api client.
-        code: The Python to run.
-        user: The user id Open WebUI would send.
-        chat: The chat id Open WebUI would send.
-
-    Returns:
-        The api's answer.
-    """
-    return api.post("/tools/run_python", json={"code": code}, headers={"X-User-Id": user, "X-Session-Id": chat})
 
 
 def _tools_call(key: str, tool: str, arguments: dict[str, Any], *, user: str, session: str) -> httpx.Response:
@@ -253,6 +237,21 @@ def ghostwriter_mcp(
     return _tools_call(key, tool, arguments, user=user, session=chat)
 
 
+def run_python(api_info: dict[str, Any], code: str, *, user: str = "user-a", chat: str = "chat-1") -> dict[str, Any]:
+    """Run ``code`` through Ghostwriter's ``run_python`` in a synthetic user's chat, as the model would.
+
+    Args:
+        api_info: ``docker inspect`` of the api's container, whose environment holds Ghostwriter's key.
+        code: The Python to run.
+        user: The user id Ghostwriter would send.
+        chat: The chat id Ghostwriter would send.
+
+    Returns:
+        The call's result (:func:`mcp_result`).
+    """
+    return mcp_result(ghostwriter_mcp(api_info, "run_python", {"code": code}, chat=chat, user=user))
+
+
 def mcp_result(response: httpx.Response) -> dict[str, Any]:
     """Take the ``result`` of a JSON-RPC answer of the MCP door.
 
@@ -268,14 +267,14 @@ def mcp_result(response: httpx.Response) -> dict[str, Any]:
     return body["result"]
 
 
-def stdout_of(response: httpx.Response) -> str:
-    """Take what a successful ``run_python`` printed.
+def stdout_of(result: dict[str, Any]) -> str:
+    """Take what a ``run_python`` that ran printed.
 
     Args:
-        response: The api's answer.
+        result: The call's result.
 
     Returns:
         The job's standard output, stripped.
     """
-    assert response.status_code == 200, response.text
-    return str(response.json()["stdout"]).strip()
+    assert result["isError"] is False, result
+    return str(result["structuredContent"]["stdout"]).strip()

@@ -8,6 +8,7 @@ is refused there: the deleted chat is held from new jobs and uploads.
 import dataclasses
 import shutil
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,7 @@ from anyio.from_thread import BlockingPortal
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import HD, HG, PG
-from tests.api.test_files import ME, H, put
+from tests.api.conftest import CALL, HD, HG, PG, PG_SETUP, put
 from tests.api.test_files_ghostwriter import P2, PURPOSE, keep, upload
 from tests.api.test_jobs import FakeClient, sample, until
 from workbench.api.audit import AuditLog
@@ -150,30 +150,24 @@ def test_a_missing_or_default_session_is_400(
     assert chat_events(audit_lines) == []
 
 
-@pytest.mark.parametrize("headers", [H, HD], ids=["open-webui", "docint"])
-def test_open_webui_and_docint_find_no_chat_delete(
-    client: TestClient, store: Store, audit_lines: AuditLines, headers: dict[str, str]
-) -> None:
-    """The chat delete is Ghostwriter's alone: the others' keys find no such route, and nothing goes."""
-    theirs = put(store, "q.csv")
-    r = delete(client, headers)
+def test_docint_finds_no_chat_delete(client: TestClient, store: Store, audit_lines: AuditLines) -> None:
+    """The chat delete is Ghostwriter's alone: docint's key, with the same user and chat, finds no such route."""
+    kept = put(store, "q.csv")
+    r = delete(client, HD)
     assert (r.status_code, r.json()) == NOT_FOUND
-    assert store.get(ME, theirs.virtual_path) == theirs
+    assert store.get(PG_SETUP, kept.virtual_path) == kept
     assert chat_events(audit_lines) == []
 
 
-@pytest.mark.parametrize("headers", [H, HD], ids=["open-webui", "docint"])
-def test_without_the_gate_the_route_still_refuses_them(
-    app: FastAPI, store: Store, audit_lines: AuditLines, headers: dict[str, str]
-) -> None:
-    """Were :class:`KeyGate` bypassed, the route's own check answers Open WebUI and docint the same 404."""
+def test_without_the_gate_the_route_still_refuses_docint(app: FastAPI, store: Store, audit_lines: AuditLines) -> None:
+    """Were :class:`KeyGate` bypassed, the route's own check answers docint the same 404."""
     app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
-    theirs = put(store, "q.csv")
+    kept = put(store, "q.csv")
     with TestClient(app) as client:
         assert client.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
-        r = delete(client, headers)
+        r = delete(client, HD)
     assert (r.status_code, r.json()) == NOT_FOUND
-    assert store.get(ME, theirs.virtual_path) == theirs
+    assert store.get(PG_SETUP, kept.virtual_path) == kept
     assert chat_events(audit_lines) == []
 
 
@@ -193,7 +187,9 @@ def test_a_late_output_of_a_running_job_is_refused(
     with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
         portal = client.portal
         assert portal is not None
-        running = portal.start_task_soon(jobs.submit, PG, "run_python", python_args("print(1)", 60), [], keeper)
+        running = portal.start_task_soon(
+            partial(jobs.submit, call=CALL), PG, "run_python", python_args("print(1)", 60), [], keeper
+        )
         try:
             portal.call(until, lambda: fake.running == 1)
             r = delete(client)
@@ -251,7 +247,9 @@ def test_a_queued_call_of_the_deleted_chat_never_runs(
 
     def submit(portal: BlockingPortal, p: Principal) -> Any:
         keeper = OutputKeeper(audit, p, "run_python", [], keep_all)
-        return portal.start_task_soon(jobs.submit, p, "run_python", python_args("print(1)", 60), [], keeper)
+        return portal.start_task_soon(
+            partial(jobs.submit, call=CALL), p, "run_python", python_args("print(1)", 60), [], keeper
+        )
 
     with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
         portal = client.portal

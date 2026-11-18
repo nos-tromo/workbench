@@ -22,8 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY, unrecorded
-from tests.api.test_files import ME, AuditLines
+from tests.api.conftest import CALL, GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
 from tests.api.test_jobs import KEEP, FakeClient, until
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
@@ -104,7 +103,7 @@ def broken_audit(sweeper: Sweeper, audit_stream: io.StringIO, monkeypatch: pytes
     monkeypatch.setattr(audit_stream, "write", refuse)
 
 
-def put(store: Store, name: str, p: Principal = ME) -> FileRecord:
+def put(store: Store, name: str, p: Principal = PG_SETUP) -> FileRecord:
     """Store a small upload for ``p`` in its chat folder."""
     return store.add_upload(
         p, f"/workspace/{p.chat_id}", name, io.BytesIO(b"x"), max_bytes=100, quota_bytes=10**9, record=unrecorded
@@ -159,14 +158,32 @@ def test_due_files_are_recorded_then_deleted(
     assert event["criteria"] == {
         "period_days": 7,
         "cutoff": iso(T0 + 1),
-        "caller": "open-webui",
+        "caller": "ghostwriter",
         "owner": "user-a",
         "count": 3,
     }
-    assert store.files_in_chat(ME) == [recent]
+    assert store.files_in_chat(PG_SETUP) == [recent]
     assert not any(on_disk(settings, rec).exists() for rec in old)
     assert on_disk(settings, recent).exists()
     assert "quarterly-figures" not in json_text(audit_lines)
+
+
+def test_a_workspace_left_by_open_webui_still_ages_out(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """A file under the open-webui caller's folder past the period is swept like any other.
+
+    No key opens that folder any more; retention still records the file by its id, then deletes it and its row.
+    """
+    left = Principal("open-webui", "user-a", "chat-1")
+    rec = put(store, "quarterly-figures.xlsx", left)
+    clock.now = T0 + 7 * DAY + 1
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    (event,) = sweeps(audit_lines)
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("delete", "ok", [rec.id])
+    assert (event["criteria"]["caller"], event["criteria"]["owner"]) == ("open-webui", "user-a")
+    assert store.files_in_chat(left) == []
+    assert not on_disk(settings, rec).exists()
 
 
 def json_text(audit_lines: AuditLines) -> str:
@@ -189,7 +206,7 @@ def test_nothing_is_deleted_without_its_record(
     with pytest.raises(AuditWriteError):
         sweeper.sweep_once()
     assert exits == [1]
-    assert sorted(store.files_in_chat(ME), key=lambda rec: rec.id) == sorted(files, key=lambda rec: rec.id)
+    assert sorted(store.files_in_chat(PG_SETUP), key=lambda rec: rec.id) == sorted(files, key=lambda rec: rec.id)
     assert all(on_disk(settings, rec).exists() for rec in files)
     err = capsys.readouterr().err
     assert "2 files" in err
@@ -209,9 +226,9 @@ def test_failed_removal_is_recorded_as_error(
 ) -> None:
     """A file that cannot go keeps its row and is recorded again as an error; the sweep goes on with the others."""
     gone, busy, odd = put(store, "a.txt"), put(store, "b.txt"), put(store, "c.txt")
-    elsewhere = Principal("open-webui", "user-a", "chat-2")
+    elsewhere = Principal("ghostwriter", "user-a", "chat-2")
     linked = put(store, "d.txt", elsewhere)
-    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-2"
+    chat = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-2"
     chat.rename(tmp_path / "moved")
     chat.symlink_to(tmp_path / "moved")  # a link in the path: the store refuses it with a PathError
     clock.now = T0 + 8 * DAY
@@ -280,8 +297,8 @@ def test_an_error_record_that_cannot_be_written_halts_too(
 def test_batches_never_mix_users(sweeper: Sweeper, store: Store, clock: Clock, audit_lines: AuditLines) -> None:
     """Each event is one caller's user, at most 200 files; together they name every due file once."""
     people = [
-        Principal("open-webui", "user-a", "chat-1"),
-        Principal("open-webui", "user-b", "chat-1"),
+        Principal("ghostwriter", "user-a", "chat-1"),
+        Principal("ghostwriter", "user-b", "chat-1"),
         Principal("docint", "user-a", "chat-1"),
     ]
     made: list[FileRecord] = []
@@ -321,7 +338,7 @@ def test_files_that_keep_failing_never_stall_the_sweep(
     monkeypatch.setattr(store, "remove", failing)
     clock.now = T0 + 8 * DAY
     assert sweeper.sweep_once() == SweepReport(deleted=50, errors=200)
-    assert {rec.id for rec in store.files_in_chat(ME)} == stuck
+    assert {rec.id for rec in store.files_in_chat(PG_SETUP)} == stuck
 
 
 def test_a_file_moved_since_it_was_listed_is_deleted_where_it_is_now(
@@ -329,8 +346,8 @@ def test_a_file_moved_since_it_was_listed_is_deleted_where_it_is_now(
 ) -> None:
     """Moving keeps a file's id and creation time: it is still due, and goes from its new place."""
     rec = put(store, "draft.docx")
-    store.mkdir(ME, "/workspace/chat-1/final")
-    moved = store.move(ME, rec.virtual_path, "/workspace/chat-1/final/report.docx")
+    store.mkdir(PG_SETUP, "/workspace/chat-1/final")
+    moved = store.move(PG_SETUP, rec.virtual_path, "/workspace/chat-1/final/report.docx")
     clock.now = T0 + 8 * DAY
     assert sweeper.sweep_once().deleted == 1
     assert not on_disk(settings, moved).exists()
@@ -343,11 +360,13 @@ async def test_sweep_during_running_job(
     """An input expires while its job runs (the job has its copy): it goes with its record; the output is kept."""
     old = put(store, "quarterly-figures.xlsx")
     executor = FakeClient(settings.data_dir)
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     executor.files = {"chart.png": b"\x89PNG"}
     queue = JobQueue(settings, executor, store, metrics)
     clock.now = T0 + 8 * DAY
-    running = asyncio.create_task(queue.submit(ME, "run_python", {"code": "print(1)"}, [old.name], KEEP))
+    running = asyncio.create_task(
+        queue.submit(PG_SETUP, "run_python", {"code": "print(1)"}, [old.name], KEEP, call=CALL)
+    )
     await until(lambda: executor.running == 1)
     report = await asyncio.to_thread(sweeper.sweep_once)
     assert report == SweepReport(deleted=1, errors=0)
@@ -356,8 +375,8 @@ async def test_sweep_during_running_job(
     executor.gate.set()
     job, result, made = await running
     assert (result.status, [rec.name for rec in made]) == ("ok", ["chart.png"])
-    assert store.files_in_chat(ME) == made
-    assert store.get_job(ME, job.id).status == "ok"
+    assert store.files_in_chat(PG_SETUP) == made
+    assert store.get_job(PG_SETUP, job.id).status == "ok"
 
 
 # --- job records, folders and staging -----------------------------------------------------------------------------
@@ -367,14 +386,14 @@ def test_old_job_records_are_forgotten_without_a_record(
     sweeper: Sweeper, store: Store, clock: Clock, audit_lines: AuditLines
 ) -> None:
     """They hold no content: they go without an event."""
-    old = store.add_job(ME, "run_python")
+    old = store.add_job(PG_SETUP, "run_python")
     clock.now = T0 + 2 * DAY
-    new = store.add_job(ME, "read_document")
+    new = store.add_job(PG_SETUP, "read_document")
     clock.now = T0 + 8 * DAY
     sweeper.sweep_once()
     with pytest.raises(NotFound):
-        store.get_job(ME, old.id)
-    assert store.get_job(ME, new.id) == new
+        store.get_job(PG_SETUP, old.id)
+    assert store.get_job(PG_SETUP, new.id) == new
     assert sweeps(audit_lines) == []
 
 
@@ -391,11 +410,11 @@ def test_empty_folders_untouched_for_an_hour_go_bottom_up(
     The clock is the file system's, so a folder whose empty folder was just removed is new again by its own time.
     """
     clock.now = time.time()
-    root = settings.data_dir / "workspaces" / "open-webui" / "user-a"
-    store.mkdir(ME, "/workspace/chat-1/reports/2026/q1")
-    store.mkdir(ME, "/workspace/chat-2/fresh")
-    store.mkdir(ME, "/workspace/chat-3/kept")
-    put(store, "notes.txt", Principal("open-webui", "user-a", "chat-3"))
+    root = settings.data_dir / "workspaces" / "ghostwriter" / "user-a"
+    store.mkdir(PG_SETUP, "/workspace/chat-1/reports/2026/q1")
+    store.mkdir(PG_SETUP, "/workspace/chat-2/fresh")
+    store.mkdir(PG_SETUP, "/workspace/chat-3/kept")
+    put(store, "notes.txt", Principal("ghostwriter", "user-a", "chat-3"))
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "chat-4").symlink_to(outside, target_is_directory=True)
@@ -412,7 +431,7 @@ def test_empty_folders_untouched_for_an_hour_go_bottom_up(
     assert not (root / "chat-3" / "kept").exists()
     assert (root / "chat-4").is_symlink() and outside.is_dir()
     assert (root / "chat-5" / "link").is_symlink()
-    gone = Principal("open-webui", "user-a", "chat-3")
+    gone = Principal("ghostwriter", "user-a", "chat-3")
     store.remove(store.get(gone, "/workspace/chat-3/notes.txt"))
     for chat in ("chat-2", "chat-3", "chat-5"):
         (root / chat / "link").unlink(missing_ok=True)
@@ -421,7 +440,7 @@ def test_empty_folders_untouched_for_an_hour_go_bottom_up(
         age(root / chat, 2 * HOUR, clock.now)
     sweeper.sweep_once()
     assert sorted(p.name for p in root.iterdir()) == ["chat-4"]
-    assert (settings.data_dir / "workspaces" / "open-webui").is_dir()
+    assert (settings.data_dir / "workspaces" / "ghostwriter").is_dir()
 
 
 def test_staging_folders_older_than_an_hour_go(
@@ -462,7 +481,7 @@ def test_staging_residue_is_recorded_with_its_jobs_owner_then_removed(
     They hold content made from the user's files.
     """
     clock.now = time.time()
-    job = store.add_job(ME, "run_python")
+    job = store.add_job(PG_SETUP, "run_python")
     residue = settings.data_dir / "staging" / job.id
     (residue / "deep").mkdir(parents=True)
     (residue / "harbour-chart.png").write_bytes(b"\x89PNG")
@@ -487,7 +506,7 @@ def test_staging_residue_is_recorded_with_its_jobs_owner_then_removed(
         "rule": "staging",
         "job": job.id,
         "count": 2,
-        "caller": "open-webui",
+        "caller": "ghostwriter",
         "owner": "user-a",
     }
     assert event["target"] == {"kind": "file", "count": 2, "container": "chat:chat-1"}
@@ -540,9 +559,9 @@ def test_orphans_are_recorded_then_removed(
     assert not (chat / "sub").exists()  # emptied by the sweep, untouched for an hour before it
     assert fresh.exists() and on_disk(settings, kept).exists()
     first, second = sweeps(audit_lines)
-    assert first["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 2}
+    assert first["criteria"] == {"rule": "orphan", "caller": "ghostwriter", "owner": "user-a", "count": 2}
     assert first["target"] == {"kind": "file", "ids": ["f" * 32], "count": 2, "container": "chat:chat-1"}
-    assert second["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 1}
+    assert second["criteria"] == {"rule": "orphan", "caller": "ghostwriter", "owner": "user-a", "count": 1}
     assert second["target"] == {"kind": "file", "count": 1, "container": "chat:chat-2"}
     text = json_text(audit_lines)
     assert [name for name in ("lost-report", "stray-sheet", "fresh-orphan", "notes.txt") if name in text] == []
@@ -561,7 +580,7 @@ def test_an_unwritable_record_of_an_orphan_or_staging_halts_with_nothing_removed
     """The same rule as for the files with rows: no record, no removal, and the process ends."""
     clock.now = time.time()
     if left == "orphan":
-        path = orphan(settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1" / "lost.txt", clock.now)
+        path = orphan(settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1" / "lost.txt", clock.now)
     else:
         path = orphan(settings.data_dir / "staging" / ("a" * 32) / "chart.png", clock.now)
         age(path.parent, 2 * HOUR, clock.now)
@@ -585,7 +604,7 @@ def test_a_move_in_progress_is_never_taken_for_an_orphan(
     """
     clock.now = time.time()
     rec = put(store, "draft.docx")
-    store.mkdir(ME, "/workspace/chat-1/final")
+    store.mkdir(PG_SETUP, "/workspace/chat-1/final")
     age(on_disk(settings, rec), 2 * HOUR, clock.now)  # a rename keeps the time, so the moved file looks old
     renamed, go_on = threading.Event(), threading.Event()
     replace = os.replace
@@ -597,7 +616,9 @@ def test_a_move_in_progress_is_never_taken_for_an_orphan(
             go_on.wait(5)
 
     monkeypatch.setattr(os, "replace", slow)
-    mover = threading.Thread(target=store.move, args=(ME, rec.virtual_path, "/workspace/chat-1/final/report.docx"))
+    mover = threading.Thread(
+        target=store.move, args=(PG_SETUP, rec.virtual_path, "/workspace/chat-1/final/report.docx")
+    )
     mover.start()
     assert renamed.wait(5)
     sweeping = threading.Thread(target=sweeper.sweep_once)
@@ -607,7 +628,7 @@ def test_a_move_in_progress_is_never_taken_for_an_orphan(
     go_on.set()
     mover.join(5)
     sweeping.join(5)
-    assert store.get(ME, "/workspace/chat-1/final/report.docx").id == rec.id
+    assert store.get(PG_SETUP, "/workspace/chat-1/final/report.docx").id == rec.id
     assert (on_disk(settings, rec).parent / "final" / "report.docx").exists()
     assert sweeps(audit_lines) == []
 
@@ -621,8 +642,8 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
     The store finds or makes the folder and puts the file into it under its lock, which the sweep's removal holds too.
     """
     clock.now = time.time()
-    store.mkdir(ME, "/workspace/chat-1")
-    root = settings.data_dir / "workspaces" / "open-webui" / "user-a"
+    store.mkdir(PG_SETUP, "/workspace/chat-1")
+    root = settings.data_dir / "workspaces" / "ghostwriter" / "user-a"
     for folder in (root / "chat-1", root):
         age(folder, 2 * HOUR, clock.now)
     found, go_on = threading.Event(), threading.Event()
@@ -647,7 +668,7 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
             return answer
 
         monkeypatch.setattr(store._ws, "chat_dir", slow)
-        job_id = store.add_job(ME, "run_python").id
+        job_id = store.add_job(PG_SETUP, "run_python").id
         staged = settings.data_dir / "staging" / job_id / "chart.png"
         staged.parent.mkdir(parents=True)
         staged.write_bytes(b"\x89PNG")
@@ -658,7 +679,7 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
             made.append(put(store, "quarterly-figures.xlsx"))
         else:
             made.append(
-                store.register_output(ME, staged, "chart.png", job_id, file_id=new_file_id(), quota_bytes=10**12)
+                store.register_output(PG_SETUP, staged, "chart.png", job_id, file_id=new_file_id(), quota_bytes=10**12)
             )
 
     arriving = threading.Thread(target=arrive)
@@ -672,7 +693,7 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
     sweeping.join(5)
     (rec,) = made
     assert on_disk(settings, rec).exists()
-    assert store.files_in_chat(ME) == [rec]
+    assert store.files_in_chat(PG_SETUP) == [rec]
 
 
 def test_an_empty_user_root_untouched_for_an_hour_goes(
@@ -681,23 +702,23 @@ def test_an_empty_user_root_untouched_for_an_hour_goes(
     """It names a pseudonymous user past the period; ``workspaces/`` and the caller's folder stay, even empty."""
     clock.now = time.time()
     workspaces = settings.data_dir / "workspaces"
-    gone, fresh, busy = (workspaces / "open-webui" / name for name in ("user-a", "user-b", "user-c"))
+    gone, fresh, busy = (workspaces / "ghostwriter" / name for name in ("user-a", "user-b", "user-c"))
     for folder in (gone, fresh):
         folder.mkdir(parents=True)
-    put(store, "notes.txt", Principal("open-webui", "user-c", "chat-1"))
-    for folder in (gone, busy, busy / "chat-1", workspaces / "open-webui", workspaces):
+    put(store, "notes.txt", Principal("ghostwriter", "user-c", "chat-1"))
+    for folder in (gone, busy, busy / "chat-1", workspaces / "ghostwriter", workspaces):
         age(folder, 2 * HOUR, clock.now)
-    age(on_disk(settings, store.files_in_chat(Principal("open-webui", "user-c", "chat-1"))[0]), 2 * HOUR, clock.now)
+    age(on_disk(settings, store.files_in_chat(Principal("ghostwriter", "user-c", "chat-1"))[0]), 2 * HOUR, clock.now)
     age(fresh, 10 * 60, clock.now)
     sweeper.sweep_once()
-    assert sorted(p.name for p in (workspaces / "open-webui").iterdir()) == ["user-b", "user-c"]
-    user_c = Principal("open-webui", "user-c", "chat-1")
+    assert sorted(p.name for p in (workspaces / "ghostwriter").iterdir()) == ["user-b", "user-c"]
+    user_c = Principal("ghostwriter", "user-c", "chat-1")
     store.remove(store.get(user_c, "/workspace/chat-1/notes.txt"))
     for folder in (fresh, busy / "chat-1", busy):
         age(folder, 2 * HOUR, clock.now)
     sweeper.sweep_once()
-    assert list((workspaces / "open-webui").iterdir()) == []
-    assert workspaces.is_dir() and (workspaces / "open-webui").is_dir()
+    assert list((workspaces / "ghostwriter").iterdir()) == []
+    assert workspaces.is_dir() and (workspaces / "ghostwriter").is_dir()
 
 
 def test_staging_and_workspaces_that_are_links_are_not_followed(
@@ -723,7 +744,7 @@ def test_an_orphan_that_cannot_be_removed_is_recorded_again_as_an_error(
 ) -> None:
     """As for a file with a row: the orphans that stay are named again, ``outcome: error``, by id where known."""
     clock.now = time.time()
-    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    chat = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
     stuck, gone = (orphan(chat / f"{letter * 32}.part", clock.now) for letter in "ef")
     loose = orphan(chat / "lost-report.docx", clock.now)
     unlink = store_module._unlink
@@ -740,7 +761,7 @@ def test_an_orphan_that_cannot_be_removed_is_recorded_again_as_an_error(
     assert (ok["outcome"], sorted(ok["target"]["ids"]), ok["target"]["count"]) == ("ok", ["e" * 32, "f" * 32], 3)
     assert error["outcome"] == "error"
     assert error["target"] == {"kind": "file", "ids": ["e" * 32], "count": 2, "container": "chat:chat-1"}
-    assert error["criteria"] == {"rule": "orphan", "caller": "open-webui", "owner": "user-a", "count": 2}
+    assert error["criteria"] == {"rule": "orphan", "caller": "ghostwriter", "owner": "user-a", "count": 2}
     assert "lost-report" not in json_text(audit_lines)
 
 
@@ -772,7 +793,7 @@ def test_more_orphans_than_one_event_names_are_recorded_in_several(
 ) -> None:
     """At most 200 ids an event: 201 ``.part`` orphans of one chat folder are two events, and no id is cut."""
     clock.now = time.time()
-    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    chat = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
     ids = [f"{n:032x}" for n in range(201)]
     for file_id in ids:
         orphan(chat / f"{file_id}.part", clock.now)
@@ -808,7 +829,7 @@ def test_one_entry_that_cannot_be_looked_at_never_stops_the_prune(
     clock.now = time.time() - 8 * DAY
     put(store, "quarterly-figures.xlsx")
     clock.now = time.time()
-    workspaces = settings.data_dir / "workspaces" / "open-webui"
+    workspaces = settings.data_dir / "workspaces" / "ghostwriter"
     chat = workspaces / "user-a" / "chat-1"
     sealed, unlisted = chat / "sealed", chat / "unlisted"
     orphan(sealed / "inside.txt", clock.now)
@@ -893,7 +914,7 @@ def test_a_stop_during_the_prune_ends_it_before_the_next_user(
 ) -> None:
     """A cancel asks the prune to stop: no user after the one in hand is swept, and no staging folder."""
     clock.now = time.time()
-    workspaces = settings.data_dir / "workspaces" / "open-webui"
+    workspaces = settings.data_dir / "workspaces" / "ghostwriter"
     lost = [orphan(workspaces / user / "chat-1" / "lost-report.docx", clock.now) for user in ("user-a", "user-b")]
     residue = orphan(settings.data_dir / "staging" / ("a" * 32) / "harbour-chart.png", clock.now)
     age(residue.parent, 2 * HOUR, clock.now)
@@ -922,7 +943,7 @@ def test_a_stop_ends_a_users_orphans_between_two_batches(
     beside it, untouched for two hours, is still there.
     """
     clock.now = time.time()
-    chat = settings.data_dir / "workspaces" / "open-webui" / "user-a" / "chat-1"
+    chat = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
     for n in range(201):
         orphan(chat / f"{n:032x}.part", clock.now)
     age(chat, 2 * HOUR, clock.now)
@@ -1040,7 +1061,7 @@ def test_a_sweep_that_deleted_and_then_failed_still_checkpoints(
     clock.now = T0 + 8 * DAY
     with pytest.raises(sqlite3.OperationalError):
         sweeper.sweep_once()
-    assert store.files_in_chat(ME) == []
+    assert store.files_in_chat(PG_SETUP) == []
     assert checkpoints == [1]
 
 
@@ -1067,12 +1088,12 @@ async def test_the_sweep_runs_at_start_and_then_every_interval(
     clock.now = T0 + 8 * DAY
     task = asyncio.create_task(sweeper.run_forever())
     try:
-        await until(lambda: store.files_in_chat(ME) == [], seconds=2)
+        await until(lambda: store.files_in_chat(PG_SETUP) == [], seconds=2)
         put(store, "b.txt")
         clock.now = T0 + 16 * DAY
         await asyncio.sleep(0.2)
-        assert len(store.files_in_chat(ME)) == 1
-        await until(lambda: store.files_in_chat(ME) == [], seconds=3)
+        assert len(store.files_in_chat(PG_SETUP)) == 1
+        await until(lambda: store.files_in_chat(PG_SETUP) == [], seconds=3)
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1141,13 +1162,13 @@ async def test_a_cancel_after_a_batch_was_recorded_leaves_its_rest_to_be_recorde
     go_on.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    left = store.files_in_chat(ME)
+    left = store.files_in_chat(PG_SETUP)
     assert len(left) == 2
     assert sweeper.sweep_once() == SweepReport(deleted=2, errors=0)
     first, again = sweeps(audit_lines)
     assert sorted(first["target"]["ids"]) == sorted(rec.id for rec in made)
     assert sorted(again["target"]["ids"]) == sorted(rec.id for rec in left)
-    assert store.files_in_chat(ME) == []
+    assert store.files_in_chat(PG_SETUP) == []
 
 
 # --- the api ------------------------------------------------------------------------------------------------------
@@ -1196,7 +1217,7 @@ def test_the_api_sweeps_at_start_and_ends_the_sweep_before_its_chain(
     assert done.is_set()
     operations = [event["operation"] for event in audit_lines()]
     assert operations == ["start", "config.audit", "retention.sweep", "shutdown"]
-    assert len(store.files_in_chat(ME)) == len(made) - 1
+    assert len(store.files_in_chat(PG_SETUP)) == len(made) - 1
 
 
 def test_the_app_the_factory_builds_sweeps(
@@ -1204,14 +1225,14 @@ def test_the_app_the_factory_builds_sweeps(
 ) -> None:
     """``uvicorn --factory`` gets a sweeper: a file due when the api starts goes."""
     data = tmp_path / "volume"
-    monkeypatch.setenv("OPEN_WEBUI_WORKBENCH_KEY", KEY)
+    monkeypatch.setenv("GHOSTWRITER_WORKBENCH_KEY", GHOSTWRITER_KEY)
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(data))
     monkeypatch.delenv("AUDIT_OUTPUT", raising=False)
     monkeypatch.delenv("WORKBENCH_RETENTION_DAYS", raising=False)
     before = Store(data / "workbench.db", Workspaces(data), lambda: time.time() - 8 * DAY)
     put(before, "quarterly-figures.xlsx")
     with TestClient(app_factory()):
-        wait_for(lambda: before.files_in_chat(ME) == [])
+        wait_for(lambda: before.files_in_chat(PG_SETUP) == [])
     assert '"retention.sweep"' in capsys.readouterr().out
 
 
@@ -1222,7 +1243,7 @@ def test_the_app_the_factory_builds_sweeps(
 def volume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """A data volume the dry run finds through the environment, as in the api's container."""
     data = tmp_path / "volume"
-    monkeypatch.setenv("OPEN_WEBUI_WORKBENCH_KEY", KEY)
+    monkeypatch.setenv("GHOSTWRITER_WORKBENCH_KEY", GHOSTWRITER_KEY)
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(data))
     monkeypatch.delenv("WORKBENCH_RETENTION_DAYS", raising=False)
     return data
@@ -1236,7 +1257,7 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
     now = time.time()
     ages = iter([10.0, 9.0, 3.0, 12.0, 12.0])
     store = Store(volume / "workbench.db", Workspaces(volume), lambda: now - next(ages) * DAY)
-    who = Principal("open-webui", "user-7f3a9c", "chat-5e1b2d")
+    who = Principal("ghostwriter", "user-7f3a9c", "chat-5e1b2d")
     secrets = [who.user_id, who.chat_id]
     for name in ("harbour-survey-2026.xlsx", "pier-inspection.docx", "fresh-notes.txt"):
         rec = store.add_upload(

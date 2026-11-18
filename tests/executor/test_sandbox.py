@@ -693,7 +693,7 @@ def test_clean_env_sets_the_tmp_variables_only_when_asked() -> None:
 async def test_child_environment_is_clean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing of the supervisor's environment, its keys and tokens included, reaches the child."""
     monkeypatch.setenv("WORKBENCH_DATA_DIR", "/data")
-    monkeypatch.setenv("OPEN_WEBUI_WORKBENCH_KEY", "k" * 32)
+    monkeypatch.setenv("GHOSTWRITER_WORKBENCH_KEY", "k" * 32)
     monkeypatch.setenv("PYTHONPATH", "/somewhere")
     monkeypatch.setenv("AUDIT_OUTPUT", "container")
     code = "import json, os; json.dump(dict(os.environ), open('env.json', 'w'))"

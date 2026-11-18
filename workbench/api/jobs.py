@@ -15,16 +15,17 @@ is sent:
 - a caller with slots of its own (:class:`CallLimits`) has that many jobs running at once over
   all its users, and that many times a user's share waiting; its further calls wait without a
   slot, and past its share they are refused at once (``queue_full``);
-- a job waits at most ``queue_wait_s`` for its turn, or its call's own wait (``wait_timeout``);
+- a job waits at most its call's wait for its turn (``wait_timeout``);
 - an executor with no free slot, or one that cannot be reached, is a refusal too
   (``executor_busy``).
 
-Every refusal is :class:`Busy`, which the api answers as ``503``, "busy, retry later". A request
-that is too large for the protocol's line is not a refusal and not worth a retry:
-:class:`RequestTooLarge`, ``422``. The queue is the only user of the staging folder: it moves what
-a job wrote into the chat folder (:meth:`~workbench.api.store.Store.register_output`), or reads it
-back for the answer (:meth:`JobQueue.submit_inline`), and removes the job's staging folder
-afterwards, whatever came of the job.
+Every refusal is :class:`Busy`, which the MCP door answers as an ``isError`` result with its
+reason and "busy, retry later". A request that is too large for the protocol's line is not a
+refusal and not worth a retry: :class:`RequestTooLarge`, answered ``too_large``. The queue is the
+only user of the staging folder: it moves what a job wrote into the chat folder
+(:meth:`~workbench.api.store.Store.register_output`), or reads it back for the answer
+(:meth:`JobQueue.submit_inline`), and removes the job's staging folder afterwards, whatever came
+of the job.
 
 No output becomes a file without its record. Once the executor has answered, the caller's
 :class:`Keeper` records the job by the ids the queue chose for its outputs, and only then are they
@@ -111,7 +112,7 @@ class CallLimits:
 
     Attributes:
         wall_s: The most wall-clock seconds its job may run; the job gets the least of this and ``job_wall_s``.
-        wait_s: The most seconds it waits for its turn, in place of ``queue_wait_s``.
+        wait_s: The most seconds it waits for its turn.
         slots: The most jobs of its caller that run at once; ``None`` for no cap of the caller's own.
     """
 
@@ -521,7 +522,7 @@ class JobQueue:
         input_files: Sequence[str],
         keeper: Keeper | None = None,
         *,
-        call: CallLimits | None = None,
+        call: CallLimits,
         previews: bool = False,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run a tool in the executor, when its turn comes, and keep what it makes.
@@ -533,8 +534,7 @@ class JobQueue:
             input_files: Paths relative to the chat folder that the job may read.
             keeper: Records the job once the executor has answered, before any output is moved into the chat folder,
                 and picks the outputs to keep. Without one, no output is kept: a tool that makes no file has none.
-            call: The call's wall, wait and caller slots; without it, ``job_wall_s``, ``queue_wait_s`` and no cap of
-                the caller's own.
+            call: The call's wall, wait and caller slots.
             previews: Whether the executor reads a table preview of each csv and xlsx output the job writes. The
                 keeper sees each on its output (``OutputFile.preview``) when it records the answer.
 
@@ -607,12 +607,12 @@ class JobQueue:
             return await self._run_inline(p, tool, args, inline_inputs, taker, call)
 
     @contextlib.asynccontextmanager
-    async def _turn(self, p: Principal, call: CallLimits | None) -> AsyncIterator[None]:
+    async def _turn(self, p: Principal, call: CallLimits) -> AsyncIterator[None]:
         """Hold the user's turn, the caller's gate and a slot while the job runs; give them back whatever happens.
 
         Args:
             p: The caller and user.
-            call: The call's wait and caller slots; ``None`` for ``queue_wait_s`` and no cap of the caller's own.
+            call: The call's wait and caller slots.
 
         Yields:
             Once the job may run.
@@ -627,7 +627,7 @@ class JobQueue:
         caller_gate = self._caller_gate(p.caller, call)
         gate.refs += 1
         try:
-            await self._admit(gate, caller_gate, self._settings.queue_wait_s if call is None else call.wait_s)
+            await self._admit(gate, caller_gate, call.wait_s)
             try:
                 yield
             finally:
@@ -640,7 +640,7 @@ class JobQueue:
             if gate.refs == 0:
                 del self._gates[key]
 
-    def _caller_gate(self, caller: str, call: CallLimits | None) -> _CallerGate | None:
+    def _caller_gate(self, caller: str, call: CallLimits) -> _CallerGate | None:
         """The gate of a capped caller, made on its first capped call.
 
         Args:
@@ -650,7 +650,7 @@ class JobQueue:
         Returns:
             The gate; ``None`` for a call with no cap of its caller's own.
         """
-        if call is None or call.slots is None:
+        if call.slots is None:
             return None
         gate = self._caller_gates.get(caller)
         if gate is None:
@@ -724,17 +724,17 @@ class JobQueue:
                 self.metrics.queue_length.set(self._waiting)
             self.metrics.queue_wait_seconds.observe(time.monotonic() - began)
 
-    def _limits(self, call: CallLimits | None) -> Limits:
+    def _limits(self, call: CallLimits) -> Limits:
         """The limits of a job: its wall, the least of the call's and ``job_wall_s``, as wall and CPU time.
 
         Args:
-            call: The call's wall; ``None`` for ``job_wall_s``.
+            call: The call's wall.
 
         Returns:
             The job's limits.
         """
         settings = self._settings
-        wall = settings.job_wall_s if call is None else min(call.wall_s, settings.job_wall_s)
+        wall = min(call.wall_s, settings.job_wall_s)
         return Limits(wall_s=wall, cpu_s=wall, memory_mb=settings.job_memory_mb, file_mb=settings.upload_max_mb)
 
     def _request(
@@ -743,7 +743,7 @@ class JobQueue:
         p: Principal,
         tool: str,
         args: dict[str, Any],
-        call: CallLimits | None,
+        call: CallLimits,
         *,
         input_files: Sequence[str] = (),
         inline_inputs: Sequence[InlineFile] = (),
@@ -756,7 +756,7 @@ class JobQueue:
             p: The caller, user and chat.
             tool: Name of the runner.
             args: The runner's arguments; every lone surrogate in their strings is sent as U+FFFD.
-            call: The call's wall; ``None`` for ``job_wall_s``.
+            call: The call's wall.
             input_files: Paths relative to the chat folder.
             inline_inputs: The data.
             previews: Whether the job reads its table outputs' previews.
@@ -785,7 +785,7 @@ class JobQueue:
         args: dict[str, Any],
         input_files: Sequence[str],
         keeper: Keeper | None,
-        call: CallLimits | None,
+        call: CallLimits,
         previews: bool,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Record the job, run it, keep its outputs and settle its record and staging folder.
@@ -796,7 +796,7 @@ class JobQueue:
             args: The runner's arguments.
             input_files: Paths relative to the chat folder.
             keeper: Records the answer and picks the outputs to keep; ``None`` keeps none.
-            call: The call's wall; ``None`` for ``job_wall_s``.
+            call: The call's wall.
             previews: Whether the job reads its table outputs' previews.
 
         Returns:

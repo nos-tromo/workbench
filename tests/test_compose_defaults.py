@@ -3,7 +3,6 @@
 Compose's settings and shape, the images' bases, ``.env.example``, the bundle script and the Makefile's targets.
 """
 
-import json
 import os
 import re
 import shutil
@@ -28,7 +27,6 @@ SPEC_DEFAULTS = {
     "WORKBENCH_RETENTION_INTERVAL_S": "300",
     "WORKBENCH_EXECUTOR_SLOTS": "4",
     "WORKBENCH_QUEUE_MAX": "16",
-    "WORKBENCH_QUEUE_WAIT_S": "60",
     "WORKBENCH_JOBS_PER_USER": "1",
     "WORKBENCH_JOB_WALL_S": "120",
     "WORKBENCH_JOB_MEMORY_MB": "1536",
@@ -145,7 +143,7 @@ def test_the_purpose_default_covers_every_recorded_ghostwriter_tool() -> None:
     assert tools | {OPERATIONS["upload"][0], OPERATIONS["view"][0]} <= required
     assert OPERATIONS["chat_delete"][0] not in required
     settings = load_settings(
-        {"OPEN_WEBUI_WORKBENCH_KEY": "k" * 32, "AUDIT_REQUIRE_PURPOSE": default.group(2)}, role="api"
+        {"GHOSTWRITER_WORKBENCH_KEY": "a" * 32, "AUDIT_REQUIRE_PURPOSE": default.group(2)}, role="api"
     )
     assert settings.require_purpose == required
 
@@ -217,9 +215,9 @@ def test_the_executor_image_strips_setuid_and_setgid_bits() -> None:
 
 
 def test_the_images_leave_out_what_neither_runs() -> None:
-    """R1 M-10: the contract's stub model, the tests, the docs and the build helpers stay out of both images."""
+    """R1 M-10: the tests, the docs and the build helpers stay out of both images."""
     ignored = set((ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines())
-    assert {"contract/", "docs/", "**/tests/", "docker/", "make/", "Makefile"} <= ignored
+    assert {"docs/", "**/tests/", "docker/", "make/", "Makefile"} <= ignored
 
 
 def test_ci_widens_the_tests_time_bounds_and_the_root_run_takes_the_factor_in() -> None:
@@ -411,117 +409,10 @@ def test_the_test_stack_keeps_nothing_of_a_developers() -> None:
     )
 
 
-class _ComposeLoader(yaml.SafeLoader):
-    """Reads compose's ``!reset`` tag as the pair ``("!reset", value)``."""
-
-
-_ComposeLoader.add_constructor("!reset", lambda loader, node: ("!reset", loader.construct_sequence(node)))  # type: ignore[arg-type]
-
-
-def contract_stack(name: str = "compose.yaml") -> dict[str, Any]:
-    """Read a file of ``contract/``: the stack, or the override it includes last."""
-    return yaml.load((ROOT / "contract" / name).read_text(encoding="utf-8"), Loader=_ComposeLoader)
-
-
-#: The shape of the Open WebUI pin: a release tag and a digest. The pin itself lives in contract/compose.yaml only, so a
-#: Dependabot bump there passes this check and reaches the contract job, which then runs the new image.
-OPEN_WEBUI_IMAGE = re.compile(r"ghcr\.io/open-webui/open-webui:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}")
-
-#: Open WebUI's production switches that bear on the contract (open-webui-service docker/compose.yaml), and the two
-#: the connection adds.
-CONTRACT_SWITCHES = {
-    "ENABLE_PERSISTENT_CONFIG": "false",
-    "AUDIT_LOG_LEVEL": "METADATA",
-    "ENABLE_AUDIT_STDOUT": "true",
-    "ENABLE_AUDIT_GET_REQUESTS": "true",
-    "AUDIT_EXCLUDED_PATHS": "/terminals",
-    "ENABLE_TOOLS": "false",
-    "ENABLE_FUNCTIONS": "false",
-    "ENABLE_CODE_INTERPRETER": "false",
-    "ENABLE_CODE_EXECUTION": "false",
-    "ENABLE_TOOL_SERVERS": "true",
-}
-
-
-def test_the_contract_stack_keeps_nothing_of_a_developers_or_the_test_stacks() -> None:
-    """Its own project, volume and network on top of the test stack; the api publishes nothing, Open WebUI loopback.
-
-    The test stack is changed by an override file that ends the ``include``'s path list, Compose's documented way;
-    the including file only adds services, since redefining an included resource there is an error.
-    """
-    stack = contract_stack()
-    assert stack["name"] == "workbench-contract"
-    assert stack["include"] == [
-        {"path": ["../docker/compose.yaml", "../docker/compose.test.yaml", "workbench.override.yaml"]}
-    ]
-    assert set(stack) == {"name", "include", "services"}
-    assert set(stack["services"]) == {"open-webui", "stub-model"}
-    override = contract_stack("workbench.override.yaml")
-    assert override["volumes"] == {"workbench-data": {"name": "workbench-contract-data"}}
-    assert override["networks"] == {"workbench-net": {"name": "workbench-contract-net"}}
-    assert set(override["services"]) == {"api"}
-    assert override["services"]["api"]["ports"] == ("!reset", [])
-    open_webui = stack["services"]["open-webui"]
-    assert open_webui["ports"] == ["127.0.0.1:18180:8080"]
-    assert "volumes" not in open_webui
-    assert open_webui["networks"] == ["workbench-net"]
-
-
-def test_the_contract_stacks_stub_model_is_hardened_and_publishes_nothing() -> None:
-    """The test-only model: the api's test image, the script read-only, hardened as the services are, no port."""
-    stub = contract_stack()["services"]["stub-model"]
-    assert stub["image"] == "workbench-api:test"
-    assert "build" not in stub and "ports" not in stub
-    assert stub["volumes"] == ["./stub_model.py:/stub/stub_model.py:ro"]
-    assert stub["networks"] == ["workbench-net"]
-    assert stub["read_only"] is True
-    assert stub["security_opt"] == ["no-new-privileges:true"]
-    assert stub["cap_drop"] == ["ALL"]
-    assert stub["tmpfs"] == ["/tmp:size=1m"]
-    assert "cap_add" not in stub and "user" not in stub  # the image's own uid, 10001
-    assert (ROOT / "contract" / "stub_model.py").is_file()
-
-
-def test_the_contract_runs_open_webui_as_production_does() -> None:
-    """Open WebUI by tag and digest, hardened as in production, its switches, one bearer connection, Dependabot's.
-
-    Hardened as open-webui-service runs it: uid 10001, a read-only root, every capability dropped, no privilege
-    escalation.
-
-    The image's value is contract/compose.yaml's alone, so a Dependabot bump passes here and reaches the contract job.
-    Its one provider is an OpenAI-compatible endpoint, as in production, here the stub model; Ollama stays off.
-    """
-    open_webui = contract_stack()["services"]["open-webui"]
-    assert OPEN_WEBUI_IMAGE.fullmatch(open_webui["image"]), open_webui["image"]
-    assert open_webui["user"] == "10001:10001"
-    assert open_webui["read_only"] is True
-    assert open_webui["cap_drop"] == ["ALL"]
-    assert "cap_add" not in open_webui
-    assert open_webui["security_opt"] == ["no-new-privileges:true"]
-    env = open_webui["environment"]
-    assert {key: env.get(key) for key in CONTRACT_SWITCHES} == CONTRACT_SWITCHES
-    assert (env["ENABLE_OPENAI_API"], env["OPENAI_API_BASE_URL"], env["ENABLE_OLLAMA_API"]) == (
-        "true",
-        "http://stub-model:9000/v1",
-        "false",
-    )
-    assert open_webui["depends_on"]["stub-model"] == {"condition": "service_healthy"}
-    key = "${WORKBENCH_CONTRACT_KEY:?make test-contract sets it}"
-    (connection,) = json.loads(env["TERMINAL_SERVER_CONNECTIONS"].replace(key, "synthetic-key"))
-    assert (connection["id"], connection["url"], connection["auth_type"]) == (
-        "workbench",
-        "http://workbench-api:8000",
-        "bearer",
-    )
-    assert connection["key"] == "synthetic-key"
-    assert connection["server_type"] == "orchestrator"
-    assert connection["config"] == {
-        "chat_uploads": "filesystem",
-        "contexts": {"chat": {"context_id": "chat_id"}},
-        "access_grants": [{"principal_type": "user", "principal_id": "*", "permission": "read"}],
-    }
+def test_dependabot_watches_only_folders_that_exist() -> None:
+    """Each update entry names a folder of the repo: none is left for a stack that went."""
     updates = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))["updates"]
-    assert [u["directory"] for u in updates if u["package-ecosystem"] == "docker-compose"] == ["/contract"]
+    assert [u["directory"] for u in updates if not (ROOT / u["directory"].lstrip("/")).is_dir()] == []
 
 
 # --- the bundle script ----------------------------------------------------------------------------------------
@@ -656,17 +547,13 @@ def test_the_examples_workbench_settings_are_all_commented_out() -> None:
     assert [match.group(2) for match in settings if match.group(1) is None] == []
 
 
-def test_open_webuis_key_is_no_longer_required() -> None:
-    """The api starts with either key: neither is ``[required]`` or active; each is a shared secret."""
+def test_no_callers_key_is_required() -> None:
+    """The api starts with either key: neither is ``[required]`` or active; docint's is a shared secret."""
     lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
     assert [line for line in lines if line.startswith("# [") and "[required]" in line] == []
     assert "# Required" not in lines
-    assert "OPEN_WEBUI_WORKBENCH_KEY=" not in lines and "DOCINT_WORKBENCH_KEY=" not in lines
-    for key, tags in (
-        ("OPEN_WEBUI_WORKBENCH_KEY", "# [secret] [shared: open-webui-service]"),
-        ("DOCINT_WORKBENCH_KEY", "# [secret] [shared: docint WORKBENCH_API_KEY]"),
-    ):
-        assert lines[lines.index(f"# {key}=") - 1] == tags, key
+    assert "DOCINT_WORKBENCH_KEY=" not in lines
+    assert lines[lines.index("# DOCINT_WORKBENCH_KEY=") - 1] == "# [secret] [shared: docint WORKBENCH_API_KEY]"
 
 
 def test_the_ghostwriter_lines_of_env_example() -> None:
@@ -675,7 +562,7 @@ def test_the_ghostwriter_lines_of_env_example() -> None:
     assert (
         lines[lines.index("# GHOSTWRITER_WORKBENCH_KEY=") - 1] == "# [secret] [shared: ghostwriter WORKBENCH_API_KEY]"
     )
-    assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: open-webui-service, ghostwriter]"
+    assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: ghostwriter]"
     assert not any(line.startswith("GHOSTWRITER_WORKBENCH_KEY=") for line in lines)
     assert not any("[required]" in line for line in lines if not line.startswith("#   "))
     assert f"# GHOSTWRITER_WORKBENCH_TOOLS={EIGHT_LIST}" in lines
@@ -705,19 +592,16 @@ def test_the_isolation_stack_is_torn_down_on_every_way_out() -> None:
     assert "--env-file" not in planned
 
 
-@pytest.mark.parametrize(
-    ("target", "project"), [("test-load", "workbench-test"), ("test-contract", "workbench-contract")]
-)
-def test_the_load_and_contract_stacks_are_torn_down_on_every_way_out(target: str, project: str) -> None:
-    """As the isolation stack: a trap takes the target's own project down, volumes included; ``.env`` stays out."""
-    planned = _make("-n", target).stdout
+def test_the_load_stack_is_torn_down_on_every_way_out() -> None:
+    """As the isolation stack: a trap takes the test project down, volumes included; ``.env`` stays out."""
+    planned = _make("-n", "test-load").stdout
     assert "trap " in planned and "EXIT" in planned and "INT" in planned
     downs = re.findall(r"docker compose ([^;']*?) down -v", planned)
-    assert downs and all(f"-p {project} " in down for down in downs)
+    assert downs and all("-p workbench-test " in down for down in downs)
     assert "--env-file" not in planned
 
 
-@pytest.mark.parametrize("target", ["test-isolation", "test-load", "test-contract"])
+@pytest.mark.parametrize("target", ["test-isolation", "test-load"])
 def test_the_stack_tests_collect_their_own_folder_with_the_executors_libraries(target: str) -> None:
     """CI run 1: a runner's environment has the dev group only; collecting every module failed on openpyxl and docx.
 
@@ -732,18 +616,9 @@ def test_the_stack_tests_collect_their_own_folder_with_the_executors_libraries(t
 def test_the_test_stacks_images_are_built_and_never_pulled() -> None:
     """No registry has the ``:test`` images; Compose would try one before building and print its refusal.
 
-    The services that build them say ``build``; those that only reuse one (the volume's one-shot, the contract's stub
-    model) say ``never``, as their image is there once the build is.
+    The services that build them say ``build``; the one that only reuses one (the volume's one-shot) says ``never``,
+    as its image is there once the build is.
     """
     test = compose("compose.test.yaml")
     policies = {name: service.get("pull_policy") for name, service in test["services"].items()}
     assert policies == {"api": "build", "executor": "build", "volume-permissions": "never"}
-    stub = yaml.safe_load((ROOT / "contract" / "compose.yaml").read_text())["services"]["stub-model"]
-    assert (stub["image"], stub["pull_policy"]) == ("workbench-api:test", "never")
-
-
-def test_the_contract_makes_its_key_and_secret_for_each_run() -> None:
-    """Nothing to keep or leak: the caller key and Open WebUI's forwarding secret exist only in the run's shell."""
-    planned = _make("-n", "test-contract").stdout
-    for name in ("WORKBENCH_CONTRACT_KEY", "WORKBENCH_CONTRACT_JWT_SECRET"):
-        assert f'{name}="$(openssl rand -hex 32)"' in planned

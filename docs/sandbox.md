@@ -229,13 +229,14 @@ Before all that, each pass asks the data volume for its free space
 (`statvfs`, the space left to a process without privilege). Below its floor,
 1 GiB or 5 % of the filesystem, whichever is more, it stops every running job,
 and the supervisor starts no job until the volume is above the floor again;
-each such job is answered with the refusal `storage_full`, which the api
-answers `507` and records as a refusal ([audit.md](audit.md)). The log says
-when the volume crosses the floor and how many jobs were stopped. The floor
-catches what no folder holds: a file a job removed and keeps open is in
-neither `home/` nor `out/`, and the supervisor cannot see it without
-`CAP_SYS_PTRACE`, which it does not get; but it takes room on the volume. The
-floor keeps that room for the api, its uploads and its database.
+each such job is answered with the refusal `storage_full`, which the MCP door
+answers as an `isError` result `refused` and the api records as a refusal
+([audit.md](audit.md)). The log says when the volume crosses the floor and how
+many jobs were stopped. The floor catches what no folder holds: a file a job
+removed and keeps open is in neither `home/` nor `out/`, and the supervisor
+cannot see it without `CAP_SYS_PTRACE`, which it does not get; but it takes
+room on the volume. The floor keeps that room for the api, its uploads and its
+database.
 
 With slots, each pass then asks the container's cgroup for its shared memory
 (`memory.stat` `shmem`, cgroup v2) and takes off what the executor's own tmpfs
@@ -253,13 +254,14 @@ running test stack under 16 MiB, idle and after a job.
 Past a fixed margin of 64 MiB (`supervisor.py:SHMEM_MARGIN`) the watchdog stops
 every running job, the innocent with the one that hid the memory, which it
 cannot tell apart; each is answered with the refusal `hidden_memory`, which the
-api answers `503` and records as a refusal. The log says how many jobs were
-stopped and how many MiB were left. The slots' cleanup then frees the memory
-with the processes that held it. The cgroup is read before and after the parts,
-and the smaller value is used, so memory that goes while a pass reads is never
-counted as left. The supervisor refuses to start without a `memory.stat` that
-gives `shmem`. Between two passes a job can still hide what it can fill in
-half a second, and up to the margin for as long as it likes.
+MCP door answers as an `isError` result `refused` and the api records as a
+refusal. The log says how many jobs were stopped and how many MiB were left.
+The slots' cleanup then frees the memory with the processes that held it. The
+cgroup is read before and after the parts, and the smaller value is used, so
+memory that goes while a pass reads is never counted as left. The supervisor
+refuses to start without a `memory.stat` that gives `shmem`. Between two passes
+a job can still hide what it can fill in half a second, and up to the margin
+for as long as it likes.
 
 `statvfs` sees the filesystem that holds the volume: for a local named volume,
 the disk of Docker's data root, which images, containers' logs and other
@@ -532,8 +534,7 @@ The model's code runs in the job process itself, as a script
   and is answered as a timeout, even though its result was already written.
 - **No multiprocessing.** No slot can write `/dev/shm` or make a POSIX queue, so
   `multiprocessing`, its process pools and the libraries built on them (such as
-  joblib's process backend) fail. Threads work. The tool description and the
-  system prompt say so.
+  joblib's process backend) fail. Threads work. The tool description says so.
 - **Path rewriting depends on the supervisor's layout.** The answer never shows
   the job's real folder: paths below `jobs/<job-id>/workspace/<chat>` are written
   as `/workspace/<chat>/…`, the rest of the job's folder as `<job>`, other paths

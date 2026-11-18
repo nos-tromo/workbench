@@ -244,7 +244,7 @@ here = pathlib.Path.cwd()
 print(os.getcwd())
 print(here.parent / "chat-2" / "a.csv")
 print(here.parents[1] / "tmp" / "scratch")
-print(str(here.parents[3] / "workspaces" / "open-webui" / "user-a") + " and " + str(here.parents[3]))
+print(str(here.parents[3] / "workspaces" / "ghostwriter" / "user-a") + " and " + str(here.parents[3]))
 pd.read_csv(here / "missing.csv")
 """
     result = tmp_job.run(code)

@@ -1,18 +1,16 @@
 """The workspace tools on the MCP door, for a caller whose files are kept in the chat's workspace: Ghostwriter.
 
-Each tool the MCP door serves (:data:`~workbench.api.registry.MCP_WORKSPACE_TOOLS`) runs its route's own function, so
-both doors run the same code (:func:`workspace_run`). The adapter passes each parameter by its name, and swaps in what
-the door decides: the audit log bound to the call's purpose and request id, which refuses a recorded tool whose
-purpose rule the call does not meet, as docint's inline tool is refused; the caller's limits on the queue
-(:class:`CallJobs`) and a settings copy whose job wall leaves :data:`PREVIEW_RESERVE_S` for the previews the job reads
-after its runner.
+Each tool is a row of :data:`~workbench.api.tool_table.WORKSPACE_TABLE` and runs the row's function
+(:func:`workspace_run`). The adapter passes each parameter by its name, and swaps in what the door decides: the audit
+log bound to the call's purpose and request id, which refuses a recorded tool whose purpose rule the call does not
+meet, as docint's inline tool is refused; the caller's limits on the queue (:class:`CallJobs`) and a settings copy
+whose job wall leaves :data:`PREVIEW_RESERVE_S` for the previews the job reads after its runner.
 
-The answer is the route's own, with its ``None`` fields as the inline door sends them, so that it holds to the output
-schema the door lists; plus ``outputs``: every file the call wrote, by reference (:class:`OutputRef`), with the table
-preview the executor read for a csv or xlsx output. The text block is that answer without the previews, so a
-model fed the text gets no table rows it did not ask for; the caller's cards read ``structuredContent``. The tools'
-texts tell the model the user sees each new file as a card, since ``display_file``, Open WebUI's card, is not served
-here (:data:`MCP_TEXT`); the terminal door's texts stay as they are.
+The answer is the function's own, with its ``None`` fields as the inline door sends them, so that it holds to the
+output schema the door lists; plus ``outputs``: every file the call wrote, by reference (:class:`OutputRef`), with the
+table preview the executor read for a csv or xlsx output. The text block is that answer without the previews, so a
+model fed the text gets no table rows it did not ask for; the caller's cards read ``structuredContent``, and the
+tools' texts tell the model the user sees each new file as a card.
 """
 
 import dataclasses
@@ -22,7 +20,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from functools import partial
 from typing import Any, Final
 
-from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
@@ -30,25 +27,19 @@ from workbench.api.audit import OPERATIONS
 from workbench.api.auth import Caller
 from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper
 from workbench.api.mcp_wire import _compact_json
-from workbench.api.openapi import tool_routes
-from workbench.api.registry import MCP_WORKSPACE_TOOLS, ToolEnv, ToolOutcome, ToolSpec, workspace_specs
+from workbench.api.registry import ToolEnv, ToolOutcome, ToolSpec
+from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.models import FileRecord, JobRecord, Principal
 from workbench.protocol import JobResult, OutputFile, TablePreview
 
 #: Seconds of a job's wall its runner leaves for the previews: their 2 s, and one C call that cannot be interrupted.
 PREVIEW_RESERVE_S: Final = 5
 
-#: The phrases of the tools' texts that name ``display_file``, and what the MCP door says instead, in order.
-MCP_TEXT: Final = (
-    ("show a file with display_file", "the user sees each file in out/ as a card in the chat"),
-    ("Show the result with display_file.", "The user sees the new file as a card in the chat."),
-    ("show it with display_file", "the user sees it as a card in the chat"),
-)
-
 
 class NoArguments(BaseModel):
     """The arguments of a tool whose route takes no body, ``list_files``: none."""
 
+    # The docstring is the schema's description in Ghostwriter's tool list, frozen there: it stays as it is.
     model_config = ConfigDict(extra="forbid")
 
 
@@ -74,10 +65,10 @@ class OutputRef(BaseModel):
 
 @dataclasses.dataclass(frozen=True)
 class _Previewing:
-    """A keeper that notes the preview of each output it is asked to keep, then records as the route's keeper does.
+    """A keeper that notes the preview of each output it is asked to keep, then records as the tool's keeper does.
 
     Attributes:
-        keeper: The route's keeper.
+        keeper: The tool's keeper.
         previews: Where each output's preview goes, by the id planned for it.
     """
 
@@ -85,21 +76,21 @@ class _Previewing:
     previews: dict[str, TablePreview | None]
 
     def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
-        """Note each planned id's preview, then have the route's keeper record the job.
+        """Note each planned id's preview, then have the tool's keeper record the job.
 
         Args:
             result: The executor's answer.
             planned: One id per output of an ``ok`` answer, in order.
 
         Returns:
-            What the route's keeper keeps.
+            What the tool's keeper keeps.
         """
         outputs: list[OutputFile] = result.outputs if result.status == "ok" else []
         self.previews.update(zip(planned, (output.preview for output in outputs), strict=True))
         return self.keeper.record(result, planned)
 
     def again(self, ids: Sequence[str]) -> None:
-        """Have the route's keeper record outputs again as errors.
+        """Have the tool's keeper record outputs again as errors.
 
         Args:
             ids: Their file ids.
@@ -137,7 +128,7 @@ class CallJobs:
             tool: Name of the runner to run.
             args: The runner's arguments.
             input_files: Paths relative to the chat folder that the job may read.
-            keeper: The route's keeper; the previews of the outputs it is asked to keep are noted first.
+            keeper: The tool's keeper; the previews of the outputs it is asked to keep are noted first.
 
         Returns:
             What :meth:`JobQueue.submit` returns.
@@ -166,46 +157,8 @@ class CallJobs:
         ]
 
 
-def mcp_text(text: str) -> str:
-    """Say a tool's text in the MCP door's words (:data:`MCP_TEXT`).
-
-    Args:
-        text: The text.
-
-    Returns:
-        The text, each phrase replaced in order.
-    """
-    for phrase, replacement in MCP_TEXT:
-        text = text.replace(phrase, replacement)
-    return text
-
-
-def mcp_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Say every ``description`` of a JSON schema in the MCP door's words, at any depth.
-
-    Args:
-        schema: The schema; it is not changed.
-
-    Returns:
-        A copy with each description passed through :func:`mcp_text`.
-    """
-
-    def worded(node: Any) -> Any:
-        if isinstance(node, dict):
-            return {
-                key: mcp_text(value) if key == "description" and isinstance(value, str) else worded(value)
-                for key, value in node.items()
-            }
-        if isinstance(node, list):
-            return [worded(item) for item in node]
-        return node
-
-    worded_schema: dict[str, Any] = worded(schema)
-    return worded_schema
-
-
 def _model_schema(model: type[BaseModel], caller: Caller) -> dict[str, Any]:
-    """A model's JSON schema in the MCP door's words, the same for every caller.
+    """A model's JSON schema, the same for every caller.
 
     Args:
         model: The model.
@@ -214,14 +167,14 @@ def _model_schema(model: type[BaseModel], caller: Caller) -> dict[str, Any]:
     Returns:
         The schema.
     """
-    return mcp_schema(model.model_json_schema())
+    return model.model_json_schema()
 
 
 def with_outputs(model: type[BaseModel]) -> type[BaseModel]:
-    """Extend a tool's REST answer by the files the call wrote.
+    """Extend a tool's answer by the files the call wrote.
 
     Args:
-        model: The route's answer.
+        model: The tool's answer.
 
     Returns:
         A model of its fields and ``outputs``, a list of :class:`OutputRef`.
@@ -232,22 +185,22 @@ def with_outputs(model: type[BaseModel]) -> type[BaseModel]:
 
 
 def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, ToolEnv], Awaitable[ToolOutcome]]:
-    """Make the MCP door's ``run`` of a workspace tool, which calls the tool's route function.
+    """Make the MCP door's ``run`` of a workspace tool, which calls the tool's function.
 
     Args:
-        endpoint: The route function.
+        endpoint: The tool's function.
         key: The tool's name; the purpose rule checks it, and its events are recorded, only if it is a key of the
             audit's operations (``list_files`` is not).
 
     Returns:
-        The adapter: it passes the route each parameter it takes, by name, and answers the route's answer, with its
-        ``None`` fields, plus ``outputs``, its text without the previews.
+        The adapter: it passes the function each parameter it takes, by name, and answers the function's answer, with
+        its ``None`` fields, plus ``outputs``, its text without the previews.
     """
     takes = frozenset(inspect.signature(endpoint).parameters)
     asynchronous = inspect.iscoroutinefunction(endpoint)
 
     async def run(body: Any, env: ToolEnv) -> ToolOutcome:
-        """Run the route for the call, within the caller's limits.
+        """Run the tool for the call, within the caller's limits.
 
         Args:
             body: The arguments, validated by the tool's input model.
@@ -259,8 +212,8 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         Raises:
             PurposeRequired: The tool's audit action needs a stated purpose and the call stated none; the ``denied``
                 event is written and nothing runs.
-            Busy: The route needs the queue and the app has none.
-            Exception: What the route raised.
+            Busy: The tool needs the queue and the app has none.
+            Exception: What the tool raised.
         """
         settings, caller = env.settings, env.caller
         audit = env.audit.bound(env.purpose, env.request_id, required=settings.require_purpose)
@@ -293,41 +246,29 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
     return run
 
 
-def workspace_tools(app: FastAPI) -> tuple[ToolSpec, ...]:
-    """Describe the app's workspace tools, those the MCP door serves with their adapters and schemas.
-
-    Args:
-        app: The application, with its routers in.
+def workspace_tools() -> tuple[ToolSpec, ...]:
+    """Describe the workspace tools the MCP door serves, one spec per row of the table.
 
     Returns:
-        Every spec of :func:`~workbench.api.registry.workspace_specs`. Each one named in
-        :data:`~workbench.api.registry.MCP_WORKSPACE_TOOLS` gets its ``run``, its input model (:class:`NoArguments`
-        for a route without a body), its output model with ``outputs``, both schemas in the MCP door's words, and its
-        description in those words. ``display_file`` stays as it is.
-
-    Raises:
-        ValueError: A tool the MCP door serves has no route function or no output model.
+        A spec per row of :data:`~workbench.api.tool_table.WORKSPACE_TABLE`, in its order: its ``run`` calls the row's
+        function (:func:`workspace_run`), its input model is the row's or :class:`NoArguments`, its output model the
+        row's with ``outputs`` (:func:`with_outputs`), and both schemas are those models' own.
     """
-    endpoints = {route.operation_id: route.endpoint for route in tool_routes(app)}
     specs: list[ToolSpec] = []
-    for spec in workspace_specs(app):
-        if spec.name not in MCP_WORKSPACE_TOOLS:
-            specs.append(spec)
-            continue
-        endpoint = endpoints.get(spec.name)
-        if endpoint is None or spec.output_model is None:
-            raise ValueError(f"the tool route {spec.name} needs a function and a response model to be served on MCP")
-        input_model = spec.input_model or NoArguments
-        output_model = with_outputs(spec.output_model)
+    for tool in WORKSPACE_TABLE:
+        input_model = tool.input_model or NoArguments
+        output_model = with_outputs(tool.output_model)
         specs.append(
-            dataclasses.replace(
-                spec,
-                run=workspace_run(endpoint, spec.name),
+            ToolSpec(
+                name=tool.name,
+                title=tool.title,
+                description=tool.description,
                 input_model=input_model,
-                input_schema=partial(_model_schema, input_model),
                 output_model=output_model,
+                form="workspace",
+                run=workspace_run(tool.function, tool.name),
+                input_schema=partial(_model_schema, input_model),
                 output_schema=partial(_model_schema, output_model),
-                description=mcp_text(spec.description),
             )
         )
     return tuple(specs)

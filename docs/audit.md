@@ -33,14 +33,12 @@ Every event a user's request causes has this shape (`workbench/api/audit.py:Audi
 | Field | Value |
 |---|---|
 | `action` / `operation` | by event key, below |
-| `actor` | `{"user": <X-User-Id>, "via": "service"}`: Open WebUI's opaque account id, or a keyed pseudonym of docint's or Ghostwriter's (see [Who](#who-the-actor)) |
+| `actor` | `{"user": <X-User-Id>, "via": "service"}`: a keyed pseudonym of docint's or Ghostwriter's user (see [Who](#who-the-actor)) |
 | `outcome` | `ok`; `error` where the table says so |
 | `target` | `kind: file`, `ids` (the files' ids, at most 200; more go on continuations), `count`, `container: chat:<chat-id>` |
-| `criteria` | `caller` (`open-webui`, `docint` or `ghostwriter`), and the keys below |
+| `criteria` | `caller` (`docint` or `ghostwriter`), and the keys below |
 
-The `container` is the chat folder the files live in, never the chat the
-request named (`workbench/api/files.py:_in_folder_of`). Open WebUI's browser can
-name any chat in `X-Session-Id`, so only the file's own folder says where it is.
+The `container` is the chat folder the files live in.
 
 ### Every event key
 
@@ -50,9 +48,6 @@ name any chat in `X-Session-Id`, so only the file's own folder says where it is.
 |---|---|---|---|---|
 | `upload` | `collect` / `file.upload` | the new file (Ghostwriter's answer names it as `id`) | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
 | `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
-| `read` | `disclose` / `file.read` | the text file read whole | — | `ok`, before the text goes; a file that is not text or is too large is refused and not recorded |
-| `display` | `disclose` / `file.display` | the file shown as a card | — | `ok`; a file that does not exist is not recorded |
-| `delete` | `delete` / `file.delete` | the file deleted by the user | — | `ok`, before the file goes; `error` again when the removal then failed |
 | `chat_delete` | `delete` / `chat.delete` | every file of the chat Ghostwriter deletes, `container` that chat | — | `ok`, before anything of the chat goes, also with no file; `error` again when the deletion then failed |
 | `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
 | `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
@@ -100,16 +95,14 @@ as `dropped`.
 
 ### Not recorded
 
-- Listing a folder (`/files/list`), `list_files`, `mkdir` and `move`: they read
-  or change no content. Moving a file keeps its id, so its later events name the
-  same file.
-- The handshake routes (`/api/config`, `/system`, `/openapi.json`,
-  `/files/cwd`, `/skills`), `/healthz` and `/metrics`.
+- Listing a folder (`/files/list`) and `list_files`: they read or change no
+  content.
+- `/healthz` and `/metrics`.
 - `make nuke`, which removes the whole data volume: the operator's act on the
   host, outside the api and its chain ([retention.md](retention.md#make-nuke-is-outside-the-trail)).
 - A request refused before it becomes an operation: no or a wrong key (`401`),
   a body too large (`413`), a missing or invalid user (`400`), a body that does
-  not validate (`422`), a full queue (`503`), a file that does not exist
+  not validate (`422`), a full queue (`queue_full`), a file that does not exist
   (`404`).
 - A tool call refused before its job ran (an invalid name, a source that is not
   in the chat), and a job whose answer never reached the api (see
@@ -170,72 +163,37 @@ A retention record that cannot be written stops the api (see
 
 ## Who: the actor
 
-The actor of every user's event is `X-User-Id`, Open WebUI's opaque account id
-or a keyed pseudonym of docint's or Ghostwriter's, with `via: service`: the
-caller acts for the user. While the account exists, an Open WebUI admin
-resolves the id in Open WebUI's user table, and Open WebUI's own per-request
-audit records carry the same id with the account. A docint pseudonym resolves
-through docint's own `disclose` event for the call (same request id and job),
-which names the user. A Ghostwriter pseudonym is an HMAC keyed with
-Ghostwriter's own workbench key, so it resolves only in Ghostwriter's own audit,
-through the event with the same request id. The caller, `open-webui`, `docint`
-or `ghostwriter`, is in every event's `criteria`.
+The actor of every user's event is `X-User-Id`, a keyed pseudonym of docint's
+or Ghostwriter's user, with `via: service`: the caller acts for the user. A
+docint pseudonym resolves through docint's own `disclose` event for the call
+(same request id and job), which names the user. A Ghostwriter pseudonym is an
+HMAC keyed with Ghostwriter's own workbench key, so it resolves only in
+Ghostwriter's own audit, through the event with the same request id. The
+caller, `docint` or `ghostwriter`, is in every event's `criteria`.
 
 The id is trusted because only a caller with the bearer key reaches the api
-(`workbench/api/auth.py`). Open WebUI can sign a token naming the user
-(`X-OpenWebUI-User-Jwt`). In one observed run of v0.13.3 it reached only the
-per-chat handshake reads, neither the proxied calls nor the model's tool calls;
-no test pins that (see
-[permissions.md](permissions.md#what-open-webui-v0133-sends)). workbench does
-not use it.
+(`workbench/api/auth.py`).
 
 ## Purpose, recipient and request id
 
 - **Purpose.** On the MCP door, and on Ghostwriter's file routes, a call states
   its purpose in `X-Audit-Purpose`, and it is recorded. `AUDIT_REQUIRE_PURPOSE`
   (`query,disclose,combine,modify,collect` in compose) makes a call without one
-  `denied`, with no target (`428` on a file route). Open WebUI cannot send a
-  purpose, so the terminal door records none and requires none.
-- **No `recipient` on `disclose`.** A view, read or display goes to the user's
-  own session, through the caller that asked; it is not a transfer to a third
+  `denied`, with no target (`428` on a file route).
+- **No `recipient` on `disclose`.** A view goes to the user's own
+  session, through the caller that asked; it is not a transfer to a third
   party, so the event names no recipient.
 - **Request id.** The `X-Request-ID` of an MCP call, or of a Ghostwriter file
   route, is on its event, which ties it to the caller's own event (docint's
-  `disclose`, Ghostwriter's `disclose` / `chat.tool`). Open WebUI's tool calls
-  carry no message id workbench could tie together: the events of one agent turn
-  share their `container` and follow each other in the chain. Only a
-  continuation of a long id list names a parent (see [Long lists of
-  files](#long-lists-of-files)).
-
-## The Open WebUI side
-
-Open WebUI's built-in audit log records every request it serves, with the full
-URL. The file browser's URLs carry file names in their query strings
-(`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`).
-`AUDIT_EXCLUDED_PATHS=/terminals`, which Open WebUI matches as a prefix of
-`/api/v1/terminals`, keeps those URLs out of its audit records; workbench
-records those accesses itself, by file id. From open-webui-service v0.14.0 its
-`docker/compose.yaml` sets `AUDIT_EXCLUDED_PATHS: "/terminals"`; without the
-setting, Open WebUI's audit records would carry the file names. The contract
-test runs its own Open WebUI with the setting and checks that no record names
-an uploaded file
-(`tests/contract/test_open_webui_contract.py:test_open_webui_audit_skips_the_terminal_proxy`);
-it does not check open-webui-service's value.
-
-From the same version, uvicorn's access log, which would print those URLs with
-their query strings, is off as well: `--no-access-log` in compose's `command:`,
-together with `AUDIT_UVICORN_LOGGER_NAMES: ""`, which keeps Open WebUI from
-attaching a handler to uvicorn's access logger again at start-up. Each setting
-alone leaves the access lines, so both are needed (open-webui-service's
-`CLAUDE.md`, § Workbench). See [data-flow.md](data-flow.md#what-leaves) for what
-still logs there.
+  `disclose`, Ghostwriter's `disclose` / `chat.tool`). Only a continuation of a
+  long id list names a parent (see [Long lists of files](#long-lists-of-files)).
 
 ## Fail closed
 
 - An action whose event cannot be written does not happen. The request gets
   `500` with `{"detail": "audit unavailable"}` (`workbench/api/errors.py`). An
-  upload or a tool's new file is never stored; a view, read, display or tool
-  answer, a refusal included, sends nothing; a delete leaves the file. A
+  upload or a tool's new file is never stored; a view or tool answer, a
+  refusal included, sends nothing; a chat delete leaves the chat. A
   continuation that cannot be written fails the action the same way; the events
   written before it stay.
 - When a second, `error` event cannot be written after a store or a removal
@@ -262,7 +220,7 @@ as `service_version`:
 - `lifecycle` / `start` opens it;
 - `admin` / `config.audit` (actor `via: system`) records the limits in force:
   `retention_days`, `executor_slots`, `queue_max`, `job_wall_s`,
-  `upload_max_mb`, `workspace_max_mb`, `callers` (up to three, each by name,
+  `upload_max_mb`, `workspace_max_mb`, `callers` (up to two, each by name,
   door, tools, wall cap and slots) and `require_purpose`, sorted. Never a key;
 - `lifecycle` / `heartbeat` follows every 60 seconds;
 - `lifecycle` / `shutdown` closes it on a clean stop.

@@ -3,7 +3,7 @@
 Version 2 has one, ``run_python``, served to docint on the MCP door (:data:`INLINE_SPECS`). The data is written into
 the job's folder (:class:`~workbench.protocol.InlineFile`) and goes with it; the outputs are read back from staging by
 type and cap (:meth:`~workbench.api.jobs.JobQueue.submit_inline`) and returned, never registered, so docint has no
-workspace. Open WebUI's ``run_python``, a route in :mod:`workbench.api.tools`, is a tool of the other form.
+workspace. Ghostwriter's ``run_python``, a function in :mod:`workbench.api.tools`, is a tool of the other form.
 
 The call is recorded once the job has answered and before anything of the answer goes out (:class:`InlineTaker`), as
 ``combine`` / ``tool.run_python.inline`` on ``inline_data``: the count of entries and their bytes, the job, how many

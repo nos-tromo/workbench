@@ -7,8 +7,8 @@ declared ``Content-Length`` over the bound is answered 413 before any body is re
 or one that lies, is counted as it arrives and stopped at the first chunk that passes the bound.
 
 There are two bounds. ``POST /files/upload`` may carry one file of the per-file limit, plus room for the multipart
-framing; the store's own check stays the exact limit (``file too large``). Every other request is a JSON body of a few
-fields or a tool call, which the executor's protocol line (1 MiB) bounds anyway, so it may have at most
+framing; the store's own check stays the exact limit (``file too large``). Every other request is a tool call, which the
+executor's protocol line (1 MiB) bounds anyway, or has no body of its own, so it may have at most
 :data:`REQUEST_MAX` (``request too large``). The caller key is checked before this guard runs
 (:class:`~workbench.api.auth.KeyGate`), so a request without a valid key never has its body read at all. Nothing here
 is logged, so no path, query or name can reach a log through it.

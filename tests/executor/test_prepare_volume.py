@@ -46,7 +46,7 @@ def test_the_layout_is_created_with_its_modes(tmp_path: Path) -> None:
 def test_running_it_again_keeps_the_content_and_repairs_the_modes(tmp_path: Path) -> None:
     """It is safe to run at every start: files stay, loosened modes are tightened again."""
     prepare_volume(tmp_path, MINE)
-    (tmp_path / "workspaces" / "open-webui").mkdir()
+    (tmp_path / "workspaces" / "ghostwriter").mkdir()
     (tmp_path / "workbench.db").write_bytes(b"SQLite format 3\x00")
     (tmp_path / "workspaces").chmod(0o755)
     (tmp_path / "jobs").chmod(0o777)
@@ -55,7 +55,7 @@ def test_running_it_again_keeps_the_content_and_repairs_the_modes(tmp_path: Path
 
     prepare_volume(tmp_path, MINE)
 
-    assert (tmp_path / "workspaces" / "open-webui").is_dir()
+    assert (tmp_path / "workspaces" / "ghostwriter").is_dir()
     assert (tmp_path / "workbench.db").read_bytes() == b"SQLite format 3\x00"
     assert _mode(tmp_path / "workspaces") == 0o700
     assert _mode(tmp_path / "jobs") == 0o711

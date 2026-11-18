@@ -1,5 +1,5 @@
 ### The test stack: compose.yaml with this file on top, for the isolation tests
-### (make test-isolation) and later the contract and load tests.
+### (make test-isolation) and the load test (make test-load).
 ###
 ### It is a project of its own (workbench-test) and keeps nothing of a
 ### developer's: a project-local data volume and network in place of the
@@ -23,7 +23,6 @@ services:
       - "127.0.0.1:18100:8000"
     environment:
       # Synthetic, test-only; never real keys.
-      OPEN_WEBUI_WORKBENCH_KEY: synthetic-isolation-test-key-not-a-secret
       DOCINT_WORKBENCH_KEY: synthetic-docint-test-key-not-a-secret-0000
       GHOSTWRITER_WORKBENCH_KEY: synthetic-ghostwriter-test-key-not-a-secret
       # docint's and Ghostwriter's caps may not pass the stack's wall time, or the api does not start.

@@ -8,15 +8,16 @@ message of these exceptions is a literal written in ``paths.py`` or ``store.py``
 A failed audit write is a 500 of the same kind: the action is not done, and the cause (the
 output stream) is not logged either.
 
-A job the queue refuses (``Busy``) is a 503 with one fixed text, whatever the reason: the model is
-told to retry later, and which limit was hit is for the metrics, not for the model. A request too
-large for the executor's protocol (``RequestTooLarge``) is a 422: retrying it cannot help.
+No route raises a job the queue refuses (``Busy``) or a request too large for the executor's
+protocol (``RequestTooLarge``): only tools do, and the MCP door answers both as an ``isError``
+result (:func:`~workbench.api.mcp.call_failure`). Their handlers stay as the app's fallback:
+``Busy`` a 503 with one fixed text, whatever the reason, and ``RequestTooLarge`` a 422.
 
 A call that had to state a purpose and stated none (``PurposeRequired``) is a 428, its ``denied`` event already
 written.
 
-Both doors answer with the same texts: :func:`describe` gives an error's status and text, :func:`compact` the body of
-a request that does not validate.
+The MCP door and the file routes answer with the same texts: :func:`describe` gives an error's status and text,
+:func:`compact` the body of a request that does not validate.
 
 A request that does not validate is FastAPI's 422, but smaller: each error keeps its ``type``, ``loc`` and ``msg``,
 never the ``input`` that failed or its ``ctx``, so a 200 000-character document or a 100 000-row table never goes back

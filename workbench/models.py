@@ -15,7 +15,7 @@ class Principal:
     user's data, whatever value a client sends.
 
     Attributes:
-        caller: Authenticated calling service, for example ``open-webui``.
+        caller: Authenticated calling service, for example ``ghostwriter``.
         user_id: The caller's own id for the end user.
         chat_id: Chat folder used when a path names none; ``default`` without a session.
         confined: The principal reaches only its own chat folder, ``chat_id``.

@@ -16,14 +16,14 @@ from workbench.paths import (
     check_id,
 )
 
-USER_A = Principal("open-webui", "user-a", "chat-1")
-USER_B = Principal("open-webui", "user-b", "chat-1")
+USER_A = Principal("ghostwriter", "user-a", "chat-1")
+USER_B = Principal("ghostwriter", "user-b", "chat-1")
 
 
 def test_virtual_path_maps_into_the_callers_own_root(tmp_path: Path) -> None:
     """A virtual file path lands under ``workspaces/<caller>/<user>/<chat>/``."""
     ws = Workspaces(tmp_path)
-    assert ws.resolve(USER_A, "/workspace/chat-1/q.xlsx") == tmp_path / "workspaces/open-webui/user-a/chat-1/q.xlsx"
+    assert ws.resolve(USER_A, "/workspace/chat-1/q.xlsx") == tmp_path / "workspaces/ghostwriter/user-a/chat-1/q.xlsx"
 
 
 def test_constants_are_the_federation_namespace() -> None:
@@ -36,13 +36,13 @@ def test_nested_folders_are_allowed(tmp_path: Path) -> None:
     """Names after the chat id may form folders; each segment is checked."""
     ws = Workspaces(tmp_path)
     real = ws.resolve(USER_A, "/workspace/chat-1/reports/2026/q.xlsx")
-    assert real == tmp_path / "workspaces/open-webui/user-a/chat-1/reports/2026/q.xlsx"
+    assert real == tmp_path / "workspaces/ghostwriter/user-a/chat-1/reports/2026/q.xlsx"
 
 
 def test_unsaved_chat_ids_are_accepted(tmp_path: Path) -> None:
-    """Open WebUI names an unsaved chat ``local:<id>``; the colon is allowed."""
+    """A chat id may hold a colon, as ``local:<id>`` does; it names the folder as it is."""
     ws = Workspaces(tmp_path)
-    p = Principal("open-webui", "user-a", "local:abc123")
+    p = Principal("ghostwriter", "user-a", "local:abc123")
     assert ws.resolve(p, "/workspace/local:abc123/q.xlsx").parts[-2] == "local:abc123"
     assert ws.chat_dir(p).name == "local:abc123"
 
@@ -209,8 +209,8 @@ def test_the_chat_id_in_the_principal_never_selects_another_users_data(tmp_path:
     ws = Workspaces(tmp_path)
     for chat in ("../user-b", "user-b/chat-1", "..", ""):
         with pytest.raises(PathError):
-            ws.chat_dir(Principal("open-webui", "user-a", chat))
-    assert ws.user_root(USER_A) in ws.chat_dir(Principal("open-webui", "user-a", "user-b")).parents
+            ws.chat_dir(Principal("ghostwriter", "user-a", chat))
+    assert ws.user_root(USER_A) in ws.chat_dir(Principal("ghostwriter", "user-a", "user-b")).parents
 
 
 @pytest.mark.parametrize("field", ["caller", "user_id"])
@@ -218,7 +218,7 @@ def test_the_chat_id_in_the_principal_never_selects_another_users_data(tmp_path:
 def test_a_hostile_caller_or_user_id_never_builds_a_root(tmp_path: Path, field: str, bad: str) -> None:
     """The caller and the user id become folder names, so they pass ``check_id`` too."""
     ws = Workspaces(tmp_path)
-    p = Principal(bad, "user-a", "chat-1") if field == "caller" else Principal("open-webui", bad, "chat-1")
+    p = Principal(bad, "user-a", "chat-1") if field == "caller" else Principal("ghostwriter", bad, "chat-1")
     with pytest.raises(PathError):
         ws.user_root(p)
     with pytest.raises(PathError):
@@ -231,7 +231,7 @@ def test_chat_dir_is_created_private_with_private_parents(tmp_path: Path) -> Non
     """The chat folder and every folder made on the way are mode 0700."""
     ws = Workspaces(tmp_path)
     chat = ws.chat_dir(USER_A)
-    assert chat == tmp_path / "workspaces/open-webui/user-a/chat-1"
+    assert chat == tmp_path / "workspaces/ghostwriter/user-a/chat-1"
     for path in (chat, chat.parent, chat.parent.parent, chat.parent.parent.parent):
         assert stat.S_IMODE(path.stat().st_mode) == 0o700, path
 
@@ -292,7 +292,7 @@ def test_bad_ids_are_refused(bad: str) -> None:
     ["chat-1", "user-a", "0", "a", "x" * 128, "f47ac10b-58cc-4372-a567-0e02b2c3d479", "local:abc123", "a.b_c-d:e"],
 )
 def test_good_ids_are_returned_unchanged(good: str) -> None:
-    """Open WebUI's UUIDs and ``local:<id>`` names pass untouched."""
+    """UUIDs and ``local:<id>`` names pass untouched."""
     assert check_id(good, what="chat id") == good
 
 

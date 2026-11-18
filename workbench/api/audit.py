@@ -8,9 +8,9 @@ one. One emitter, and so one hash chain, per process; the lifespan opens it with
 
 The acting user is the caller's own id for the end user (``via="service"``), and
 the authenticated caller is always in the event's criteria. An action's event has
-no ``parent_event_id``: Open WebUI's tool calls carry no message id, so the events
-of one agent turn are tied together only by their ``container`` and their order in
-the chain. Only a continuation, below, names a parent.
+no ``parent_event_id``: a call names no message of its caller's, so the events of
+one agent turn are tied together by their ``container``, the request id a call
+states, and their order in the chain. Only a continuation, below, names a parent.
 
 An event names at most 200 file ids (``MAX_IDS``). An action on more files is
 split, never cut: its event carries the first 200 ids and the full count, and each
@@ -43,9 +43,6 @@ SERVICE: Final = "workbench"
 OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "upload": ("collect", "file.upload"),
     "view": ("disclose", "file.view"),
-    "read": ("disclose", "file.read"),
-    "display": ("disclose", "file.display"),
-    "delete": ("delete", "file.delete"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
     "run_python": ("combine", "tool.run_python"),

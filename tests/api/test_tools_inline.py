@@ -17,8 +17,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY
-from tests.api.test_files import AuditLines, H
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, AuditLines
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.callers import EIGHT
@@ -28,8 +27,7 @@ from workbench.api.auth import CallerRegistry
 from workbench.api.jobs import Busy, CallLimits, ExecutorClient, JobQueue, RequestTooLarge, SkippedOutput
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.openapi import tool_openapi
-from workbench.api.registry import INLINE_TOOLS, WORKSPACE_TOOLS, PurposeRequired, Registry, ToolEnv, ToolOutcome
+from workbench.api.registry import INLINE_TOOLS, PurposeRequired, Registry, ToolEnv, ToolOutcome
 from workbench.api.store import Store
 from workbench.api.tools import MAX_CODE, NotCompleted
 from workbench.api.tools_inline import (
@@ -410,7 +408,7 @@ def test_stdout_and_stderr_stay_within_the_result_limit(client: TestClient, fake
 def test_code_that_could_not_complete_raises_not_completed(
     client: TestClient, fake_executor: Scripted, audit_lines: AuditLines
 ) -> None:
-    """A job past its wall time is the 422 the terminal answers too, and its event says ``not_completed``."""
+    """A job past its wall time is the 422 the workspace tool raises too, and its event says ``not_completed``."""
     fake_executor.status = "timeout"
     fake_executor.message = "the job ran past its wall time of 60 s"
     with pytest.raises(NotCompleted) as refused:
@@ -489,18 +487,6 @@ def test_nothing_is_registered_and_no_workspace_is_made(
     assert store.count_files() == 0
     assert not (settings.data_dir / "workspaces" / "docint").exists()
     assert not (settings.data_dir / "staging" / outcome.structured["job_id"]).exists()
-
-
-def test_open_webuis_run_python_is_unchanged(client: TestClient, app: FastAPI, audit_lines: AuditLines) -> None:
-    """Open WebUI's tool still takes code alone, keeps its outputs and records ``tool.run_python``."""
-    doc = tool_openapi(app, cast(CallerRegistry, app.state.callers).get("open-webui"))
-    reference = doc["paths"]["/tools/run_python"]["post"]["requestBody"]["content"]["application/json"]["schema"]
-    schema = doc["components"]["schemas"][reference["$ref"].rsplit("/", 1)[1]]
-    assert set(schema["properties"]) == {"code"}
-    assert client.post("/tools/run_python", json={"code": "print(1)"}, headers=H).status_code == 200
-    assert [e["operation"] for e in audit_lines() if e["operation"].startswith("tool.run_python")] == [
-        "tool.run_python"
-    ]
 
 
 def test_the_inline_specs_are_the_inline_tools(app: FastAPI) -> None:
@@ -625,20 +611,10 @@ def test_an_empty_purpose_is_none(client: TestClient, fake_executor: Scripted, s
     assert fake_executor.requests == []
 
 
-def test_the_terminal_door_keeps_version_1s_rule(
-    settings: Settings, store: Store, audit: AuditLog, fake_executor: Scripted
-) -> None:
-    """Open WebUI cannot state a purpose: its ``run_python`` runs whatever the rule says."""
-    required = dataclasses.replace(settings, require_purpose=frozenset({"combine"}))
-    queue = JobQueue(required, fake_executor, store, Metrics(settings.data_dir))
-    with TestClient(create_app(required, store=store, audit=audit, jobs=queue)) as terminal:
-        assert terminal.post("/tools/run_python", json={"code": "print(1)"}, headers=H).status_code == 200
-
-
 def test_config_audit_lists_the_callers_and_the_purpose_rule(
     settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines
 ) -> None:
-    """Each caller's name, door, tools, wall cap and slots, and the purpose rule, sorted; never a key."""
+    """Each caller's name, door (the MCP door, every caller's), tools, wall cap and slots, and the purpose rule."""
     required = dataclasses.replace(settings, require_purpose=frozenset({"query", "disclose", "combine"}))
     with TestClient(create_app(required, store=store, audit=audit)):
         pass
@@ -646,10 +622,8 @@ def test_config_audit_lists_the_callers_and_the_purpose_rule(
     assert config["criteria"]["callers"] == [
         {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
         {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
-        {"name": "open-webui", "door": "terminal", "tools": sorted(WORKSPACE_TOOLS), "wall_s": 120, "slots": None},
     ]
     assert config["criteria"]["require_purpose"] == ["combine", "disclose", "query"]
     raw = json.dumps(audit_lines())
-    assert KEY not in raw
     assert DOCINT_KEY not in raw
     assert GHOSTWRITER_KEY not in raw

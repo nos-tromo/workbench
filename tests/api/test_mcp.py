@@ -10,7 +10,7 @@ import dataclasses
 import json
 import logging
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Final
 
@@ -22,8 +22,9 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, HD, KEY
-from tests.api.test_files import AuditLines
+from tests.api.conftest import DOCINT_KEY, HD, HG, AuditLines
+from tests.api.mcp_calls import NONE, NOTIFICATION, error, refused, result, rpc, send
+from tests.api.mcp_calls import Headers as Headers
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.conftest import scaled
@@ -45,9 +46,6 @@ from workbench.config import Settings
 app = python_tests.app
 fake_executor = python_tests.fake_executor
 
-#: Open WebUI's headers, its key on the terminal door.
-OW: Final = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
-META_PREFIX: Final = "io.modelcontextprotocol/"
 SERVER_INFO: Final = {"name": "workbench", "version": __version__}
 PASSAGES: Final = {
     "name": "passages.json",
@@ -58,99 +56,10 @@ PNG: Final = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 COUNTS: Final = b"author,posts\nuser-a,12\nuser-b,7\n"
 INLINE_OPERATION: Final = "tool.run_python.inline"
 
-#: An empty object: no params, no capabilities.
-NONE: Final[dict[str, object]] = {}
-
-#: The id a notification leaves out.
-NOTIFICATION: Final = object()
-
-Headers = Mapping[str, str | bytes | None]
-
-
-def send(client: TestClient, body: bytes, headers: Headers, path: str = MCP_PATH) -> httpx2.Response:
-    """POST raw bytes; a header given as ``None`` is left out, even one the client would add by itself."""
-    present = [
-        (name.encode(), value if isinstance(value, bytes) else value.encode("latin-1"))
-        for name, value in headers.items()
-        if value is not None
-    ]
-    request = client.build_request("POST", path, content=body, headers=present)
-    for name, value in headers.items():
-        if value is None and name in request.headers:
-            del request.headers[name]
-    return client.send(request, follow_redirects=False)
-
-
-def rpc(
-    client: TestClient,
-    method: str,
-    params: dict[str, Any] | None = None,
-    *,
-    id: object = 1,
-    version: str | None = MODERN,
-    headers: Headers = HD,
-    meta: bool | Mapping[str, object] = True,
-    name: str | None = None,
-) -> httpx2.Response:
-    """Send one JSON-RPC message as docint does.
-
-    ``Content-Type``, ``Accept`` and ``MCP-Protocol-Version`` go on every message; on the modern revision also
-    ``Mcp-Method``, ``Mcp-Name`` on ``tools/call`` (``name``, else the tool's) and ``params._meta`` with the version
-    and ``clientCapabilities``. ``meta`` may give another ``_meta``; ``headers`` come last, ``None`` leaving one out.
-    """
-    sent = dict(params or {})
-    modern = version == MODERN
-    if isinstance(meta, Mapping):
-        sent["_meta"] = dict(meta)
-    elif meta and modern:
-        sent["_meta"] = {f"{META_PREFIX}protocolVersion": version, f"{META_PREFIX}clientCapabilities": NONE}
-    protocol: dict[str, str | bytes | None] = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    if version is not None:
-        protocol["MCP-Protocol-Version"] = version
-    if modern:
-        protocol["Mcp-Method"] = method
-        if method == "tools/call":
-            protocol["Mcp-Name"] = name if name is not None else str(sent.get("name"))
-    message: dict[str, object] = {"jsonrpc": "2.0", "method": method, "params": sent}
-    if id is not NOTIFICATION:
-        message["id"] = id
-    return send(client, json.dumps(message).encode(), {**protocol, **headers})
-
 
 def call(client: TestClient, arguments: object = ARGS, **options: Any) -> httpx2.Response:
     """Call inline ``run_python`` on the modern revision."""
     return rpc(client, "tools/call", {"name": "run_python", "arguments": arguments}, **options)
-
-
-def error(r: httpx2.Response, status: int, code: int) -> dict[str, Any]:
-    """Check a JSON-RPC error answer's status and code, and give its body."""
-    assert r.status_code == status, r.text
-    assert r.headers["content-type"] == "application/json"
-    body = r.json()
-    assert body["jsonrpc"] == "2.0" and "result" not in body
-    assert body["error"]["code"] == code, body
-    return body
-
-
-def result(r: httpx2.Response) -> dict[str, Any]:
-    """Check a JSON-RPC result answer and give its ``result``."""
-    assert r.status_code == 200, r.text
-    assert r.headers["content-type"] == "application/json"
-    body = r.json()
-    assert body["jsonrpc"] == "2.0" and "error" not in body
-    return body["result"]
-
-
-def refused(r: httpx2.Response) -> dict[str, Any]:
-    """Check an ``isError`` result and give its ``structuredContent``."""
-    answer = result(r)
-    assert answer["isError"] is True
-    (block,) = answer["content"]
-    assert block["type"] == "text" and block["text"]
-    return answer["structuredContent"]
 
 
 def inline_events(audit_lines: AuditLines) -> list[dict[str, Any]]:
@@ -391,14 +300,7 @@ def test_a_message_of_another_shape_is_an_invalid_request(client: TestClient, me
 # --- the door's own caller -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
-def test_open_webuis_key_on_mcp_is_not_found(client: TestClient, method: str) -> None:
-    """The terminal caller finds no MCP door: the gate's 404, never a 405 or an answer of the door."""
-    r = client.request(method, MCP_PATH, headers={**OW, "Content-Type": "application/json"}, content=b"{}")
-    assert (r.status_code, r.json()) == (404, {"detail": "not found"})
-
-
-@pytest.mark.parametrize("headers", [HD, OW], ids=["docint", "open-webui"])
+@pytest.mark.parametrize("headers", [HD, HG], ids=["docint", "ghostwriter"])
 @pytest.mark.parametrize("method", ["POST", "GET"])
 def test_mcp_with_a_trailing_slash_is_not_found_never_a_redirect(
     client: TestClient, headers: dict[str, str], method: str
@@ -413,15 +315,15 @@ def test_the_door_refuses_to_run_under_a_root_path(app: FastAPI) -> None:
     """Behind a proxy that sets a root path, the door is not there: the gate judged a path routing does not use."""
     with TestClient(app, root_path="/prefix") as prefixed:
         for path in (MCP_PATH, "/prefix" + MCP_PATH):
-            for headers in (HD, OW):
+            for headers in (HD, HG):
                 r = prefixed.post(path, headers={**headers, "Content-Type": "application/json"}, content=b"{}")
                 assert (r.status_code, r.json()) == (404, {"detail": "not found"}), (path, headers is HD)
             r = prefixed.get(path, headers=HD)
             assert (r.status_code, r.json()) == (404, {"detail": "not found"})
 
 
-def test_without_the_gate_the_door_still_refuses_open_webuis_key(app: FastAPI) -> None:
-    """Were the gate bypassed, every method of ``/mcp`` still answers Open WebUI's key with the gate's 404."""
+def test_without_the_gate_the_door_still_checks_the_key(app: FastAPI) -> None:
+    """Were the gate bypassed, every method of ``/mcp`` still answers a key no caller holds with the gate's 401."""
     app.user_middleware = [middleware for middleware in app.user_middleware if middleware.cls is not KeyGate]
     methods = sorted(
         method for route in iter_route_contexts(app.routes) if route.path == MCP_PATH for method in route.methods or ()
@@ -430,9 +332,10 @@ def test_without_the_gate_the_door_still_refuses_open_webuis_key(app: FastAPI) -
     with TestClient(app) as bypassed:
         assert bypassed.get("/nowhere").status_code == 404  # the gate would answer 401: it is really out
         for method in methods:
-            r = bypassed.request(method, MCP_PATH, headers={**OW, "Content-Type": "application/json"}, content=b"{}")
-            assert r.status_code == 404, method
-            assert method == "HEAD" or r.json() == {"detail": "not found"}, method
+            wrong = {**HD, "Authorization": "Bearer wrong", "Content-Type": "application/json"}
+            r = bypassed.request(method, MCP_PATH, headers=wrong, content=b"{}")
+            assert r.status_code == 401, method
+            assert method == "HEAD" or r.json() == {"detail": "missing or invalid key"}, method
         assert bypassed.post(MCP_PATH, content=b"{}").status_code == 401
 
 

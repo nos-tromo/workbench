@@ -4,31 +4,19 @@ What enters workbench, where it is stored, for how long, and where it goes
 from there. The last section collects the facts an operator needs for the
 record of processing and the impact assessment.
 
-> **The main copy outside workbench is Open WebUI's chat history.** Every tool
-> result workbench sends to Open WebUI (text read from a document, search hits,
-> what code printed, file names and paths) becomes part of the chat in Open WebUI,
-> and so does every argument the model wrote (code, values, Markdown). Open WebUI
-> keeps a chat for its own retention period, 365 days by default
-> (open-webui-service, `OPEN_WEBUI_CHAT_RETENTION_DAYS`), far longer than
-> workbench's 7 days. Deleting a file in workbench does not remove what a chat
-> already holds of it. docint and Ghostwriter, the other callers, keep what a run
-> returns with the chat turn, each for its own retention.
+> **The main copy outside workbench is the callers' chat history.** Every tool
+> result workbench sends to Ghostwriter or docint (text read from a document,
+> search hits, what code printed, file names and paths) becomes part of the chat
+> turn the caller keeps, and so does every argument the model wrote (code,
+> values, Markdown). Each keeps it for its own retention, which can be far
+> longer than workbench's 7 days. Deleting a file in workbench does not remove
+> what a chat already holds of it.
 
 ## What enters
 
-- **Uploads.** A user attaches a file to a chat, or drops it into the file
-  browser. The browser sends it through Open WebUI's terminal proxy to
-  `POST /files/upload`. With the connection's `chat_uploads: filesystem`, Open
-  WebUI stores nothing of it and builds no vectors.
-  workbench streams it to disk (`workbench/api/store.py:Store.add_upload`).
-  This is the path of a chat that has Workbench selected as its terminal. From
-  open-webui-service v0.14.0, an attachment in a chat without it goes to Open
-  WebUI's own file routes, which its edge-guard refuses with `403` for every
-  account. A temporary chat is the exception: there the browser extracts the
-  text of a PDF or text file itself, or keeps a pasted image as a data URL, and
-  sends it to the model inline with the message, like pasted text. It does not
-  pass workbench, which records nothing of it (see
-  open-webui-service's `CLAUDE.md`, § Workbench).
+- **Uploads.** A user drops a file into a Ghostwriter chat; Ghostwriter's
+  backend sends it to `POST /files/upload`. workbench streams it to disk
+  (`workbench/api/store.py:Store.add_upload`).
 - **Tool arguments the model writes** (`workbench/api/tools*.py`). They reach
   the executor in the job's request. What becomes of them:
   - paths, search queries and Python code end with the job: workbench keeps
@@ -51,10 +39,9 @@ record of processing and the impact assessment.
   user and session pseudonyms, the purpose and the request id in the headers.
   The data ends with the job (see
   [What a docint call leaves](#what-a-docint-call-leaves)).
-- **Identity headers.** The caller key, `X-User-Id` (Open WebUI's opaque account
-  id, or docint's or Ghostwriter's pseudonym) and `X-Session-Id` (the chat id, or
-  docint's or Ghostwriter's session pseudonym). See
-  [permissions.md](permissions.md#the-boundaries).
+- **Identity headers.** The caller key, `X-User-Id` (docint's or Ghostwriter's
+  pseudonym) and `X-Session-Id` (docint's or Ghostwriter's session pseudonym).
+  See [permissions.md](permissions.md#the-boundaries).
 
 ## Where it is stored
 
@@ -79,7 +66,7 @@ The database has two tables (`workbench/api/store.py`):
   status. No argument, code or result.
 
 **File names and user ids are personal data in themselves.** A file name can
-name a person or a case, and the user id names an Open WebUI account. Both are
+name a person or a case, and the user id identifies a user to its caller. Both are
 in the database and in the folder names on the volume.
 
 Two more places hold data for a short time:
@@ -97,7 +84,7 @@ operator's.
 
 | What | Kept for | Enforced by |
 |---|---|---|
-| Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using, moving or renaming a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
+| Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
@@ -124,16 +111,16 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
 
 ## What leaves
 
-- **Tool results go to the caller that asked**: Open WebUI, Ghostwriter, or docint
-  (workbench keeps neither docint's data nor its outputs). Open WebUI puts them into
-  the chat and sends them, in the model's context, to whatever model the operator
-  configured behind the federation's inference router. If that model is run by an
-  outside provider (a hosted API, or an Ollama `*-cloud` model), the results leave
-  the host and the federation to that provider. They stay in the chat history for
-  Open WebUI's chat retention, 365 days by default (see the box at the top).
-- **Files go to the user's browser** through Open WebUI's proxy, when the user
-  views or downloads them (`GET /files/view`), or when a card shows one
-  (`display_file`). What a user downloads is outside workbench from then on.
+- **Tool results go to the caller that asked**: Ghostwriter or docint
+  (workbench keeps neither docint's data nor its outputs). The caller puts them
+  into the chat and sends them, in the model's context, to whatever model the
+  operator configured behind the federation's inference router. If that model is
+  run by an outside provider (a hosted API, or an Ollama `*-cloud` model), the
+  results leave the host and the federation to that provider. They stay in the
+  caller's chat history for its own retention (see the box at the top).
+- **Files go to Ghostwriter**, and from it to the user's browser, when the user
+  views or downloads them (`GET /files/view`). What a user downloads is outside
+  workbench from then on.
 - **Audit events** go to the api container's standard output. obs-plane
   collects them into its audit store (see [audit.md](audit.md)). They name
   files by id, never by name.
@@ -159,27 +146,10 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
 - **Metrics.** `GET /metrics` gives queue lengths, waits, job durations,
   refusals by reason and disk use; no user id, chat id or file name
   (`workbench/api/metrics.py`).
-- **Open WebUI's logs and the file names.** Open WebUI proxies the file
-  browser's calls, and their URLs carry file names in their query strings
-  (`/api/v1/terminals/<id>/files/view?path=/workspace/<chat>/<name>`). From
-  open-webui-service v0.14.0 neither request log of Open WebUI prints them: its
-  audit records skip the terminal proxy (`AUDIT_EXCLUDED_PATHS: "/terminals"`),
-  and uvicorn's access log is off (`--no-access-log` together with
-  `AUDIT_UVICORN_LOGGER_NAMES: ""`, both needed;
-  [audit.md](audit.md#the-open-webui-side)). Still logging there: the audit
-  records of Open WebUI's other routes, its application log (the proxy's errors
-  name host and port, not the path), and the log of the edge-guard in front of
-  it, which writes the decoded path without the query. The contract test runs
-  its own Open WebUI with the audit setting and checks it; it does not check
-  open-webui-service's values. workbench cannot change any of this, since those
-  paths are Open WebUI's protocol; it belongs to open-webui-service. What the
-  gateway logs is edge-plane's: its access log cuts the query string from the
-  URI (`caddy/Caddyfile` there).
 
 workbench itself sends nothing outside the host: the executor has no network,
 and the api calls no model and no other service. What leaves the federation
-leaves through the callers' model calls: Open WebUI's, above, and docint's and
-Ghostwriter's.
+leaves through the callers' model calls: docint's and Ghostwriter's.
 
 ## Facts for the record of processing and the impact assessment
 
@@ -191,35 +161,26 @@ sends with a call (passages of its documents), which workbench cannot know in
 advance: documents, spreadsheets, e-mails, presentations, and what is in them.
 That can include special categories of personal data. Also what the model
 writes into new files (table values, Markdown, template values) and their
-names. Besides: file names, the Open WebUI account id of each user, chat ids,
-the user and session pseudonyms of docint and Ghostwriter with the purpose and
-request id they send, and the time and tool of each run.
+names. Besides: file names, chat ids, the user and session pseudonyms of docint
+and Ghostwriter with the purpose and request id they send, and the time and
+tool of each run.
 
-**Categories of data subjects.** The users of Open WebUI, docint and Ghostwriter
-(the last two as pseudonyms), and every person named in the files or data they
+**Categories of data subjects.** The users of docint and Ghostwriter (as
+pseudonyms), and every person named in the files or data they
 send or in the values the model writes.
 
 **Where data flows.** These are the flows, as facts:
 
-- to the caller that asked, for the same user: tool results and files to Open
-  WebUI; results to docint (workbench keeps neither its data nor its outputs);
-  results to Ghostwriter, with `outputs` and a preview of each csv or xlsx file,
-  which Ghostwriter keeps for `WORKBENCH_RETENTION_DAYS`;
-- through Open WebUI, to the federation's inference router and the model the
-  operator configured behind it: tool results enter the model's context. When
-  that model is run by an outside provider, they leave the host and the
-  federation to that provider. What Open WebUI does with an answer (the chat
-  history, the model call) is its own processing, recorded there. An attachment
-  in a temporary chat without Workbench selected takes the same way to the
-  model, inline with the message, without passing workbench, which records
-  nothing of it;
+- to the caller that asked, for the same user: results to docint (workbench
+  keeps neither its data nor its outputs); results and viewed files to
+  Ghostwriter, with `outputs` and a preview of each csv or xlsx file, which
+  Ghostwriter keeps for `WORKBENCH_RETENTION_DAYS`;
 - through docint and Ghostwriter, to their models and their own databases: what
   a run returns enters their model context and is kept with the turn; their own
   processing, recorded there;
-- to obs-plane: the audit events (account id, chat id, file ids, times, counts;
-  the pseudonyms, purpose and request id of docint and Ghostwriter) into its
-  audit store, and the containers' log lines into its log store. Metrics hold no
-  personal data.
+- to obs-plane: the audit events (user pseudonym, chat id, file ids, times,
+  counts, purpose and request id) into its audit store, and the containers' log
+  lines into its log store. Metrics hold no personal data.
 
 workbench itself sends nothing outside the host. Tool results go to whatever
 model the operator configured behind the inference router; if that is an
@@ -230,16 +191,14 @@ is a recipient in the legal sense is for the operator to decide.
 default, from creation. Ghostwriter's chat delete (`DELETE /files/chat`) removes
 the chat's files at once and leaves an event by file id, nothing else.
 Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
-retention (`AUDIT_RETENTION`, one year by default). Copies in
-Open WebUI's chat history: its chat retention, 365 days by default. Copies in
-docint's session database, the analyses kept with the chat turn: docint's own
+retention (`AUDIT_RETENTION`, one year by default). Copies in Ghostwriter's
+chat database and docint's session database, kept with the chat turn: their own
 retention; workbench keeps neither the data nor the outputs of a docint call.
 Docker's `local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a
-copy of each container's output on the host, the api's audit lines (account ids,
-chat ids, file ids; the pseudonyms, purposes and request ids of docint and
-Ghostwriter) among them: rotated by size, at most five files of 50 MB per
-container, not by time, so with little traffic it can outlive obs-plane's
-retention.
+copy of each container's output on the host, the api's audit lines (user
+pseudonyms, chat ids, file ids, purposes and request ids) among them: rotated
+by size, at most five files of 50 MB per container, not by time, so with
+little traffic it can outlive obs-plane's retention.
 
 **Technical and organisational measures.**
 
@@ -261,11 +220,7 @@ retention.
   or an outside provider that receives the tool results;
 - whether any of the flows above goes to a recipient in the legal sense;
 - the outcome of the impact assessment;
-- the notice to users: what workbench keeps and for how long, and that Open
-  WebUI's chat history and docint's analyses keep tool results for longer;
-- whether the retention periods (workbench's, Open WebUI's, docint's, the audit
-  store's) fit the rules that apply;
-- whether temporary chats stay available in Open WebUI, where an attachment in
-  a chat without Workbench selected goes to the model without passing workbench
-  (`USER_PERMISSIONS_CHAT_TEMPORARY`, which open-webui-service leaves at Open
-  WebUI's default, on).
+- the notice to users: what workbench keeps and for how long, and that
+  Ghostwriter's chat history and docint's analyses keep tool results for longer;
+- whether the retention periods (workbench's, Ghostwriter's, docint's, the audit
+  store's) fit the rules that apply.

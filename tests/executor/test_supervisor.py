@@ -47,7 +47,7 @@ ROOT_ON_LINUX = LINUX and os.geteuid() == 0
 #: Root in the executor image (its ``/workspace`` link), never a bare host: the tests that change ``/dev/zero`` need it.
 IN_THE_IMAGE = ROOT_ON_LINUX and Path("/workspace").is_symlink()
 ME = (os.getuid(), os.getgid())
-CALLER, USER, CHAT = "open-webui", "user-a", "chat-1"
+CALLER, USER, CHAT = "ghostwriter", "user-a", "chat-1"
 MB = 1024 * 1024
 
 PRELUDE = """\
@@ -3985,7 +3985,7 @@ def test_the_executor_image_has_no_setuid_or_setgid_program() -> None:
         ["find", "/", "-xdev", "-perm", "/6000", "-type", "f"], capture_output=True, text=True, check=False
     )
     assert found.stdout.split() == []
-    assert not Path("/app/contract").exists() and not Path("/app/docs").exists()  # R1 M-10: .dockerignore
+    assert not Path("/app/docs").exists()  # R1 M-10: .dockerignore
 
 
 class _Limits:

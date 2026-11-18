@@ -3,7 +3,8 @@
 Manual and not in CI (``make test-load``, on the isolation tests' stack, never on a developer's). It measures what the
 queue and the executor do under that load, apart from any model: how long a job waits for its slot and how long it
 then holds it, how many jobs run at once, what is refused, and how much memory the executor uses against its limit.
-Each job holds 200 MB for 2 s, well inside the stack's 20 s wall time.
+Each job holds 200 MB for 2 s, well inside the stack's 20 s wall time. Half the users come through Ghostwriter's door,
+half through docint's: each caller has slots of its own, fewer than the executor's, and the two together fill them.
 
 Three clocks are in play. The test's own times its calls. The api records when it admitted a job (``created_at`` of
 the job's record), and the job prints when its code began and ended; both are the containers' clock, which is set
@@ -23,12 +24,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Final
 
-import httpx
 import pytest
 
-from tests.isolation.conftest import api, api_info, container_of, docker, environment, executor, inspect, run_python
+from tests.isolation.conftest import (
+    api_info,
+    container_of,
+    docker,
+    environment,
+    executor,
+    ghostwriter_mcp,
+    inspect,
+    mcp_call,
+)
 
-__all__ = ["api", "api_info", "executor"]  # fixtures of the test stack, used below by name
+__all__ = ["api_info", "executor"]  # fixtures of the test stack, used below by name
 
 pytestmark = pytest.mark.load
 
@@ -45,7 +54,9 @@ time.sleep({HOLD_S})
 print(began, time.time(), len(held))
 """
 
-BUSY: Final = (503, {"detail": "busy, retry later"})
+#: Why a call may be refused as busy, and what the caller is told then.
+BUSY_REASONS: Final = frozenset({"queue_full", "wait_timeout", "executor_busy"})
+BUSY: Final = "busy, retry later"
 _UNITS: Final = {
     "B": 1,
     "KiB": 1024,
@@ -71,7 +82,7 @@ class Call:
         sent: When the test sent it, by the test's clock.
         answered: When the answer came, by the test's clock.
         status: The answer's status.
-        body: The answer's JSON.
+        body: The answer's JSON: a JSON-RPC answer of the MCP door.
     """
 
     user: str
@@ -185,20 +196,45 @@ def most_at_once(spans: list[tuple[float, float]]) -> int:
     return peak
 
 
+def _ran(c: Call) -> bool:
+    """Whether the call's job ran: a result that is no error."""
+    return c.status == 200 and c.body.get("result", {}).get("isError") is False
+
+
+def _busy(c: Call) -> bool:
+    """Whether the call was refused as busy: an error result with a busy reason and the busy text."""
+    found = c.body.get("result", {})
+    told = [block.get("text") for block in found.get("content", [])]
+    return (
+        c.status == 200
+        and found.get("isError") is True
+        and found["structuredContent"]["reason"] in BUSY_REASONS
+        and told == [BUSY]
+    )
+
+
 def test_ten_users_at_once_are_queued_refused_and_bounded(
-    api: httpx.Client, api_info: dict[str, Any], executor: str, capsys: pytest.CaptureFixture[str]
+    api_info: dict[str, Any], executor: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """At most ``executor_slots`` jobs run at once, every refusal is "busy", the executor stays below its memory."""
+    """At most ``executor_slots`` jobs run at once, every refusal is "busy", the executor stays below its memory.
+
+    Each caller runs at most its own slots; both callers together fill the executor's.
+    """
     settings = environment(api_info)
     slots = int(settings["WORKBENCH_EXECUTOR_SLOTS"])
+    callers_slots = int(settings["GHOSTWRITER_WORKBENCH_SLOTS"]) + int(settings["DOCINT_WORKBENCH_SLOTS"])
     limit = int(inspect(executor)["HostConfig"]["Memory"])
     api_container = container_of("api")
     offset, error = clock_offset(api_container)
     users = [f"load-user-{n:02d}" for n in range(1, USERS + 1)]
+    through_docint = set(users[USERS // 2 :])
 
     def call(user: str) -> Call:
         sent = time.time()
-        r = run_python(api, CODE, user=user)
+        if user in through_docint:
+            r = mcp_call(api_info, CODE, [], user=user)
+        else:
+            r = ghostwriter_mcp(api_info, "run_python", {"code": CODE}, chat="load-chat", user=user)
         answered = time.time()
         try:
             body = r.json()
@@ -211,17 +247,17 @@ def test_ten_users_at_once_are_queued_refused_and_bounded(
         calls = list(pool.map(call, [user for user in users for _ in range(JOBS_EACH)]))
         took = time.time() - began
 
-    done = [c for c in calls if c.status == 200]
-    refused = [c for c in calls if (c.status, c.body) == BUSY]
+    done = [c for c in calls if _ran(c)]
+    refused = [c for c in calls if _busy(c)]
     assert [(c.user, c.status, c.body) for c in calls if c not in done and c not in refused] == []
-    ran = {c.body["job_id"]: c for c in done}
+    ran = {c.body["result"]["structuredContent"]["job_id"]: c for c in done}
     when = admitted(api_container, list(ran))
     assert set(when) == set(ran)
     waits = [when[job] - offset - c.sent for job, c in ran.items()]
     holds = [c.answered - (when[job] - offset) for job, c in ran.items()]
     spans = []
     for c in done:
-        start, end, size = c.body["stdout"].split()
+        start, end, size = c.body["result"]["structuredContent"]["stdout"].split()
         assert int(size) == HOLD_MB * 1024 * 1024
         spans.append((float(start), float(end)))
     at_once = most_at_once(spans)
@@ -236,15 +272,15 @@ def test_ten_users_at_once_are_queued_refused_and_bounded(
         print(
             f"\nload: {USERS} users x {JOBS_EACH} run_python jobs, all at once ({HOLD_MB} MB held {HOLD_S} s each); "
             f"{slots} slots, queue {settings['WORKBENCH_QUEUE_MAX']}, {settings['WORKBENCH_JOBS_PER_USER']} job a user"
-            f"\n  {len(done)} answered 200, {len(refused)} refused 503 busy, 0 other; all answered in {took:.1f} s"
+            f"\n  {len(done)} ran, {len(refused)} refused busy, 0 other; all answered in {took:.1f} s"
             f"\n  queue wait   p50 {wait_p50:.2f} s   p95 {wait_p95:.2f} s"
             f"\n  job duration p50 {hold_p50:.2f} s   p95 {hold_p95:.2f} s   (admission to answer)"
-            f"\n  most jobs running at once: {at_once} (slots: {slots})"
+            f"\n  most jobs running at once: {at_once} (slots: {slots}, the two callers' together: {callers_slots})"
             f"\n  executor memory: sampled peak {peak_sampled / mib:.0f} MiB, cgroup peak {cgroup_peak / mib:.0f} MiB,"
             f" limit {limit / mib:.0f} MiB ({len(memory.used)} samples, largest gap {max(gaps):.2f} s)"
             f"\n  clock offset to the containers {offset * 1000:+.1f} ms (within {error * 1000:.1f} ms)"
         )
-    assert at_once == slots
+    assert at_once == min(slots, callers_slots)
     assert max(gaps) <= 1.0
     assert peak_sampled < limit
     assert cgroup_peak < limit

@@ -1,12 +1,9 @@
-"""The tools the model calls: routes tagged :data:`~workbench.api.openapi.TOOL_TAG`, one operation each.
+"""The workspace tools the model calls, one function each, and the helpers the other tool modules share.
 
-Open WebUI makes a tool of every operation with an ``operationId``, so each route sets its
-own, and the description is written for the model rather than taken from the docstring.
-``display_file`` lives with the file browser in :mod:`workbench.api.files`, since it shares
-that module's audit rule; ``read_document``, ``search_files`` and ``run_python`` hand the chat's files
-to a job in the executor (:mod:`workbench.executor.runners.documents`,
-:mod:`workbench.executor.runners.python`) and are built here from what the store knows and what the job
-answers. Each later tool has a module of its own on this module's router, sharing its helpers:
+:mod:`workbench.api.tool_table` names each tool, describes it for the model and binds it to its function here.
+``read_document``, ``search_files`` and ``run_python`` hand the chat's files to a job in the executor
+(:mod:`workbench.executor.runners.documents`, :mod:`workbench.executor.runners.python`) and are built here from what
+the store knows and what the job answers. Each later tool has a module of its own, sharing this module's helpers:
 ``inspect_template`` and ``fill_template`` are in :mod:`workbench.api.tools_templates`, ``write_table`` and
 ``write_document`` in :mod:`workbench.api.tools_output`.
 
@@ -25,22 +22,21 @@ entries), so it is an ``error`` event whose criteria name the refusal's code, ne
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import require_tool
-from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep, StoreDep
-from workbench.api.openapi import TOOL_TAG
-from workbench.api.routing import EncodableRoute
+from workbench.api.store import Store
+from workbench.config import Settings
 from workbench.models import Principal
 from workbench.protocol import KILLED, MAX_INPUT_FILES, OUT_DIR, JobResult
 
-router = APIRouter(tags=[TOOL_TAG], route_class=EncodableRoute)
+if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
+    from workbench.api.tools_mcp import CallJobs
 
 
 class FileInfo(BaseModel):
@@ -131,20 +127,7 @@ def _fit(files: list[FileInfo], limit_kb: int) -> FileList:
     return FileList(files=kept, truncated=True, hint=_notice(total - len(kept), total, limit_kb))
 
 
-@router.post(
-    "/tools/list_files",
-    operation_id="list_files",
-    dependencies=[Depends(require_tool("list_files"))],
-    summary="List the files of this conversation",
-    description=(
-        "List every file in this conversation's workspace, the user's uploads and the files "
-        "tools made, newest first, with path, size, date and kind. Takes no arguments. Call it first "
-        "to see what there is to work with. A very long list is cut: truncated is then true, and hint "
-        "says how many older files are not listed."
-    ),
-    response_model_exclude_none=True,
-)
-def list_files(p: PrincipalDep, settings: SettingsDep, store: StoreDep) -> FileList:
+def list_files(p: Principal, settings: Settings, store: Store) -> FileList:
     """List the files of the principal's chat, newest first, within the result limit.
 
     Listing is the user's own metadata and is not recorded (spec section 7). Files made at the
@@ -177,10 +160,11 @@ def list_files(p: PrincipalDep, settings: SettingsDep, store: StoreDep) -> FileL
 #: The most hits a search may return.
 MAX_HITS: Final = 200
 
-#: The runner's failures the model is told, and the status each is answered with; any other is a 500. Two are the
-#: executor's own: ``storage_full``, the data volume is below its free-space floor, so the job was stopped or never
-#: started (507, as a full volume is everywhere in the api); and ``hidden_memory``, the container held shared memory no
-#: job's count showed, so every running job was stopped (503: nothing was wrong with the call, retry later).
+#: The runner's failures the model is told, and the status each is raised with; any other is a 500. The MCP door answers
+#: every one as ``refused`` with its text. Two are the executor's own: ``storage_full``, the data volume is below its
+#: free-space floor, so the job was stopped or never started (507, as a full volume is everywhere in the api); and
+#: ``hidden_memory``, the container held shared memory no job's count showed, so every running job was stopped (503:
+#: nothing was wrong with the call, retry later).
 _RUNNER_ERRORS: Final = {
     "unsupported_format": 422,
     "unreadable_file": 422,
@@ -444,7 +428,7 @@ def record_answer(
         criteria: The event's criteria, flags and counts.
         result: The executor's answer.
         model: The shape an ``ok`` answer must have to be sent on.
-        payload: The answer as the route checks it against ``model``.
+        payload: The answer as the tool checks it against ``model``.
 
     Raises:
         AuditWriteError: The event could not be written; the answer must not go out.
@@ -673,41 +657,19 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
     return _within(final.model_copy(update={"skipped": skipped or None}), limit)
 
 
-@router.post(
-    "/tools/read_document",
-    operation_id="read_document",
-    dependencies=[Depends(require_tool("read_document"))],
-    summary="Read a file of this conversation as text",
-    description=(
-        "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
-        "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
-        "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
-        "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
-        "call again with part set to next_part. "
-        "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table "
-        "rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to "
-        "200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's "
-        "name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. "
-        "pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so "
-        "tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: "
-        "ask the user to save them as .eml or PDF."
-    ),
-    response_model_exclude_none=True,
-)
 async def read_document(
     body: ReadDocumentRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    store: StoreDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: "CallJobs",
 ) -> DocumentRead:
     """Read one of the user's files in the executor and answer with its text, cut to the result limit.
 
-    The job runs in the chat folder the file lives in, whatever chat the request came from, with that one
-    file as its input. The job is recorded by the file's id once it has answered and before anything of
-    the answer goes out, a refusal as ``error`` with its code; neither the name, the part nor the text is
-    recorded.
+    The job runs in the request's chat folder, where the file lives, with that one file as its input. The job
+    is recorded by the file's id once it has answered and before anything of the answer goes out, a refusal as
+    ``error`` with its code; neither the name, the part nor the text is recorded.
 
     Args:
         body: The path and where to start.
@@ -715,46 +677,28 @@ async def read_document(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The parts read, the pages without text and how to go on.
     """
     rec = await run_in_threadpool(store.get, p, body.path)
-    in_chat = dataclasses.replace(p, chat_id=rec.chat_id)
     args = {"path": rec.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
-    _, result, _ = await jobs.submit(in_chat, "read_document", args, [rec.name])
+    _, result, _ = await jobs.submit(p, "read_document", args, [rec.name])
     shown = {**result.result, "path": rec.virtual_path} if isinstance(result.result, dict) else None
     criteria = {"paged": body.part is not None}
-    await run_in_threadpool(
-        record_answer, audit, "read_document", in_chat, [rec.id], criteria, result, DocumentRead, shown
-    )
+    await run_in_threadpool(record_answer, audit, "read_document", p, [rec.id], criteria, result, DocumentRead, shown)
     _payload(result, "file")
     return _fit_read(_parse(DocumentRead, shown), settings.result_max_kb)
 
 
-@router.post(
-    "/tools/search_files",
-    operation_id="search_files",
-    dependencies=[Depends(require_tool("search_files"))],
-    summary="Search all files of this conversation",
-    description=(
-        "Search every file of this conversation for a text or, with regex true, a regular expression; case is "
-        "ignored. Each hit has the file's path, the location in it (page 3, Sheet1!B7, paragraph 12, line 40) and "
-        "a snippet of at most 200 characters; read the place with read_document. max_hits is 50 by default and at "
-        "most 200. Files that cannot be searched are named in skipped (no text layer, encrypted, damaged) or "
-        "counted in unsupported_files (images and other types): never tell the user something is not in the "
-        "files without saying what could not be searched."
-    ),
-    response_model_exclude_none=True,
-)
 async def search_files(
     body: SearchFilesRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    store: StoreDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: "CallJobs",
 ) -> SearchResult:
     """Search the chat's files in the executor and answer with the hits, cut to the result limit.
 
@@ -769,7 +713,7 @@ async def search_files(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The hits, and what could not be searched.
@@ -957,7 +901,7 @@ def read_code_run(result: JobResult) -> tuple[CodeRun, str | None]:
 
 
 def _kept_note(result: JobResult, note: str | None) -> str | None:
-    """Say in the terminal's words what the executor's note means: which files in ``out/`` were not kept.
+    """Say what the executor's note means for a call whose outputs are kept: which files in ``out/`` were not.
 
     Args:
         result: The executor's answer, as :func:`read_code_run` read it.
@@ -1041,35 +985,13 @@ def fit_python[M: BaseModel](answer: M, limit_kb: int, *, keep_none: bool = Fals
     return _within(best, limit, keep_none=keep_none)
 
 
-@router.post(
-    "/tools/run_python",
-    operation_id="run_python",
-    dependencies=[Depends(require_tool("run_python"))],
-    summary="Run Python on the files of this conversation",
-    description=(
-        "Run Python code on this conversation's files and get back what it printed. The files are in the current "
-        "folder, under their names as list_files gives them (also at their /workspace/<chat>/<name> paths), "
-        "read-only. Write every result file directly into the out/ folder, not into a subfolder: each becomes a "
-        "new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image "
-        "files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so show a file with "
-        "display_file. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, "
-        "python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, XLSX) into a table file, "
-        "load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or .csv; do not copy its rows "
-        "into write_table. There is no network and nothing can be installed. Use threads, not multiprocessing: "
-        "process pools and multiprocessing do not work here. The code runs as a "
-        "script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when "
-        "long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures "
-        "the code computed."
-    ),
-    response_model_exclude_none=True,
-)
 async def run_python(
     body: RunPythonRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    store: StoreDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: "CallJobs",
 ) -> PythonRun:
     """Run the model's code in the executor over the chat's files and answer with its output and new files.
 
@@ -1084,7 +1006,7 @@ async def run_python(
         settings: The api's settings; ``result_max_kb`` caps the answer, ``job_wall_s`` gives the time limit.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         What the code printed, the files it made and the job's id.

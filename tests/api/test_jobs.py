@@ -17,7 +17,7 @@ from typing import Any, override
 
 import pytest
 
-from tests.api.conftest import unrecorded
+from tests.api.conftest import CALL, unrecorded
 from tests.conftest import scaled
 from workbench.api.jobs import (
     IMAGE_MAX,
@@ -67,8 +67,8 @@ def anyio_backend() -> str:
 
 
 def user(name: str, chat: str = "chat-1") -> Principal:
-    """A synthetic user of Open WebUI."""
-    return Principal("open-webui", name, chat)
+    """A synthetic user of Ghostwriter's, called with no limits of its caller's."""
+    return Principal("ghostwriter", name, chat)
 
 
 def sample_result(
@@ -233,7 +233,9 @@ async def test_never_more_than_slots_run_at_once(
     """Ten users, four slots: four jobs are in flight at the most, and all ten finish."""
     executor.delay = 0.05
     queue = queue_for(settings, executor, store, metrics, executor_slots=4)
-    done = await asyncio.gather(*(queue.submit(user(f"user-{n}"), "run_python", ARGS, []) for n in range(10)))
+    done = await asyncio.gather(
+        *(queue.submit(user(f"user-{n}"), "run_python", ARGS, [], call=CALL) for n in range(10))
+    )
     assert executor.peak == 4
     assert len(executor.requests) == 10
     assert {result.status for _, result, _ in done} == {"ok"}
@@ -244,15 +246,15 @@ async def test_full_queue_refuses_at_once(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """One slot and room for one waiter: the third call is refused without waiting."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b", "open-webui/user-c"}
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_max=1)
-    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    second = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, []))
+    second = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 1)
     async with asyncio.timeout(0.5):
         with pytest.raises(Busy) as refused:
-            await queue.submit(user("user-c"), "run_python", ARGS, [])
+            await queue.submit(user("user-c"), "run_python", ARGS, [], call=CALL)
     assert refused.value.reason == "queue_full"
     assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
     executor.gate.set()
@@ -262,13 +264,13 @@ async def test_full_queue_refuses_at_once(
 
 
 async def test_wait_timeout(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
-    """A job that waits longer than ``queue_wait_s`` for a slot is refused, and gives its place up."""
-    executor.hold = {"open-webui/user-a"}
-    queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_wait_s=1)
-    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    """A job that waits longer than its call's wait for a slot is refused, and gives its place up."""
+    executor.hold = {"ghostwriter/user-a"}
+    queue = queue_for(settings, executor, store, metrics, executor_slots=1)
+    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
     with pytest.raises(Busy) as refused:
-        await queue.submit(user("user-b"), "run_python", ARGS, [])
+        await queue.submit(user("user-b"), "run_python", ARGS, [], call=dataclasses.replace(CALL, wait_s=1))
     assert refused.value.reason == "wait_timeout"
     assert sample(metrics, "workbench_job_refusals_total", reason="wait_timeout") == 1
     assert sample(metrics, "workbench_queue_length") == 0
@@ -278,21 +280,21 @@ async def test_wait_timeout(settings: Settings, store: Store, executor: FakeClie
     executor.gate.set()
     await first
     executor.hold = set()
-    await queue.submit(user("user-b"), "run_python", ARGS, [])
+    await queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL)
 
 
 async def test_one_job_per_user_others_proceed(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """User A's second job waits for the first, and does not take a slot the other user needs."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, jobs_per_user=1)
-    a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    a2 = asyncio.create_task(queue.submit(user("user-a", "chat-2"), "run_python", ARGS, []))
+    a2 = asyncio.create_task(queue.submit(user("user-a", "chat-2"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 1)
     async with asyncio.timeout(2):
-        job, result, _ = await queue.submit(user("user-b"), "run_python", ARGS, [])
+        job, result, _ = await queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL)
     assert result.status == "ok"
     assert job.user_id == "user-b"
     assert not a2.done()
@@ -309,7 +311,7 @@ async def test_two_jobs_per_user_when_configured(
     """``jobs_per_user`` is how many of one user's jobs run at once."""
     executor.delay = 0.05
     queue = queue_for(settings, executor, store, metrics, executor_slots=4, jobs_per_user=2)
-    await asyncio.gather(*(queue.submit(user("user-a"), "run_python", ARGS, []) for _ in range(5)))
+    await asyncio.gather(*(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL) for _ in range(5)))
     assert executor.peak == 2
 
 
@@ -317,10 +319,12 @@ async def test_the_same_user_id_of_another_caller_is_another_user(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """The limit is per caller and user, as the workspaces are."""
-    executor.hold = {"open-webui/user-a", "docint/user-a"}
+    executor.hold = {"ghostwriter/user-a", "docint/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, jobs_per_user=1)
-    one = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
-    other = asyncio.create_task(queue.submit(Principal("docint", "user-a", "chat-1"), "run_python", ARGS, []))
+    one = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
+    other = asyncio.create_task(
+        queue.submit(Principal("docint", "user-a", "chat-1"), "run_python", ARGS, [], call=CALL)
+    )
     await until(lambda: executor.running == 2)
     executor.gate.set()
     await asyncio.gather(one, other)
@@ -330,11 +334,11 @@ async def test_a_cancelled_waiter_gives_its_place_up(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A client that goes away while its job waits leaves no waiter and no held slot behind."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_max=1)
-    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    waiter = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, []))
+    waiter = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 1)
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -343,7 +347,7 @@ async def test_a_cancelled_waiter_gives_its_place_up(
     executor.gate.set()
     await first
     executor.hold = set()
-    await queue.submit(user("user-b"), "run_python", ARGS, [])
+    await queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL)
     assert len(executor.requests) == 2
 
 
@@ -351,9 +355,9 @@ async def test_a_cancelled_running_job_frees_its_slot_and_is_recorded(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A client that goes away mid-job releases its slot, and the job record does not stay ``running``."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1)
-    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
     job_id = executor.requests[0].job_id
     executor.staged(job_id, "left.txt").parent.mkdir(parents=True)
@@ -364,7 +368,7 @@ async def test_a_cancelled_running_job_frees_its_slot_and_is_recorded(
     assert store.get_job(user("user-a"), job_id).status == "cancelled"
     assert not (settings.data_dir / "staging" / job_id).exists()
     executor.hold = set()
-    await queue.submit(user("user-b"), "run_python", ARGS, [])
+    await queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL)
 
 
 async def test_user_gates_do_not_accumulate(
@@ -372,11 +376,11 @@ async def test_user_gates_do_not_accumulate(
 ) -> None:
     """A user that has nothing queued or running leaves nothing in the queue's memory."""
     queue = queue_for(settings, executor, store, metrics)
-    await asyncio.gather(*(queue.submit(user(f"user-{n}"), "run_python", ARGS, []) for n in range(5)))
+    await asyncio.gather(*(queue.submit(user(f"user-{n}"), "run_python", ARGS, [], call=CALL) for n in range(5)))
     assert queue.tracked_users == 0
     executor.status = "busy"
     with pytest.raises(Busy):
-        await queue.submit(user("user-z"), "run_python", ARGS, [])
+        await queue.submit(user("user-z"), "run_python", ARGS, [], call=CALL)
     assert queue.tracked_users == 0
 
 
@@ -384,19 +388,22 @@ async def test_one_user_cannot_fill_the_queue(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A user has ``queue_max // executor_slots`` calls waiting; the next is refused at once, theirs only."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b", "open-webui/user-c"}
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_max=4, jobs_per_user=1)
-    a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    a_waiting = [asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [])) for n in (2, 3)]
+    a_waiting = [
+        asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [], call=CALL))
+        for n in (2, 3)
+    ]
     await until(lambda: sample(metrics, "workbench_queue_length") == 2)
-    b1 = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, []))
+    b1 = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 2)
-    c1 = asyncio.create_task(queue.submit(user("user-c"), "run_python", ARGS, []))
+    c1 = asyncio.create_task(queue.submit(user("user-c"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 3)
     async with asyncio.timeout(0.5):
         with pytest.raises(Busy) as refused:
-            await queue.submit(user("user-a", "chat-4"), "run_python", ARGS, [])
+            await queue.submit(user("user-a", "chat-4"), "run_python", ARGS, [], call=CALL)
     assert refused.value.reason == "queue_full"
     assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
     assert sample(metrics, "workbench_queue_length") == 3
@@ -410,21 +417,21 @@ async def test_the_users_share_of_the_queue_is_at_least_one(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """With more slots than queue places the share rounds up to one, and a waiter that leaves gives it back."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=4, queue_max=2, jobs_per_user=1)
-    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    waiter = asyncio.create_task(queue.submit(user("user-a", "chat-2"), "run_python", ARGS, []))
+    waiter = asyncio.create_task(queue.submit(user("user-a", "chat-2"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 1)
     async with asyncio.timeout(0.5):
         with pytest.raises(Busy) as refused:
-            await queue.submit(user("user-a", "chat-3"), "run_python", ARGS, [])
+            await queue.submit(user("user-a", "chat-3"), "run_python", ARGS, [], call=CALL)
     assert refused.value.reason == "queue_full"
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
     assert sample(metrics, "workbench_queue_length") == 0
-    again = asyncio.create_task(queue.submit(user("user-a", "chat-4"), "run_python", ARGS, []))
+    again = asyncio.create_task(queue.submit(user("user-a", "chat-4"), "run_python", ARGS, [], call=CALL))
     await until(lambda: sample(metrics, "workbench_queue_length") == 1)
     executor.gate.set()
     await asyncio.gather(first, again)
@@ -434,14 +441,17 @@ async def test_the_default_share_is_four_waiting_calls(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """16 places over 4 slots: one running and four waiting calls of a user, and the sixth is refused."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics)
-    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 1)
-    waiting = [asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [])) for n in range(4)]
+    waiting = [
+        asyncio.create_task(queue.submit(user("user-a", f"chat-{n}"), "run_python", ARGS, [], call=CALL))
+        for n in range(4)
+    ]
     await until(lambda: sample(metrics, "workbench_queue_length") == 4)
     with pytest.raises(Busy) as refused:
-        await queue.submit(user("user-a", "chat-9"), "run_python", ARGS, [])
+        await queue.submit(user("user-a", "chat-9"), "run_python", ARGS, [], call=CALL)
     assert refused.value.reason == "queue_full"
     executor.gate.set()
     await asyncio.gather(running, *waiting)
@@ -457,12 +467,12 @@ async def test_the_request_carries_the_users_place_and_the_limits(
     queue = queue_for(
         settings, executor, store, metrics, job_wall_s=30, job_memory_mb=512, upload_max_mb=7, result_max_kb=4
     )
-    job, _, _ = await queue.submit(user("user-a", "chat-9"), "run_python", ARGS, ["a.xlsx", "sub/b.docx"])
+    job, _, _ = await queue.submit(user("user-a", "chat-9"), "run_python", ARGS, ["a.xlsx", "sub/b.docx"], call=CALL)
     (req,) = executor.requests
     assert req.job_id == job.id
     assert JOB_ID.fullmatch(job.id)
     assert (req.tool, req.args) == ("run_python", ARGS)
-    assert (req.caller, req.user_id, req.chat_id) == ("open-webui", "user-a", "chat-9")
+    assert (req.caller, req.user_id, req.chat_id) == ("ghostwriter", "user-a", "chat-9")
     assert req.input_files == ["a.xlsx", "sub/b.docx"]
     assert (req.limits.wall_s, req.limits.cpu_s, req.limits.memory_mb, req.limits.file_mb) == (30, 30, 512, 7)
     assert req.max_chars == 4 * 1024
@@ -473,7 +483,7 @@ async def test_the_read_timeout_covers_the_cleanup(
 ) -> None:
     """The client waits the job's wall time plus the 300 s the executor's cleanup can take."""
     queue = queue_for(settings, executor, store, metrics, job_wall_s=45)
-    await queue.submit(user("user-a"), "run_python", ARGS, [])
+    await queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL)
     assert executor.timeouts == [345]
 
 
@@ -482,7 +492,7 @@ async def test_the_job_is_recorded_and_finished(
 ) -> None:
     """A job record exists for the run and ends with the executor's status."""
     queue = queue_for(settings, executor, store, metrics)
-    job, _, _ = await queue.submit(user("user-a"), "run_python", ARGS, [])
+    job, _, _ = await queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL)
     assert (job.tool, job.status) == ("run_python", "ok")
     assert store.get_job(user("user-a"), job.id).status == "ok"
     assert sample(metrics, "workbench_job_duration_seconds_count", tool="run_python") == 1
@@ -503,7 +513,7 @@ async def test_a_lone_surrogate_in_the_arguments_is_sent_as_a_replacement_charac
     """UTF-8 cannot hold one, so the request could not be encoded: it goes as U+FFFD, in keys and nested values too."""
     queue = queue_for(settings, executor, store, metrics)
     args = {"values": {"a\ud800": {"value": ["b\udc00", 1]}}}
-    await queue.submit(user("user-a"), "fill_template", args, [])
+    await queue.submit(user("user-a"), "fill_template", args, [], call=CALL)
     (req,) = executor.requests
     assert req.args == {"values": {"a\ufffd": {"value": ["b\ufffd", 1]}}}
     assert encode(req).endswith(b"\n")
@@ -535,7 +545,7 @@ async def test_an_invalid_input_path_is_refused_before_a_job_exists(
     """Every input is a relative path of plain names; a bad one is a ``PathError``, with no record and no log line."""
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG), pytest.raises(PathError):
-        await queue.submit(user("user-a"), "read_document", {}, ["fine.txt", bad])
+        await queue.submit(user("user-a"), "read_document", {}, ["fine.txt", bad], call=CALL)
     assert executor.requests == []
     assert jobs_recorded(settings) == 0
     assert [r for r in caplog.records if r.name == "workbench.api.jobs"] == []
@@ -548,16 +558,16 @@ async def test_too_many_input_files_are_refused_before_a_job_exists(
     """The protocol takes 1000 input files; one more is refused as a bad request, not as a failed job."""
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(PathError):
-        await queue.submit(user("user-a"), "read_document", {}, [f"f{n}.txt" for n in range(1001)])
+        await queue.submit(user("user-a"), "read_document", {}, [f"f{n}.txt" for n in range(1001)], call=CALL)
     assert jobs_recorded(settings) == 0
-    await queue.submit(user("user-a"), "search_files", {}, [f"f{n}.txt" for n in range(1000)])
+    await queue.submit(user("user-a"), "search_files", {}, [f"f{n}.txt" for n in range(1000)], call=CALL)
 
 
 async def test_valid_input_paths_pass(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
     """Plain names, folders and odd but legal characters are sent as they are."""
     queue = queue_for(settings, executor, store, metrics)
     names = ["a.txt", "reports/q 3 (final).docx", "dir/sub/b-c_d.xlsx", "ä.csv"]
-    await queue.submit(user("user-a"), "read_document", {}, names)
+    await queue.submit(user("user-a"), "read_document", {}, names, call=CALL)
     assert executor.requests[0].input_files == names
 
 
@@ -578,7 +588,7 @@ async def test_the_known_tools_are_accepted(
 ) -> None:
     """The allow-list is the seven tools of version 1."""
     queue = queue_for(settings, executor, store, metrics)
-    job, _, _ = await queue.submit(user("user-a"), tool, ARGS, [])
+    job, _, _ = await queue.submit(user("user-a"), tool, ARGS, [], call=CALL)
     assert job.tool == tool
 
 
@@ -589,7 +599,7 @@ async def test_an_unknown_tool_is_a_programming_error(
     """A tool name that is not on the list never reaches the executor, the metrics' labels or the job table."""
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(ValueError, match="unknown tool"):
-        await queue.submit(user("user-a"), tool, ARGS, [])
+        await queue.submit(user("user-a"), tool, ARGS, [], call=CALL)
     assert executor.requests == []
     assert jobs_recorded(settings) == 0
     assert sample(metrics, "workbench_job_duration_seconds_count", tool=tool) == 0
@@ -642,7 +652,7 @@ async def test_a_request_too_large_is_not_a_refusal(
     queue = JobQueue(settings, ExecutorClient(sock_dir / "none.sock"), store, metrics)
     p = user("user-a")
     with pytest.raises(RequestTooLarge):
-        await queue.submit(p, "run_python", {"code": "x" * MAX_LINE}, [])
+        await queue.submit(p, "run_python", {"code": "x" * MAX_LINE}, [], call=CALL)
     for reason in ("queue_full", "wait_timeout", "executor_busy"):
         assert sample(metrics, "workbench_job_refusals_total", reason=reason) == 0
     db = sqlite3.connect(settings.data_dir / "workbench.db")
@@ -668,7 +678,7 @@ async def test_outputs_are_registered_as_files(
     executor.files = {"summary.docx": b"doc", "chart.png": b"png!"}
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert result.status == "ok"
     assert {(f.name, f.kind, f.job_id, f.size) for f in files} == {
         ("summary.docx", "output", job.id, 3),
@@ -688,8 +698,8 @@ async def test_a_name_clash_gets_a_numbered_name(
     """A second run's output of the same name does not replace the first."""
     executor.files = {"out.txt": b"1"}
     queue = queue_for(settings, executor, store, metrics)
-    _, _, first = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
-    _, _, second = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+    _, _, first = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
+    _, _, second = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert [f.name for f in first] == ["out.txt"]
     assert [f.name for f in second] == ["out (1).txt"]
 
@@ -700,7 +710,7 @@ async def test_the_executors_own_note_is_kept(
     """An ``ok`` answer with a message such as "dropped 1 outputs" passes it on."""
     executor.message = "dropped 1 outputs"
     queue = queue_for(settings, executor, store, metrics)
-    _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+    _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert result.message == "dropped 1 outputs"
 
 
@@ -714,7 +724,7 @@ async def test_a_failed_job_is_returned_without_registering_outputs(
     executor.message = "the job did not finish"
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert (result.status, result.message, files) == (status, "the job did not finish", [])
     assert result.outputs == []
     assert chat_files(store, p) == []
@@ -732,7 +742,7 @@ async def test_a_busy_executor_is_a_refusal(
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
     with pytest.raises(Busy) as refused:
-        await queue.submit(p, "run_python", ARGS, [], KEEP)
+        await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert refused.value.reason == "executor_busy"
     assert store.get_job(p, executor.requests[0].job_id).status == "busy"
     assert chat_files(store, p) == []
@@ -765,7 +775,7 @@ async def test_an_unreachable_executor_is_busy_and_logs_no_path(
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
     with caplog.at_level(logging.DEBUG), pytest.raises(Busy) as refused:
-        await queue.submit(p, "run_python", ARGS, [], KEEP)
+        await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert refused.value.reason == "executor_busy"
     assert store.get_job(p, executor.requests[0].job_id).status == "busy"
     assert sample(metrics, "workbench_job_refusals_total", reason="executor_busy") == 1
@@ -795,7 +805,7 @@ async def test_one_output_over_quota_does_not_stop_the_rest(
     monkeypatch.setattr(store, "register_output", register)
     queue = queue_for(settings, executor, store, metrics)
     p = user("user-a")
-    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
+    job, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert result.status == "ok"
     assert sorted(f.name for f in files) == ["a.txt", "c.txt"]
     assert result.message == "1 output could not be kept (quota)"
@@ -819,7 +829,7 @@ async def test_the_note_counts_and_joins_the_executors(
 
     monkeypatch.setattr(store, "register_output", register)
     queue = queue_for(settings, executor, store, metrics)
-    _, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+    _, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert files == []
     assert result.message == "dropped 1 outputs; 2 outputs could not be kept (quota)"
 
@@ -843,7 +853,7 @@ async def test_an_output_that_is_not_in_the_jobs_staging_folder_is_not_registere
 
     queue = queue_for(settings, Lying(settings.data_dir), store, metrics)
     p = user("user-a")
-    _, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP)
+    _, result, files = await queue.submit(p, "run_python", ARGS, [], KEEP, call=CALL)
     assert files == []
     assert chat_files(store, p) == []
     assert secret.read_bytes() == b"not an output"
@@ -861,7 +871,7 @@ async def test_an_answer_for_another_job_is_refused(settings: Settings, store: S
 
     queue = queue_for(settings, Wrong(settings.data_dir), store, metrics)
     with pytest.raises(Busy) as refused:
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert refused.value.reason == "executor_busy"
 
 
@@ -880,7 +890,7 @@ async def test_an_unexpected_failure_finishes_the_job_as_an_error(
     executor.files = {"a.txt": b"a"}
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("synthetic keeper failure"))
+        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("synthetic keeper failure"), call=CALL)
     assert store.get_job(user("user-a"), executor.requests[0].job_id).status == "error"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
@@ -908,7 +918,7 @@ async def test_a_failed_job_record_does_not_hide_a_busy_executor(
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG), pytest.raises(Busy) as refused:
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert refused.value.reason == "executor_busy"
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert "synthetic" not in caplog.text
@@ -927,7 +937,7 @@ async def test_a_failed_job_record_does_not_hide_the_original_error(
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(RuntimeError, match="the original failure"):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("the original failure"))
+        await queue.submit(user("user-a"), "run_python", ARGS, [], Exploding("the original failure"), call=CALL)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
 
 
@@ -939,10 +949,10 @@ async def test_a_failed_job_record_does_not_hide_a_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A client that goes away is still cancelled, its slot is freed and its staging folder cleared."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics, executor_slots=1)
-    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], KEEP))
+    running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL))
     await until(lambda: executor.running == 1)
     job_id = executor.requests[0].job_id
     executor.staged(job_id, "left.txt").parent.mkdir(parents=True)
@@ -953,7 +963,7 @@ async def test_a_failed_job_record_does_not_hide_a_cancellation(
     assert not (settings.data_dir / "staging" / job_id).exists()
     executor.hold = set()
     monkeypatch.undo()
-    await queue.submit(user("user-b"), "run_python", ARGS, [], KEEP)
+    await queue.submit(user("user-b"), "run_python", ARGS, [], KEEP, call=CALL)
 
 
 async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is_cleared(
@@ -968,7 +978,7 @@ async def test_a_failed_job_record_after_a_good_run_is_raised_and_the_staging_is
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(sqlite3.OperationalError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert queue.tracked_users == 0
 
@@ -991,7 +1001,7 @@ async def test_outputs_kept_before_a_failed_job_record_are_removed(
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     with pytest.raises(sqlite3.OperationalError):
-        await queue.submit(me, "run_python", ARGS, [], KEEP)
+        await queue.submit(me, "run_python", ARGS, [], KEEP, call=CALL)
     assert store.files_in_chat(me) == []
     assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
@@ -1024,7 +1034,7 @@ async def test_a_cancel_while_outputs_are_registered_leaves_none_of_them(
 
     monkeypatch.setattr(store, "register_output", slow)
     queue = queue_for(settings, executor, store, metrics)
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP, call=CALL))
     await until(moved.is_set)
     running.cancel()
     await asyncio.sleep(0.05)
@@ -1089,7 +1099,7 @@ async def test_outputs_registered_while_the_loop_shuts_down_are_removed(
     held = hold_the_first_move(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
     before = asyncio.all_tasks()
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP, call=CALL))
     await until(held.moved.is_set)
     for task in asyncio.all_tasks() - before:
         task.cancel()  # every task the call made, as asyncio.run's shutdown cancels every task there is
@@ -1115,7 +1125,7 @@ async def test_a_second_cancel_while_outputs_are_registered_still_leaves_none_of
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
     held = hold_the_first_move(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics)
-    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP))
+    running = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], KEEP, call=CALL))
     await until(held.moved.is_set)
     running.cancel()
     await asyncio.sleep(0.05)
@@ -1166,7 +1176,7 @@ async def test_an_output_whose_registration_fails_in_any_way_is_recorded_again(
     keeper = KeepAll()
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG):
-        _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper)
+        _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper, call=CALL)
     ((_, planned, _),) = keeper.recorded
     assert sorted(rec.name for rec in files) == ["a.txt", "c.txt"]
     assert keeper.again_ids == [[planned[1]]]
@@ -1194,7 +1204,7 @@ async def test_outputs_removed_again_after_a_failed_job_record_are_recorded_agai
     break_finish(store, monkeypatch)
     keeper = KeepAll()
     with pytest.raises(sqlite3.OperationalError):
-        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper, call=CALL)
     ((_, planned, _),) = keeper.recorded
     assert keeper.again_ids == [planned]
     assert store.files_in_chat(me) == []
@@ -1218,7 +1228,7 @@ async def test_a_failed_removal_of_those_outputs_does_not_hide_the_store_failure
     monkeypatch.setattr(store, "remove", refuse)
     queue = queue_for(settings, executor, store, metrics)
     with caplog.at_level(logging.DEBUG), pytest.raises(sqlite3.OperationalError):
-        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
     assert "a.txt" not in caplog.text
     assert str(settings.data_dir) not in caplog.text
@@ -1244,7 +1254,7 @@ def request_for(job_id: str = "a" * 32) -> JobRequest:
             "job_id": job_id,
             "tool": "run_python",
             "args": ARGS,
-            "caller": "open-webui",
+            "caller": "ghostwriter",
             "user_id": "user-a",
             "chat_id": "chat-1",
             "input_files": [],
@@ -1375,7 +1385,7 @@ async def test_the_real_client_works_through_the_queue(
 
     queue = JobQueue(settings, ExecutorClient(path), store, metrics)
     async with serve(path, handler):
-        job, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP)
+        job, result, files = await queue.submit(user("user-a"), "run_python", ARGS, [], KEEP, call=CALL)
     assert result.status == "ok"
     assert [(f.name, f.job_id) for f in files] == [("made.txt", job.id)]
 
@@ -1390,7 +1400,7 @@ async def test_without_a_keeper_no_output_becomes_a_file(
     me = user("user-a")
     executor.files = {"planted.txt": b"x"}
     queue = queue_for(settings, executor, store, metrics)
-    _, result, files = await queue.submit(me, "read_document", {}, [])
+    _, result, files = await queue.submit(me, "read_document", {}, [], call=CALL)
     assert (result.status, files) == ("ok", [])
     assert store.files_in_chat(me) == []
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
@@ -1403,7 +1413,9 @@ async def test_the_keeper_records_before_any_output_is_a_file_and_by_the_ids_the
     me = user("user-a")
     executor.files = {"a.txt": b"a", "b.txt": b"b"}
     keeper = KeepAll(store, me)
-    _, _, files = await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+    _, _, files = await queue_for(settings, executor, store, metrics).submit(
+        me, "run_python", ARGS, [], keeper, call=CALL
+    )
     ((status, planned, seen),) = keeper.recorded
     assert (status, seen) == ("ok", [])
     assert sorted(planned) == sorted(rec.id for rec in files)
@@ -1428,7 +1440,7 @@ async def test_the_keeper_sees_each_outputs_preview(
     executor.previews = {"counts.csv": COUNTS_PREVIEW, "totals.csv": TOTALS_PREVIEW}
     queue = queue_for(settings, executor, store, metrics)
     keeper = KeepAll()
-    _, _, files = await queue.submit(me, "run_python", ARGS, [], keeper, previews=True)
+    _, _, files = await queue.submit(me, "run_python", ARGS, [], keeper, call=CALL, previews=True)
     (result,) = keeper.results
     (_, planned, _) = keeper.recorded[0]
     assert [(o.name, o.preview) for o in result.outputs] == [
@@ -1447,7 +1459,9 @@ async def test_without_the_ask_the_keeper_sees_no_preview(
     executor.files = {"counts.csv": b"x"}
     executor.previews = {"counts.csv": COUNTS_PREVIEW}
     keeper = KeepAll()
-    await queue_for(settings, executor, store, metrics).submit(user("user-a"), "run_python", ARGS, [], keeper)
+    await queue_for(settings, executor, store, metrics).submit(
+        user("user-a"), "run_python", ARGS, [], keeper, call=CALL
+    )
     (result,) = keeper.results
     assert [o.preview for o in result.outputs] == [None]
 
@@ -1465,7 +1479,7 @@ async def test_a_keeper_that_cannot_record_keeps_nothing(
             raise AuditWriteError("synthetic audit stream failure")
 
     with pytest.raises(AuditWriteError):
-        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], Broken())
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], Broken(), call=CALL)
     assert store.files_in_chat(me) == []
     assert [path.name for path in _chat_folder(settings, me).glob("*")] == []
     assert not (settings.data_dir / "staging" / executor.requests[0].job_id).exists()
@@ -1488,7 +1502,7 @@ async def test_an_output_past_the_users_quota_is_not_kept_and_is_recorded_again(
     executor.files = {"small.txt": b"1234", "large.txt": b"y" * 64}
     keeper = KeepAll()
     queue = queue_for(settings, executor, store, metrics, workspace_max_mb=1)
-    _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper)
+    _, result, files = await queue.submit(me, "run_python", ARGS, [], keeper, call=CALL)
     assert [rec.name for rec in files] == ["small.txt"]
     assert result.message == "1 output could not be kept (quota)"
     ((_, planned, _),) = keeper.recorded
@@ -1515,7 +1529,7 @@ async def test_an_output_that_stays_after_a_failed_job_record_is_recorded_again(
     monkeypatch.setattr(store, "remove", refuse)
     keeper = KeepAll()
     with caplog.at_level(logging.WARNING), pytest.raises(sqlite3.OperationalError):
-        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper)
+        await queue_for(settings, executor, store, metrics).submit(me, "run_python", ARGS, [], keeper, call=CALL)
     (left,) = store.files_in_chat(me)
     assert keeper.again_ids == [[left.id]]
     assert "OSError" in caplog.text
@@ -1548,7 +1562,7 @@ async def test_a_failed_error_record_and_a_failed_removal_do_not_hide_the_audit_
     monkeypatch.setattr(store, "remove", refuse)
     queue = queue_for(settings, executor, store, metrics, workspace_max_mb=1)
     with caplog.at_level(logging.WARNING), pytest.raises(AuditWriteError):
-        await queue.submit(me, "run_python", ARGS, [], NoAgain())
+        await queue.submit(me, "run_python", ARGS, [], NoAgain(), call=CALL)
     assert "OSError" in caplog.text
 
 
@@ -1668,16 +1682,16 @@ async def test_inline_data_the_protocol_refuses_is_refused_before_a_turn_or_a_jo
 async def test_a_capped_caller_runs_at_most_its_slots_and_leaves_room_for_others(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Four docint users, two slots of its own: two run, two wait without a global slot, and Open WebUI still runs."""
+    """Four docint users, two slots of its own: two run, two wait without a global slot, and Ghostwriter still runs."""
     executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(4)}
     queue = queue_for(settings, executor, store, metrics)
     calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(4)]
     await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 2)
     async with asyncio.timeout(scaled(2)):
-        _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [])
+        _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL)
     assert result.status == "ok"
     assert executor.running == 2
-    assert [r.caller for r in executor.requests] == ["docint", "docint", "open-webui"]
+    assert [r.caller for r in executor.requests] == ["docint", "docint", "ghostwriter"]
     executor.gate.set()
     await asyncio.gather(*calls)
     assert len(executor.requests) == 5
@@ -1688,7 +1702,7 @@ async def test_the_callers_waiting_calls_are_capped_across_many_users(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """Docint's users are pseudonyms each: 2 run, 8 wait (2 * 16 // 4), the 11th is refused, and places come back."""
-    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)} | {"open-webui/user-a"}
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)} | {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics)
     calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(10)]
     await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 8)
@@ -1697,7 +1711,7 @@ async def test_the_callers_waiting_calls_are_capped_across_many_users(
             await run_inline(queue, Takes(settings), docint_user(10))
     assert refused.value.reason == "queue_full"
     assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
-    other = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
+    other = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
     await until(lambda: executor.running == 3)
     executor.gate.set()
     await asyncio.gather(*calls, other)
@@ -1710,13 +1724,16 @@ async def test_the_callers_waiting_calls_are_capped_across_many_users(
     await asyncio.gather(*again)
 
 
-async def test_a_per_call_wait_replaces_the_queue_wait(
+async def test_a_call_waits_its_own_wait_then_gives_the_callers_slot_back(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """The queue waits 60 s, the call 1 s: it is refused after its own wait, and gives the caller's slot back."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b"}
-    queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_wait_s=60)
-    held = [asyncio.create_task(queue.submit(user(name), "run_python", ARGS, [])) for name in ("user-a", "user-b")]
+    """Ghostwriter's calls may wait 60 s, docint's 1 s: it is refused after its own wait, and gives its slot back."""
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b"}
+    queue = queue_for(settings, executor, store, metrics, executor_slots=2)
+    held = [
+        asyncio.create_task(queue.submit(user(name), "run_python", ARGS, [], call=CALL))
+        for name in ("user-a", "user-b")
+    ]
     await until(lambda: executor.running == 2)
     async with asyncio.timeout(scaled(3)):
         with pytest.raises(Busy) as refused:
@@ -1841,9 +1858,9 @@ async def test_previews_are_asked_only_when_told(
     """A job asks the executor for previews when its call says so; the default, and an inline job, never do."""
     me = user("user-a")
     queue = queue_for(settings, executor, store, metrics)
-    await queue.submit(me, "run_python", ARGS, [])
+    await queue.submit(me, "run_python", ARGS, [], call=CALL)
     assert executor.requests[-1].previews is False
-    await queue.submit(me, "run_python", ARGS, [], previews=True)
+    await queue.submit(me, "run_python", ARGS, [], call=CALL, previews=True)
     assert executor.requests[-1].previews is True
     await queue.submit(me, "run_python", ARGS, [], call=DOCINT, previews=True)
     assert executor.requests[-1].previews is True
@@ -2087,14 +2104,14 @@ async def test_inline_data_past_the_line_is_too_large_and_not_sent(
     assert record is not None and record.status == "error"
 
 
-async def test_open_webui_is_never_capped(
+async def test_a_call_without_caller_limits_is_never_capped(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Docint's gate holds docint alone: four Open WebUI users run at once while docint's calls wait for a slot."""
+    """Docint's gate holds docint alone: four users of a call without limits run at once while docint's wait."""
     queue = queue_for(settings, executor, store, metrics)
     await run_inline(queue, Takes(settings))
-    executor.hold = {f"open-webui/user-{n}" for n in range(4)}
-    others = [asyncio.create_task(queue.submit(user(f"user-{n}"), "run_python", ARGS, [])) for n in range(4)]
+    executor.hold = {f"ghostwriter/user-{n}" for n in range(4)}
+    others = [asyncio.create_task(queue.submit(user(f"user-{n}"), "run_python", ARGS, [], call=CALL)) for n in range(4)]
     await until(lambda: executor.running == 4)
     waiting = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in (2, 3)]
     await until(lambda: sample(metrics, "workbench_queue_length") == 2)

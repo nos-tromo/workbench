@@ -22,13 +22,13 @@ root (e.g. `docker/compose.yaml`).
 
 `workbench` is the nos-tromo federation's shared tool tier: the place where
 tools run on users' files, so that no app runs a code sandbox or office tooling
-of its own ("tool execution is shared, never embedded"). Open WebUI connects
-as a "terminal server". Users drop files into a chat; the model lists, reads
-and searches them, runs Python over them, inspects and fills report templates,
-and writes tables and documents, through nine typed tools. Every file is
-recorded in the audit trail by id and deleted `WORKBENCH_RETENTION_DAYS` (7)
-days after it was made. docint, the second caller since version 2, comes in
-through an MCP door and runs Python over data that comes with the call.
+of its own ("tool execution is shared, never embedded"). Ghostwriter connects
+through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
+reads and searches them, runs Python over them, inspects and fills report
+templates, and writes tables and documents, through eight typed tools. Every
+file is recorded in the audit trail by id and deleted `WORKBENCH_RETENTION_DAYS`
+(7) days after it was made. docint, the second caller, comes in through the
+same door and runs Python over data that comes with the call.
 
 workbench holds compute tools only. Data tools stay with the data's owner:
 docint's search stays in docint, and workbench never joins `data-net`.
@@ -38,8 +38,9 @@ build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`; version 2's are
 `docs/superpowers/specs/2026-11-15-v2-mcp-docint-design.md` and
 `docs/superpowers/plans/2026-11-15-workbench-v2.md`; v0.3.0's are deploy's spec
 `docs/superpowers/specs/2026-11-16-ghostwriter-design.md` and its plan
-`docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`. Where they
-and `docs/` differ, `docs/` describes the code.
+`docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`; v0.5.0's is
+deploy's spec `docs/superpowers/specs/2026-11-17-open-webui-retirement-design.md`.
+Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
 
@@ -48,9 +49,9 @@ For any non-trivial change (>1 file or any root-cause fix), present a plan and w
 ## Architecture
 
 ```
-browser ── edge-plane :8443 ── Open WebUI ── agent loop (native tool calls → vllm-router)
+ghostwriter-backend, docint-backend ── agent loop (native tool calls → vllm-router)
                                    │
-                                   │ terminal-server HTTP: Bearer key, X-User-Id, X-Session-Id
+                                   │ MCP at /mcp, Ghostwriter's file routes: Bearer key, X-User-Id, X-Session-Id
                                    │ over workbench-net (only callers and obs-plane's scraper)
                                    ▼
                            workbench / api ─── workbench-data (workspaces, staging, jobs, database)
@@ -89,20 +90,20 @@ executor imports nothing of the api.
 
 ## The tool core and the doors
 
-**The tools are routes.** Each tool is a FastAPI route tagged `TOOL_TAG` with
-an explicit `operation_id`, a description written for the model and an
-explicit type on every parameter. `workbench/api/openapi.py:tool_openapi` builds
-the document of those routes only, once, and serves it from memory: Open WebUI
-makes a tool of every operation in it. The nine: `list_files`,
-`display_file`, `read_document`, `search_files`, `run_python`,
-`inspect_template`, `fill_template`, `write_table`, `write_document`.
+**The tools are rows.** Each workspace tool is a row of
+`workbench/api/tool_table.py:WORKSPACE_TABLE`: its name, a description written
+for the model, the models of its arguments and its answer, and the function that
+runs it. The door tells each caller the tools it may call (`tools/list`, frozen
+in `tests/api/golden/`). The eight: `list_files`, `read_document`,
+`search_files`, `run_python`, `inspect_template`, `fill_template`,
+`write_table`, `write_document`.
 
 - `workbench/api/tools.py`: `list_files`, `read_document`, `search_files`,
   `run_python`, and the helpers the other tool modules share.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
-  template and output tools, on the same router. A new tool gets a module of
-  its own on that router.
-- `workbench/api/files.py`: the file browser and `display_file`.
+  template and output tools. A new tool gets a module of its own.
+- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, view, the
+  chat delete).
 - `workbench/executor/runners/`: one runner per tool that needs file content
   (`RUNNERS`). `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made
   and settles its record.
@@ -112,20 +113,20 @@ makes a tool of every operation in it. The nine: `list_files`,
   returned and never kept). `mcp.py` is the MCP door's dispatch and
   `mcp_wire.py` its wire rules, with no I/O.
 - `workbench/api/tools_mcp.py`: Ghostwriter's eight workspace tools on `/mcp`,
-  each calling its route function. A call's `structuredContent` is the route's
-  answer plus `outputs`, each file it wrote with its id and, for csv and xlsx, a
-  preview that `workbench/executor/preview.py` reads in the job. The text block
-  carries no previews and is not re-cut after `outputs`; 5 s of the wall
-  (`PREVIEW_RESERVE_S`) are kept for the previews.
+  each calling its row's function. A call's `structuredContent` is the
+  function's answer plus `outputs`, each file it wrote with its id and, for csv
+  and xlsx, a preview that `workbench/executor/preview.py` reads in the job. The
+  text block carries no previews and is not re-cut after `outputs`; 5 s of the
+  wall (`PREVIEW_RESERVE_S`) are kept for the previews.
 
-Adding a tool touches: its route and a name in `registry.WORKSPACE_TOOLS` (and
-`registry.MCP_WORKSPACE_TOOLS`, if Ghostwriter may call it), or
-for an inline tool its spec in `tools_inline.INLINE_SPECS` and a name in
-`registry.INLINE_TOOLS`; its runner and `jobs.TOOLS`, if it runs in the
-executor; `audit.OPERATIONS`, if it is recorded; `docs/permissions.md` and
-`docs/audit.md` (`tests/test_docs.py` fails without them); and the contract
-test's `TOOLS`. A new tool route needs its own named `require_tool` guard and a
-registry spec, and the start check refuses a tool route without it.
+Adding a tool touches: its row in `tool_table.WORKSPACE_TABLE` and a name in
+`registry.WORKSPACE_TOOLS`, or for an inline tool its spec in
+`tools_inline.INLINE_SPECS` and a name in `registry.INLINE_TOOLS`; its runner and
+`jobs.TOOLS`, if it runs in the executor; `audit.OPERATIONS`, if it is recorded;
+`docs/permissions.md` and `docs/audit.md` (`tests/test_docs.py` fails without
+them); and the golden `tools/list` files, edited on purpose, never regenerated.
+The start check refuses a caller's tool list that names a tool of another file
+form.
 
 Every router is built with `route_class=EncodableRoute`
 (`workbench/api/routing.py`: a JSON body read within a depth limit, lone
@@ -133,34 +134,26 @@ surrogates replaced); a new one must be too. A request meets the middleware
 in this order (`workbench/api/main.py`): `ViewHardening`, `QuietErrors`,
 `KeyGate`, `BodyLimit`, then the route.
 
-**The terminal door** (`workbench/api/contract.py`) is what Open WebUI
-v0.13.3 calls besides the tools: `GET /api/v1/policies` must answer non-2xx (so
-no route exists for it), `/api/config` says `features.system`, `/system` serves
-the prompt (`workbench/api/system_prompt.md`), `/openapi.json` (key only),
-`/files/cwd`, `/files/read` of `<home>/AGENTS.md` (404), `/skills` (`[]`).
 Every route that is not registered answers 404 (401 without the key, which is
-checked before any body is read): Open WebUI's proxy forwards every method and
-path the browser sends, so the allow-list is workbench's. A trailing slash is a
-404 too, never a 307 (`redirect_slashes=False`).
-Handshake routes answer from memory or the database, never through the queue.
+checked before any body is read). A trailing slash is a 404 too, never a 307
+(`redirect_slashes=False`).
 
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
-key, door, file form and allowed tools. Three, each with a door and a file form:
-`open-webui` (terminal door, workspace files, all nine tools), `docint` (MCP
-door at `/mcp`, inline data, `DOCINT_WORKBENCH_TOOLS`, with its own wall cap and
-running-job cap) and `ghostwriter` (`/mcp` and four file routes, workspace files,
-the eight tools, its own caps, confined to its chat). The key picks the caller;
-the door answers 404 on any other caller's paths. The api starts with any one of
-the three keys.
+key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
+with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and four file routes,
+workspace files, the eight tools, its own caps, confined to its chat). The key
+picks the caller; the door answers 404 on any other caller's paths. The api
+starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
 
 ## The boundaries
 
 `docs/permissions.md` has them in full. In short:
 
 - **The user is the boundary; the chat is a folder.** The caller is its bearer
-  key; the user is `X-User-Id`, Open WebUI's opaque account id, or docint's
-  keyed pseudonym, resolved through docint's own `disclose` event (same request
-  id and job); the chat is `X-Session-Id`, or `default`. Every path resolves
+  key; the user is `X-User-Id`, a keyed pseudonym of docint's or Ghostwriter's,
+  resolved through the caller's own audit event for the call (same request id);
+  the chat is `X-Session-Id`, or `default`. Every path resolves
   below the user's root (`workbench/paths.py:Workspaces`); another user's file
   is a 404.
 - **Files live only inside chat folders.** Nothing is ever a file directly
@@ -171,8 +164,8 @@ the three keys.
   its `out/` and its private `home/` (with its `tmp/`), both removed with the
   job, inside a job folder no other slot can pass. A watchdog holds each running
   job to its disk and memory.
-- **The agent deletes nothing.** No tool deletes or overwrites a file; the user
-  (file browser) and retention do.
+- **The agent deletes nothing.** No tool deletes or overwrites a file; Ghostwriter's
+  chat delete and retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error
   answers are short fixed texts (`workbench/api/errors.py`); no handler logs a
   traceback or a cause of a path or store error. An error no handler expected is
@@ -200,8 +193,7 @@ container is set up as compose sets it.
   `workbench/utils/audit_runtime.py` are vendored verbatim from
   `nos-tromo/.github` (`configs/audit/`); never edit them, CI fails on drift.
   A purpose on the MCP door and Ghostwriter's file routes (`X-Audit-Purpose`,
-  `AUDIT_REQUIRE_PURPOSE`), none on the terminal door; no `recipient` on
-  `disclose`.
+  `AUDIT_REQUIRE_PURPOSE`); no `recipient` on `disclose`.
 - **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
   is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
   first; leftovers of interrupted work after an hour, recorded first; empty
@@ -220,9 +212,8 @@ uv run pytest tests/api/test_files.py -q -k <name>   # one file, or one test
 make test-executor-root   # executor tests as root in its image, in both /dev/shm shapes
 make test-isolation       # the sandbox on a real stack (project workbench-test)
 make test-load            # the 10-user load test on that stack (manual, not in CI)
-make test-contract        # against the pinned Open WebUI (project workbench-contract)
 
-cp .env.example .env      # set one of the three caller keys (32+ characters)
+cp .env.example .env      # set one of the two caller keys (32+ characters)
 make network volumes      # the external workbench-net and workbench-data
 make build && make up     # production shape, no host port; make dev = build + up-dev (:8100)
 make health               # container status, then the api's /healthz from inside
@@ -236,8 +227,8 @@ make nuke                 # DESTROY workbench-data (type 'workbench' to confirm)
 
 How the tests are laid out:
 
-- `pyproject.toml`'s `addopts` deselects the `isolation`, `contract` and
-  `load` markers; those run only through their make targets, on a live stack.
+- `pyproject.toml`'s `addopts` deselects the `isolation` and `load` markers;
+  those run only through their make targets, on a live stack.
 - The api tests (`tests/api/conftest.py`) run the real `create_app` on a
   throwaway data folder, audit lines kept in a `StringIO`. The executor is a
   `FakeClient` (`tests/api/test_jobs.py`); its subclass `Local`
@@ -261,11 +252,10 @@ The settings live in `workbench/config.py`; compose gives the api and the
 executor one shared block (`x-settings`), since the executor bounds every job by
 its own copy. `WORKBENCH_DATA_DIR`, `WORKBENCH_EXECUTOR_SOCKET` and
 `WORKBENCH_SLOT_UID_BASE` are tied to the images and mounts and are never set
-in compose. `OPEN_WEBUI_WORKBENCH_KEY` holds the same value as
-open-webui-service's, `DOCINT_WORKBENCH_KEY` as docint's `WORKBENCH_API_KEY` and
-`GHOSTWRITER_WORKBENCH_KEY` as Ghostwriter's; docint's and Ghostwriter's
-variables and `AUDIT_REQUIRE_PURPOSE` are in the api's `environment:` alone,
-since the executor reads none of them.
+in compose. `DOCINT_WORKBENCH_KEY` holds the same value as docint's
+`WORKBENCH_API_KEY` and `GHOSTWRITER_WORKBENCH_KEY` as Ghostwriter's; docint's
+and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
+`environment:` alone, since the executor reads none of them.
 
 ## Gotchas (verified)
 
@@ -288,10 +278,8 @@ since the executor reads none of them.
 - **The test stacks are their own projects.** `make test-isolation` and
   `make test-load` use `docker/compose.test.yaml` (project `workbench-test`,
   volume `workbench-test-data`, network `workbench-test-net`, `:test` images,
-  no `.env`); `make test-contract` uses `contract/compose.yaml` (project
-  `workbench-contract`, its own volume and network, a key made per run). Each
-  is torn down with `down -v` by a trap on every way out. Never point them at
-  `workbench-data` or `workbench-net`.
+  no `.env`). Each is torn down with `down -v` by a trap on every way out.
+  Never point them at `workbench-data` or `workbench-net`.
 - **The test process limits BLAS threads.** `tests/conftest.py` sets
   `OPENBLAS_NUM_THREADS` and `OMP_NUM_THREADS` to 1 before anything imports
   numpy, as every job has them: the timer tests hold `SIGALRM` back in one
@@ -302,10 +290,6 @@ since the executor reads none of them.
   repo root.
 - **`WORKBENCH_EXECUTOR_CPUS` must not pass the host's CPUs.** Docker refuses to
   start the executor otherwise (default 4); CI lowers it on small runners.
-- **The Open WebUI pin lives in `contract/compose.yaml` only.** It must stay
-  the tag and digest open-webui-service deploys. Dependabot bumps it on its own;
-  merge such a bump only with the same bump there. The static tests check its
-  shape, not its value, so a bump reaches the contract job.
 - **`.gitignore` ignores `*.txt`, `*.sh`, `*.log` and `*.ipynb` everywhere.**
   Only `scripts/bundle_images.sh` and `scripts/bundle-lib.sh` are excepted. A
   new file of those types is silently untracked, so pre-commit and CI never see

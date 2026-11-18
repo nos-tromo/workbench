@@ -10,19 +10,20 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message
 
-from tests.api.conftest import KEY
+from tests.api.conftest import CHAT, GHOSTWRITER_KEY, HG
+from tests.api.mcp_calls import acall
 from tests.api.raising_app import PATH, RefusingStore
-from tests.api.test_files import CHAT, H
 from workbench.api.audit import AuditLog
 from workbench.api.errors import QuietErrors
 from workbench.api.main import create_app
@@ -37,10 +38,25 @@ SECRETS = (PATH, "quarterly-figures", "/data/workspaces", "Permission denied")
 #: The test client's own loggers, which name the URL it asked for; the server's log is everything else.
 CLIENT_LOGGERS = ("httpx", "httpcore")
 
-#: The two routes that fail, as the browser and the model call them.
-ROUTES: dict[str, tuple[str, str, dict[str, Any]]] = {
-    "view": ("GET", "/files/view", {"params": {"path": f"{CHAT}/quarterly-figures.xlsx"}}),
-    "list_files": ("POST", "/tools/list_files", {"json": {}}),
+#: The route that fails as the browser calls it.
+VIEW: tuple[str, str, dict[str, Any]] = ("GET", "/files/view", {"params": {"path": f"{CHAT}/quarterly-figures.xlsx"}})
+
+#: Each failure as its caller meets it: the request, the body of the 500, and the one line logged.
+FAILURES: dict[str, tuple[Callable[[TestClient], httpx2.Response], dict[str, Any], str]] = {
+    "view": (
+        lambda client: client.request(VIEW[0], VIEW[1], headers=HG, **VIEW[2]),
+        {"detail": "internal error"},
+        "an unexpected error ended GET /files/view (PermissionError)",
+    ),
+    "list_files": (
+        lambda client: acall(client, "list_files"),
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32603, "message": "internal error", "data": {"reason": "internal"}},
+        },
+        "an unexpected error ended tools/call on /mcp (PermissionError)",
+    ),
 }
 
 
@@ -53,18 +69,18 @@ def refusing(settings: Settings, audit: AuditLog) -> Iterator[TestClient]:
         yield client
 
 
-@pytest.mark.parametrize("route", sorted(ROUTES))
+@pytest.mark.parametrize("route", sorted(FAILURES))
 def test_an_unexpected_error_is_a_short_500_logged_by_its_type_and_route(
     refusing: TestClient, route: str, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The answer is fixed text; the log line names the method, the route and the type, and nothing of the message."""
-    method, path, kwargs = ROUTES[route]
+    """The answer is fixed text; the log line names the method and the route or door, the type, never the message."""
+    request, answer, line = FAILURES[route]
     with caplog.at_level(logging.DEBUG):
-        r = refusing.request(method, path, headers=H, **kwargs)
-    assert (r.status_code, r.json()) == (500, {"detail": "internal error"})
+        r = request(refusing)
+    assert (r.status_code, r.json()) == (500, answer)
     server = [rec for rec in caplog.records if not rec.name.startswith(CLIENT_LOGGERS)]
     (record,) = [rec for rec in server if rec.levelno >= logging.ERROR]
-    assert record.getMessage() == f"an unexpected error ended {method} {path} (PermissionError)"
+    assert record.getMessage() == line
     assert all(rec.exc_info is None and rec.exc_text is None for rec in server)
     logged = "\n".join(rec.getMessage() for rec in server)
     printed = capsys.readouterr()
@@ -74,8 +90,8 @@ def test_an_unexpected_error_is_a_short_500_logged_by_its_type_and_route(
 
 def test_the_500_of_a_view_keeps_the_viewing_headers(refusing: TestClient) -> None:
     """The answer is made inside the hardening of ``/files/view``, so it carries its headers like every other."""
-    method, path, kwargs = ROUTES["view"]
-    r = refusing.request(method, path, headers=H, **kwargs)
+    method, path, kwargs = VIEW
+    r = refusing.request(method, path, headers=HG, **kwargs)
     assert r.status_code == 500
     assert r.headers["content-security-policy"].startswith("sandbox;")
     assert r.headers["x-content-type-options"] == "nosniff"
@@ -95,7 +111,7 @@ def test_under_uvicorn_the_error_leaves_one_line_and_no_traceback(tmp_path: Path
     """
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "OPEN_WEBUI_WORKBENCH_KEY": KEY,
+        "GHOSTWRITER_WORKBENCH_KEY": GHOSTWRITER_KEY,
         "WORKBENCH_DATA_DIR": str(tmp_path / "data"),
         "PYTHONUNBUFFERED": "1",
     }
@@ -117,8 +133,8 @@ def test_under_uvicorn_the_error_leaves_one_line_and_no_traceback(tmp_path: Path
                 pytest.fail(f"uvicorn did not start: {''.join(err)[-2000:]}")
             time.sleep(0.05)
         address = next(line for line in err if "Uvicorn running on" in line).split("running on ", 1)[1].split()[0]
-        method, path, kwargs = ROUTES["view"]
-        r = httpx.request(method, address + path, headers=H, timeout=30, **kwargs)
+        method, path, kwargs = VIEW
+        r = httpx.request(method, address + path, headers=HG, timeout=30, **kwargs)
     finally:
         server.terminate()
         server.wait(timeout=30)

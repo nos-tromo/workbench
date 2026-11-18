@@ -6,17 +6,13 @@ inside the api (`workbench/api/retention.py:Sweeper`), at start and then every
 `WORKBENCH_RETENTION_INTERVAL_S` seconds (300), in a thread off the event loop.
 It also removes what interrupted work left behind, and forgets old job records.
 
-Users are told the period: the system prompt names it, and the model is asked
-to tell the user to download what they want to keep
-(`workbench/api/system_prompt.md`).
-
 ## The rules
 
 ### Files past the period
 
 - **Due by creation.** A file is due once its `created_at` lies more than the
   period back: an upload or an output, whether or not its chat still exists in
-  Open WebUI. Viewing, using, moving or renaming a file never extends it, and
+  its caller. Viewing or using a file never extends it, and
   there is no extension of any kind (`workbench/api/store.py:Store.due`).
 - **In pages and batches.** A sweep reads the due files oldest first, in pages
   of at most 200, and deletes them in batches of one user each
@@ -108,15 +104,13 @@ are not recorded: they are copies the job's own event covers.
 
 The period is read when the api starts. After a restart with a new
 `WORKBENCH_RETENTION_DAYS`, the next sweep applies it to every file, by its
-creation time. There is no notice period, unlike open-webui-service's
-retention.
+creation time. There is no notice period.
 
 - A **shorter** period deletes, at once, every file older than it, earlier than
   its users were told.
 - A **longer** period keeps every file longer, those already there included.
 
-Announce a change to the users before it takes effect. The system prompt names
-the new period from the restart on.
+Announce a change to the users before it takes effect.
 
 ## The dry run
 
@@ -158,6 +152,6 @@ service sees") is what can record that call.
 ## Copies outside workbench
 
 Retention deletes workbench's files. It does not reach the copies elsewhere:
-the tool results in Open WebUI's chat history, kept for that service's chat
-retention (365 days by default), and what users downloaded. See
+the tool results in Ghostwriter's and docint's chat history, kept for their own
+retention, and what users downloaded. See
 [data-flow.md](data-flow.md).

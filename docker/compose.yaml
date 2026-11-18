@@ -51,7 +51,6 @@ x-settings: &settings
   WORKBENCH_RETENTION_INTERVAL_S: ${WORKBENCH_RETENTION_INTERVAL_S:-300}
   WORKBENCH_EXECUTOR_SLOTS: ${WORKBENCH_EXECUTOR_SLOTS:-4}
   WORKBENCH_QUEUE_MAX: ${WORKBENCH_QUEUE_MAX:-16}
-  WORKBENCH_QUEUE_WAIT_S: ${WORKBENCH_QUEUE_WAIT_S:-60}
   WORKBENCH_JOBS_PER_USER: ${WORKBENCH_JOBS_PER_USER:-1}
   WORKBENCH_JOB_WALL_S: ${WORKBENCH_JOB_WALL_S:-120}
   WORKBENCH_JOB_MEMORY_MB: ${WORKBENCH_JOB_MEMORY_MB:-1536}
@@ -100,16 +99,14 @@ services:
       - /tmp:size=512m
     environment:
       <<: *settings
-      # The bearer key Open WebUI presents: at least 32 characters when set.
-      # The api starts with any one caller key and refuses to start with none.
-      OPEN_WEBUI_WORKBENCH_KEY: ${OPEN_WEBUI_WORKBENCH_KEY:-}
-      # docint, the second caller: its key (at least 32 characters when set),
-      # its tools and its limits. The executor reads none of these.
+      # The api starts with either caller's key and refuses to start with none.
+      # docint: its key (at least 32 characters when set), its tools and its
+      # limits. The executor reads none of these.
       DOCINT_WORKBENCH_KEY: ${DOCINT_WORKBENCH_KEY:-}
       DOCINT_WORKBENCH_TOOLS: ${DOCINT_WORKBENCH_TOOLS:-run_python}
       DOCINT_WORKBENCH_WALL_S: ${DOCINT_WORKBENCH_WALL_S:-60}
       DOCINT_WORKBENCH_SLOTS: ${DOCINT_WORKBENCH_SLOTS:-2}
-      # Ghostwriter, the third caller: the same four.
+      # Ghostwriter: the same four.
       GHOSTWRITER_WORKBENCH_KEY: ${GHOSTWRITER_WORKBENCH_KEY:-}
       GHOSTWRITER_WORKBENCH_TOOLS: ${GHOSTWRITER_WORKBENCH_TOOLS:-list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document}
       GHOSTWRITER_WORKBENCH_WALL_S: ${GHOSTWRITER_WORKBENCH_WALL_S:-120}
@@ -145,9 +142,9 @@ services:
       executor:
         condition: service_healthy
     healthcheck:
-      # /healthz needs no key and is not in the tool schema. urllib without
-      # proxies, so a proxy set for the container never sees the probe;
-      # start_interval marks it healthy ~5s after boot (Docker >=25).
+      # /healthz needs no key. urllib without proxies, so a proxy set for the
+      # container never sees the probe; start_interval marks it healthy ~5s
+      # after boot (Docker >=25).
       test:
         - CMD
         - python

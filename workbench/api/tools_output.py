@@ -1,4 +1,4 @@
-"""The output tools, ``write_table`` and ``write_document``, on the router of :mod:`workbench.api.tools`.
+"""The output tools, ``write_table`` and ``write_document``, two rows of :mod:`workbench.api.tool_table`.
 
 Each makes one new file of the chat from the model's values: a table as an Excel workbook or a CSV file, a document as
 a Word file written from Markdown or as the Markdown itself. The runners (:mod:`workbench.executor.runners.outputs`)
@@ -15,16 +15,13 @@ is never kept, and a job that refused is recorded too, by the refusal's code.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
-from fastapi import Depends, HTTPException
+from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import require_tool
-from workbench.api.deps import AuditDep, JobsDep, PrincipalDep, SettingsDep
-from workbench.api.jobs import JobQueue
 from workbench.api.tools import (
     MAX_HINT,
     OutputKeeper,
@@ -35,12 +32,15 @@ from workbench.api.tools import (
     _readable,
     _within,
     judged,
-    router,
 )
+from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, check_filename
 from workbench.protocol import JobResult
-from workbench.tables import MAX_COLUMNS, MAX_ROWS, MAX_SHEET_NAME, MAX_WORD_COLUMNS, Delimiter, table_problem
+from workbench.tables import MAX_COLUMNS, MAX_ROWS, MAX_SHEET_NAME, Delimiter, table_problem
+
+if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
+    from workbench.api.tools_mcp import CallJobs
 
 #: Most characters of a document's Markdown; the runner checks it again (a test ties the two).
 MAX_MARKDOWN: Final = 200_000
@@ -115,7 +115,7 @@ class WrittenTable(BaseModel):
         hint: What to tell the user.
     """
 
-    path: str = Field(description="The new file's path; show it with display_file.")
+    path: str = Field(description="The new file's path; the user sees it as a card in the chat.")
     rows: int = Field(description="How many rows were written below the header.")
     hint: str | None = Field(default=None, max_length=MAX_HINT, description="What to tell the user about the file.")
 
@@ -128,7 +128,7 @@ class WrittenDocument(BaseModel):
         hint: What to tell the user.
     """
 
-    path: str = Field(description="The new file's path; show it with display_file.")
+    path: str = Field(description="The new file's path; the user sees it as a card in the chat.")
     hint: str | None = Field(default=None, max_length=MAX_HINT, description="What to tell the user about the file.")
 
 
@@ -176,7 +176,7 @@ def _output_name(wanted: str, extension: str) -> str:
 async def _write(
     p: Principal,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
     tool: str,
     args: dict[str, Any],
     criteria: Mapping[str, object] | None = None,
@@ -186,7 +186,7 @@ async def _write(
     Args:
         p: The caller, user and chat.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
         tool: ``write_table`` or ``write_document``.
         args: The runner's arguments.
         criteria: The event's criteria.
@@ -216,32 +216,12 @@ async def _write(
     return new, done
 
 
-@router.post(
-    "/tools/write_table",
-    operation_id="write_table",
-    dependencies=[Depends(require_tool("write_table"))],
-    summary="Write a table into a new Excel or CSV file",
-    description=(
-        "Write a table into a new file of this conversation: an Excel workbook (format xlsx, a bold header row that "
-        "stays in view) or a CSV file (format csv, UTF-8, comma-separated unless delimiter is ; or a tab). For "
-        "people who will open the file in Excel, use xlsx: Excel reads a CSV file by the computer's regional "
-        "settings (German Excel splits it on ; and may read 1.5 as text or a date), so CSV is for exchanging data "
-        "with other programs. columns are the header's names; rows are lists of values in the columns' order, each "
-        "a string, a number, true, false or null; a shorter row is filled with empty cells. At most 100000 rows, "
-        "16384 columns and 32767 characters a cell. Values are data, never formulas: =SUM(A1:A3), 0042 or a web "
-        "address stay text; a number keeps 15 significant digits in Excel, so write long identifiers as strings. In "
-        "a CSV a text that starts with =, +, -, @, a tab or a carriage return gets a leading ' so that a spreadsheet "
-        "does not run it, and hint says how many. sheet names the workbook's sheet. One request is at most 1 MB: for "
-        "a large table, write the file with run_python into out/ instead. Show the result with display_file."
-    ),
-    response_model_exclude_none=True,
-)
 async def write_table(
     body: WriteTableRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    audit: AuditLog,
+    jobs: "CallJobs",
 ) -> WrittenTable:
     """Write the model's table into a new file of the chat, in the executor.
 
@@ -250,7 +230,7 @@ async def write_table(
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The new file's path, how many rows it has, and the runner's hint.
@@ -278,29 +258,12 @@ async def write_table(
     return _within(answer, settings.result_max_kb * 1024)
 
 
-@router.post(
-    "/tools/write_document",
-    operation_id="write_document",
-    dependencies=[Depends(require_tool("write_document"))],
-    summary="Write a document into a new Word or Markdown file",
-    description=(
-        "Write a document into a new file of this conversation from Markdown: a Word document (format docx) or the "
-        "Markdown itself (format md). A Word document takes headings # to #### (##### and ###### become level 4), "
-        "paragraphs, **bold** and *italic*, bullet and numbered lists nested up to three levels (each numbered list "
-        f"counts from its own first number), tables of up to {MAX_WORD_COLUMNS} columns (| a | b | over a |---|---| "
-        "line; Word holds no wider one, so write that with write_table) and code, in blocks or "
-        "`inline`, in a monospace font. A link is written as its text with the address in parentheses, an image as "
-        "its alt text: nothing is fetched. Raw HTML and other syntax stay plain text. At most 200000 characters. "
-        "Show the result with display_file."
-    ),
-    response_model_exclude_none=True,
-)
 async def write_document(
     body: WriteDocumentRequest,
-    p: PrincipalDep,
-    settings: SettingsDep,
-    audit: AuditDep,
-    jobs: JobsDep,
+    p: Principal,
+    settings: Settings,
+    audit: AuditLog,
+    jobs: "CallJobs",
 ) -> WrittenDocument:
     """Write the model's Markdown into a new Word or Markdown file of the chat, in the executor.
 
@@ -309,7 +272,7 @@ async def write_document(
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The new file's path, and the runner's hint.

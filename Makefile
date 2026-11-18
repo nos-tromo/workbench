@@ -23,7 +23,7 @@ help:
 	@echo "workbench — FastAPI tool API + sandboxed executor."
 	@echo
 	@echo "Setup (first time):"
-	@echo "  cp .env.example .env   # then set OPEN_WEBUI_WORKBENCH_KEY, DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY (at least 32 characters)"
+	@echo "  cp .env.example .env   # then set DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY (at least 32 characters)"
 	@echo
 	@echo "Lifecycle:"
 	@echo "  make help       this list"
@@ -57,7 +57,6 @@ help:
 	@echo "  make test-executor-root  executor tests as root in the executor image: production shape, then Docker's default /dev/shm"
 	@echo "  make test-isolation      build + start the test stack (own project, volume, network), run pytest -m isolation, remove it"
 	@echo "  make test-load           the same stack, then the 10-user load test (pytest -m load; manual, not in CI); prints its numbers"
-	@echo "  make test-contract       build + start the contract stack (test stack + the pinned Open WebUI, own project), run pytest -m contract, remove it"
 
 ### Container status, then the api's /healthz asked from inside its container:
 ### production publishes no port. Both services report (healthy) in the status
@@ -138,30 +137,5 @@ test-isolation test-load:
 			pytest tests/$(@:test-%=%) -m $(@:test-%=%) -q -rfEsxX || status=$$?; \
 	else \
 		$(TEST_COMPOSE) ps --all; $(TEST_COMPOSE) logs --tail=30; \
-	fi; \
-	exit $$status
-
-### The contract stack (contract/compose.yaml): project workbench-contract, the
-### test stack's services with a data volume and a network of their own, and
-### the Open WebUI image open-webui-service deploys, pulled (never on the
-### airgapped host). The caller key and Open WebUI's forwarding secret are made
-### for each run and live only in this shell. Torn down, volumes included, on
-### every way out, as the test stack is; the trap names the contract project
-### alone. It collects tests/contract only, with the executor extra, as the
-### test stack does.
-CONTRACT_PROJECT := workbench-contract
-CONTRACT_COMPOSE := docker compose -p $(CONTRACT_PROJECT) -f contract/compose.yaml
-
-.PHONY: test-contract
-test-contract:
-	@export WORKBENCH_CONTRACT_KEY="$$(openssl rand -hex 32)" WORKBENCH_CONTRACT_JWT_SECRET="$$(openssl rand -hex 32)"; \
-	trap '$(CONTRACT_COMPOSE) down -v --remove-orphans' EXIT; trap 'exit 130' INT TERM HUP; \
-	status=0; \
-	$(BUILD_ENV) $(CONTRACT_COMPOSE) up -d --build --wait --wait-timeout 600 || status=$$?; \
-	if [ $$status -eq 0 ]; then \
-		WORKBENCH_CONTRACT_PROJECT=$(CONTRACT_PROJECT) uv run --locked --extra executor \
-			pytest tests/contract -m contract -q -rfEsxX || status=$$?; \
-	else \
-		$(CONTRACT_COMPOSE) ps --all; $(CONTRACT_COMPOSE) logs --tail=30; \
 	fi; \
 	exit $$status

@@ -6,10 +6,10 @@ the design record for contributors and coding agents.
 
 | Document | What it covers |
 |---|---|
-| [configuration.md](configuration.md) | Every variable of `.env.example` with its default and meaning, the formulas for the executor's limits, the caller key shared with open-webui-service, what is not exposed and why |
-| [permissions.md](permissions.md) | Per tool and per file route: what it reads, writes, records and keeps; the boundaries (the user, the chat as a folder, no network, no deletion by the agent); what Open WebUI sends; which runs are audited; what the model is told |
-| [data-flow.md](data-flow.md) | What enters, where it is stored, for how long, and where it goes, Open WebUI's chat history included; the facts for the record of processing and the impact assessment |
-| [audit.md](audit.md) | The data-protection audit log: every event, its target and criteria, what is never recorded, the retention events, the Open WebUI side, the chain, fail closed |
+| [configuration.md](configuration.md) | Every variable of `.env.example` with its default and meaning, the formulas for the executor's limits, the caller keys shared with docint and Ghostwriter, what is not exposed and why |
+| [permissions.md](permissions.md) | Per tool and per file route: what it reads, writes, records and keeps; the boundaries (the user, the chat as a folder, no network, no deletion by the agent); which runs are audited; what the model is told |
+| [data-flow.md](data-flow.md) | What enters, where it is stored, for how long, and where it goes, the callers' chat history included; the facts for the record of processing and the impact assessment |
+| [audit.md](audit.md) | The data-protection audit log: every event, its target and criteria, what is never recorded, the retention events, the chain, fail closed |
 | [retention.md](retention.md) | Every file deleted a fixed period after it was made, each deletion recorded first; leftovers, folders, job records, the checkpoint; a changed period; the dry run |
 | [sandbox.md](sandbox.md) | The executor: its capabilities and why, the uid pool and slot lifecycle, the limits, the start-up checks, output validation, the residual risks, gVisor, the limits of `run_python` |
 
