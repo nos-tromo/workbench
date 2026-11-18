@@ -1,12 +1,13 @@
 """The template tools, ``inspect_template`` and ``fill_template``, two rows of :mod:`workbench.api.tool_table`.
 
 A template is a file of the chat: a Word ``.docx`` or ``.dotx`` (content controls, legacy form fields, ``{{ }}``
-placeholders) or an Excel ``.xlsx`` (``{{ }}`` cells and ``{{ table:<name> }}`` anchors). The runners
-(:mod:`workbench.executor.runners.templates`) open it in the executor; here the api checks what it alone knows before
-a job is sent: that the template is a template, that the output's name is a plain name with the output's extension,
-that each ``file`` source is a file of the template's chat and each ``job`` source a finished ``run_python`` run of
-the user in that chat. The job is given the template and every file a source names, so it can check a page, sheet
-or cell in its copy.
+placeholders) or an Excel ``.xlsx`` (``{{ }}`` cells and ``{{ table:<name> }}`` anchors). A PowerPoint ``.pptx`` or
+``.potx`` is a slide master: ``inspect_template`` lists its layouts, and ``fill_template`` refuses it, since a deck is
+built in it with ``write_presentation``. The runners (:mod:`workbench.executor.runners.templates`) open the file in
+the executor; here the api checks what it alone knows before a job is sent: that the template is a template, that the
+output's name is a plain name with the output's extension, that each ``file`` source is a file of the template's chat
+and each ``job`` source a finished ``run_python`` run of the user in that chat. The job is given the template and
+every file a source names, so it can check a page, sheet or cell in its copy.
 
 ``inspect_template`` is recorded as a ``query`` of the template. ``fill_template`` is recorded as a ``modify`` before
 its file becomes visible, by the ids of the template, of every file source and of the new file, with how many fields
@@ -17,11 +18,11 @@ be in its message.
 
 import posixpath
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
+from pydantic import BaseModel, BeforeValidator, Field, StringConstraints, model_validator
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
@@ -41,6 +42,7 @@ from workbench.api.tools import (
     record_answer,
 )
 from workbench.config import Settings
+from workbench.decks import MAX_LAYOUT_NAME
 from workbench.models import FileRecord, Principal
 from workbench.paths import MAX_FILENAME, MAX_FILENAME_BYTES, PathError, check_filename
 from workbench.protocol import MAX_INPUT_FILES, JobResult
@@ -48,8 +50,11 @@ from workbench.protocol import MAX_INPUT_FILES, JobResult
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
     from workbench.api.tools_mcp import CallJobs
 
-#: The templates, by extension, and the extension of what they are filled into.
-OUTPUTS: Final = {".docx": ".docx", ".dotx": ".docx", ".xlsx": ".xlsx"}
+#: The templates a fill takes, by extension, and the extension of what they are filled into.
+TEMPLATE_FILES: Final = {".docx": ".docx", ".dotx": ".docx", ".xlsx": ".xlsx"}
+
+#: The slide masters, which ``inspect_template`` lists the layouts of and a deck is built in.
+SLIDE_MASTERS: Final = frozenset({".pptx", ".potx"})
 
 #: Most values one fill takes; the longest field name and user's note.
 MAX_VALUES: Final = 1000
@@ -60,6 +65,8 @@ MAX_NOTE: Final = 1000
 SOURCE_KINDS: Final = ("file", "job", "user", "assistant")
 
 _NOT_A_TEMPLATE: Final = "templates are .docx and .dotx Word files and .xlsx workbooks"
+_NOT_INSPECTABLE: Final = "templates are .docx and .dotx Word files, .xlsx workbooks and .pptx and .potx slide masters"
+_A_MASTER: Final = "unsupported_template: a slide master is filled with write_presentation"
 _INTEGER: Final[JsonDict] = {"type": "integer"}
 _STRING: Final[JsonDict] = {"type": "string"}
 _OBJECT: Final[JsonDict] = {"type": "object"}
@@ -140,42 +147,113 @@ class TemplateField(BaseModel):
     )
 
 
+class LayoutPlace(BaseModel):
+    """One place of a slide layout, which one block of a slide fills.
+
+    Attributes:
+        role: What it takes: text, content (text, a table, a chart or a picture), picture, table or chart.
+        lines: About how many lines fit.
+        chars: About how many characters fit on a line.
+    """
+
+    role: Literal["text", "content", "picture", "table", "chart"] = Field(
+        description="What it takes: text, content (text, a table, a chart or a picture), picture, table or chart."
+    )
+    lines: int = Field(description="About how many lines fit at the font size the place inherits.")
+    chars: int = Field(description="About how many characters fit on a line.")
+
+
+class SlideLayout(BaseModel):
+    """One layout of a slide master.
+
+    Attributes:
+        number: Its number, from 1, over all the master's layouts.
+        name: Its name, as the file has it.
+        title: Whether it has a title.
+        subtitle: Whether it has a subtitle.
+        places: Its places in reading order: top, then left.
+        footer: Whether it has a date, footer or slide number.
+    """
+
+    number: int = Field(description="Its number, from 1: a slide names its layout by it.")
+    name: Annotated[str, BeforeValidator(_cut_to(MAX_LAYOUT_NAME))] = Field(
+        max_length=MAX_LAYOUT_NAME, description="Its name, as the file has it; it may be empty or shared."
+    )
+    title: bool = Field(description="Whether it has a title.")
+    subtitle: bool = Field(description="Whether it has a subtitle.")
+    places: list[LayoutPlace] = Field(description="Its places in reading order, top then left; a block fills each.")
+    footer: bool = Field(description="Whether it has a date, a footer or a slide number.")
+
+
 class TemplateInfo(BaseModel):
     """What ``inspect_template`` answers.
 
     Attributes:
         path: The template's path.
-        template_kind: The kind of template, or ``none``.
-        fields: Its fields, each name once.
-        truncated: Whether fields were left out to keep the answer within the result limit.
+        template_kind: The kind of template, ``none``, or ``slide_master``.
+        fields: Its fields, each name once; empty for a slide master.
+        layouts: A slide master's layouts; ``None`` for any other template.
+        slides: The example slides a slide master has; ``None`` for any other template.
+        truncated: Whether fields or layouts were left out to keep the answer within the result limit.
         hint: What to tell the user, or what is not listed.
     """
 
     path: str = Field(description="The template's path.")
-    template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none"] = Field(
-        description="The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs."
+    template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none", "slide_master"] = Field(
+        description=(
+            "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs; slide_master: a "
+            ".pptx or .potx, whose layouts are listed in layouts."
+        )
     )
-    fields: list[TemplateField] = Field(description="Its fields, in document order, each name once.")
-    truncated: bool = Field(default=False, description="True if some fields are not listed.")
+    fields: list[TemplateField] = Field(
+        description="Its fields, in document order, each name once; empty for a slide master."
+    )
+    layouts: list[SlideLayout] | None = Field(
+        default=None, description="A slide master's layouts, numbered from 1; null for any other template."
+    )
+    slides: int | None = Field(
+        default=None,
+        description="The example slides the file already has; a deck leaves them out. Null for any other template.",
+    )
+    truncated: bool = Field(default=False, description="True if some fields or layouts are not listed.")
     hint: str | None = Field(default=None, max_length=MAX_HINT, description="What to tell the user, or how to go on.")
 
 
 class _Inspected(BaseModel):
-    """What the inspecting runner answers; checked before anything of it is sent on.
+    """What the inspecting runner answers, of a document or of a slide master; checked before anything is sent on.
 
     Attributes:
         template_kind: The kind of template.
-        fields: The fields it lists.
-        total: How many fields there are.
+        fields: The fields it lists; a slide master's answer has none.
+        layouts: The layouts of a slide master it lists; any other answer has none.
+        slides: The example slides of a slide master.
+        total: How many fields, or for a slide master layouts, there are.
         truncated: Whether it listed fewer.
         hint: What the model should know.
     """
 
-    template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none"]
-    fields: Annotated[list[TemplateField], BeforeValidator(_nameable)]
+    template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none", "slide_master"]
+    fields: Annotated[list[TemplateField], BeforeValidator(_nameable)] = Field(default_factory=list)
+    layouts: list[SlideLayout] | None = None
+    slides: int | None = Field(default=None, ge=0)
     total: int = Field(ge=0)
     truncated: bool
     hint: Annotated[str | None, BeforeValidator(_cut_to(MAX_HINT))] = Field(default=None, max_length=MAX_HINT)
+
+    @model_validator(mode="after")
+    def _of_its_kind(self) -> Self:
+        """Check that the answer holds what its kind lists: layouts and slides for a slide master, and no others.
+
+        Returns:
+            The answer.
+
+        Raises:
+            ValueError: A slide master without layouts or slides, or another kind with either.
+        """
+        given = (self.layouts is not None, self.slides is not None)
+        if given != ((True, True) if self.template_kind == "slide_master" else (False, False)):
+            raise ValueError("layouts and slides belong to a slide master alone")
+        return self
 
 
 class FileSource(BaseModel):
@@ -321,24 +399,30 @@ class _Filled(BaseModel):
     warnings: list[Annotated[str, BeforeValidator(_cut_to(MAX_HINT)), StringConstraints(max_length=MAX_HINT)]]
 
 
-def _output_extension(name: str) -> str:
+def _output_extension(name: str, *, inspecting: bool = False) -> str:
     """Tell what a template is filled into, by its name.
 
     Args:
         name: The template's name below its chat folder.
+        inspecting: Whether the file is inspected, not filled: a slide master is a template then.
 
     Returns:
-        ``.docx`` or ``.xlsx``.
+        ``.docx`` or ``.xlsx``; for a slide master being inspected, its own extension.
 
     Raises:
-        HTTPException: It is not a template (422).
+        HTTPException: It is not a template, or it is a slide master and is to be filled (422).
     """
     ext = posixpath.splitext(name)[1].lower()
-    filled = OUTPUTS.get(ext)
+    if ext in SLIDE_MASTERS:
+        if inspecting:
+            return ext
+        raise HTTPException(status_code=422, detail=_A_MASTER)
+    filled = TEMPLATE_FILES.get(ext)
     if filled is None:
         shown = ext or "a file without an extension"
+        taken = _NOT_INSPECTABLE if inspecting else _NOT_A_TEMPLATE
         raise HTTPException(
-            status_code=422, detail=_clean(f"unsupported_template: {shown} cannot be filled here; {_NOT_A_TEMPLATE}")
+            status_code=422, detail=_clean(f"unsupported_template: {shown} cannot be filled here; {taken}")
         )
     return filled
 
@@ -445,36 +529,38 @@ def _sources(
 
 
 def _fit_inspection(answer: TemplateInfo, total: int, limit_kb: int) -> TemplateInfo:
-    """Keep as many fields as fit within the result limit, and say how many of how many are listed.
+    """Keep as many fields, or a slide master's layouts, as fit within the result limit, and say how many of how many.
 
     Args:
-        answer: The answer, with the fields the runner listed.
-        total: How many fields the template has.
+        answer: The answer, with the fields or layouts the runner listed.
+        total: How many fields, or layouts, the template has.
         limit_kb: The result limit in kilobytes.
 
     Returns:
         The answer within the limit as sent.
     """
     limit = limit_kb * 1024
+    key = "fields" if answer.layouts is None else "layouts"
+    listed: list[Any] = answer.fields if answer.layouts is None else answer.layouts
 
-    def told(kept: list[TemplateField]) -> TemplateInfo:
+    def told(kept: list[Any]) -> TemplateInfo:
         if len(kept) >= total:
-            return answer.model_copy(update={"fields": kept})
+            return answer.model_copy(update={key: kept})
         note = (
-            f"Only {len(kept)} of {total} fields are listed: the answer is cut at the result limit ({limit_kb} KB). "
+            f"Only {len(kept)} of {total} {key} are listed: the answer is cut at the result limit ({limit_kb} KB). "
             "Plan with these, and ask the user about the rest."
         )
         hint = _capped(_join(answer.hint, note), MAX_HINT)
-        return answer.model_copy(update={"fields": kept, "truncated": True, "hint": hint})
+        return answer.model_copy(update={key: kept, "truncated": True, "hint": hint})
 
-    whole = told(answer.fields)
+    whole = told(listed)
     if _json_size(whole) <= limit:
         return whole
-    kept: list[TemplateField] = []
-    for field in answer.fields:
-        if _json_size(told([*kept, field])) > limit:
+    kept: list[Any] = []
+    for item in listed:
+        if _json_size(told([*kept, item])) > limit:
             break
-        kept.append(field)
+        kept.append(item)
     return _within(told(kept), limit)
 
 
@@ -516,11 +602,11 @@ async def inspect_template(
     audit: AuditLog,
     jobs: "CallJobs",
 ) -> TemplateInfo:
-    """List a template's fields in the executor and answer with them, cut to the result limit.
+    """List a template's fields, or a slide master's layouts, in the executor and answer, cut to the result limit.
 
     The job runs in the chat folder the template lives in, with that one file as its input. The job is recorded by
     the template's id once it has answered and before anything of the answer goes out, a refusal as ``error`` with its
-    code.
+    code; never a layout's name, which is the template's content.
 
     Args:
         body: The template's path.
@@ -531,10 +617,10 @@ async def inspect_template(
         jobs: The queue, within the call's limits.
 
     Returns:
-        The kind of template and its fields.
+        The kind of template and its fields, or a slide master's layouts and example slides.
     """
     rec = await run_in_threadpool(store.get, p, body.path)
-    _output_extension(rec.name)
+    _output_extension(rec.name, inspecting=True)
     args = {"path": rec.name, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
     _, result, _ = await jobs.submit(p, "inspect_template", args, [rec.name])
     await run_in_threadpool(
@@ -545,10 +631,13 @@ async def inspect_template(
         path=rec.virtual_path,
         template_kind=found.template_kind,
         fields=found.fields,
+        layouts=found.layouts,
+        slides=found.slides,
         truncated=found.truncated,
         hint=found.hint,
     )
-    return _fit_inspection(answer, max(found.total, len(found.fields)), settings.result_max_kb)
+    listed = found.fields if found.layouts is None else found.layouts
+    return _fit_inspection(answer, max(found.total, len(listed)), settings.result_max_kb)
 
 
 async def fill_template(

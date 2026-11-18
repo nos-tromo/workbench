@@ -3,7 +3,7 @@
     {
       "name": "fill_template",
       "title": "Fill a report template into a new file",
-      "description": "Fill a report template of this conversation into a new file; the template itself is not changed, and a .dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each field's name to its value and its source, and every value needs a source: kind file (the path of a file of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; include_sources false leaves it out. The user sees the new file as a card in the chat.",
+      "description": "Fill a report template of this conversation into a new file; the template itself is not changed, and a .dotx becomes a .docx. A slide master (.pptx or .potx) is not filled with this: build a deck in it with write_presentation. Call inspect_template first and agree the values with the user. values maps each field's name to its value and its source, and every value needs a source: kind file (the path of a file of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; include_sources false leaves it out. The user sees the new file as a card in the chat.",
       "inputSchema": {
         "$defs": {
           "AssistantSource": {
@@ -403,7 +403,7 @@
     {
       "name": "inspect_template",
       "title": "List the fields of a report template",
-      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. A very long list is cut: truncated is then true.",
+      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, numbered, with each layout's places in reading order (role, about how many lines and characters fit) and whether it has a footer; build a deck in one with write_presentation. A very long list is cut: truncated is then true.",
       "inputSchema": {
         "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path.",
         "properties": {
@@ -423,6 +423,40 @@
       },
       "outputSchema": {
         "$defs": {
+          "LayoutPlace": {
+            "description": "One place of a slide layout, which one block of a slide fills.\n\nAttributes:\n    role: What it takes: text, content (text, a table, a chart or a picture), picture, table or chart.\n    lines: About how many lines fit.\n    chars: About how many characters fit on a line.",
+            "properties": {
+              "role": {
+                "description": "What it takes: text, content (text, a table, a chart or a picture), picture, table or chart.",
+                "enum": [
+                  "text",
+                  "content",
+                  "picture",
+                  "table",
+                  "chart"
+                ],
+                "title": "Role",
+                "type": "string"
+              },
+              "lines": {
+                "description": "About how many lines fit at the font size the place inherits.",
+                "title": "Lines",
+                "type": "integer"
+              },
+              "chars": {
+                "description": "About how many characters fit on a line.",
+                "title": "Chars",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "role",
+              "lines",
+              "chars"
+            ],
+            "title": "LayoutPlace",
+            "type": "object"
+          },
           "OutputRef": {
             "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
             "properties": {
@@ -472,6 +506,55 @@
               "preview"
             ],
             "title": "OutputRef",
+            "type": "object"
+          },
+          "SlideLayout": {
+            "description": "One layout of a slide master.\n\nAttributes:\n    number: Its number, from 1, over all the master's layouts.\n    name: Its name, as the file has it.\n    title: Whether it has a title.\n    subtitle: Whether it has a subtitle.\n    places: Its places in reading order: top, then left.\n    footer: Whether it has a date, footer or slide number.",
+            "properties": {
+              "number": {
+                "description": "Its number, from 1: a slide names its layout by it.",
+                "title": "Number",
+                "type": "integer"
+              },
+              "name": {
+                "description": "Its name, as the file has it; it may be empty or shared.",
+                "maxLength": 100,
+                "title": "Name",
+                "type": "string"
+              },
+              "title": {
+                "description": "Whether it has a title.",
+                "title": "Title",
+                "type": "boolean"
+              },
+              "subtitle": {
+                "description": "Whether it has a subtitle.",
+                "title": "Subtitle",
+                "type": "boolean"
+              },
+              "places": {
+                "description": "Its places in reading order, top then left; a block fills each.",
+                "items": {
+                  "$ref": "#/$defs/LayoutPlace"
+                },
+                "title": "Places",
+                "type": "array"
+              },
+              "footer": {
+                "description": "Whether it has a date, a footer or a slide number.",
+                "title": "Footer",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "number",
+              "name",
+              "title",
+              "subtitle",
+              "places",
+              "footer"
+            ],
+            "title": "SlideLayout",
             "type": "object"
           },
           "TablePreview": {
@@ -600,28 +683,58 @@
             "type": "string"
           },
           "template_kind": {
-            "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs.",
+            "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs; slide_master: a .pptx or .potx, whose layouts are listed in layouts.",
             "enum": [
               "content_controls",
               "form_fields",
               "placeholders",
               "mixed",
-              "none"
+              "none",
+              "slide_master"
             ],
             "title": "Template Kind",
             "type": "string"
           },
           "fields": {
-            "description": "Its fields, in document order, each name once.",
+            "description": "Its fields, in document order, each name once; empty for a slide master.",
             "items": {
               "$ref": "#/$defs/TemplateField"
             },
             "title": "Fields",
             "type": "array"
           },
+          "layouts": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/SlideLayout"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "A slide master's layouts, numbered from 1; null for any other template.",
+            "title": "Layouts"
+          },
+          "slides": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The example slides the file already has; a deck leaves them out. Null for any other template.",
+            "title": "Slides"
+          },
           "truncated": {
             "default": false,
-            "description": "True if some fields are not listed.",
+            "description": "True if some fields or layouts are not listed.",
             "title": "Truncated",
             "type": "boolean"
           },

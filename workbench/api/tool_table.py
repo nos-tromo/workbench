@@ -44,7 +44,8 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         title="Fill a report template into a new file",
         description=(
             "Fill a report template of this conversation into a new file; the template itself is not changed, and a "
-            ".dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each "
+            ".dotx becomes a .docx. A slide master (.pptx or .potx) is not filled with this: build a deck in it with "
+            "write_presentation. Call inspect_template first and agree the values with the user. values maps each "
             "field's name to its value and its source, and every value needs a source: kind file (the path of a file "
             "of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell "
             "such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed "
@@ -68,7 +69,10 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name "
             "(give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, "
             "table) and location. template_kind none means version 1 cannot fill the file: tell the user what it "
-            "needs, as hint says. A very long list is cut: truncated is then true."
+            "needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, "
+            "numbered, with each layout's places in reading order (role, about how many lines and characters fit) and "
+            "whether it has a footer; build a deck in one with write_presentation. A very long list is cut: truncated "
+            "is then true."
         ),
         input_model=tools_templates.InspectTemplateRequest,
         output_model=tools_templates.TemplateInfo,

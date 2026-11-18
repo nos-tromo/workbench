@@ -255,6 +255,79 @@ def test_an_inspection_is_cut_at_the_result_limit(
     assert f"{len(body['fields'])} of 60 fields" in body["hint"]
 
 
+def test_a_word_or_excel_inspection_has_no_layouts_or_slides(client: TestClient, store: Store, tmp_path: Path) -> None:
+    """``layouts`` and ``slides`` are null in the answer for a document: they belong to a slide master."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    body = answered(inspect(client, f"{CHAT}/form.docx"))
+    assert (body["layouts"], body["slides"]) == (None, None)
+
+
+def test_inspect_answers_a_slide_masters_layouts(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """The master alone goes to the job; its layouts, numbered, and its example slides; one query event by its id."""
+    master = stored(store, tmp_path, "master.pptx", mt.make_master)
+    body = answered(inspect(client, f"{CHAT}/master.pptx"))
+    assert body["path"] == f"{CHAT}/master.pptx"
+    assert body["template_kind"] == "slide_master"
+    assert (body["fields"], body["slides"], body["truncated"]) == ([], 2, False)
+    layouts = body["layouts"]
+    assert [layout["number"] for layout in layouts] == list(range(1, 12))
+    assert all(
+        set(layout) == {"number", "name", "title", "subtitle", "places", "footer"}
+        and set(place) == {"role", "lines", "chars"}
+        for layout in layouts
+        for place in layout["places"]
+    )
+    assert layouts[1]["name"] == "Titel und Inhalt"
+    assert (layouts[1]["title"], layouts[1]["subtitle"]) == (True, False)
+    assert [place["role"] for place in layouts[1]["places"]] == ["content"]
+    assert (layouts[0]["title"], layouts[0]["subtitle"]) == (True, True)
+    (req,) = fake_executor.requests
+    assert (req.tool, req.input_files) == ("inspect_template", ["master.pptx"])
+    (event,) = events(audit_lines, "inspect_template")
+    assert (event["action"], event["target"]["ids"], event["outcome"]) == ("query", [master.id], "ok")
+    assert "Titel und Inhalt" not in json.dumps(audit_lines())
+
+
+def test_inspect_answers_a_potx_too(client: TestClient, store: Store, tmp_path: Path) -> None:
+    """A ``.potx`` is the same master under the template content type: the same answer."""
+
+    def build(target: Path) -> Path:
+        return mt.as_potx(mt.make_master(tmp_path / "built" / "source.pptx"), target)
+
+    stored(store, tmp_path, "master.potx", build)
+    body = answered(inspect(client, f"{CHAT}/master.potx"))
+    assert (body["template_kind"], len(body["layouts"]), body["slides"]) == ("slide_master", 11, 2)
+
+
+def test_a_long_layout_list_is_cut_to_the_result_limit(
+    settings: Settings, store: Store, audit: AuditLog, fake_executor: Local, tmp_path: Path
+) -> None:
+    """The layouts that fit, from the first, ``truncated``, and how many of how many are listed."""
+    stored(store, tmp_path, "master.pptx", mt.make_master)
+    with small(settings, store, audit, fake_executor) as client:
+        body = answered(inspect(client, f"{CHAT}/master.pptx"))
+    assert sent_size(body) <= 1024
+    listed = len(body["layouts"])
+    assert 0 < listed < 11
+    assert [layout["number"] for layout in body["layouts"]] == list(range(1, listed + 1))
+    assert body["truncated"] is True
+    assert f"{listed} of 11 layouts" in body["hint"]
+
+
+def test_only_an_inspections_refusal_names_the_slide_masters_among_the_templates(
+    client: TestClient, store: Store, fake_executor: Local
+) -> None:
+    """``inspect_template`` takes a master, ``fill_template`` does not: each refusal names what that tool takes."""
+    put(store, "notes.pdf", b"PK", p=PG)
+    _, inspecting = refusal(inspect(client, f"{CHAT}/notes.pdf"))
+    _, filling = refusal(fill(client, f"{CHAT}/notes.pdf", {"x": "y"}))
+    assert ".pptx" in inspecting and ".potx" in inspecting
+    assert ".pptx" not in filling and ".potx" not in filling
+    assert fake_executor.requests == []
+
+
 # --- fill_template ------------------------------------------------------------------------------------------------
 
 
@@ -351,6 +424,18 @@ def test_a_dotx_template_is_filled_into_a_docx(client: TestClient, store: Store,
     assert answered(named)["path"] == f"{CHAT}/for-the-board.docx"
     refused_name = fill(client, f"{CHAT}/form.dotx", {"customer": "x"}, output_name="x.dotx")
     assert refusal(refused_name) == ("refused", "output_name must be a plain file name ending in .docx")
+
+
+@pytest.mark.parametrize("name", ["master.pptx", "master.potx"])
+def test_fill_template_refuses_a_slide_master(
+    client: TestClient, store: Store, fake_executor: Local, audit_lines: AuditLines, name: str
+) -> None:
+    """A slide master is filled with ``write_presentation``: a 422 before any job, and no event."""
+    put(store, name, b"PK", p=PG)
+    reason, detail = refusal(fill(client, f"{CHAT}/{name}", {"x": "y"}))
+    assert (reason, detail) == ("refused", "unsupported_template: a slide master is filled with write_presentation")
+    assert fake_executor.requests == []
+    assert events(audit_lines, "fill_template") == []
 
 
 @pytest.mark.parametrize(
@@ -561,6 +646,31 @@ def test_a_runners_answer_over_the_apis_bounds_is_cut_never_a_500(
     assert len(body["hint"]) <= 2000
 
 
+def test_a_masters_answer_is_cut_and_checked_like_a_documents(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """The backstop for a master: a long layout name is cut; layouts missing from a master's answer cannot be read."""
+    master = stored(store, tmp_path, "master.pptx", mt.make_master)
+    place = {"role": "text", "lines": 3, "chars": 40}
+    layout = {"number": 1, "name": "n" * 400, "title": True, "subtitle": False, "places": [place], "footer": False}
+    fake_executor.payload = {
+        "template_kind": "slide_master",
+        "layouts": [layout],
+        "slides": 0,
+        "total": 1,
+        "truncated": False,
+    }
+    body = answered(inspect(client, f"{CHAT}/master.pptx"))
+    assert [len(entry["name"]) for entry in body["layouts"]] == [100]
+    fake_executor.payload = {"template_kind": "slide_master", "total": 1, "truncated": False}
+    assert refusal(inspect(client, f"{CHAT}/master.pptx")) == (
+        "refused",
+        "the tool returned an answer that could not be read",
+    )
+    first, second = events(audit_lines, "inspect_template")
+    assert (first["outcome"], second["outcome"], second["target"]["ids"]) == ("ok", "error", [master.id])
+
+
 def test_a_busy_executor_is_executor_busy(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
 ) -> None:
@@ -626,6 +736,8 @@ def test_the_tools_are_listed_with_typed_parameters(client: TestClient) -> None:
     for phrase in ("inspect_template first", "every value needs a source", "job_id", "run_python"):
         assert phrase in fill_description, phrase
     assert "fill_template" in tools["inspect_template"]["description"]
+    for name in ("inspect_template", "fill_template"):
+        assert "write_presentation" in tools[name]["description"], name
     fill_schema = tools["fill_template"]["inputSchema"]
     bodies = [tools["inspect_template"]["inputSchema"], fill_schema, *fill_schema["$defs"].values()]
     assert len(bodies) >= 7
