@@ -8,7 +8,8 @@ layout's position. A picture in a picture place is cropped to fill it; in a cont
 aspect kept and centred, and the placeholder goes.
 
 A chart is PowerPoint's own, its data in an embedded workbook, so it can be edited; no colour is set, so the theme's
-accents apply. The workbook takes every text as text, never as a formula, a number or a link.
+accents apply, and it has no title of its own: the slide's title names it. The workbook takes every text as text,
+never as a formula, a number or a link.
 
 A picture is a PNG, JPEG or GIF of the chat, known by its content, not by its extension; its size and its header are
 read (:func:`check_image`) before any slide is made, and it is placed from its bytes, so its file's name is nowhere in
@@ -33,7 +34,7 @@ from pptx.oxml.ns import qn
 from pptx.parts.image import Image
 from pptx.shapes.placeholder import ChartPlaceholder, PicturePlaceholder, TablePlaceholder
 from pptx.text.text import Font
-from pptx.util import Emu, Pt, lazyproperty
+from pptx.util import Emu, Length, Pt, lazyproperty
 from xlsxwriter import Workbook
 
 from workbench import decks, protocol
@@ -63,9 +64,10 @@ CHART_TYPES: Final = {
 #: The content types a picture may have, read from its header.
 IMAGE_CONTENT: Final = frozenset({CT.PNG, CT.JPEG, CT.GIF})
 
-#: A table of more rows than this has its cells' text at :data:`LONG_TABLE_SIZE`.
-LONG_TABLE: Final = 8
-LONG_TABLE_SIZE: Final = Pt(12)
+#: The sizes a table's text steps down through, largest first, until its rows fit its place; and a line's height, as
+#: a multiple of the size.
+TABLE_SIZES: Final = (Pt(18), Pt(16), Pt(14), Pt(12), Pt(10))
+LINE_HEIGHT: Final = 1.2
 
 #: ``normAutofit``'s ``fontScale``, in thousandths of a percent: the full size, and the least that text is shrunk to.
 FULL_SCALE: Final = 100_000
@@ -259,7 +261,8 @@ def fill(
             continue
         filled.add(place.idx)
         if not isinstance(block, str):
-            place_block(on_slide, block, images, where, warnings)
+            if not place_block(on_slide, block, images, where, warnings):
+                warnings.append(f"slide {number}: the table may not fit; split it over two slides")
             continue
         frame = on_slide.shape.text_frame
         written = text.write_markdown(frame, block)
@@ -297,7 +300,7 @@ def fit(frame: Any, needed: int, place: Place) -> bool:
 
 def place_block(
     on_slide: Place, block: Mapping[str, Any], images: Mapping[str, Path], label: str, warnings: list[str]
-) -> None:
+) -> bool:
     """Put a table, chart or picture block into its place of the slide.
 
     Args:
@@ -306,58 +309,72 @@ def place_block(
         images: The pictures :func:`find_images` found.
         label: The block (``slide N, block M``), for a warning and the pictures.
         warnings: Where a warning goes, should a text hold characters a document cannot.
+
+    Returns:
+        Whether the block fits its place; only a table may not (:func:`place_table`).
     """
     kind = decks.block_kind(block)
+    fits = True
     if kind == "table":
-        replaced = place_table(on_slide, block["table"])
+        replaced, fits = place_table(on_slide, block["table"])
     elif kind == "chart":
         replaced = place_chart(on_slide, block["chart"])
     else:
         replaced = place_image(on_slide, images[label], block.get("alt"))
     if replaced:
         warnings.append(f"{label}: {REPLACED}")
+    return fits
 
 
-def place_table(place: Place, rows: Sequence[Sequence[Any]]) -> bool:
+def place_table(place: Place, rows: Sequence[Sequence[Any]]) -> tuple[bool, bool]:
     """Write a native table into a table or content place: its first row the header, the table style's own.
 
-    A row shorter than the widest is filled with empty cells. The rows share the place's height; with more than
-    :data:`LONG_TABLE` of them, the cells' text is :data:`LONG_TABLE_SIZE`.
+    A row shorter than the widest is filled with empty cells. The text takes the largest of :data:`TABLE_SIZES` at which
+    the rows fit the place's height, each row at its natural height: a line of :data:`LINE_HEIGHT` times the size, and
+    its cells' top and bottom margins (python-pptx's, or a cell's own). A row is never stretched, so a short table is
+    short; one that does not fit even at the smallest size keeps that size.
 
     Args:
         place: The place on the slide.
         rows: The rows, each a list of strings, numbers, bools and ``None``.
 
     Returns:
-        Whether a cell had characters a document cannot hold, now U+FFFD.
+        Whether a cell had characters a document cannot hold, now U+FFFD; and whether the table fits its place.
     """
     width = max(len(row) for row in rows)
-    row_height = Emu(int(place.shape.height or 0) // len(rows))
+    room = int(place.shape.height or 0)
     frame = TablePlaceholder(place.shape._element, place.shape._parent).insert_table(len(rows), width)
-    size = LONG_TABLE_SIZE if len(rows) > LONG_TABLE else None
+    table = frame.table
+    margins = [
+        max(cell.margin_top + cell.margin_bottom for cell in table.rows[index].cells) for index in range(len(rows))
+    ]
+
+    def heights(size: Length) -> list[int]:
+        return [int(size * LINE_HEIGHT) + margin for margin in margins]
+
+    size = next((size for size in TABLE_SIZES if sum(heights(size)) <= room), TABLE_SIZES[-1])
     replaced = False
-    for index, values in enumerate(rows):
-        row = frame.table.rows[index]
-        row.height = row_height
+    for index, (values, height) in enumerate(zip(rows, heights(size), strict=True)):
+        row = table.rows[index]
+        row.height = Emu(height)
         for cell, value in zip(row.cells, [*values, *[None] * (width - len(values))], strict=True):
             written, changed = xml_safe("" if value is None else shown(value))
             replaced |= changed
             cell.text = written
-            if size is not None:
-                for paragraph in cell.text_frame.paragraphs:
-                    for run in paragraph.runs:
-                        run.font.size = size
-                    Font(paragraph._p.get_or_add_endParaRPr()).size = size
-    frame.height = Emu(row_height * len(rows))
-    return replaced
+            for paragraph in cell.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = size
+                Font(paragraph._p.get_or_add_endParaRPr()).size = size
+    frame.height = Emu(sum(heights(size)))
+    return replaced, frame.height <= room
 
 
 def place_chart(place: Place, chart: Mapping[str, Any]) -> bool:
     """Draw a native chart into a chart or content place, its data in an embedded workbook, in the theme's colours.
 
     A bar chart lists its first category on top, its value axis below; a pie, or a chart of several series, has a
-    legend at the bottom, outside the plot. Categories that are all numbers stay numbers; otherwise each is a text. A
-    value of ``None`` is a gap: no point is written for it.
+    legend at the bottom, outside the plot; no chart has a title, as the slide's title names it. Categories that are
+    all numbers stay numbers; otherwise each is a text. A value of ``None`` is a gap: no point is written for it.
 
     Args:
         place: The place on the slide.
@@ -387,6 +404,7 @@ def place_chart(place: Place, chart: Mapping[str, Any]) -> bool:
     if kind == "bar":
         drawn.category_axis.reverse_order = True
         drawn.value_axis._element.get_or_add_crosses().val = XL_AXIS_CROSSES.MAXIMUM  # the value axis stays below
+    drawn.has_title = False  # no automatic title of a single series' name
     drawn.has_legend = kind == "pie" or len(chart["series"]) > 1
     legend = drawn.legend
     if legend is not None:

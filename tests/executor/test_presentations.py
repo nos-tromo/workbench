@@ -25,7 +25,7 @@ from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
-from pptx.util import Length, Pt
+from pptx.util import Inches, Pt
 
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
@@ -1064,31 +1064,44 @@ def test_a_table_fills_a_content_place(job: Job) -> None:
         ["Invented south", ""],
     ]
     assert table.first_row is True
-    assert {row.height for row in table.rows} == {place.shape.height // 3}
-    assert (shape.left, shape.top, shape.width, shape.height) == (
-        place.shape.left,
-        place.shape.top,
-        place.shape.width,
-        place.shape.height // 3 * 3,
-    )
-    sizes = {
-        run.font.size for row in table.rows for cell in row.cells for p in cell.text_frame.paragraphs for run in p.runs
-    }
-    assert sizes == {None}
+    assert (shape.left, shape.top, shape.width) == (place.shape.left, place.shape.top, place.shape.width)
 
 
-@pytest.mark.parametrize(("count", "size"), [(8, None), (9, Pt(12))])
-def test_a_long_table_takes_a_smaller_font(job: Job, count: int, size: Length | None) -> None:
-    """More than eight rows are written at 12 pt, every cell, an empty one too; eight keep the master's size."""
+def row_height(size: int) -> int:
+    """A table row's natural height at ``size`` pt: one line, 1.2 times the size, and python-pptx's cell margins."""
+    return int(Pt(size) * 1.2) + 2 * Inches(0.05)
+
+
+@pytest.mark.parametrize(
+    ("count", "size", "fits"),
+    [
+        (3, 18, True),
+        (12, 18, True),
+        (13, 16, True),
+        (14, 14, True),
+        (16, 12, True),
+        (18, 10, True),
+        (19, 10, False),
+        (30, 10, False),
+    ],
+)
+def test_a_table_takes_the_size_that_fits_its_place(job: Job, count: int, size: int, fits: bool) -> None:
+    """The font steps down from 18 pt until the rows, each its natural height, fit the place; at 10 pt, a warning."""
     mt.make_master(job.path("master.pptx"))
     rows = [["Invented column", "Invented value"], *[[f"Invented {number}"] for number in range(count - 1)]]
-    job.write([{"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]}])
-    table = next(shape for shape in job.deck().slides[0].shapes if shape.has_table).table
+    warnings = job.write([{"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]}])["warnings"]
+    assert warnings == ([] if fits else ["slide 1: the table may not fit; split it over two slides"])
+    shape = next(shape for shape in job.deck().slides[0].shapes if shape.has_table)
+    table = shape.table
     assert len(table.rows) == count
     paragraphs = [p for row in table.rows for cell in row.cells for p in cell.text_frame.paragraphs]
-    assert {run.font.size for p in paragraphs for run in p.runs} == {size}
-    ends = [p._p.endParaRPr for p in paragraphs]
-    assert {None if end is None else end.sz for end in ends} == {None if size is None else size.centipoints}
+    assert {run.font.size for p in paragraphs for run in p.runs} == {Pt(size)}
+    assert {p._p.endParaRPr.sz for p in paragraphs} == {Pt(size).centipoints}
+    assert [row.height for row in table.rows] == [row_height(size)] * count
+    assert shape.height == row_height(size) * count
+    assert (shape.height <= place_of(TITLE_AND_CONTENT).shape.height) is fits
+    if count == 3:
+        assert shape.height < place_of(TITLE_AND_CONTENT).shape.height // 2
 
 
 def test_a_tables_values_are_shown_as_text(job: Job) -> None:
@@ -1129,6 +1142,8 @@ def test_a_chart_is_native_and_editable(job: Job) -> None:
         XL_CHART_TYPE.PIE,
     ]
     assert [one.has_legend for one in drawn] == [False, True, True, True]
+    assert [one.has_title for one in drawn] == [False] * 4
+    assert [one._chartSpace.chart.autoTitleDeleted.val for one in drawn] == [True] * 4
     for one in drawn[1:]:
         assert (one.legend.position, one.legend.include_in_layout) == (XL_LEGEND_POSITION.BOTTOM, False)
     column, bar = drawn[0], drawn[1]
