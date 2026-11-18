@@ -468,6 +468,56 @@ def _refused(name: str, why: str) -> HTTPException:
     return HTTPException(status_code=422, detail=_clean(f"invalid_source: {name}: {why}"))
 
 
+def _source_spec(
+    store: Store, p: Principal, chat_id: str, source: Source, label: str
+) -> tuple[dict[str, Any], FileRecord | None]:
+    """Check one source as far as the api can, and write it as the runner takes it.
+
+    Args:
+        store: The file store.
+        p: The caller and user.
+        chat_id: The chat the job runs in: a job source must be a run of it.
+        source: The source.
+        label: What the refusal names: a field, or ``slide N, source M``.
+
+    Returns:
+        The source for the runner (a file source by its path below the chat folder, with its virtual path for the
+        notes or the appendix), and the file a file source names, or ``None``.
+
+    Raises:
+        HTTPException: A file source is not a file of the request's chat, or a job source is not a finished
+            ``run_python`` run of the user in that chat (422, naming ``label`` and never whether a job exists for
+            someone else).
+    """
+    if isinstance(source, FileSource):
+        try:
+            rec = store.get(p, source.path)
+        except (NotFound, PathError):
+            rec = None
+        if rec is None:
+            raise _refused(label, f"{source.path} is not a file of this conversation")
+        spec: dict[str, Any] = {"kind": "file", "path": rec.name, "virtual": rec.virtual_path}
+        spec.update(
+            (key, value)
+            for key, value in (("page", source.page), ("sheet", source.sheet), ("cell", source.cell))
+            if value is not None
+        )
+        return spec, rec
+    if isinstance(source, JobSource):
+        try:
+            job = store.get_job(p, source.job_id)
+        except NotFound:
+            job = None
+        if job is None or (job.tool, job.chat_id, job.status) != ("run_python", chat_id, "ok"):
+            raise _refused(
+                label, f"{source.job_id} is not the job_id of a run_python run of this conversation that finished"
+            )
+        return {"kind": "job", "job_id": job.id}, None
+    if isinstance(source, UserSource):
+        return ({"kind": "user"} if source.note is None else {"kind": "user", "note": source.note}), None
+    return {"kind": "assistant"}, None
+
+
 def _sources(
     store: Store, p: Principal, template: FileRecord, values: Mapping[str, FieldValue]
 ) -> tuple[dict[str, Any], list[str], list[str]]:
@@ -484,44 +534,17 @@ def _sources(
         appendix), the job's input files (the template first) and the ids of the source files.
 
     Raises:
-        HTTPException: A file source is not a file of the request's chat, or a job source is not a finished
-            ``run_python`` run of the user in that chat (422, naming the field and never whether a job exists for
-            someone else); or the sources name more files than a job takes.
+        HTTPException: A source is refused (:func:`_source_spec`), naming the field; or the sources name more files
+            than a job takes.
     """
     sent: dict[str, Any] = {}
     inputs: dict[str, None] = {template.name: None}
     ids: dict[str, None] = {}
     for name, entry in values.items():
-        source = entry.source
-        if isinstance(source, FileSource):
-            try:
-                rec = store.get(p, source.path)
-            except (NotFound, PathError):
-                rec = None
-            if rec is None:
-                raise _refused(name, f"{source.path} is not a file of this conversation")
+        spec, rec = _source_spec(store, p, template.chat_id, entry.source, name)
+        if rec is not None:
             inputs[rec.name] = None
             ids[rec.id] = None
-            spec: dict[str, Any] = {"kind": "file", "path": rec.name, "virtual": rec.virtual_path}
-            spec.update(
-                (key, value)
-                for key, value in (("page", source.page), ("sheet", source.sheet), ("cell", source.cell))
-                if value is not None
-            )
-        elif isinstance(source, JobSource):
-            try:
-                job = store.get_job(p, source.job_id)
-            except NotFound:
-                job = None
-            if job is None or (job.tool, job.chat_id, job.status) != ("run_python", template.chat_id, "ok"):
-                raise _refused(
-                    name, f"{source.job_id} is not the job_id of a run_python run of this conversation that finished"
-                )
-            spec = {"kind": "job", "job_id": job.id}
-        elif isinstance(source, UserSource):
-            spec = {"kind": "user"} if source.note is None else {"kind": "user", "note": source.note}
-        else:
-            spec = {"kind": "assistant"}
         sent[name] = {"value": entry.value, "source": spec}
     if len(inputs) > MAX_INPUT_FILES:
         raise HTTPException(status_code=422, detail=f"the sources name more than {MAX_INPUT_FILES - 1} files")

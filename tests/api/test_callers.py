@@ -14,7 +14,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HD, HG, PG, AuditLines, put
 from tests.api.mcp_calls import acall, error, result, rpc
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import (
@@ -34,7 +34,7 @@ from workbench.config import NO_CALLER_KEY, ConfigError, Settings, load_settings
 from workbench.models import Principal
 
 DOCINT = Caller("docint", DOCINT_KEY, frozenset({"run_python"}), files="inline", wall_s=60, slots=2)
-GHOSTWRITER = Caller("ghostwriter", GHOSTWRITER_KEY, EIGHT, files="workspace", wall_s=120, slots=2)
+GHOSTWRITER = Caller("ghostwriter", GHOSTWRITER_KEY, GHOSTWRITER_TOOLS, files="workspace", wall_s=120, slots=2)
 NOT_FOUND = (404, {"detail": "not found"})
 
 
@@ -350,7 +350,7 @@ def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
 
     assert [caller.name for caller in registry.callers] == ["docint", "ghostwriter"]
     assert row(registry.get("docint")) == ("inline", frozenset({"run_python"}), 60, 2)
-    assert row(registry.get("ghostwriter")) == ("workspace", EIGHT, 120, 2)
+    assert row(registry.get("ghostwriter")) == ("workspace", GHOSTWRITER_TOOLS, 120, 2)
     assert registry.get("docint").key == DOCINT_KEY
     assert registry.get("ghostwriter").key == GHOSTWRITER_KEY
     assert registry.authenticate("wrong") is None
@@ -515,12 +515,12 @@ def test_a_session_header_that_is_not_a_plain_id_is_refused(
 
 
 @pytest.mark.parametrize("full", [False, True], ids=["reduced", "full"])
-@pytest.mark.parametrize("tool", sorted(EIGHT))
+@pytest.mark.parametrize("tool", sorted(GHOSTWRITER_TOOLS))
 def test_a_reduced_list_is_refused_on_the_mcp_door(
     settings: Settings, store: Store, audit: AuditLog, tool: str, full: bool
 ) -> None:
     """Each tool is an unknown tool to a list without it, never to one with it; the tool list follows the list."""
-    listed = EIGHT if full else EIGHT - {tool}
+    listed = GHOSTWRITER_TOOLS if full else GHOSTWRITER_TOOLS - {tool}
     app = create_app(dataclasses.replace(settings, ghostwriter_tools=listed), store=store, audit=audit)
     with TestClient(app) as client:
         r = acall(client, tool, {})

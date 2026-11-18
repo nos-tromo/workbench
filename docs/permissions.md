@@ -51,6 +51,7 @@ Every tool that runs in the executor also leaves a job record (see
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
 | `write_document` | nothing of the chat: the Markdown comes in the call | one new `.docx` or `.md` in the chat | `collect` / `tool.write_document` | the new file and a job record |
+| `write_presentation` | the slide master, every picture a slide shows and every file a slide's source names, as copies in a job | one new `.pptx` in the master's chat; the master is not changed | `modify` / `tool.write_presentation` | the new file and a job record |
 | `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
 
 The eight tools answer Ghostwriter with `outputs` besides their own answer: the

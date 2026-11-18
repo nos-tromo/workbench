@@ -39,6 +39,7 @@ GHOSTWRITER_DEFAULT_TOOLS: Final = frozenset(
         "fill_template",
         "write_table",
         "write_document",
+        "write_presentation",
     }
 )
 GHOSTWRITER_DEFAULT_WALL_S: Final = 120

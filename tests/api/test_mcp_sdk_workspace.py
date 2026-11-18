@@ -1,4 +1,4 @@
-"""The official MCP SDK's client against Ghostwriter's door, on loopback: the eight workspace tools, listed and called.
+"""The official MCP SDK's client against Ghostwriter's door, on loopback: the nine workspace tools, listed and called.
 
 The api runs the real runners (the in-process executor of ``tests/api/test_tools_templates.py``), so the table
 preview of a written csv is the executor's own. The client reaches nothing but the socket ``served`` binds.
@@ -18,7 +18,7 @@ from mcp.client.streamable_http import streamable_http_client
 from tests.api.conftest import GHOSTWRITER_KEY, AuditLines
 from tests.api.test_mcp_sdk_client import served
 from tests.api.test_tools_templates import Local
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from tests.conftest import scaled
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
@@ -68,10 +68,10 @@ async def converse(url: str) -> tuple[list[Any], Any, Any]:
 def test_the_official_client_lists_and_calls_the_workspace_tools(
     app_with_local_executor: FastAPI, audit_lines: AuditLines
 ) -> None:
-    """Eight tools, each with schemas the validator accepts; a table written with its preview, then listed."""
+    """Nine tools, each with schemas the validator accepts; a table written with its preview, then listed."""
     with served(app_with_local_executor) as (url, recorded):
         tools, written, files = asyncio.run(asyncio.wait_for(converse(url), scaled(60)))
-    assert [tool.name for tool in tools] == sorted(EIGHT)
+    assert [tool.name for tool in tools] == sorted(GHOSTWRITER_TOOLS)
     for tool in tools:
         jsonschema.Draft202012Validator.check_schema(tool.input_schema)
         assert tool.output_schema is not None, tool.name

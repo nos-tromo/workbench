@@ -1,9 +1,10 @@
 """The workspace tools, one row each: what the MCP door tells the model of every tool, and what runs it.
 
 A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
-and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates` and
-:mod:`workbench.api.tools_output`). :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the
-registry. A new workspace tool is a row here.
+and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`,
+:mod:`workbench.api.tools_output` and :mod:`workbench.api.tools_presentations`).
+:func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the registry. A new workspace tool is a row
+here.
 """
 
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
-from workbench.api import tools, tools_output, tools_templates
+from workbench.api import tools, tools_output, tools_presentations, tools_templates
 from workbench.tables import MAX_WORD_COLUMNS
 
 
@@ -61,7 +62,7 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
     ),
     WorkspaceTool(
         name="inspect_template",
-        title="List the fields of a report template",
+        title="List the fields of a template or the layouts of a slide master",
         description=(
             "List the fields of a report template in this conversation, so you can plan the fill with the user before "
             "you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form "
@@ -163,6 +164,25 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools_output.WriteDocumentRequest,
         output_model=tools_output.WrittenDocument,
         function=tools_output.write_document,
+    ),
+    WorkspaceTool(
+        name="write_presentation",
+        title="Build a slide deck in a slide master",
+        description=(
+            "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. "
+            "Call inspect_template on the master first. Then show the user the outline (each slide's title, layout "
+            "number and name, key points, figures and sources) and call this tool only in a later message, after they "
+            "agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its "
+            "places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first "
+            "row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this "
+            "conversation (make a chart image with run_python, or prefer a native chart). At most 30 slides. Footers "
+            "and slide numbers come from the master; the master's own slides are left out. Each slide's sources go "
+            "into its speaker notes. To change a deck, read it with read_document and write it again. The user sees "
+            "the new file as a card in the chat."
+        ),
+        input_model=tools_presentations.WritePresentationRequest,
+        output_model=tools_presentations.BuiltPresentation,
+        function=tools_presentations.write_presentation,
     ),
     WorkspaceTool(
         name="write_table",

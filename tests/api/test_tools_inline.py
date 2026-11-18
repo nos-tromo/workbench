@@ -20,7 +20,7 @@ from tests.api import test_tools_python as python_tests
 from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, AuditLines
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from workbench import protocol
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry
@@ -621,7 +621,7 @@ def test_config_audit_lists_the_callers_and_the_purpose_rule(
     (config,) = [e for e in audit_lines() if e["operation"] == "config.audit"]
     assert config["criteria"]["callers"] == [
         {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
-        {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
+        {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 2},
     ]
     assert config["criteria"]["require_purpose"] == ["combine", "disclose", "query"]
     raw = json.dumps(audit_lines())

@@ -402,7 +402,7 @@
     },
     {
       "name": "inspect_template",
-      "title": "List the fields of a report template",
+      "title": "List the fields of a template or the layouts of a slide master",
       "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, numbered, with each layout's places in reading order (role, about how many lines and characters fit) and whether it has a footer; build a deck in one with write_presentation. A very long list is cut: truncated is then true.",
       "inputSchema": {
         "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path.",
@@ -1846,6 +1846,498 @@
           "path"
         ],
         "title": "WrittenDocumentWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "write_presentation",
+      "title": "Build a slide deck in a slide master",
+      "description": "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. Call inspect_template on the master first. Then show the user the outline (each slide's title, layout number and name, key points, figures and sources) and call this tool only in a later message, after they agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this conversation (make a chart image with run_python, or prefer a native chart). At most 30 slides. Footers and slide numbers come from the master; the master's own slides are left out. Each slide's sources go into its speaker notes. To change a deck, read it with read_document and write it again. The user sees the new file as a card in the chat.",
+      "inputSchema": {
+        "$defs": {
+          "AssistantSource": {
+            "description": "A value the model wrote itself.\n\nAttributes:\n    kind: ``assistant``.",
+            "properties": {
+              "kind": {
+                "const": "assistant",
+                "description": "assistant: you wrote the value yourself.",
+                "title": "Kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "AssistantSource",
+            "type": "object"
+          },
+          "ChartBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "chart": {
+                "$ref": "#/$defs/ChartSpec",
+                "description": "The chart.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "chart"
+            ],
+            "type": "object"
+          },
+          "ChartSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "description": "bar: horizontal bars; column: vertical bars.",
+                "enum": [
+                  "bar",
+                  "column",
+                  "line",
+                  "pie"
+                ],
+                "type": "string"
+              },
+              "categories": {
+                "description": "Axis labels, or a pie's slices.",
+                "items": {
+                  "type": [
+                    "string",
+                    "number"
+                  ]
+                },
+                "type": "array"
+              },
+              "series": {
+                "additionalProperties": {
+                  "items": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "type": "array"
+                },
+                "description": "Each series' name to a value per category, or null; a pie has one.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "type",
+              "categories",
+              "series"
+            ],
+            "type": "object"
+          },
+          "FileSource": {
+            "description": "A value read in a file of the conversation.\n\nAttributes:\n    kind: ``file``.\n    path: The file's absolute path.\n    page: The page of a PDF, or the slide of a presentation.\n    sheet: The sheet of a workbook.\n    cell: The cell of that sheet, such as ``B7``.",
+            "properties": {
+              "kind": {
+                "const": "file",
+                "description": "file: the value was read in a file of this conversation.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "title": "Path",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The page of a PDF or the slide of a PPTX it is on.",
+                "title": "Page",
+                "type": "integer"
+              },
+              "sheet": {
+                "anyOf": [
+                  {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The sheet of an XLSX or ODS it is on.",
+                "title": "Sheet",
+                "type": "string"
+              },
+              "cell": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The cell of that sheet, such as B7.",
+                "title": "Cell",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "title": "FileSource",
+            "type": "object"
+          },
+          "ImageBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "description": "The path of a PNG, JPEG or GIF of this conversation.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "alt": {
+                "description": "Its alternative text.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "image"
+            ],
+            "type": "object"
+          },
+          "JobSource": {
+            "description": "A value a ``run_python`` run computed.\n\nAttributes:\n    kind: ``job``.\n    job_id: The run's ``job_id``.",
+            "properties": {
+              "kind": {
+                "const": "job",
+                "description": "job: the value was computed by a run_python run.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "The job_id run_python answered with.",
+                "maxLength": 64,
+                "minLength": 1,
+                "title": "Job Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "job_id"
+            ],
+            "title": "JobSource",
+            "type": "object"
+          },
+          "SlideSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "layout": {
+                "description": "Its number or name, as inspect_template lists it.",
+                "type": [
+                  "integer",
+                  "string"
+                ]
+              },
+              "title": {
+                "description": "Its title.",
+                "type": "string"
+              },
+              "subtitle": {
+                "description": "Its subtitle.",
+                "type": "string"
+              },
+              "content": {
+                "description": "One block a place of the layout, in its order.",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "$ref": "#/$defs/TableBlock"
+                    },
+                    {
+                      "$ref": "#/$defs/ChartBlock"
+                    },
+                    {
+                      "$ref": "#/$defs/ImageBlock"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "notes": {
+                "description": "Its speaker notes.",
+                "type": "string"
+              },
+              "sources": {
+                "description": "Where its content comes from.",
+                "items": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/FileSource"
+                    },
+                    {
+                      "$ref": "#/$defs/JobSource"
+                    },
+                    {
+                      "$ref": "#/$defs/UserSource"
+                    },
+                    {
+                      "$ref": "#/$defs/AssistantSource"
+                    }
+                  ]
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "layout"
+            ],
+            "type": "object"
+          },
+          "TableBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "table": {
+                "description": "Rows of cells; the first is the header.",
+                "items": {
+                  "items": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "table"
+            ],
+            "type": "object"
+          },
+          "UserSource": {
+            "description": "A value the user stated.\n\nAttributes:\n    kind: ``user``.\n    note: Where or how the user said it.",
+            "properties": {
+              "kind": {
+                "const": "user",
+                "description": "user: the user stated the value in the chat.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "note": {
+                "anyOf": [
+                  {
+                    "maxLength": 1000,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Where or how the user said it.",
+                "title": "Note",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "UserSource",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "The slide master's path, as list_files gives it.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "description": "The new file's name; .pptx is added if missing.",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "slides": {
+            "description": "The slides, in order.",
+            "items": {
+              "$ref": "#/$defs/SlideSpec"
+            },
+            "type": "array"
+          },
+          "include_sources": {
+            "default": true,
+            "description": "Put each slide's sources in its speaker notes.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "slides"
+        ],
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The new file's path; the user sees it as a card in the chat.",
+            "title": "Path",
+            "type": "string"
+          },
+          "slides": {
+            "description": "How many slides the deck has.",
+            "title": "Slides",
+            "type": "integer"
+          },
+          "warnings": {
+            "description": "What to tell the user about the deck, such as text that may not fit.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "slides",
+          "warnings"
+        ],
+        "title": "BuiltPresentationWithOutputs",
         "type": "object"
       }
     },

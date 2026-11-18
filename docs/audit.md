@@ -57,6 +57,7 @@ The `container` is the chat folder the files live in.
 | `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 | `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size; `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 | `write_document` | `collect` / `tool.write_document` | the new file | `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
+| `write_presentation` | `modify` / `tool.write_presentation` | the slide master, every picture, every file a slide's source names, and the new file | `slides`, `tables`, `charts`, `images`: the deck's counts; `sources_by_kind`: how many sources of each kind its slides cite (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 
 An event about more than 200 files is followed by continuation events under
 `<operation>.ids` (`tool.search_files.ids`, `tool.run_python.ids`,

@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 
 from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from workbench.api.auth import Caller, CallerRegistry
 from workbench.api.errors import MAX_ERRORS, compact, describe
 from workbench.api.jobs import Busy, RequestTooLarge
@@ -37,9 +37,9 @@ KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs"})
 # --- the table ------------------------------------------------------------------------------------------------------
 
 
-def test_the_table_holds_the_eight_tools_in_name_order() -> None:
+def test_the_table_holds_the_nine_tools_in_name_order() -> None:
     """The workspace tools are the table's rows, one per tool Ghostwriter may call, by name."""
-    assert [tool.name for tool in WORKSPACE_TABLE] == sorted(EIGHT)
+    assert [tool.name for tool in WORKSPACE_TABLE] == sorted(GHOSTWRITER_TOOLS)
 
 
 def test_each_function_takes_only_known_parameters() -> None:
@@ -116,8 +116,8 @@ def test_a_tool_without_the_callers_form_stops_the_start(settings: Settings, too
 
 
 def test_allowed_tools_by_form() -> None:
-    """A caller with workspace files may list the eight workspace tools; one whose data comes inline, the inline."""
-    assert allowed_tools("workspace") == WORKSPACE_TOOLS == EIGHT
+    """A caller with workspace files may list the nine workspace tools; one whose data comes inline, the inline."""
+    assert allowed_tools("workspace") == WORKSPACE_TOOLS == GHOSTWRITER_TOOLS
     assert allowed_tools("inline") == INLINE_TOOLS
 
 
