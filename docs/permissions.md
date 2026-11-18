@@ -74,8 +74,8 @@ chat.
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
 
 The service routes (`/healthz`, `/metrics`) read no file content and are not
-recorded (`workbench/api/health.py`, `workbench/api/metrics.py`). Every other path answers `404` to a caller with the
-key, and `401` to anyone without it.
+recorded (`workbench/api/health.py`, `workbench/api/metrics.py`). Every other
+path answers `404` to a caller with the key, and `401` to anyone without it.
 
 [audit.md](audit.md) says what each event holds.
 
@@ -173,7 +173,7 @@ things, the limits that matter to users:
   not copied into `write_table`. `read_document` shows a JSON file indented,
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
-  Markdown table with a `422` that points to `write_table`.
+  Markdown table (`refused`), with a text that points to `write_table`.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
   newest 1000 files of the chat; answers are cut at `WORKBENCH_RESULT_MAX_KB`
   and say how to go on; `read_document` does no OCR and lists pages without a

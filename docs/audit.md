@@ -102,7 +102,7 @@ as `dropped`.
   host, outside the api and its chain ([retention.md](retention.md#make-nuke-is-outside-the-trail)).
 - A request refused before it becomes an operation: no or a wrong key (`401`),
   a body too large (`413`), a missing or invalid user (`400`), a body that does
-  not validate (`422`), a full queue (`503`), a file that does not exist
+  not validate (`422`), a full queue (`queue_full`), a file that does not exist
   (`404`).
 - A tool call refused before its job ran (an invalid name, a source that is not
   in the chat), and a job whose answer never reached the api (see

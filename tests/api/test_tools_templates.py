@@ -21,7 +21,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CHAT, HG, PG, AuditLines, put, unrecorded
+from tests.api.conftest import CALL, CHAT, HG, PG, AuditLines, put, unrecorded
 from tests.api.mcp_calls import (
     Headers,
     acall,
@@ -176,8 +176,8 @@ def test_the_local_executor_reads_the_previews_a_job_asks_for(
     asked, unasked = KeepAll(), KeepAll()
 
     async def run() -> None:
-        await queue.submit(PG, "write_table", args, [], asked, previews=True)
-        await queue.submit(PG, "write_table", {**args, "name": "other.csv"}, [], unasked)
+        await queue.submit(PG, "write_table", args, [], asked, call=CALL, previews=True)
+        await queue.submit(PG, "write_table", {**args, "name": "other.csv"}, [], unasked, call=CALL)
 
     asyncio.run(run())
 

@@ -114,10 +114,10 @@ in `tests/api/golden/`). The eight: `list_files`, `read_document`,
   `mcp_wire.py` its wire rules, with no I/O.
 - `workbench/api/tools_mcp.py`: Ghostwriter's eight workspace tools on `/mcp`,
   each calling its row's function. A call's `structuredContent` is the
-  function's answer plus `outputs`, each file it wrote with its id and, for csv and xlsx, a
-  preview that `workbench/executor/preview.py` reads in the job. The text block
-  carries no previews and is not re-cut after `outputs`; 5 s of the wall
-  (`PREVIEW_RESERVE_S`) are kept for the previews.
+  function's answer plus `outputs`, each file it wrote with its id and, for csv
+  and xlsx, a preview that `workbench/executor/preview.py` reads in the job. The
+  text block carries no previews and is not re-cut after `outputs`; 5 s of the
+  wall (`PREVIEW_RESERVE_S`) are kept for the previews.
 
 Adding a tool touches: its row in `tool_table.WORKSPACE_TABLE` and a name in
 `registry.WORKSPACE_TOOLS`, or for an inline tool its spec in
@@ -139,8 +139,8 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 (`redirect_slashes=False`).
 
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
-key, door, file form and allowed tools. Two, each with a door and a file form:
-`docint` (MCP door at `/mcp`, inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
+key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
+with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
 wall cap and running-job cap) and `ghostwriter` (`/mcp` and four file routes,
 workspace files, the eight tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api

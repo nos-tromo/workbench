@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
+from tests.api.conftest import CALL, GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
 from tests.api.test_jobs import KEEP, FakeClient, until
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
@@ -364,7 +364,9 @@ async def test_sweep_during_running_job(
     executor.files = {"chart.png": b"\x89PNG"}
     queue = JobQueue(settings, executor, store, metrics)
     clock.now = T0 + 8 * DAY
-    running = asyncio.create_task(queue.submit(PG_SETUP, "run_python", {"code": "print(1)"}, [old.name], KEEP))
+    running = asyncio.create_task(
+        queue.submit(PG_SETUP, "run_python", {"code": "print(1)"}, [old.name], KEEP, call=CALL)
+    )
     await until(lambda: executor.running == 1)
     report = await asyncio.to_thread(sweeper.sweep_once)
     assert report == SweepReport(deleted=1, errors=0)

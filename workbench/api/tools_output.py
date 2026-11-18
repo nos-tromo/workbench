@@ -15,14 +15,13 @@ is never kept, and a job that refused is recorded too, by the refusal's code.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue
 from workbench.api.tools import (
     MAX_HINT,
     OutputKeeper,
@@ -39,6 +38,9 @@ from workbench.models import FileRecord, Principal
 from workbench.paths import PathError, check_filename
 from workbench.protocol import JobResult
 from workbench.tables import MAX_COLUMNS, MAX_ROWS, MAX_SHEET_NAME, Delimiter, table_problem
+
+if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
+    from workbench.api.tools_mcp import CallJobs
 
 #: Most characters of a document's Markdown; the runner checks it again (a test ties the two).
 MAX_MARKDOWN: Final = 200_000
@@ -174,7 +176,7 @@ def _output_name(wanted: str, extension: str) -> str:
 async def _write(
     p: Principal,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
     tool: str,
     args: dict[str, Any],
     criteria: Mapping[str, object] | None = None,
@@ -184,7 +186,7 @@ async def _write(
     Args:
         p: The caller, user and chat.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
         tool: ``write_table`` or ``write_document``.
         args: The runner's arguments.
         criteria: The event's criteria.
@@ -219,7 +221,7 @@ async def write_table(
     p: Principal,
     settings: Settings,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> WrittenTable:
     """Write the model's table into a new file of the chat, in the executor.
 
@@ -228,7 +230,7 @@ async def write_table(
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The new file's path, how many rows it has, and the runner's hint.
@@ -261,7 +263,7 @@ async def write_document(
     p: Principal,
     settings: Settings,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> WrittenDocument:
     """Write the model's Markdown into a new Word or Markdown file of the chat, in the executor.
 
@@ -270,7 +272,7 @@ async def write_document(
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The new file's path, and the runner's hint.

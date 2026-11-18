@@ -8,6 +8,7 @@ is refused there: the deleted chat is held from new jobs and uploads.
 import dataclasses
 import shutil
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from anyio.from_thread import BlockingPortal
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import HD, HG, PG, PG_SETUP, put
+from tests.api.conftest import CALL, HD, HG, PG, PG_SETUP, put
 from tests.api.test_files_ghostwriter import P2, PURPOSE, keep, upload
 from tests.api.test_jobs import FakeClient, sample, until
 from workbench.api.audit import AuditLog
@@ -186,7 +187,9 @@ def test_a_late_output_of_a_running_job_is_refused(
     with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
         portal = client.portal
         assert portal is not None
-        running = portal.start_task_soon(jobs.submit, PG, "run_python", python_args("print(1)", 60), [], keeper)
+        running = portal.start_task_soon(
+            partial(jobs.submit, call=CALL), PG, "run_python", python_args("print(1)", 60), [], keeper
+        )
         try:
             portal.call(until, lambda: fake.running == 1)
             r = delete(client)
@@ -244,7 +247,9 @@ def test_a_queued_call_of_the_deleted_chat_never_runs(
 
     def submit(portal: BlockingPortal, p: Principal) -> Any:
         keeper = OutputKeeper(audit, p, "run_python", [], keep_all)
-        return portal.start_task_soon(jobs.submit, p, "run_python", python_args("print(1)", 60), [], keeper)
+        return portal.start_task_soon(
+            partial(jobs.submit, call=CALL), p, "run_python", python_args("print(1)", 60), [], keeper
+        )
 
     with TestClient(create_app(settings, store=store, audit=audit, jobs=jobs)) as client:
         portal = client.portal

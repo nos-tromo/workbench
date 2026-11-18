@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import DOCINT_KEY, FORMER, GHOSTWRITER_KEY, HG, PG, put, unrecorded
+from tests.api.conftest import CALL, DOCINT_KEY, FORMER, GHOSTWRITER_KEY, HG, PG, put, unrecorded
 from tests.api.test_tools_documents import Scripted
 from workbench.api.audit import AuditLog
 from workbench.api.auth import require_file_caller
@@ -24,6 +24,7 @@ from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import ReadDocumentRequest, read_document
+from workbench.api.tools_mcp import CallJobs
 from workbench.api.tools_templates import InspectTemplateRequest, inspect_template
 from workbench.config import Settings
 from workbench.layout import WORKSPACES
@@ -313,9 +314,9 @@ def executor(settings: Settings) -> Scripted:
 
 
 @pytest.fixture
-def jobs(settings: Settings, store: Store, executor: Scripted) -> JobQueue:
-    """A queue over that executor."""
-    return JobQueue(settings, executor, store, Metrics(settings.data_dir))
+def jobs(settings: Settings, store: Store, executor: Scripted) -> CallJobs:
+    """A queue over that executor, as one call sees it."""
+    return CallJobs(JobQueue(settings, executor, store, Metrics(settings.data_dir)), CALL)
 
 
 @pytest.mark.parametrize("spelling", ["/workspace/chat-2/{}", "/workspace/chat-1/../chat-2/{}"])
@@ -325,7 +326,7 @@ def test_a_confined_read_of_another_chats_file_is_not_found_and_reads_nothing(
     audit: AuditLog,
     audit_lines: AuditLines,
     executor: Scripted,
-    jobs: JobQueue,
+    jobs: CallJobs,
     spelling: str,
 ) -> None:
     """``read_document`` and ``inspect_template`` stop at the store for another chat's file: no job, no event.

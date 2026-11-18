@@ -112,13 +112,13 @@ NOFILE_MARGIN = 256
 FREE_FLOOR_MIN = 1 << 30
 #: That share: one part in 20, 5 %.
 FREE_FLOOR_PARTS = 20
-#: The refusal of a job the floor stops or keeps from starting: a runner's ``code: text``, which the api answers 507.
+#: The refusal of a job the floor stops or keeps from starting: a runner's ``code: text``; the MCP door's ``refused``.
 STORAGE_FULL = "storage_full: storage is full"
 #: Shared memory of the container that no job's count shows, past which every running job stops (R90). Idle, the
 #: executor has none (measured, 0 bytes); the margin keeps a pass from tripping on a mount or segment that changes
 #: while it is read.
 SHMEM_MARGIN = 64 * MB
-#: The refusal of a job stopped for it: a runner's ``code: text``, which the api answers 503.
+#: The refusal of a job stopped for it: a runner's ``code: text``; the MCP door's ``refused``.
 HIDDEN_MEMORY = "hidden_memory: memory outside any job's count"
 
 _WORKSPACE = "workspace"

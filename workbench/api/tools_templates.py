@@ -17,7 +17,7 @@ be in its message.
 
 import posixpath
 from collections.abc import Callable, Mapping, Sequence
-from typing import Annotated, Any, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -25,7 +25,6 @@ from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
     MAX_HINT,
@@ -45,6 +44,9 @@ from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.paths import MAX_FILENAME, MAX_FILENAME_BYTES, PathError, check_filename
 from workbench.protocol import MAX_INPUT_FILES, JobResult
+
+if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
+    from workbench.api.tools_mcp import CallJobs
 
 #: The templates, by extension, and the extension of what they are filled into.
 OUTPUTS: Final = {".docx": ".docx", ".dotx": ".docx", ".xlsx": ".xlsx"}
@@ -512,7 +514,7 @@ async def inspect_template(
     settings: Settings,
     store: Store,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> TemplateInfo:
     """List a template's fields in the executor and answer with them, cut to the result limit.
 
@@ -526,7 +528,7 @@ async def inspect_template(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The kind of template and its fields.
@@ -555,7 +557,7 @@ async def fill_template(
     settings: Settings,
     store: Store,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> FilledTemplate:
     """Fill a template in the executor into a new file of its chat, and answer with the file and what was filled.
 
@@ -565,7 +567,7 @@ async def fill_template(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The new file's path, how many fields were filled, which were not, and warnings.

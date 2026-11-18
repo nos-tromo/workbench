@@ -5,7 +5,9 @@ caller's own claims, trusted only because only a caller holding a key can reach
 the api (``workbench-net`` has no other member). Both become folder names, so
 both go through :func:`~workbench.paths.check_id`.
 
-The headers are read from the request itself, not declared as parameters of each route.
+The headers are read from the request itself, not declared as parameters of each route, so the MCP
+door and the file routes read them with one function (:func:`principal_from_headers`), after the
+key, and refuse them with the same texts.
 
 The key is checked twice: by :class:`KeyGate`, before anything of the request's
 body is read, and again by each route's dependency. Without a valid key a request

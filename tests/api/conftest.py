@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from workbench import __version__
 from workbench.api.audit import SERVICE, AuditLog
+from workbench.api.jobs import CallLimits
 from workbench.api.main import create_app
 from workbench.api.store import Store
 from workbench.config import Settings, load_settings
@@ -35,6 +36,8 @@ PG_SETUP = Principal("ghostwriter", "user-a", "chat-1")
 FORMER = Principal("former-caller", "user-a", "chat-1")
 CHAT = "/workspace/chat-1"
 MIB = 1024 * 1024
+#: The limits of a call a test hands the queue itself: the default job wall, a 60 s wait, no cap of the caller's own.
+CALL = CallLimits(wall_s=120, wait_s=60)
 
 AuditLines = Callable[[], list[dict[str, Any]]]
 

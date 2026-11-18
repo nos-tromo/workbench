@@ -62,7 +62,6 @@ class Settings:
         retention_interval_s: Seconds between retention sweeps.
         executor_slots: Jobs the executor runs at once; at most the uid pool.
         queue_max: Jobs that may wait for a free slot.
-        queue_wait_s: Seconds a job may wait for a free slot.
         jobs_per_user: Jobs one user may have running at once; their further calls wait.
         job_wall_s: Wall-clock seconds a job may run.
         job_memory_mb: Memory a job may use, in megabytes.
@@ -91,7 +90,6 @@ class Settings:
     retention_interval_s: int
     executor_slots: int
     queue_max: int
-    queue_wait_s: int
     jobs_per_user: int
     job_wall_s: int
     job_memory_mb: int
@@ -260,7 +258,6 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
         retention_interval_s=_positive_int(env, "WORKBENCH_RETENTION_INTERVAL_S", 300),
         executor_slots=slots,
         queue_max=_positive_int(env, "WORKBENCH_QUEUE_MAX", 16),
-        queue_wait_s=_positive_int(env, "WORKBENCH_QUEUE_WAIT_S", 60),
         jobs_per_user=_positive_int(env, "WORKBENCH_JOBS_PER_USER", 1),
         job_wall_s=job_wall_s,
         job_memory_mb=_positive_int(env, "WORKBENCH_JOB_MEMORY_MB", 1536),

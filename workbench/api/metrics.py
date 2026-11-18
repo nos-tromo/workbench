@@ -19,7 +19,7 @@ from workbench.api.routing import EncodableRoute
 
 _log = logging.getLogger(__name__)
 
-#: Seconds a job waited for a slot; most wait none, the longest may wait ``WORKBENCH_QUEUE_WAIT_S``.
+#: Seconds a job waited for a slot; most wait none, the longest may wait ``MCP_QUEUE_WAIT_S``.
 _WAIT_BUCKETS: Final = (0.005, 0.05, 0.25, 1, 2.5, 5, 10, 20, 30, 60, 120)
 
 #: Seconds a job ran in the executor, up to its wall time plus the executor's cleanup.

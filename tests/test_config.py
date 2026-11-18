@@ -1,5 +1,6 @@
 """Settings are read from the environment, with the spec's defaults and hard limits."""
 
+import dataclasses
 from pathlib import Path
 from typing import Literal
 
@@ -17,7 +18,7 @@ def test_defaults_match_the_spec() -> None:
     """With only a caller's key set, every limit takes its documented default."""
     s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
     assert (s.retention_days, s.retention_interval_s) == (7, 300)
-    assert (s.executor_slots, s.queue_max, s.queue_wait_s) == (4, 16, 60)
+    assert (s.executor_slots, s.queue_max) == (4, 16)
     assert (s.jobs_per_user, s.job_wall_s, s.job_memory_mb) == (1, 120, 1536)
     assert (s.result_max_kb, s.upload_max_mb, s.workspace_max_mb) == (16, 50, 500)
     assert s.data_dir == Path("/data")
@@ -40,7 +41,6 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
             "WORKBENCH_RETENTION_INTERVAL_S": "30",
             "WORKBENCH_EXECUTOR_SLOTS": "2",
             "WORKBENCH_QUEUE_MAX": "5",
-            "WORKBENCH_QUEUE_WAIT_S": "7",
             "WORKBENCH_JOBS_PER_USER": "2",
             "WORKBENCH_JOB_WALL_S": "11",
             "WORKBENCH_JOB_MEMORY_MB": "256",
@@ -68,7 +68,6 @@ def test_every_variable_is_read_by_its_exact_name() -> None:
         retention_interval_s=30,
         executor_slots=2,
         queue_max=5,
-        queue_wait_s=7,
         jobs_per_user=2,
         job_wall_s=11,
         job_memory_mb=256,
@@ -300,6 +299,13 @@ def test_the_old_key_alone_starts_nothing() -> None:
     assert str(e.value) == NO_CALLER_KEY
     assert NO_CALLER_KEY.startswith("DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY must be set")
     assert "OPEN_WEBUI" not in NO_CALLER_KEY
+
+
+def test_the_queue_wait_is_no_setting() -> None:
+    """A leftover WORKBENCH_QUEUE_WAIT_S changes nothing, even one that would not parse: each call has its own wait."""
+    env = {"GHOSTWRITER_WORKBENCH_KEY": A}
+    assert load_settings({**env, "WORKBENCH_QUEUE_WAIT_S": "abc"}, role="api") == load_settings(env, role="api")
+    assert "queue_wait_s" not in {f.name for f in dataclasses.fields(Settings)}
 
 
 @pytest.mark.parametrize(

@@ -40,9 +40,8 @@ record of processing and the impact assessment.
   The data ends with the job (see
   [What a docint call leaves](#what-a-docint-call-leaves)).
 - **Identity headers.** The caller key, `X-User-Id` (docint's or Ghostwriter's
-  pseudonym) and `X-Session-Id` (the chat id, or docint's or Ghostwriter's
-  session pseudonym). See
-  [permissions.md](permissions.md#the-boundaries).
+  pseudonym) and `X-Session-Id` (docint's or Ghostwriter's session pseudonym).
+  See [permissions.md](permissions.md#the-boundaries).
 
 ## Where it is stored
 
@@ -180,8 +179,8 @@ send or in the values the model writes.
   a run returns enters their model context and is kept with the turn; their own
   processing, recorded there;
 - to obs-plane: the audit events (user pseudonym, chat id, file ids, times,
-  counts, purpose and request id) into its audit store, and the containers' log lines into its log store. Metrics hold no
-  personal data.
+  counts, purpose and request id) into its audit store, and the containers' log
+  lines into its log store. Metrics hold no personal data.
 
 workbench itself sends nothing outside the host. Tool results go to whatever
 model the operator configured behind the inference router; if that is an
@@ -197,9 +196,9 @@ chat database and docint's session database, kept with the chat turn: their own
 retention; workbench keeps neither the data nor the outputs of a docint call.
 Docker's `local` log driver (`docker/compose.yaml`, `x-logging`) also keeps a
 copy of each container's output on the host, the api's audit lines (user
-pseudonyms, chat ids, file ids, purposes and request ids) among them: rotated by size, at most five files of 50 MB per
-container, not by time, so with little traffic it can outlive obs-plane's
-retention.
+pseudonyms, chat ids, file ids, purposes and request ids) among them: rotated
+by size, at most five files of 50 MB per container, not by time, so with
+little traffic it can outlive obs-plane's retention.
 
 **Technical and organisational measures.**
 

@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute, iter_route_contexts
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import GHOSTWRITER_KEY, unrecorded
+from tests.api.conftest import CALL, GHOSTWRITER_KEY, unrecorded
 from workbench.api.audit import AuditLog
 from workbench.api.auth import KeyGate
 from workbench.api.jobs import Busy, ExecutorClient, JobQueue, Reason, RequestTooLarge
@@ -74,7 +74,7 @@ def test_metrics_after_jobs_name_the_tool_but_no_user_chat_or_caller(
     metrics = Metrics(settings.data_dir)
     queue = JobQueue(settings, OkClient(), store, metrics)
     app = create_app(settings, store=store, audit=audit, jobs=queue)
-    asyncio.run(queue.submit(Principal("ghostwriter", "user-a", "chat-1"), "read_document", {}, []))
+    asyncio.run(queue.submit(Principal("ghostwriter", "user-a", "chat-1"), "read_document", {}, [], call=CALL))
     with TestClient(app) as client:
         text = client.get("/metrics").text
     assert 'workbench_job_duration_seconds_count{tool="read_document"} 1.0' in text

@@ -37,15 +37,17 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 
 The api needs at least one of the two keys, or it refuses to start; two
 callers with the same key stop the start too. A host whose `.env` sets only
-`OPEN_WEBUI_WORKBENCH_KEY` must set `GHOSTWRITER_WORKBENCH_KEY`: the old key is
-ignored (deploy's `docs/runbooks/retire-open-webui.md`).
+`OPEN_WEBUI_WORKBENCH_KEY` must set `GHOSTWRITER_WORKBENCH_KEY`,
+`DOCINT_WORKBENCH_KEY` or both: the old key is ignored (deploy's
+`docs/runbooks/retire-open-webui.md`).
 
 ### The caller key
 
 `DOCINT_WORKBENCH_KEY` is shared with docint, and `GHOSTWRITER_WORKBENCH_KEY`
-with Ghostwriter; each holds the value as its `WORKBENCH_API_KEY`. Both `.env`
-files must hold it; change it in both and restart both stacks. It is not the
-inference router's key. deploy's `make env` copies it between the two files:
+with Ghostwriter; each holds the value as its `WORKBENCH_API_KEY`. workbench's
+`.env` and the caller's must both hold it; change it in both and restart both
+stacks. It is not the inference router's key. deploy's `make env` copies it
+between the two files:
 each key has its row (`workbench-docint-key`, `workbench-ghostwriter-key`) in
 deploy's `env-sync.conf`, the `[shared: … WORKBENCH_API_KEY]` tag in
 `.env.example` names it, and `make env ENV_GENERATE=1` generates one where it
@@ -69,31 +71,32 @@ The executor has no network.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WORKBENCH_EXECUTOR_SLOTS` | 4 | Jobs the executor runs at once, one slot uid each; at most 16, the size of the uid pool. |
-| `WORKBENCH_QUEUE_MAX` | 16 | Jobs that may wait for a free slot. Past it a call answers `503` "busy, retry later" at once. |
-| `WORKBENCH_QUEUE_WAIT_S` | 60 | Seconds a job may wait for its turn; then `503`. |
+| `WORKBENCH_QUEUE_MAX` | 16 | Jobs that may wait for a free slot. Past it a call is refused at once (`queue_full`, "busy, retry later"). |
 | `WORKBENCH_JOBS_PER_USER` | 1 | Jobs one user may have **running** at once. Their further calls wait, and hold no slot while they wait. |
 | `WORKBENCH_JOB_WALL_S` | 120 | Wall-clock seconds a job may run; also its CPU-time limit. |
 | `WORKBENCH_JOB_MEMORY_MB` | 1536 | Address space one job may map, in MB. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots times this. |
 | `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. |
 
-How the queue decides (`workbench/api/jobs.py:JobQueue`):
+How the queue decides (`workbench/api/jobs.py:JobQueue`); a refused call gets
+an `isError` result whose `reason` says why:
 
 - Each user also has a cap on **waiting** calls:
   `WORKBENCH_QUEUE_MAX / WORKBENCH_EXECUTOR_SLOTS`, rounded down, at least 1
-  (4 by default). A user past it gets `503` at once, and the other users are not
-  affected: one user cannot fill every waiting place.
+  (4 by default). A user past it is refused at once (`queue_full`), and the
+  other users are not affected: one user cannot fill every waiting place.
 - docint's and Ghostwriter's calls wait at most 5 s for their turn
-  (`MCP_QUEUE_WAIT_S`, fixed; not `WORKBENCH_QUEUE_WAIT_S`), may fill 8 of the 16
+  (`MCP_QUEUE_WAIT_S`, fixed; then `wait_timeout`), may fill 8 of the 16
   waiting places by default (`DOCINT_WORKBENCH_SLOTS` or
   `GHOSTWRITER_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
   slot and that user's turn until its wall time. Each is held to its own share
   only, so at the defaults docint and Ghostwriter together can hold all 4 slots
   and all 16 waiting places.
-- An executor with no free slot, or one the api cannot reach, is a `503` too.
+- An executor with no free slot, or one the api cannot reach, is refused too
+  (`executor_busy`).
 - So is a job the executor stopped because the container held more than
-  64 MiB of shared memory that no job's count showed (`hidden_memory`): it
-  stops every running job then, the innocent with the rest
-  ([sandbox.md](sandbox.md#limits)). Nothing was wrong with the call; retry.
+  64 MiB of shared memory that no job's count showed (`refused`, with the text
+  `hidden_memory: …`): it stops every running job then, the innocent with the
+  rest ([sandbox.md](sandbox.md#limits)). Nothing was wrong with the call; retry.
 - A job's code gets 9/10 of `WORKBENCH_JOB_WALL_S` for `run_python` and 3/4 for
   the other tools, before the wall time stops it (see
   [sandbox.md](sandbox.md#limits)).
@@ -160,11 +163,12 @@ The formulas, for other slot counts or job memory:
 - **Free space on the volume:** not a setting. The executor keeps 1 GiB free
   on the filesystem that holds `workbench-data`, or 5 % of that filesystem where
   that is more: below it, every running job is stopped and no job starts, and
-  the tool answers `507` ([sandbox.md](sandbox.md#limits)). For a local named
-  volume that filesystem is the disk of Docker's data root, which images,
-  containers' logs and other volumes share: their growth stops jobs too, and on
-  a large disk the floor is large (100 GB of a 2 TB disk). Size that disk for
-  the users' quotas, everything else on it, and the floor.
+  the tool is refused (`refused`, with the text `storage_full: storage is full`;
+  [sandbox.md](sandbox.md#limits)). For a local named volume that filesystem is
+  the disk of Docker's data root, which images, containers' logs and other
+  volumes share: their growth stops jobs too, and on a large disk the floor is
+  large (100 GB of a 2 TB disk). Size that disk for the users' quotas,
+  everything else on it, and the floor.
 
 ## Audit and retention
 

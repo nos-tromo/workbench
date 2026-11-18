@@ -22,7 +22,7 @@ entries), so it is an ``error`` event whose criteria name the refusal's code, ne
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -30,11 +30,13 @@ from pydantic import BaseModel, Field, ValidationError
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue
 from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.models import Principal
 from workbench.protocol import KILLED, MAX_INPUT_FILES, OUT_DIR, JobResult
+
+if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
+    from workbench.api.tools_mcp import CallJobs
 
 
 class FileInfo(BaseModel):
@@ -158,10 +160,11 @@ def list_files(p: Principal, settings: Settings, store: Store) -> FileList:
 #: The most hits a search may return.
 MAX_HITS: Final = 200
 
-#: The runner's failures the model is told, and the status each is answered with; any other is a 500. Two are the
-#: executor's own: ``storage_full``, the data volume is below its free-space floor, so the job was stopped or never
-#: started (507, as a full volume is everywhere in the api); and ``hidden_memory``, the container held shared memory no
-#: job's count showed, so every running job was stopped (503: nothing was wrong with the call, retry later).
+#: The runner's failures the model is told, and the status each is raised with; any other is a 500. The MCP door answers
+#: every one as ``refused`` with its text. Two are the executor's own: ``storage_full``, the data volume is below its
+#: free-space floor, so the job was stopped or never started (507, as a full volume is everywhere in the api); and
+#: ``hidden_memory``, the container held shared memory no job's count showed, so every running job was stopped (503:
+#: nothing was wrong with the call, retry later).
 _RUNNER_ERRORS: Final = {
     "unsupported_format": 422,
     "unreadable_file": 422,
@@ -660,7 +663,7 @@ async def read_document(
     settings: Settings,
     store: Store,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> DocumentRead:
     """Read one of the user's files in the executor and answer with its text, cut to the result limit.
 
@@ -674,7 +677,7 @@ async def read_document(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The parts read, the pages without text and how to go on.
@@ -695,7 +698,7 @@ async def search_files(
     settings: Settings,
     store: Store,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> SearchResult:
     """Search the chat's files in the executor and answer with the hits, cut to the result limit.
 
@@ -710,7 +713,7 @@ async def search_files(
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         The hits, and what could not be searched.
@@ -988,7 +991,7 @@ async def run_python(
     settings: Settings,
     store: Store,
     audit: AuditLog,
-    jobs: JobQueue,
+    jobs: "CallJobs",
 ) -> PythonRun:
     """Run the model's code in the executor over the chat's files and answer with its output and new files.
 
@@ -1003,7 +1006,7 @@ async def run_python(
         settings: The api's settings; ``result_max_kb`` caps the answer, ``job_wall_s`` gives the time limit.
         store: The file store.
         audit: The audit log.
-        jobs: The job queue.
+        jobs: The queue, within the call's limits.
 
     Returns:
         What the code printed, the files it made and the job's id.

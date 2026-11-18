@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from tests.api.conftest import CHAT, FORMER, HG, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CALL, CHAT, FORMER, HG, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
@@ -31,6 +31,7 @@ from workbench.api.jobs import CallLimits, JobQueue, Keeper
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store
+from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
 from workbench.models import FileRecord, JobRecord, Principal
 from workbench.protocol import JobResult
@@ -442,7 +443,7 @@ class CancelledOnReturn(JobQueue):
         input_files: Sequence[str],
         keeper: Keeper | None = None,
         *,
-        call: CallLimits | None = None,
+        call: CallLimits,
         previews: bool = False,
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
@@ -486,7 +487,7 @@ def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
     executor = Scripted(settings.data_dir)
     executor.files = {"made.docx": b"PK"}
     executor.payload = payload
-    queue = CancelledOnReturn(settings, executor, store, Metrics(settings.data_dir))
+    queue = CallJobs(CancelledOnReturn(settings, executor, store, Metrics(settings.data_dir)), CALL)
     audit.start({})
 
     async def call() -> None:
