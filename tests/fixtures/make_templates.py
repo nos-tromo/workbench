@@ -2,11 +2,13 @@
 
 Every builder writes one file and returns its path. All text is invented. Word templates are made with
 python-docx, their content controls and legacy form fields written as WordprocessingML with lxml; workbooks with
-openpyxl.
+openpyxl; slide masters with python-pptx, the parts it does not write as PresentationML with lxml.
 """
 
+import io
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from docx import Document
 from docx.document import Document as DocumentObject
@@ -14,6 +16,15 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml import parse_xml
 from docx.text.paragraph import Paragraph
 from openpyxl import Workbook
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.oxml import parse_xml as parse_pml
+from pptx.oxml.ns import qn
+from pptx.util import Inches
+
+from tests.fixtures import make_fixtures as mk
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
@@ -25,6 +36,17 @@ PLACEHOLDER_STYLE = "PlaceholderText"
 #: The style, header text and protection a filled template keeps.
 BODY_STYLE = "Report Body"
 HEADER_TEXT = "Invented Harbour Office"
+
+P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+#: The footer every layout of a master shows, and what each example slide's title starts with (then its number).
+MASTER_FOOTER = "Synthetic Ltd · internal"
+EXAMPLE_TITLE = "Invented example slide"
+
+#: The extension of ``ppt/presentation.xml`` that holds PowerPoint's sections.
+SECTIONS_URI = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
 
 
 def _xml(text: str) -> object:
@@ -384,3 +406,77 @@ def make_placeholder_xlsx(path: Path, *, blocker: str | None = None) -> Path:
         sheet[blocker] = "kept"
     book.save(str(path))
     return path
+
+
+def make_master(
+    path: Path,
+    *,
+    footer: str = MASTER_FOOTER,
+    examples: int = 2,
+    hidden_footer: bool = False,
+    duplicate_name: bool = False,
+) -> Path:
+    """Write a slide master: python-pptx's default presentation and its eleven layouts, as a user's master looks.
+
+    Layout 2 is named "Titel und Inhalt", and every layout's footer placeholder holds ``footer``. The example slides
+    are titled ``EXAMPLE_TITLE`` and their number: the first, on "Title Only", has speaker notes, a picture and a
+    column chart; the others, on "Titel und Inhalt", a line of text. A custom show names slide 1 and a section holds
+    every slide, as PowerPoint writes them.
+
+    Args:
+        path: Where to write it.
+        footer: The footer text of every layout.
+        examples: How many example slides it has; with none, no custom show or section either.
+        hidden_footer: Turn the footer, slide number and date off on the master (``p:hf``).
+        duplicate_name: Name layouts 3 and 4 both "Zwei Inhalte".
+
+    Returns:
+        ``path``.
+    """
+    deck: Any = Presentation()
+    layouts = deck.slide_layouts
+    layouts[1].name = "Titel und Inhalt"
+    if duplicate_name:
+        layouts[2].name = layouts[3].name = "Zwei Inhalte"
+    for layout in layouts:
+        for placeholder in layout.placeholders:
+            if placeholder.placeholder_format.type == PP_PLACEHOLDER.FOOTER:
+                placeholder.text_frame.text = footer
+    for number in range(1, examples + 1):
+        slide = deck.slides.add_slide(layouts[5] if number == 1 else layouts[1])
+        slide.shapes.title.text = f"{EXAMPLE_TITLE} {number}"
+        if number > 1:
+            slide.placeholders[1].text = "Invented example text"
+            continue
+        slide.notes_slide.notes_text_frame.text = "Invented speaker notes of the example."
+        slide.shapes.add_picture(io.BytesIO(mk._png()), Inches(0.5), Inches(1.5), Inches(2), Inches(2))
+        data = CategoryChartData()
+        data.categories = ["North pier", "South pier"]
+        data.add_series("Invented tonnes", (12, 7))
+        slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(3), Inches(1.5), Inches(5), Inches(4), data)
+    if examples:
+        _custom_show_and_section(deck)
+    if hidden_footer:
+        styles = deck.slide_master._element.find(qn("p:txStyles"))
+        styles.addprevious(parse_pml(f'<p:hf xmlns:p="{P}" ftr="0" sldNum="0" dt="0"/>'))
+    deck.save(str(path))
+    return path
+
+
+def _custom_show_and_section(deck: Any) -> None:
+    """Add a custom show of slide 1 and a section of every slide to ``ppt/presentation.xml``, where PowerPoint does."""
+    root = deck.part._element
+    slides = root.find(qn("p:sldIdLst"))
+    show = parse_pml(
+        f'<p:custShowLst xmlns:p="{P}" xmlns:r="{R}"><p:custShow name="Invented short show" id="0"><p:sldLst>'
+        f'<p:sld r:id="{slides[0].get(qn("r:id"))}"/></p:sldLst></p:custShow></p:custShowLst>'
+    )
+    root.find(qn("p:notesSz")).addnext(show)
+    ids = "".join(f'<p14:sldId id="{entry.get("id")}"/>' for entry in slides)
+    root.append(
+        parse_pml(
+            f'<p:extLst xmlns:p="{P}"><p:ext uri="{SECTIONS_URI}"><p14:sectionLst xmlns:p14="{P14}">'
+            '<p14:section name="Invented section" id="{00000000-0000-0000-0000-000000000001}">'
+            f"<p14:sldIdLst>{ids}</p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst>"
+        )
+    )

@@ -2,10 +2,12 @@
 
 A template is a ``.docx`` or ``.dotx`` (content controls, legacy form fields, ``{{ }}`` placeholders) or an
 ``.xlsx`` (``{{ }}`` cells and ``{{ table:<name> }}`` anchors); nothing else is one, not ``.docm``, ``.xlsm`` or
-``.xltx`` either. The files are untrusted and go through the guards of ``read_document`` first: the zip guard for
-both kinds, and for a workbook the counts openpyxl would otherwise load in one call that no clock can stop. All of
-the work runs under the job's time limit (:mod:`workbench.executor.timer`), so a long library call is interrupted
-too; the libraries parse part XML without entities or network.
+``.xltx`` either. A ``.pptx`` or ``.potx`` is a slide master: ``inspect_template`` lists its layouts
+(:mod:`workbench.executor.presentations.master`), and ``fill_template`` refuses it, since a deck is built in a master
+with ``write_presentation``. The files are untrusted and go through the guards of ``read_document`` first: the zip
+guard for every kind, and for a workbook the counts openpyxl would otherwise load in one call that no clock can stop.
+All of the work runs under the job's time limit (:mod:`workbench.executor.timer`), so a long library call is
+interrupted too; the libraries parse part XML without entities or network.
 
 A fill writes one file into ``out/``: a ``.dotx`` becomes a ``.docx``. Every value is checked in the field's type, and
 every source's page, sheet or cell in the job's copy of its file, before anything is written; a value or source that
@@ -33,7 +35,7 @@ from workbench.executor.timer import limit_until
 from workbench.paths import PathError, check_filename
 
 #: The template types, by extension.
-TEMPLATES: Final = {".docx": "docx", ".dotx": "docx", ".xlsx": "xlsx"}
+TEMPLATES: Final = {".docx": "docx", ".dotx": "docx", ".xlsx": "xlsx", ".pptx": "pptx", ".potx": "pptx"}
 
 #: The answer's fields may take this many times ``max_chars`` as the job writes them; the api cuts them to its limit.
 FIELDS_ROOM: Final = 3
@@ -63,7 +65,7 @@ NEEDS: Final = (
     "box) or legacy form fields in a Word .docx or .dotx; {{ field }} placeholders in a Word .docx, with loops and "
     "conditions; {{ field }} cells and a {{ table:name }} cell for a table in an Excel .xlsx. Ask the user to add them"
 )
-_NOT_A_TEMPLATE: Final = "templates are .docx and .dotx Word files and .xlsx workbooks"
+NOT_A_TEMPLATE: Final = "templates are .docx and .dotx Word files, .xlsx workbooks and .pptx and .potx slide masters"
 _NO_FIELDS: Final = (
     "the template has no content controls, form fields or {{ }} placeholders, so version 1 cannot fill it; "
     "inspect_template says what it needs"
@@ -77,7 +79,7 @@ def _family(path: Path) -> str:
         path: The file.
 
     Returns:
-        ``docx`` or ``xlsx``.
+        ``docx``, ``xlsx`` or ``pptx``.
 
     Raises:
         Refusal: It is not a template (``unsupported_template``).
@@ -86,12 +88,12 @@ def _family(path: Path) -> str:
     family = TEMPLATES.get(ext)
     if family is None:
         shown = ext or "a file without an extension"
-        raise Refusal("unsupported_template", f"{shown} cannot be filled here; {_NOT_A_TEMPLATE}")
+        raise Refusal("unsupported_template", f"{shown} cannot be filled here; {NOT_A_TEMPLATE}")
     return family
 
 
 @contextmanager
-def _limited(budget: float) -> Iterator[None]:
+def limited(budget: float) -> Iterator[None]:
     """Run the work under the job's time limit, the readers' deadline the same, and the libraries' warnings unshown.
 
     What openpyxl warns of as it loads a workbook is not lost: :func:`_open_xlsx` records it for the answer.
@@ -115,30 +117,31 @@ def _limited(budget: float) -> Iterator[None]:
         readers.set_deadline(None)
 
 
-def _answered(work: Callable[[], dict[str, Any]], budget: float) -> dict[str, Any]:
+def answered(work: Callable[[], dict[str, Any]], budget: float, *, unsupported: str = NOT_A_TEMPLATE) -> dict[str, Any]:
     """Run the work, turning what it refuses or cannot read into the answer the api understands.
 
     Args:
         work: The runner's work.
         budget: Seconds it may take.
+        unsupported: What a file of a format the work cannot open is told, after why it cannot.
 
     Returns:
         What the work returns, or an ``error`` result.
     """
     try:
-        with _limited(budget):
+        with limited(budget):
             return work()
     except Refusal as exc:
         return error(exc.code, exc.message)
     except readers.UnreadableFile as exc:
         return error("unreadable_file", str(exc))
     except readers.UnsupportedFormat as exc:
-        return error("unsupported_template", f"{exc}; {_NOT_A_TEMPLATE}")
+        return error("unsupported_template", f"{exc}; {unsupported}")
     except readers.ReadTimeout:
         return error("read_timeout", f"the template took longer than {budget:g} s; it is too large or too complex")
 
 
-def _library(work: Callable[[], Any]) -> Any:
+def library(work: Callable[[], Any]) -> Any:
     """Run a library's work on an untrusted file; whatever it fails with is the file's damage.
 
     Args:
@@ -187,11 +190,11 @@ def _open_docx(path: Path, ctx: JobContext) -> Any:
             template.init_docx()
         except ValueError:
             raise Refusal(
-                "unsupported_template", f"it is not a Word document or template (macros?); {_NOT_A_TEMPLATE}"
+                "unsupported_template", f"it is not a Word document or template (macros?); {NOT_A_TEMPLATE}"
             ) from None
         return template
 
-    return _library(opened)
+    return library(opened)
 
 
 def _open_xlsx(path: Path, ctx: JobContext) -> tuple[Any, list[str]]:
@@ -222,11 +225,11 @@ def _open_xlsx(path: Path, ctx: JobContext) -> tuple[Any, list[str]]:
             book = openpyxl.load_workbook(path, rich_text=True)
         said = [str(warning.message) for warning in caught]
         return book, [
-            _cut(f"Not kept in the filled workbook: {text}.", WARNING_MAX) for text in said if _LOST.search(text)
+            cut(f"Not kept in the filled workbook: {text}.", WARNING_MAX) for text in said if _LOST.search(text)
         ]
 
-    book, losses = _library(opened)
-    flattened = _library(lambda: xlsx_placeholders.flatten_rich_text(book))
+    book, losses = library(opened)
+    flattened = library(lambda: xlsx_placeholders.flatten_rich_text(book))
     if flattened:
         cells = "1 cell holds" if flattened == 1 else f"{flattened} cells hold"
         losses.append(
@@ -236,7 +239,7 @@ def _open_xlsx(path: Path, ctx: JobContext) -> tuple[Any, list[str]]:
     return book, list(dict.fromkeys(losses))
 
 
-def _input(args: Mapping[str, Any], ctx: JobContext) -> tuple[Path, str]:
+def job_input(args: Mapping[str, Any], ctx: JobContext) -> tuple[Path, str]:
     """Find the template among the job's inputs.
 
     Args:
@@ -297,7 +300,7 @@ def _nameable(fields: list[Field]) -> tuple[list[Field], str | None]:
     )
 
 
-def _cut(text: str, limit: int) -> str:
+def cut(text: str, limit: int) -> str:
     """Cut a text to at most ``limit`` characters, marking the cut.
 
     Args:
@@ -321,10 +324,10 @@ def _docx_fields(template: Any) -> tuple[list[Field], list[str]]:
     """
     from workbench.executor.templates import docx_controls, docx_jinja
 
-    found = _library(lambda: docx_controls.find(template.docx))
+    found = library(lambda: docx_controls.find(template.docx))
     places = [spot.field for spot in found.spots]
-    if _library(lambda: docx_jinja.has_code(template)):
-        places += _library(lambda: docx_jinja.fields(template, docx_jinja.environment()))
+    if library(lambda: docx_jinja.has_code(template)):
+        places += library(lambda: docx_jinja.fields(template, docx_jinja.environment()))
     notes: list[str] = []
     if found.unnamed_controls:
         count = found.unnamed_controls
@@ -360,7 +363,7 @@ def _kind(fields: list[Field]) -> str:
 
 
 def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
-    """List the fields of a template, with their types, a drop-down's entries and where they sit.
+    """List the fields of a template, with their types, a drop-down's entries and where they sit; or a master's layouts.
 
     Args:
         args: ``path``, relative to the chat folder; ``budget_s``, the seconds the work may take.
@@ -368,20 +371,26 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
     Returns:
         ``template_kind``, ``fields``, ``total`` (fields there are), ``truncated`` and, when it applies, ``hint``;
-        or an ``error`` result.
+        for a slide master, ``template_kind`` ``slide_master``, ``layouts``, ``slides``, ``total`` (layouts there are)
+        and ``truncated`` (:func:`workbench.executor.presentations.master.inspect`); or an ``error`` result.
     """
     budget = float(args.get("budget_s", _DEFAULT_BUDGET_S))
 
     def work() -> dict[str, Any]:
-        path, _ = _input(args, ctx)
+        path, _ = job_input(args, ctx)
+        family = _family(path)
+        if family == "pptx":
+            from workbench.executor.presentations import master
+
+            return master.inspect(master.open_master(path, ctx), FIELDS_ROOM * ctx.max_chars)
         notes: list[str] = []
-        if _family(path) == "docx":
+        if family == "docx":
             places, notes = _docx_fields(_open_docx(path, ctx))
         else:
             from workbench.executor.templates import xlsx_placeholders
 
             book, _ = _open_xlsx(path, ctx)
-            places = _library(lambda: xlsx_placeholders.fields(book))
+            places = library(lambda: xlsx_placeholders.fields(book))
         merged = merge(places)
         fields, long_names = _nameable(merged)
         if long_names is not None:
@@ -394,7 +403,7 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         room = FIELDS_ROOM * ctx.max_chars
         listed: list[dict[str, Any]] = []
         for field in fields:
-            entry = {**field.as_dict(), "location": _cut(field.location, LOCATION_MAX)}
+            entry = {**field.as_dict(), "location": cut(field.location, LOCATION_MAX)}
             room -= len(json.dumps(entry)) + 2  # and the ", " before the next
             if room < 0:
                 break
@@ -402,10 +411,10 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         truncated = len(listed) < len(fields)  # the api says how many of how many it lists
         answer: dict[str, Any] = {"template_kind": kind, "fields": listed, "total": len(fields), "truncated": truncated}
         if notes:
-            answer["hint"] = _cut(" ".join(notes), WARNING_MAX)
+            answer["hint"] = cut(" ".join(notes), WARNING_MAX)
         return answer
 
-    return _answered(work, budget)
+    return answered(work, budget)
 
 
 def _fill_docx(
@@ -434,11 +443,11 @@ def _fill_docx(
     if not names:
         raise Refusal("unsupported_template", _NO_FIELDS)
     env = docx_jinja.environment()
-    if _library(lambda: docx_jinja.has_code(template)):
-        _library(lambda: docx_jinja.render(template, values, env, warned))
+    if library(lambda: docx_jinja.has_code(template)):
+        library(lambda: docx_jinja.render(template, values, env, warned))
     document = template.docx
     placeholders = {field.name for field in places if field.kind == "placeholder"}
-    not_filled = set(_library(lambda: docx_controls.fill(document, values, warned))) - placeholders
+    not_filled = set(library(lambda: docx_controls.fill(document, values, warned))) - placeholders
     return document, names, not_filled
 
 
@@ -462,11 +471,11 @@ def _fill_xlsx(
     from workbench.executor.templates import xlsx_placeholders
 
     book, losses = _open_xlsx(path, ctx)
-    names = [field.name for field in _library(lambda: xlsx_placeholders.fields(book))]
+    names = [field.name for field in library(lambda: xlsx_placeholders.fields(book))]
     if not names:
         raise Refusal("unsupported_template", _NO_FIELDS)
     warned.extend(losses)
-    _library(lambda: xlsx_placeholders.fill(book, values, warned))
+    library(lambda: xlsx_placeholders.fill(book, values, warned))
     if xlsx_placeholders.unkept_parts(path):
         warned.append(
             "The template has charts, pivot tables, pictures or other drawings: the filled workbook may not keep them "
@@ -495,8 +504,10 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     budget = float(args.get("budget_s", _DEFAULT_BUDGET_S))
 
     def work() -> dict[str, Any]:
-        path, _ = _input(args, ctx)
+        path, _ = job_input(args, ctx)
         family = _family(path)
+        if family == "pptx":
+            raise Refusal("unsupported_template", "a slide master is filled with write_presentation")
         try:
             output = check_filename(str(args["output_name"]))
         except PathError:
@@ -534,6 +545,6 @@ def fill_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             unfilled = unfilled[: LISTED * 10]
         if len(warned) > LISTED:
             warned[LISTED - 1 :] = [f"{len(warned) - LISTED + 1} more warnings are not shown."]
-        return {"filled": filled, "unfilled": unfilled, "warnings": [_cut(warning, WARNING_MAX) for warning in warned]}
+        return {"filled": filled, "unfilled": unfilled, "warnings": [cut(warning, WARNING_MAX) for warning in warned]}
 
-    return _answered(work, budget)
+    return answered(work, budget)
