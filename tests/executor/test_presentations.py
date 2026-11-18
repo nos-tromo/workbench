@@ -5,25 +5,32 @@ decks in it. Every master is built at test time from python-pptx's default prese
 (``tests/fixtures/make_templates.py``), all its text invented.
 """
 
+import io
 import json
+import re
+import struct
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 from lxml import etree
+from PIL import Image as PILImage
 from pptx import Presentation
-from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
+from pptx.util import Length, Pt
 
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
 from workbench import decks
-from workbench.executor.presentations import deck, master, text
+from workbench.executor.presentations import blocks, deck, master, text
 from workbench.executor.runners import RUNNERS, JobContext
 from workbench.executor.runners.templates import LISTED
 from workbench.executor.templates import Refusal
@@ -842,12 +849,12 @@ def test_fit_scales_the_font_to_the_place() -> None:
     body.append(parse_xml(f"<a:noAutofit {nsdecls('a')}/>"))
     body.append(parse_xml(f"<a:extLst {nsdecls('a')}/>"))
     place = master.Place(role="text", lines=10, chars=40, idx=1, shape=None)
-    assert deck.fit(frame, 10, place) is True
+    assert blocks.fit(frame, 10, place) is True
     assert [child.tag.split("}")[1] for child in body] == ["noAutofit", "extLst"]
-    assert deck.fit(frame, 12, place) is True
+    assert blocks.fit(frame, 12, place) is True
     assert [child.tag.split("}")[1] for child in body] == ["normAutofit", "extLst"]
     assert (body[0].get("fontScale"), body[0].get("lnSpcReduction")) == ("83333", "10000")
-    assert deck.fit(frame, 30, place) is False
+    assert blocks.fit(frame, 30, place) is False
     assert body[0].get("fontScale") == "60000"
 
 
@@ -964,19 +971,21 @@ def test_parts_of_one_name_are_refused(job: Job) -> None:
         ({"path": "report.docx"}, "unsupported_template: a deck is built in a .pptx or .potx slide master"),
         (
             {"slides": [{"layout": TITLE_AND_CONTENT, "content": ["Invented", "Invented"]}]},
-            "invalid_value: slide 1: 2 blocks, but layout 2 has 1 place",
+            "invalid_value: slide 1, block 2: text goes into a text or content place; layout 'Titel und Inhalt' has: "
+            "content",
         ),
         (
             {"slides": [{"layout": TITLE_SLIDE, "content": ["Invented"]}]},
-            "invalid_value: slide 1: 1 block, but layout 1 has no place for one",
+            "invalid_value: slide 1, block 1: text goes into a text or content place; layout 'Title Slide' has: none",
         ),
         (
             {"slides": [{"layout": PICTURE_WITH_CAPTION, "content": ["Invented"]}]},
-            "invalid_value: slide 1, block 1: text goes into a text or content place, and place 1 takes a picture",
+            "invalid_value: slide 1, block 1: text goes into a text or content place; layout 'Picture with Caption' "
+            "has: picture, text",
         ),
         (
-            {"slides": [{"layout": TITLE_AND_CONTENT, "content": [{"table": [["Invented"]]}]}]},
-            "invalid_value: slide 1, block 1: ",
+            {"slides": [{"layout": TITLE_AND_CONTENT, "content": [{"image": "missing.png"}]}]},
+            "invalid_value: slide 1, block 1: /workspace/chat-1/missing.png is not in this conversation",
         ),
     ],
 )
@@ -987,3 +996,398 @@ def test_a_deck_that_cannot_be_written_is_refused(job: Job, change: dict[str, An
     args = {"path": "master.pptx", "name": "deck.pptx", "slides": [{"layout": 2}], "budget_s": 30, **change}
     assert RUNNERS["write_presentation"](args, job.ctx)["error"].startswith(wanted)
     assert list(job.ctx.out_dir.iterdir()) == []
+
+
+# --- tables, charts and images ------------------------------------------------------------------------------------
+
+TWO_CONTENT = 4
+CATEGORIES = ["Invented north", "Invented south", "Invented east"]
+TONNES = {"Invented tonnes": [12, 7, 3]}
+TWO_SERIES = {**TONNES, "Invented crates": [4, 5, 6]}
+CHART_PART = re.compile(r"ppt/charts/chart\d+\.xml")
+WORKBOOK_PART = re.compile(r"ppt/embeddings/Microsoft_Excel_Sheet\d+\.xlsx")
+
+
+def image(name: str, **extra: Any) -> dict[str, Any]:
+    """An image block as the api hands it to the runner: the path below the chat folder and its virtual path."""
+    return {"image": name, "virtual": f"/workspace/{CHAT}/{name}", **extra}
+
+
+def chart(kind: str, series: dict[str, list[Any]], categories: list[Any] | None = None) -> dict[str, Any]:
+    """A chart block."""
+    return {"chart": {"type": kind, "categories": CATEGORIES if categories is None else categories, "series": series}}
+
+
+def place_of(layout: int, index: int = 0) -> Any:
+    """A place of python-pptx's default master, the master ``make_master`` builds on, by layout number and order."""
+    return master.layouts(Presentation())[layout - 1].places[index]
+
+
+def frame_idx(shape: Any) -> str | None:
+    """The ``p:ph idx`` a graphic frame or picture carries, if any."""
+    found = shape._element.find(f"./*/{qn('p:nvPr')}/{qn('p:ph')}")
+    return None if found is None else found.get("idx", "0")
+
+
+def pillow(kind: str, size: tuple[int, int] = (4, 2)) -> bytes:
+    """A small picture written by Pillow in another format: ``JPEG``, ``GIF`` or ``BMP``."""
+    buffer = io.BytesIO()
+    PILImage.new("RGB", size, (128, 128, 128)).save(buffer, kind)
+    return buffer.getvalue()
+
+
+def claimed(width: int, height: int) -> bytes:
+    """A PNG whose header claims a size its few bytes do not hold: only the header is read before it is refused."""
+    header = b"IHDR" + struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    png = mk._png()
+    return png[:8] + struct.pack(">I", 13) + header + struct.pack(">I", zlib.crc32(header)) + png[33:]
+
+
+def test_a_table_fills_a_content_place(job: Job) -> None:
+    """A native table takes the content place, its ``ph idx`` kept: the header first, a short row padded."""
+    mt.make_master(job.path("master.pptx"))
+    rows = [["Invented pier", "Invented tonnes"], ["Invented north", 12], ["Invented south"]]
+    answer = job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented", "content": [{"table": rows}]}])
+    assert answer == {"slides": 1, "warnings": []}
+    slide = job.deck().slides[0]
+    place = place_of(TITLE_AND_CONTENT)
+    frames = slide.shapes._spTree.findall(qn("p:graphicFrame"))
+    assert len(frames) == 1
+    assert frames[0].find(f".//{qn('a:tbl')}") is not None
+    shape = next(shape for shape in slide.shapes if shape.has_table)
+    assert frame_idx(shape) == str(place.idx)
+    table = shape.table
+    assert (len(table.rows), len(table.columns)) == (3, 2)
+    assert [[cell.text for cell in row.cells] for row in table.rows] == [
+        ["Invented pier", "Invented tonnes"],
+        ["Invented north", "12"],
+        ["Invented south", ""],
+    ]
+    assert table.first_row is True
+    assert {row.height for row in table.rows} == {place.shape.height // 3}
+    assert (shape.left, shape.top, shape.width, shape.height) == (
+        place.shape.left,
+        place.shape.top,
+        place.shape.width,
+        place.shape.height // 3 * 3,
+    )
+    sizes = {
+        run.font.size for row in table.rows for cell in row.cells for p in cell.text_frame.paragraphs for run in p.runs
+    }
+    assert sizes == {None}
+
+
+@pytest.mark.parametrize(("count", "size"), [(8, None), (9, Pt(12))])
+def test_a_long_table_takes_a_smaller_font(job: Job, count: int, size: Length | None) -> None:
+    """More than eight rows are written at 12 pt, every cell, an empty one too; eight keep the master's size."""
+    mt.make_master(job.path("master.pptx"))
+    rows = [["Invented column", "Invented value"], *[[f"Invented {number}"] for number in range(count - 1)]]
+    job.write([{"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]}])
+    table = next(shape for shape in job.deck().slides[0].shapes if shape.has_table).table
+    assert len(table.rows) == count
+    paragraphs = [p for row in table.rows for cell in row.cells for p in cell.text_frame.paragraphs]
+    assert {run.font.size for p in paragraphs for run in p.runs} == {size}
+    ends = [p._p.endParaRPr for p in paragraphs]
+    assert {None if end is None else end.sz for end in ends} == {None if size is None else size.centipoints}
+
+
+def test_a_tables_values_are_shown_as_text(job: Job) -> None:
+    """A number, a bool and null are shown as text, the null empty; a character XML cannot hold is replaced."""
+    mt.make_master(job.path("master.pptx"))
+    rows = [["Invented a", "Invented b", "Invented c"], [1.5, True, None], [-3, False, "Invented\x01d"]]
+    answer = job.write([{"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]}])
+    assert answer["warnings"] == ["slide 1, block 1: characters a document cannot hold were replaced with �"]
+    table = next(shape for shape in job.deck().slides[0].shapes if shape.has_table).table
+    assert [[cell.text for cell in row.cells] for row in table.rows][1:] == [
+        ["1.5", "true", ""],
+        ["-3", "false", "Invented�d"],
+    ]
+
+
+def test_a_chart_is_native_and_editable(job: Job) -> None:
+    """Each type is PowerPoint's own chart in the content place, its data in an embedded workbook; no colour is set."""
+    mt.make_master(job.path("master.pptx"))
+    kinds_asked = [("column", TONNES), ("bar", TWO_SERIES), ("line", TWO_SERIES), ("pie", TONNES)]
+    slides = [{"layout": TITLE_AND_CONTENT, "content": [chart(kind, series)]} for kind, series in kinds_asked]
+    assert job.write(slides)["warnings"] == []
+    out = job.ctx.out_dir / "deck.pptx"
+    with zipfile.ZipFile(out) as package:
+        names = package.namelist()
+        charts = [package.read(name) for name in names if CHART_PART.fullmatch(name)]
+    assert len(charts) == 4
+    assert len([name for name in names if WORKBOOK_PART.fullmatch(name)]) == 4
+    for xml in charts:
+        assert b"srgbClr" not in xml
+        assert b"schemeClr" not in xml
+    frames: list[Any] = [next(s for s in slide.shapes if s.has_chart) for slide in Presentation(str(out)).slides]
+    assert [frame_idx(frame) for frame in frames] == ["1"] * 4
+    drawn = [frame.chart for frame in frames]
+    assert [one.chart_type for one in drawn] == [
+        XL_CHART_TYPE.COLUMN_CLUSTERED,
+        XL_CHART_TYPE.BAR_CLUSTERED,
+        XL_CHART_TYPE.LINE_MARKERS,
+        XL_CHART_TYPE.PIE,
+    ]
+    assert [one.has_legend for one in drawn] == [False, True, True, True]
+    for one in drawn[1:]:
+        assert (one.legend.position, one.legend.include_in_layout) == (XL_LEGEND_POSITION.BOTTOM, False)
+    column, bar = drawn[0], drawn[1]
+    assert (column.category_axis.reverse_order, bar.category_axis.reverse_order) == (False, True)
+    crossing = [one._chartSpace.find(f".//{qn('c:valAx')}/{qn('c:crosses')}").get("val") for one in (column, bar)]
+    assert crossing == ["autoZero", "max"]
+    for one in drawn:
+        assert one.part.chart_workbook.xlsx_part is not None
+    assert [list(one.plots[0].categories) for one in drawn] == [CATEGORIES] * 4
+    assert [series.name for series in drawn[2].series] == list(TWO_SERIES)
+    assert list(drawn[2].series[1].values) == TWO_SERIES["Invented crates"]
+
+
+def test_a_chart_keeps_its_gaps(job: Job) -> None:
+    """A null value is a gap: no point is written for it, in a line and in a pie."""
+    mt.make_master(job.path("master.pptx"))
+    gappy = {"Invented tonnes": [1, None, 3]}
+    job.write([{"layout": TITLE_AND_CONTENT, "content": [chart(kind, gappy)]} for kind in ("line", "pie")])
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        charts = [
+            etree.fromstring(package.read(name)) for name in sorted(package.namelist()) if CHART_PART.fullmatch(name)
+        ]
+    assert len(charts) == 2
+    for root in charts:
+        (values,) = root.iter(qn("c:val"))
+        points = values.findall(f".//{qn('c:pt')}")
+        assert [(point.get("idx"), point.findtext(qn("c:v"))) for point in points] == [("0", "1"), ("2", "3")]
+
+
+def test_chart_categories_are_numbers_or_text(job: Job) -> None:
+    """Categories that are all numbers stay numbers; a mix is written as text, so the chart stays valid."""
+    mt.make_master(job.path("master.pptx"))
+    series = {"Invented tonnes": [1, 2]}
+    job.write(
+        [
+            {"layout": TITLE_AND_CONTENT, "content": [chart("column", series, [2024, 2025.5])]},
+            {"layout": TITLE_AND_CONTENT, "content": [chart("column", series, [2024, "Invented later"])]},
+        ]
+    )
+    first, second = (next(s for s in slide.shapes if s.has_chart).chart for slide in job.deck().slides)
+    numbers = first._chartSpace.find(f".//{qn('c:cat')}")
+    assert numbers[0].tag == qn("c:numRef")
+    assert [point.findtext(qn("c:v")) for point in numbers.iter(qn("c:pt"))] == ["2024", "2025.5"]
+    texts = second._chartSpace.find(f".//{qn('c:cat')}")
+    assert texts[0].tag == qn("c:strRef")
+    assert list(second.plots[0].categories) == ["2024", "Invented later"]
+
+
+def test_a_charts_workbook_holds_text_as_text(job: Job) -> None:
+    """A label that looks like a formula or a link is text in the embedded workbook, never a formula or a link."""
+    mt.make_master(job.path("master.pptx"))
+    labels = ["=1+2", "https://example.invalid/", "@Invented"]
+    job.write([{"layout": TITLE_AND_CONTENT, "content": [chart("line", {"=SUM(1,2)": [1, 2, 3]}, labels)]}])
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        (name,) = [name for name in package.namelist() if WORKBOOK_PART.fullmatch(name)]
+        embedded = package.read(name)
+    with zipfile.ZipFile(io.BytesIO(embedded)) as workbook:
+        sheet = workbook.read("xl/worksheets/sheet1.xml")
+        parts = workbook.namelist()
+    assert b"<f>" not in sheet
+    assert b"hyperlink" not in sheet
+    assert not [part for part in parts if part.endswith("sheet1.xml.rels")]
+    drawn = next(shape for shape in job.deck().slides[0].shapes if shape.has_chart).chart
+    assert list(drawn.plots[0].categories) == labels
+
+
+def test_an_image_is_cropped_in_a_picture_place_and_fitted_in_a_content_place(job: Job) -> None:
+    """A picture place is filled, the picture cropped; in a content place it is fitted, centred, its aspect kept."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("square.png").write_bytes(mk._png(8))
+    job.path("figures").mkdir()
+    job.path("figures/wide.png").write_bytes(mk._png(16, 8))
+    slides = [
+        {"layout": PICTURE_WITH_CAPTION, "title": "Invented", "content": [image("square.png", alt="Invented grey")]},
+        {"layout": TITLE_AND_CONTENT, "title": "Invented", "content": [image("figures/wide.png")]},
+    ]
+    assert job.write(slides)["warnings"] == []
+    first, second = job.deck().slides
+
+    cropped = first.placeholders[1]
+    assert cropped._element.tag == qn("p:pic")
+    assert (cropped.crop_left, cropped.crop_right) == (0, 0)
+    assert cropped.crop_top == pytest.approx(0.125) and cropped.crop_bottom == pytest.approx(0.125)
+    assert cropped._element.nvPicPr.cNvPr.get("descr") == "Invented grey"
+
+    place = place_of(TITLE_AND_CONTENT).shape
+    pictures = [shape for shape in second.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    assert len(pictures) == 1
+    fitted = pictures[0]
+    assert not fitted.is_placeholder
+    assert 1 not in {shape.placeholder_format.idx for shape in second.placeholders}
+    assert fitted.width / fitted.height == pytest.approx(2, rel=1e-4)
+    assert (fitted.crop_left, fitted.crop_right, fitted.crop_top, fitted.crop_bottom) == (0, 0, 0, 0)
+    assert place.left <= fitted.left and fitted.left + fitted.width <= place.left + place.width
+    assert place.top <= fitted.top and fitted.top + fitted.height <= place.top + place.height
+    assert fitted.width == place.width
+    assert abs((fitted.top - place.top) - (place.top + place.height - fitted.top - fitted.height)) <= 1
+    assert list(second.shapes).index(fitted) == 1
+    assert fitted._element.nvPicPr.cNvPr.get("descr") is None
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        assert [name for name, data in ((n, package.read(n)) for n in package.namelist()) if b"wide.png" in data] == []
+
+
+def test_a_jpeg_and_a_gif_are_placed_by_their_content(job: Job) -> None:
+    """A picture is known by its content, not its extension: a JPEG named .png is placed as the JPEG it is."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("photo.png").write_bytes(pillow("JPEG"))
+    job.path("drawing.gif").write_bytes(pillow("GIF"))
+    slides = [{"layout": TITLE_AND_CONTENT, "content": [image(name)]} for name in ("photo.png", "drawing.gif")]
+    assert job.write(slides)["warnings"] == []
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        media = sorted(name.rsplit(".", 1)[1] for name in package.namelist() if name.startswith("ppt/media/"))
+    assert media == ["gif", "jpg"]
+    for slide in job.deck().slides:
+        (picture,) = [shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        assert picture.width / picture.height == pytest.approx(2, rel=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("content", "wanted"),
+    [
+        (b"Invented text, not a picture", "is not a PNG, JPEG or GIF image"),
+        (pillow("BMP"), "is not a PNG, JPEG or GIF image"),
+        (claimed(8000, 6000), "is larger than 40 megapixels"),
+        (claimed(20000, 10000), "is larger than 40 megapixels"),
+    ],
+)
+def test_a_bad_image_is_refused(job: Job, content: bytes, wanted: str) -> None:
+    """A file that is not a PNG, JPEG or GIF, whatever its extension, or too many pixels: refused, nothing written."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("figure.png").write_bytes(content)
+    slides = [
+        {"layout": TITLE_ONLY, "title": "Invented"},
+        {"layout": TITLE_AND_CONTENT, "content": [image("figure.png")]},
+    ]
+    error = job.write(slides)["error"]
+    assert error == f"invalid_value: slide 2, block 1: /workspace/{CHAT}/figure.png {wanted}"
+    assert list(job.ctx.out_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["missing.png", "out/figure.png", "../figure.png", "folder.png"])
+def test_an_image_not_in_the_chat_is_refused(job: Job, name: str) -> None:
+    """A picture that is not a file among the job's inputs is not in this conversation; no path of the job is said."""
+    mt.make_master(job.path("master.pptx"))
+    (job.ctx.out_dir / "figure.png").write_bytes(mk._png())
+    job.path("folder.png").mkdir()
+    error = job.write([{"layout": TITLE_AND_CONTENT, "content": [image(name)]}])["error"]
+    assert error == f"invalid_value: slide 1, block 1: /workspace/{CHAT}/{name} is not in this conversation"
+    assert str(job.ctx.work_dir) not in error
+
+
+def test_images_over_their_bytes_are_refused(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The executor measures the files too: one over the bytes of a picture, or all together over the deck's."""
+    mt.make_master(job.path("master.pptx"))
+    figure = mk._png(8)
+    job.path("figure.png").write_bytes(figure)
+    slides = [{"layout": TWO_CONTENT, "content": [image("figure.png"), image("figure.png")]}]
+    monkeypatch.setattr(decks, "MAX_IMAGES_BYTES", len(figure) * 2 - 1)
+    error = job.write(slides)["error"]
+    assert error == "invalid_value: slide 1, block 2: the deck's images take more than 0 MB together"
+    monkeypatch.setattr(decks, "MAX_IMAGE_BYTES", len(figure) - 1)
+    error = job.write(slides)["error"]
+    assert error == f"invalid_value: slide 1, block 1: /workspace/{CHAT}/figure.png is larger than 0 MB"
+    assert list(job.ctx.out_dir.iterdir()) == []
+
+
+def test_blocks_that_do_not_fit_the_layout_are_refused(job: Job) -> None:
+    """A block its place does not take, or one past the layout's places, is refused with the layout's places."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("figure.png").write_bytes(mk._png())
+    cases = [
+        (
+            [{"layout": TITLE_ONLY, "title": "Invented"}, {"layout": TITLE_ONLY, "content": [{"table": [["A"]]}]}],
+            "slide 2, block 1: a table goes into a table or content place; layout 'Title Only' has: none",
+        ),
+        (
+            [{"layout": COMPARISON, "content": [image("figure.png")]}],
+            "slide 1, block 1: an image goes into a picture or content place; layout 'Comparison' has: text, text, "
+            "content, content",
+        ),
+        (
+            [{"layout": TITLE_AND_CONTENT, "content": ["Invented", chart("pie", TONNES), "Invented"]}],
+            "slide 1, block 2: a chart goes into a chart or content place; layout 'Titel und Inhalt' has: content",
+        ),
+        (
+            [{"layout": PICTURE_WITH_CAPTION, "content": [image("figure.png"), image("figure.png")]}],
+            "slide 1, block 2: an image goes into a picture or content place; layout 'Picture with Caption' has: "
+            "picture, text",
+        ),
+    ]
+    for slides, wanted in cases:
+        assert job.write(slides)["error"] == f"invalid_value: {wanted}"
+        assert list(job.ctx.out_dir.iterdir()) == []
+
+
+def test_a_table_and_a_chart_take_their_own_places(job: Job) -> None:
+    """A table place takes a table and a chart place a chart, each keeping its ``ph``; text goes into neither."""
+
+    def retype(prs: Any) -> None:
+        layout = prs.slide_layouts[TWO_CONTENT - 1]
+        for idx, kind in ((1, "tbl"), (2, "chart")):
+            layout.placeholders.get(idx=idx)._element.ph.set("type", kind)
+
+    resaved(mt.make_master(job.path("master.pptx")), retype)
+    answer = job.write(
+        [{"layout": TWO_CONTENT, "content": [{"table": [["Invented"], ["Invented"]]}, chart("bar", TONNES)]}]
+    )
+    assert answer["warnings"] == []
+    slide = job.deck().slides[0]
+    table = next(shape for shape in slide.shapes if shape.has_table)
+    drawn = next(shape for shape in slide.shapes if shape.has_chart)
+    assert (table.placeholder_format.type, frame_idx(table)) == (PP_PLACEHOLDER.TABLE, "1")
+    assert (drawn.placeholder_format.type, frame_idx(drawn)) == (PP_PLACEHOLDER.CHART, "2")
+    error = job.write([{"layout": TWO_CONTENT, "content": ["Invented"]}], name="text.pptx")["error"]
+    wanted = "slide 1, block 1: text goes into a text or content place; layout 'Two Content' has: table, chart"
+    assert error == f"invalid_value: {wanted}"
+
+
+def test_characters_a_chart_or_an_alt_text_cannot_hold_are_replaced(job: Job) -> None:
+    """A category, a series' name and an alt text with a control character are written with U+FFFD, and warned of."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("figure.png").write_bytes(mk._png())
+    content = [
+        chart("column", {"Invented\x02tonnes": [1, 2]}, ["Invented\x01north", "South"]),
+        image("figure.png", alt="A\x03b"),
+    ]
+    warnings = job.write([{"layout": TWO_CONTENT, "content": content}])["warnings"]
+    assert warnings == [
+        f"slide 1, block {block}: characters a document cannot hold were replaced with �" for block in (1, 2)
+    ]
+    slide = job.deck().slides[0]
+    drawn = next(shape for shape in slide.shapes if shape.has_chart).chart
+    assert list(drawn.plots[0].categories) == ["Invented�north", "South"]
+    assert drawn.series[0].name == "Invented�tonnes"
+    (picture,) = [shape for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    assert picture._element.nvPicPr.cNvPr.get("descr") == "A�b"
+
+
+def test_a_deck_of_every_block_kind_has_parts_of_their_own(job: Job) -> None:
+    """Text, tables, charts and pictures across slides: every part a name of its own, a picture used twice kept once."""
+    mt.make_master(job.path("master.pptx"))
+    job.path("figure.png").write_bytes(mk._png(16, 8))
+    slides = [
+        {"layout": TWO_CONTENT, "content": ["- Invented point", {"table": [["Invented"], [1]]}]},
+        {"layout": TWO_CONTENT, "content": [chart("column", TONNES), image("figure.png")]},
+        {"layout": TWO_CONTENT, "content": [chart("pie", TONNES), image("figure.png", alt="Invented")]},
+    ]
+    assert job.write(slides) == {"slides": 3, "warnings": []}
+    out = job.ctx.out_dir / "deck.pptx"
+    with zipfile.ZipFile(out) as package:
+        names = package.namelist()
+    assert len({name.lower() for name in names}) == len(names)
+    assert len([name for name in names if CHART_PART.fullmatch(name)]) == 2
+    assert len([name for name in names if WORKBOOK_PART.fullmatch(name)]) == 2
+    assert len([name for name in names if name.startswith("ppt/media/")]) == 1
+    reopened = Presentation(str(out))
+    assert len({str(part.partname).lower() for part in reopened.part.package.iter_parts()}) == len(
+        list(reopened.part.package.iter_parts())
+    )
+    for slide in reopened.slides:
+        ids = [shape.shape_id for shape in slide.shapes]
+        assert len(ids) == len(set(ids))

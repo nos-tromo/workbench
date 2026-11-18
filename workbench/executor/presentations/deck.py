@@ -1,11 +1,11 @@
 """A deck built in a user's slide master: the master's example slides removed, then one slide a layout for each asked.
 
 A slide is made from the layout it names (:func:`resolve`): its title and subtitle, block i of its content in place i of
-the layout (the reading order ``inspect_template`` lists), the layout's footer and slide number (:func:`copy_footers`),
-and its notes with its sources. A place no block fills is removed, so that no slide says "Click to add text"; text that
-may not fit its place is shrunk (:func:`fit`). The example slides go first, with what in the package still describes
-them (:func:`remove_slides`), and before the deck is written no example slide may be left in it and its part names must
-be unique (:func:`check_parts`).
+the layout (the reading order ``inspect_template`` lists), as :mod:`.blocks` places text, tables, charts and pictures,
+the layout's footer and slide number (:func:`copy_footers`), and its notes with its sources. A place no block fills is
+removed, so that no slide says "Click to add text". The example slides go first, with what in the package still
+describes them (:func:`remove_slides`), and before the deck is written no example slide may be left in it and its part
+names must be unique (:func:`check_parts`).
 
 The master is untrusted: its python-pptx objects are worked on under
 :func:`~workbench.executor.runners.templates.library`, so whatever the library fails with is the file's damage. What the
@@ -14,14 +14,13 @@ both name the slide, never a path of the job. Nothing here logs: a slide's text 
 """
 
 import copy
-import dataclasses
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from functools import partial
+from pathlib import Path
 from typing import Any, Final
 
 from pptx.enum.shapes import PP_PLACEHOLDER
-from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.opc.constants import CONTENT_TYPE as CT
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.oxml import serialize_part_xml
@@ -31,17 +30,10 @@ from pptx.oxml.xmlchemy import OxmlElement
 
 from workbench import decks
 from workbench.executor.context import JobContext
-from workbench.executor.presentations import master, text
-from workbench.executor.presentations.master import Layout, Place
+from workbench.executor.presentations import blocks, master
+from workbench.executor.presentations.master import Layout
 from workbench.executor.runners.templates import LISTED, LISTED_ROOM, cut, library
 from workbench.executor.templates import Refusal, safe_text, sources
-
-#: ``normAutofit``'s ``fontScale``, in thousandths of a percent: the full size, and the least that text is shrunk to.
-FULL_SCALE: Final = 100_000
-MIN_SCALE: Final = 60_000
-
-#: How much shrunk text's line spacing is reduced, in thousandths of a percent.
-LINE_REDUCTION: Final = "10000"
 
 #: The extension of ``ppt/presentation.xml`` that holds PowerPoint's sections, and the sections' element.
 _SECTIONS: Final = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
@@ -56,8 +48,6 @@ _LINKED: Final = (
 
 _TITLES: Final = frozenset({PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE})
 _SUBTITLES: Final = frozenset({PP_PLACEHOLDER.SUBTITLE})
-_TEXT_ROLES: Final = frozenset({"text", "content"})
-_REPLACED: Final = "characters a document cannot hold were replaced with �"
 
 
 def remove_slides(prs: Any) -> None:
@@ -222,29 +212,6 @@ def copy_footers(slide: Any, layout: Layout, number: int) -> None:
         tree.insert_element_before(element, "p:extLst")
 
 
-def fit(frame: Any, needed: int, place: Place) -> bool:
-    """Shrink a text frame's text when it needs more lines than its place has, as PowerPoint's autofit would.
-
-    The font is scaled to the place's lines over the lines needed, but not below :data:`MIN_SCALE`, and the line
-    spacing is reduced by :data:`LINE_REDUCTION`. A bare ``normAutofit`` would shrink nothing until the text is edited.
-
-    Args:
-        frame: The python-pptx text frame, written.
-        needed: The lines its text takes at full size (:func:`~workbench.executor.presentations.text.estimate_lines`).
-        place: The place it fills.
-
-    Returns:
-        Whether the text fits at the scale written; ``False`` when even :data:`MIN_SCALE` is too large.
-    """
-    if needed <= place.lines:
-        return True
-    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
-    autofit = frame._bodyPr.normAutofit
-    autofit.set("fontScale", str(max(MIN_SCALE, FULL_SCALE * place.lines // needed)))
-    autofit.set("lnSpcReduction", LINE_REDUCTION)
-    return FULL_SCALE * place.lines >= MIN_SCALE * needed
-
-
 def check_parts(prs: Any) -> None:
     """Make sure the deck holds no slide but its own, and each part a name of its own, as a package's names ignore case.
 
@@ -270,7 +237,7 @@ def check_parts(prs: Any) -> None:
 def build(prs: Any, args: Mapping[str, Any], ctx: JobContext, warnings: list[str]) -> int:
     """Build the deck in the master: its example slides removed, then every slide asked for, in order.
 
-    Every layout and every source is checked before a slide is made.
+    Every layout, every block's place, every picture and every source is checked before a slide is made.
 
     Args:
         prs: The master, open.
@@ -290,6 +257,9 @@ def build(prs: Any, args: Mapping[str, Any], ctx: JobContext, warnings: list[str
     slides: Sequence[Mapping[str, Any]] = args["slides"]
     found = master.layouts(prs)
     chosen = [resolve(found, slide["layout"], number) for number, slide in enumerate(slides, 1)]
+    for number, (slide, layout) in enumerate(zip(slides, chosen, strict=True), 1):
+        blocks.check_places(layout, slide.get("content", []), number)
+    images = blocks.find_images(slides, ctx)
     cited = sources.check(
         {
             _label(number, index): {"source": source}
@@ -302,7 +272,7 @@ def build(prs: Any, args: Mapping[str, Any], ctx: JobContext, warnings: list[str
     library(lambda: remove_slides(prs))
     for number, (slide, layout) in enumerate(zip(slides, chosen, strict=True), 1):
         notes = _notes(slide, number, cited if include else None)
-        library(partial(_slide, prs, layout, slide, number, notes, warnings))
+        library(partial(_slide, prs, layout, slide, number, notes, images, warnings))
     library(lambda: check_parts(prs))
     return len(slides)
 
@@ -343,11 +313,19 @@ def _notes(slide: Mapping[str, Any], number: int, cited: Mapping[str, str] | Non
     return "\n\n".join(parts)
 
 
-def _slide(prs: Any, layout: Layout, spec: Mapping[str, Any], number: int, notes: str, warnings: list[str]) -> None:
+def _slide(
+    prs: Any,
+    layout: Layout,
+    spec: Mapping[str, Any],
+    number: int,
+    notes: str,
+    images: Mapping[str, Path],
+    warnings: list[str],
+) -> None:
     """Add one slide: its title and subtitle, its blocks, its footers and its notes; the places left empty removed.
 
-    The places that hold something are known by ``idx``, which a placeholder keeps when a table, chart or picture
-    takes its place.
+    The places that hold something are known by ``idx``, which a placeholder keeps when a table or chart takes its
+    place, or a picture a picture place's.
 
     Args:
         prs: The presentation.
@@ -355,10 +333,8 @@ def _slide(prs: Any, layout: Layout, spec: Mapping[str, Any], number: int, notes
         spec: The slide as asked.
         number: Its number.
         notes: Its speaker notes (:func:`_notes`).
+        images: The deck's pictures (:func:`~.blocks.find_images`).
         warnings: Where warnings go.
-
-    Raises:
-        Refusal: A block cannot go into its place.
     """
     slide = prs.slides.add_slide(layout.layout)
     filled: set[int] = set()
@@ -372,7 +348,7 @@ def _slide(prs: Any, layout: Layout, spec: Mapping[str, Any], number: int, notes
             continue
         shape.text_frame.text = safe_text(f"slide {number}, {field}", str(value), warnings)
         filled.add(shape.placeholder_format.idx)
-    _content(slide, layout, spec.get("content", []), number, filled, warnings)
+    blocks.fill(slide, layout, spec.get("content", []), number, images, filled, warnings)
     for shape in list(slide.placeholders):
         if shape.placeholder_format.idx not in filled:
             shape._element.getparent().remove(shape._element)
@@ -383,53 +359,3 @@ def _slide(prs: Any, layout: Layout, spec: Mapping[str, Any], number: int, notes
             warnings.append(f"slide {number}: the master's notes page has no place for notes; they were left out")
         else:
             frame.text = safe_text(f"slide {number}, notes", notes, warnings)
-
-
-def _content(
-    slide: Any, layout: Layout, blocks: Sequence[Any], number: int, filled: set[int], warnings: list[str]
-) -> None:
-    """Fill the slide's places with its blocks, block i in place i.
-
-    Args:
-        slide: The slide.
-        layout: Its layout.
-        blocks: The slide's content.
-        number: Its number.
-        filled: The ``idx`` of each place that holds something, added to.
-        warnings: Where warnings go.
-
-    Raises:
-        Refusal: There are more blocks than places, or a block cannot go into its place (``invalid_value``).
-    """
-    if len(blocks) > len(layout.places):
-        places = len(layout.places)
-        room = "no place for one" if not places else f"{places} place{'' if places == 1 else 's'}"
-        count = f"{len(blocks)} block{'' if len(blocks) == 1 else 's'}"
-        raise Refusal("invalid_value", f"slide {number}: {count}, but layout {layout.number} has {room}")
-    for index, (block, place) in enumerate(zip(blocks, layout.places[: len(blocks)], strict=True), 1):
-        where = f"slide {number}, block {index}"
-        kind = decks.block_kind(block)
-        if kind != "text":
-            raise Refusal("invalid_value", f"{where}: a {kind} block is not written in this version")
-        if place.role not in _TEXT_ROLES:
-            raise Refusal(
-                "invalid_value",
-                f"{where}: text goes into a text or content place, and place {index} takes a {place.role}",
-            )
-        if not block.strip():
-            continue
-        try:
-            on_slide = dataclasses.replace(place, shape=slide.placeholders[place.idx])
-        except KeyError:
-            warnings.append(f"{where}: the layout's place {index} is not on the slide; the block was left out")
-            continue
-        frame = on_slide.shape.text_frame
-        written = text.write_markdown(frame, block)
-        if written.replaced:
-            warnings.append(f"{where}: {_REPLACED}")
-        if not fit(frame, text.estimate_lines(written, on_slide.chars), on_slide):
-            warnings.append(
-                f"slide {number}: the text may not fit, even at {MIN_SCALE // 1000} % of its size (block {index}); "
-                "shorten it or move some of it to another slide"
-            )
-        filled.add(place.idx)

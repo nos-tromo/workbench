@@ -59,6 +59,39 @@ def _listed(warned: list[str]) -> list[str]:
     return [cut(warning, WARNING_MAX) for warning in warned]
 
 
+def _as_checked(slides: object) -> object:
+    """Take the slides as the api checked them: an image block without the ``virtual`` path the api adds for messages.
+
+    Args:
+        slides: The runner's ``slides``.
+
+    Returns:
+        The slides, each image block without ``virtual``; anything that is not a list of slides as it is.
+    """
+    if not isinstance(slides, list):
+        return slides
+    return [
+        {**slide, "content": [_without_virtual(block) for block in slide["content"]]}
+        if isinstance(slide, dict) and isinstance(slide.get("content"), list)
+        else slide
+        for slide in slides
+    ]
+
+
+def _without_virtual(block: object) -> object:
+    """Leave out an image block's ``virtual``, which the runner does not trust: it names a picture by its own path.
+
+    Args:
+        block: A block of a slide.
+
+    Returns:
+        The block, or for an image block a copy without ``virtual``.
+    """
+    if isinstance(block, dict) and decks.block_kind(block) == "image":
+        return {key: value for key, value in block.items() if key != "virtual"}
+    return block
+
+
 def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Build a deck in a slide master into a new ``.pptx`` in ``out/``.
 
@@ -66,8 +99,9 @@ def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         args: ``path`` (the master, relative to the chat folder); ``name`` (the new file's, with ``.pptx``);
             ``slides`` (each a ``layout`` and, optionally, ``title``, ``subtitle``, ``content``, ``notes`` and
             ``sources``; a file source's ``path`` is relative to the chat folder and ``virtual`` is how the notes
-            name it); ``include_sources``, whether the notes end with the sources; and ``budget_s``, the seconds the
-            work may take.
+            name it; an image block's ``image`` is relative to the chat folder too, its ``virtual`` left aside);
+            ``include_sources``, whether the notes end with the sources; and ``budget_s``, the seconds the work may
+            take.
         ctx: The job's surroundings.
 
     Returns:
@@ -78,7 +112,7 @@ def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     def work() -> dict[str, Any]:
         from workbench.executor.presentations import deck, master
 
-        why = decks.deck_problem(args.get("slides"))
+        why = decks.deck_problem(_as_checked(args.get("slides")))
         if why is not None:
             raise Refusal("invalid_value", why)
         output = _output(args, ctx)
