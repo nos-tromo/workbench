@@ -16,6 +16,7 @@ from lxml import etree
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
 
@@ -895,22 +896,61 @@ def test_characters_a_deck_cannot_hold_are_replaced_with_a_warning(job: Job) -> 
     assert written.notes_slide.notes_text_frame.text == "E�f"
 
 
-def test_a_master_whose_parts_would_clash_is_refused(job: Job) -> None:
-    """An example slide another part still relates to would share its part name with a new slide: no deck is written."""
+def test_the_metadata_of_the_example_slides_is_dropped(job: Job) -> None:
+    """The thumbnail and ``docProps/app.xml`` (the example slides' titles) go, and the custom show; core.xml stays."""
+    with zipfile.ZipFile(mt.make_master(job.path("master.pptx"))) as package:
+        assert "docProps/thumbnail.jpeg" in package.namelist()
+        assert mt.EXAMPLE_TITLE.encode() in package.read("docProps/app.xml")
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}])
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        names = package.namelist()
+        parts = {name: package.read(name) for name in names}
+    assert "docProps/thumbnail.jpeg" not in names
+    assert "docProps/app.xml" not in names
+    assert "docProps/core.xml" in names
+    for listing in ("[Content_Types].xml", "_rels/.rels"):
+        for said in (b"thumbnail", b"app.xml", b"extended-properties"):
+            assert said not in parts[listing]
+    assert [name for name, data in parts.items() if mt.EXAMPLE_TITLE.encode() in data] == []
+    settings = etree.fromstring(parts["ppt/presProps.xml"])
+    assert settings.find(f"{qn('p:showPr')}/{qn('p:custShow')}") is None
+    assert settings.find(f"{qn('p:showPr')}/{qn('p:present')}") is not None
 
-    def change(prs: Any) -> None:
-        prs.slide_layouts[TITLE_AND_CONTENT - 1].part.relate_to(prs.slides[0].part, RT.SLIDE)
 
-    resaved(mt.make_master(job.path("master.pptx")), change)
-    prs = master.open_master(job.path("master.pptx"), job.ctx)
+def link_to_example(prs: Any, index: int) -> None:
+    """Give layout 2's title a slide-jump link to an example slide, as a "back to the agenda" button has."""
+    layout = prs.slide_layouts[TITLE_AND_CONTENT - 1]
+    rid = layout.part.relate_to(prs.slides[index].part, RT.SLIDE)
+    run = kinds(layout)[PP_PLACEHOLDER.TITLE].text_frame.paragraphs[0].runs[0]
+    jump = f'<a:hlinkClick {nsdecls("a", "r")} r:id="{rid}" action="ppaction://hlinksldjump"/>'
+    run._r.get_or_add_rPr().append(parse_xml(jump))
+
+
+@pytest.mark.parametrize("index", [0, 1])
+def test_a_master_linking_to_its_own_slides_is_refused(job: Job, index: int) -> None:
+    """An example slide a layout links to would stay in the deck, hidden or under a new slide's name: no deck."""
+    resaved(mt.make_master(job.path("master.pptx")), lambda prs: link_to_example(prs, index))
+    error = job.write([{"layout": TITLE_SLIDE, "title": "Invented"}])["error"]
+    assert error == (
+        "invalid_template: the master links to its own slides (a link on a layout or the master); remove the links or "
+        "save it without slides"
+    )
+    assert list(job.ctx.out_dir.iterdir()) == []
+
+
+def test_parts_of_one_name_are_refused(job: Job) -> None:
+    """Two parts under one name, whatever its case, cannot both be written: the master is refused."""
+    prs = master.open_master(mt.make_master(job.path("master.pptx"), examples=0), job.ctx)
     deck.remove_slides(prs)
-    prs.slides.add_slide(prs.slide_layouts[0])
+    deck.check_parts(prs)
+    first, second = prs.slide_layouts[0].part, prs.slide_layouts[1].part
+    second.partname = PackURI(str(first.partname).replace("slideLayout", "SlideLayout"))
     with pytest.raises(Refusal) as caught:
         deck.check_parts(prs)
-    refused = ("invalid_template", "the master cannot be written as a new deck")
-    assert (caught.value.code, caught.value.message) == refused
-    assert job.write([{"layout": TITLE_SLIDE, "title": "Invented"}])["error"] == ": ".join(refused)
-    assert list(job.ctx.out_dir.iterdir()) == []
+    assert (caught.value.code, caught.value.message) == (
+        "invalid_template",
+        "the master cannot be written as a new deck",
+    )
 
 
 @pytest.mark.parametrize(

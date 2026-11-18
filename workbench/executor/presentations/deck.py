@@ -3,8 +3,9 @@
 A slide is made from the layout it names (:func:`resolve`): its title and subtitle, block i of its content in place i of
 the layout (the reading order ``inspect_template`` lists), the layout's footer and slide number (:func:`copy_footers`),
 and its notes with its sources. A place no block fills is removed, so that no slide says "Click to add text"; text that
-may not fit its place is shrunk (:func:`fit`). The example slides go first (:func:`remove_slides`), and before the deck
-is written its part names must be unique (:func:`check_parts`).
+may not fit its place is shrunk (:func:`fit`). The example slides go first, with what in the package still describes
+them (:func:`remove_slides`), and before the deck is written no example slide may be left in it and its part names must
+be unique (:func:`check_parts`).
 
 The master is untrusted: its python-pptx objects are worked on under
 :func:`~workbench.executor.runners.templates.library`, so whatever the library fails with is the file's damage. What the
@@ -21,6 +22,10 @@ from typing import Any, Final
 
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import MSO_AUTO_SIZE
+from pptx.opc.constants import CONTENT_TYPE as CT
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.oxml import serialize_part_xml
+from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
 
@@ -42,6 +47,13 @@ LINE_REDUCTION: Final = "10000"
 _SECTIONS: Final = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
 _SECTION_LIST: Final = "{http://schemas.microsoft.com/office/powerpoint/2010/main}sectionLst"
 
+#: The package's relationships to what describes its slides: the thumbnail, a picture of the first, and the extended
+#: properties, which count them and list their titles.
+_SLIDE_METADATA: Final = frozenset({RT.THUMBNAIL, RT.EXTENDED_PROPERTIES})
+_LINKED: Final = (
+    "the master links to its own slides (a link on a layout or the master); remove the links or save it without slides"
+)
+
 _TITLES: Final = frozenset({PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE})
 _SUBTITLES: Final = frozenset({PP_PLACEHOLDER.SUBTITLE})
 _TEXT_ROLES: Final = frozenset({"text", "content"})
@@ -49,14 +61,23 @@ _REPLACED: Final = "characters a document cannot hold were replaced with �"
 
 
 def remove_slides(prs: Any) -> None:
-    """Remove the slides a master has, and what in its presentation part points at them.
+    """Remove the slides a master has, and what in the package points at them or describes them.
 
     The custom shows and PowerPoint's sections go first: they name slides, and dropping a slide's relationship would
-    leave them pointing at nothing (or, for a section, at a new slide that is given the old one's id).
+    leave them pointing at nothing (or, for a section, at a new slide that is given the old one's id). The slide show
+    then runs no custom show (:func:`_run_no_custom_show`). The thumbnail and the extended properties
+    (``docProps/app.xml``) are dropped, as they show or list the master's slides; the core properties are the master's
+    own and stay. A part is saved only while a relationship reaches it, and ``[Content_Types].xml`` is written from the
+    parts saved, so neither is left there.
 
     Args:
         prs: The presentation, open.
     """
+    package = prs.part.package
+    for rid, relationship in list(package._rels.items()):
+        if relationship.reltype in _SLIDE_METADATA:
+            package.drop_rel(rid)
+    _run_no_custom_show(prs)
     root = prs.part._element
     for shows in root.findall(qn("p:custShowLst")):
         root.remove(shows)
@@ -76,6 +97,26 @@ def remove_slides(prs: Any) -> None:
     for rid in dict.fromkeys(ids):
         if rid in prs.part.rels:
             prs.part.drop_rel(rid)
+
+
+def _run_no_custom_show(prs: Any) -> None:
+    """Make the slide show run the whole deck: the deck has no custom show, so one the master's show names is gone.
+
+    ``ppt/presProps.xml`` is a part python-pptx keeps as bytes; it is parsed, changed and written back.
+
+    Args:
+        prs: The presentation, open.
+    """
+    try:
+        properties = prs.part.part_related_by(RT.PRES_PROPS)
+    except (KeyError, ValueError):  # none, or more than one
+        return
+    root = parse_xml(properties.blob)
+    shows = root.findall(f"{qn('p:showPr')}/{qn('p:custShow')}")
+    for show in shows:
+        show.getparent().remove(show)
+    if shows:
+        properties.blob = serialize_part_xml(root)
 
 
 def resolve(layouts: Sequence[Layout], wanted: int | str, slide: int) -> Layout:
@@ -205,18 +246,23 @@ def fit(frame: Any, needed: int, place: Place) -> bool:
 
 
 def check_parts(prs: Any) -> None:
-    """Make sure every part of the deck has a name of its own, as a package's names ignore case.
+    """Make sure the deck holds no slide but its own, and each part a name of its own, as a package's names ignore case.
 
-    A part of an example slide that another part still relates to stays in the package under its old name, which a new
-    slide may be given too.
+    An example slide that another part still relates to (a link on a layout or the master) stays in the package,
+    hidden, under its old name, which a new slide may be given too.
 
     Args:
         prs: The presentation, built.
 
     Raises:
-        Refusal: Two parts share a name (``invalid_template``).
+        Refusal: A slide the deck does not list is in it, or two parts share a name (``invalid_template``).
     """
-    names = Counter(str(part.partname).lower() for part in prs.part.package.iter_parts())
+    parts = list(prs.part.package.iter_parts())
+    entries = prs.part._element.find(qn("p:sldIdLst"))
+    listed = {prs.part.related_part(entry.get(qn("r:id"))) for entry in ([] if entries is None else entries)}
+    if any(part.content_type == CT.PML_SLIDE and part not in listed for part in parts):
+        raise Refusal("invalid_template", _LINKED)
+    names = Counter(str(part.partname).lower() for part in parts)
     if any(count > 1 for count in names.values()):
         raise Refusal("invalid_template", "the master cannot be written as a new deck")
 

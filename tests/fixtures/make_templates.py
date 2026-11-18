@@ -20,6 +20,8 @@ from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.oxml import serialize_part_xml
 from pptx.oxml import parse_xml as parse_pml
 from pptx.oxml.ns import qn
 from pptx.util import Inches
@@ -40,6 +42,8 @@ HEADER_TEXT = "Invented Harbour Office"
 P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+EXTENDED = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+VT = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
 
 #: The footer every layout of a master shows, and what each example slide's title starts with (then its number).
 MASTER_FOOTER = "Synthetic Ltd · internal"
@@ -420,8 +424,9 @@ def make_master(
 
     Layout 2 is named "Titel und Inhalt", and every layout's footer placeholder holds ``footer``. The example slides
     are titled ``EXAMPLE_TITLE`` and their number: the first, on "Title Only", has speaker notes, a picture and a
-    column chart; the others, on "Titel und Inhalt", a line of text. A custom show names slide 1 and a section holds
-    every slide, as PowerPoint writes them.
+    column chart; the others, on "Titel und Inhalt", a line of text. A custom show names slide 1, a section holds
+    every slide and the slide show runs the custom show; ``docProps/app.xml`` lists the slides' titles, and
+    ``docProps/thumbnail.jpeg`` (python-pptx's own) is kept, as PowerPoint writes them.
 
     Args:
         path: Where to write it.
@@ -464,7 +469,26 @@ def make_master(
 
 
 def _custom_show_and_section(deck: Any) -> None:
-    """Add a custom show of slide 1 and a section of every slide to ``ppt/presentation.xml``, where PowerPoint does."""
+    """Add a custom show of slide 1 and a section of every slide to ``ppt/presentation.xml``, where PowerPoint does.
+
+    The slide show runs the custom show (``ppt/presProps.xml``), and ``docProps/app.xml`` lists the slides' titles.
+    """
+    titles = [slide.shapes.title.text for slide in deck.slides]
+    shown = "".join(f"<vt:lpstr>{title}</vt:lpstr>" for title in ["Office Theme", *titles])
+    deck.part.package.part_related_by(RT.EXTENDED_PROPERTIES).blob = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="{EXTENDED}" xmlns:vt="{VT}">'
+        f"<Application>Microsoft Office PowerPoint</Application><Slides>{len(titles)}</Slides><HeadingPairs>"
+        '<vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Theme</vt:lpstr></vt:variant><vt:variant>'
+        "<vt:i4>1</vt:i4></vt:variant><vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant>"
+        f'<vt:i4>{len(titles)}</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="'
+        f'{len(titles) + 1}" baseType="lpstr">{shown}</vt:vector></TitlesOfParts></Properties>'
+    ).encode()
+    properties = deck.part.part_related_by(RT.PRES_PROPS)
+    settings = parse_pml(properties.blob)
+    settings.insert(
+        0, parse_pml(f'<p:showPr xmlns:p="{P}" showNarration="1"><p:present/><p:custShow id="0"/></p:showPr>')
+    )
+    properties.blob = serialize_part_xml(settings)
     root = deck.part._element
     slides = root.find(qn("p:sldIdLst"))
     show = parse_pml(
