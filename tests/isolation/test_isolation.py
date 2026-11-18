@@ -311,7 +311,9 @@ def test_fork_bomb_is_contained(api_info: dict[str, Any]) -> None:
     """The job ends as killed, error or timeout; the next job runs normally.
 
     At the slot's process limit ``fork`` fails, so the code itself usually ends in that error, which the answer
-    carries as its traceback; else the executor stopped the job, on a resource limit or its wall time.
+    carries as its traceback; else the executor stopped the job: the kernel on a resource limit, the watchdog on
+    the memory its processes hold together (each counts the pages it shares with its forks, ``docs/sandbox.md``),
+    or its wall time.
     """
     bomb = run_python(api_info, "import os\nwhile True:\n    os.fork()\n")
 
@@ -324,7 +326,7 @@ def test_fork_bomb_is_contained(api_info: dict[str, Any]) -> None:
             {"reason": "not_completed"},
             "the code could not be completed",
         ), bomb
-        assert "resource limit" in detail or "wall time" in detail, detail
+        assert any(reason in detail for reason in ("resource limit", "MB of memory together", "wall time")), detail
     assert stdout_of(run_python(api_info, 'print("still here")')) == "still here"
 
 
