@@ -29,6 +29,8 @@ HG_B = {**HG, "X-User-Id": "user-b"}
 PG = Principal("ghostwriter", "user-a", "chat-1", confined=True)
 #: Ghostwriter's user and chat, unconfined: to lay out folders below its chat, which no call of its can make.
 PG_SETUP = Principal("ghostwriter", "user-a", "chat-1")
+#: A caller no key names, whose files are still on the volume under its own folder: none of them is Ghostwriter's.
+FORMER = Principal("former-caller", "user-a", "chat-1")
 H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 H_B = {**H, "X-User-Id": "user-b"}
 KEY_ONLY = {"Authorization": f"Bearer {KEY}"}

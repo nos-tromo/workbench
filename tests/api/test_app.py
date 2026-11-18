@@ -13,7 +13,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY, KEY_ONLY, H
+from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HG, KEY
+from tests.api.mcp_calls import send
 from tests.callers import EIGHT
 from workbench.api import auth
 from workbench.api.audit import AuditLog
@@ -25,23 +26,21 @@ from workbench.config import ConfigError, Settings
 from workbench.paths import PathError
 
 KEYED_ROUTES = [
-    ("GET", "/api/config"),
-    ("GET", "/system"),
-    ("GET", "/skills"),
-    ("GET", "/skills/read?name=x"),
-    ("GET", "/files/cwd"),
-    ("POST", "/files/cwd"),
-    ("GET", "/files/read?path=/workspace/chat-1/a.txt"),
+    ("POST", "/mcp"),
+    ("GET", "/files/list?directory=/workspace/chat-1"),
+    ("POST", "/files/upload?directory=/workspace/chat-1"),
+    ("GET", "/files/view?path=/workspace/chat-1/a.txt"),
+    ("DELETE", "/files/chat"),
 ]
 
 
 BAD_AUTHORIZATION: list[dict[str, str]] = [
     {},
     {"Authorization": "Bearer wrong"},
-    {"Authorization": f"Bearer {KEY}x"},
-    {"Authorization": f"Bearer {KEY[:-1]}"},
-    {"Authorization": KEY},
-    {"Authorization": f"Basic {KEY}"},
+    {"Authorization": f"Bearer {GHOSTWRITER_KEY}x"},
+    {"Authorization": f"Bearer {GHOSTWRITER_KEY[:-1]}"},
+    {"Authorization": GHOSTWRITER_KEY},
+    {"Authorization": f"Basic {GHOSTWRITER_KEY}"},
     {"Authorization": "Bearer"},
     {"Authorization": "Bearer "},
 ]
@@ -59,7 +58,8 @@ def test_wrong_or_missing_key_is_refused(client: TestClient, method: str, url: s
 
 def test_the_scheme_is_matched_without_regard_to_case(client: TestClient) -> None:
     """RFC 9110: the authentication scheme is case-insensitive."""
-    assert client.get("/api/config", headers={"Authorization": f"bearer {KEY}"}).status_code == 200
+    lower = {**HG, "Authorization": f"bearer {GHOSTWRITER_KEY}"}
+    assert client.get("/files/list", params={"directory": CHAT}, headers=lower).status_code == 200
 
 
 def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,25 +72,32 @@ def test_the_key_is_compared_in_constant_time(client: TestClient, monkeypatch: p
         return compare_digest(a, b)
 
     monkeypatch.setattr(auth.hmac, "compare_digest", spy)
-    assert client.get("/api/config", headers=KEY_ONLY).status_code == 200
-    compared = [(KEY, KEY), (KEY, DOCINT_KEY), (KEY, GHOSTWRITER_KEY)]
+    assert client.get("/files/list", params={"directory": CHAT}, headers=HG).status_code == 200
+    compared = [(GHOSTWRITER_KEY, KEY), (GHOSTWRITER_KEY, DOCINT_KEY), (GHOSTWRITER_KEY, GHOSTWRITER_KEY)]
     assert seen == [(a.encode(), b.encode()) for a, b in compared] * 2
 
 
 def test_the_key_is_checked_before_the_user(client: TestClient) -> None:
     """A caller without the key learns nothing about the other headers."""
-    r = client.get("/files/cwd", headers={"Authorization": "Bearer wrong"})
-    assert r.status_code == 401
+    for path in ("/files/list", "/files/view", "/files/chat"):
+        r = client.get(path, headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401, path
 
 
 def test_headers_that_are_not_ascii_are_refused_not_crashed(client: TestClient) -> None:
     """A byte outside ASCII in a key or an id is an ordinary refusal."""
-    key = client.get("/api/config", headers={b"authorization": "Bearer k\u00e9y".encode("latin-1")})
+    listing = {"directory": CHAT}
+    key = client.get("/files/list", params=listing, headers={b"authorization": "Bearer k\u00e9y".encode("latin-1")})
     assert key.status_code == 401
-    user = client.get(
-        "/files/cwd", headers={b"authorization": f"Bearer {KEY}".encode(), b"x-user-id": "u\u00e4".encode()}
-    )
-    assert user.status_code == 400
+    session = {b"x-session-id": b"chat-1"}
+    for name in (b"x-user-id", b"x-session-id"):
+        headers = {b"authorization": f"Bearer {GHOSTWRITER_KEY}".encode(), b"x-user-id": b"user-a", **session}
+        headers[name] = "u\u00e4".encode()
+        r = client.get("/files/list", params=listing, headers=headers)
+        assert (r.status_code, r.json()) == (
+            400,
+            {"detail": "invalid session" if name == b"x-session-id" else "missing or invalid user"},
+        )
 
 
 @pytest.mark.parametrize(
@@ -109,15 +116,15 @@ def test_headers_that_are_not_ascii_are_refused_not_crashed(client: TestClient) 
 )
 def test_unknown_paths_are_not_found(client: TestClient, path: str) -> None:
     """The allow-list is workbench's: everything not listed answers 404 to a caller, 401 to anyone without the key."""
-    assert client.get(path, headers=H).status_code == 404
+    assert client.get(path, headers=HG).status_code == 404
     assert client.get(path).status_code == 401
 
 
 #: A path no route serves, a route's other method, and routes that read a JSON body.
 GATED = [
     ("GET", "/files/archive"),
-    ("PUT", "/files/mkdir"),
-    ("POST", "/files/mkdir"),
+    ("PUT", "/files/upload"),
+    ("DELETE", "/files/list"),
     ("POST", "/mcp"),
     ("POST", "/files/upload"),
 ]
@@ -167,9 +174,12 @@ def test_the_service_routes_need_no_key(client: TestClient, path: str) -> None:
 
 
 def test_a_request_body_over_2_mib_is_413_and_never_parsed(client: TestClient) -> None:
-    """With the key, a body past the request bound is refused as it arrives: declared or chunked (R74)."""
+    """With the key, a body past the request bound is refused as it arrives: declared or chunked (R74).
+
+    A file route answers the plain refusal; the MCP door answers it as JSON-RPC, also for a body that grows past it.
+    """
     big = b'{"path": "' + b"x" * (2 * 1024 * 1024) + b'"}'
-    r = client.post("/files/mkdir", content=big, headers={**H, "Content-Type": "application/json"})
+    r = client.request("DELETE", "/files/chat", content=big, headers={**HG, "Content-Type": "application/json"})
     assert (r.status_code, r.json()) == (413, {"detail": "request too large"})
 
     def chunks() -> Iterator[bytes]:
@@ -178,16 +188,20 @@ def test_a_request_body_over_2_mib_is_413_and_never_parsed(client: TestClient) -
             yield b"x" * (1024 * 1024)
         yield b'"}'
 
-    r = client.post("/files/mkdir", content=chunks(), headers={**H, "Content-Type": "application/json"})
-    assert (r.status_code, r.json()) == (413, {"detail": "request too large"})
+    too_large = {"jsonrpc": "2.0", "error": {"code": -32600, "message": "request too large"}}
+    for content in (big, chunks()):
+        r = client.post("/mcp", content=content, headers={**HG, "Content-Type": "application/json"})
+        assert (r.status_code, r.json()) == (413, too_large)
 
 
 def test_a_request_body_of_2_mib_is_read(client: TestClient) -> None:
-    """The bound itself is allowed: the route answers, here with its own refusal of the folder's name."""
-    body = b'{"path": "/workspace/chat-1/' + b"x" * 300 + b'"}'
+    """The bound itself is allowed: the door answers, here refusing an argument the tool does not take."""
+    params = {"name": "list_files", "arguments": {"folder": "x" * 300}}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}).encode()
     padded = body + b" " * (2 * 1024 * 1024 - len(body))
-    r = client.post("/files/mkdir", content=padded, headers={**H, "Content-Type": "application/json"})
-    assert r.status_code == 400
+    protocol = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    r = send(client, padded, {**protocol, "MCP-Protocol-Version": "2025-11-25", **HG})
+    assert (r.status_code, r.json()["result"]["structuredContent"]["reason"]) == (200, "invalid_arguments")
 
 
 def test_healthz_needs_no_key(client: TestClient) -> None:
@@ -221,11 +235,11 @@ def test_store_errors_answer_short_json_and_log_nothing(
     marker = "quarterly-figures-marker.xlsx"
 
     def refuse(*_args: object, **_kwargs: object) -> list[object]:
-        raise error from OSError(f"/data/workspaces/open-webui/user-a/chat-1/{marker}")
+        raise error from OSError(f"/data/workspaces/ghostwriter/user-a/chat-1/{marker}")
 
     monkeypatch.setattr(store, "list_dir", refuse)
     caplog.set_level(logging.DEBUG)
-    r = client.post("/files/cwd", json={"path": "/workspace/chat-1"}, headers=H)
+    r = client.get("/files/list", params={"directory": CHAT}, headers=HG)
     assert r.status_code == status
     assert r.json() == {"detail": detail}
     assert marker not in r.text
@@ -285,23 +299,23 @@ def test_app_factory_builds_the_app_from_the_environment(
 ) -> None:
     """``uvicorn --factory`` needs the key and the volume from the environment, and the DB lives on the volume."""
     data = tmp_path / "volume"
-    monkeypatch.setenv("OPEN_WEBUI_WORKBENCH_KEY", KEY)
+    monkeypatch.setenv("GHOSTWRITER_WORKBENCH_KEY", GHOSTWRITER_KEY)
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(data))
     monkeypatch.delenv("AUDIT_OUTPUT", raising=False)
     with TestClient(app_factory()) as running:
         assert running.get("/healthz").json() == {"ok": True}
-        assert running.get("/api/config", headers=KEY_ONLY).status_code == 200
+        assert running.get("/files/list", params={"directory": CHAT}, headers=HG).status_code == 200
     assert (data / "workbench.db").is_file()
     out = capsys.readouterr().out
     assert '"config.audit"' in out
-    assert KEY not in out
+    assert GHOSTWRITER_KEY not in out
 
 
 def test_app_factory_refuses_a_short_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A weak key stops the start, and the message does not hold it."""
-    monkeypatch.setenv("OPEN_WEBUI_WORKBENCH_KEY", "zz-too-weak")
+    monkeypatch.setenv("GHOSTWRITER_WORKBENCH_KEY", "zz-too-weak")
     monkeypatch.setenv("WORKBENCH_DATA_DIR", str(tmp_path))
-    with pytest.raises(ConfigError, match="OPEN_WEBUI_WORKBENCH_KEY") as excinfo:
+    with pytest.raises(ConfigError, match="GHOSTWRITER_WORKBENCH_KEY") as excinfo:
         app_factory()
     assert "zz-too-weak" not in str(excinfo.value)
 

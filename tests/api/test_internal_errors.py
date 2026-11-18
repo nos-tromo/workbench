@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message
 
-from tests.api.conftest import CHAT, KEY, H
+from tests.api.conftest import CHAT, GHOSTWRITER_KEY, HG
 from tests.api.mcp_calls import acall
 from tests.api.raising_app import PATH, RefusingStore
 from workbench.api.audit import AuditLog
@@ -44,7 +44,7 @@ VIEW: tuple[str, str, dict[str, Any]] = ("GET", "/files/view", {"params": {"path
 #: Each failure as its caller meets it: the request, the body of the 500, and the one line logged.
 FAILURES: dict[str, tuple[Callable[[TestClient], httpx2.Response], dict[str, Any], str]] = {
     "view": (
-        lambda client: client.request(VIEW[0], VIEW[1], headers=H, **VIEW[2]),
+        lambda client: client.request(VIEW[0], VIEW[1], headers=HG, **VIEW[2]),
         {"detail": "internal error"},
         "an unexpected error ended GET /files/view (PermissionError)",
     ),
@@ -91,7 +91,7 @@ def test_an_unexpected_error_is_a_short_500_logged_by_its_type_and_route(
 def test_the_500_of_a_view_keeps_the_viewing_headers(refusing: TestClient) -> None:
     """The answer is made inside the hardening of ``/files/view``, so it carries its headers like every other."""
     method, path, kwargs = VIEW
-    r = refusing.request(method, path, headers=H, **kwargs)
+    r = refusing.request(method, path, headers=HG, **kwargs)
     assert r.status_code == 500
     assert r.headers["content-security-policy"].startswith("sandbox;")
     assert r.headers["x-content-type-options"] == "nosniff"
@@ -111,7 +111,7 @@ def test_under_uvicorn_the_error_leaves_one_line_and_no_traceback(tmp_path: Path
     """
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
-        "OPEN_WEBUI_WORKBENCH_KEY": KEY,
+        "GHOSTWRITER_WORKBENCH_KEY": GHOSTWRITER_KEY,
         "WORKBENCH_DATA_DIR": str(tmp_path / "data"),
         "PYTHONUNBUFFERED": "1",
     }
@@ -134,7 +134,7 @@ def test_under_uvicorn_the_error_leaves_one_line_and_no_traceback(tmp_path: Path
             time.sleep(0.05)
         address = next(line for line in err if "Uvicorn running on" in line).split("running on ", 1)[1].split()[0]
         method, path, kwargs = VIEW
-        r = httpx.request(method, address + path, headers=H, timeout=30, **kwargs)
+        r = httpx.request(method, address + path, headers=HG, timeout=30, **kwargs)
     finally:
         server.terminate()
         server.wait(timeout=30)

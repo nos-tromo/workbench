@@ -2,7 +2,7 @@
 
 The configuration tests read ``docker inspect`` and look from inside the running executor, so
 they prove what the kernel enforces, not only what the compose file asks for. The tests that
-run code go through the ``run_python`` tool, as the model would, on Open WebUI's door, docint's or Ghostwriter's.
+run code go through the ``run_python`` tool, as the model would, on Ghostwriter's door or docint's.
 """
 
 import base64
@@ -127,7 +127,7 @@ def test_executor_is_isolated_by_configuration(executor: str) -> None:
     }
     assert host["Sysctls"] == {"fs.mqueue.queues_max": "0", "kernel.shm_rmid_forced": "1"}
     assert info["Config"]["User"] == "0:0"
-    assert not {"OPEN_WEBUI_WORKBENCH_KEY", "DOCINT_WORKBENCH_KEY", "GHOSTWRITER_WORKBENCH_KEY"} & set(env)
+    assert [name for name in env if name.endswith("_WORKBENCH_KEY")] == []
 
 
 def test_the_running_executor_has_what_its_configuration_asks_for(executor: str) -> None:
@@ -175,7 +175,7 @@ def test_the_api_runs_unprivileged_on_its_network_alone(api_info: dict[str, Any]
 # --- jobs that try to escape -------------------------------------------------------------------
 
 
-def test_no_network(api: httpx.Client) -> None:
+def test_no_network(api_info: dict[str, Any]) -> None:
     """A job reaches no address, not even by IP."""
     code = """
 import socket
@@ -186,10 +186,10 @@ except OSError:
 else:
     print("connected")
 """
-    assert stdout_of(run_python(api, code)) == "no network"
+    assert stdout_of(run_python(api_info, code)) == "no network"
 
 
-def test_other_workspaces_are_unreadable(api: httpx.Client) -> None:
+def test_other_workspaces_are_unreadable(api_info: dict[str, Any]) -> None:
     """The users' files are the api's alone."""
     code = """
 import os
@@ -200,7 +200,7 @@ except PermissionError:
 else:
     print("listed")
 """
-    assert stdout_of(run_python(api, code)) == "refused"
+    assert stdout_of(run_python(api_info, code)) == "refused"
 
 
 FIND_THE_OTHER_JOB = """
@@ -228,10 +228,11 @@ time.sleep(3)
 """
 
 
-def test_other_jobs_are_unreadable(api: httpx.Client) -> None:
+def test_other_jobs_are_unreadable(api_info: dict[str, Any]) -> None:
     """Two jobs at once, each finding the other's folder from its command line: neither may list it."""
     with ThreadPoolExecutor(max_workers=2) as pool:
-        answers = list(pool.map(lambda user: run_python(api, FIND_THE_OTHER_JOB, user=user), ["user-a", "user-b"]))
+        users = ["user-a", "user-b"]
+        answers = list(pool.map(lambda user: run_python(api_info, FIND_THE_OTHER_JOB, user=user), users))
 
     assert [stdout_of(answer) for answer in answers] == ["refused", "refused"]
 
@@ -273,23 +274,18 @@ time.sleep(3)
 """
 
 
-def test_a_job_that_opens_its_folders_to_all_opens_them_to_no_other_job(api: httpx.Client) -> None:
+def test_a_job_that_opens_its_folders_to_all_opens_them_to_no_other_job(api_info: dict[str, Any]) -> None:
     """R76: two jobs at once open their ``home/`` to everyone and try a loopback listener; neither reaches the other."""
     with ThreadPoolExecutor(max_workers=2) as pool:
-        answers = list(pool.map(lambda user: run_python(api, OPEN_UP_AND_LISTEN, user=user), ["user-a", "user-b"]))
+        users = ["user-a", "user-b"]
+        answers = list(pool.map(lambda user: run_python(api_info, OPEN_UP_AND_LISTEN, user=user), users))
 
     assert [stdout_of(answer) for answer in answers] == ["no socket,refused,refused"] * 2
 
 
-def test_inputs_are_read_only(api: httpx.Client) -> None:
+def test_inputs_are_read_only(api_info: dict[str, Any]) -> None:
     """The job's copy of an upload is root's; only ``out/`` takes writes."""
-    upload = api.post(
-        "/files/upload",
-        params={"directory": "/workspace/chat-1"},
-        headers={"X-User-Id": "user-a", "X-Session-Id": "chat-1"},
-        files={"file": ("in.csv", b"quarter,figure\nq1,10\n")},
-    )
-    assert upload.status_code == 200, upload.text
+    _upload(api_info, "in.csv", b"quarter,figure\nq1,10\n")
     code = """
 try:
     open("in.csv", "w").write("changed")
@@ -298,33 +294,38 @@ except PermissionError:
 open("out/x", "w").write("synthetic")
 print("output written")
 """
-    assert stdout_of(run_python(api, code)).splitlines() == ["input refused", "output written"]
+    assert stdout_of(run_python(api_info, code)).splitlines() == ["input refused", "output written"]
 
 
-def test_no_secrets_in_environment(api: httpx.Client) -> None:
-    """The caller key is in no job's environment, by name or by value."""
-    key = api.headers["Authorization"].removeprefix("Bearer ")
-    env = json.loads(stdout_of(run_python(api, "import json, os; print(json.dumps(dict(os.environ)))")))
+def test_no_secrets_in_environment(api_info: dict[str, Any]) -> None:
+    """No caller's key is in a job's environment, by name or by value."""
+    keys = {name: value for name, value in environment(api_info).items() if name.endswith("_WORKBENCH_KEY") and value}
+    assert {"DOCINT_WORKBENCH_KEY", "GHOSTWRITER_WORKBENCH_KEY"} <= set(keys)
+    env = json.loads(stdout_of(run_python(api_info, "import json, os; print(json.dumps(dict(os.environ)))")))
 
-    assert "OPEN_WEBUI_WORKBENCH_KEY" not in env
-    assert not any(key in value for value in env.values())
+    assert not set(keys) & set(env)
+    assert not any(key in value for key in keys.values() for value in env.values())
 
 
-def test_fork_bomb_is_contained(api: httpx.Client) -> None:
+def test_fork_bomb_is_contained(api_info: dict[str, Any]) -> None:
     """The job ends as killed, error or timeout; the next job runs normally.
 
     At the slot's process limit ``fork`` fails, so the code itself usually ends in that error, which the answer
     carries as its traceback; else the executor stopped the job, on a resource limit or its wall time.
     """
-    bomb = run_python(api, "import os\nwhile True:\n    os.fork()\n")
+    bomb = run_python(api_info, "import os\nwhile True:\n    os.fork()\n")
 
-    if bomb.status_code == 200:
-        assert bomb.json()["stderr"].rstrip().endswith("BlockingIOError: [Errno 11] Resource temporarily unavailable")
+    if not bomb["isError"]:
+        stderr = bomb["structuredContent"]["stderr"]
+        assert stderr.rstrip().endswith("BlockingIOError: [Errno 11] Resource temporarily unavailable")
     else:
-        detail = bomb.json()["detail"]
-        assert (bomb.status_code, detail.split(": ")[0]) == (422, "the code could not be completed"), bomb.text
+        detail = bomb["content"][0]["text"]
+        assert (bomb["structuredContent"], detail.split(": ")[0]) == (
+            {"reason": "not_completed"},
+            "the code could not be completed",
+        ), bomb
         assert "resource limit" in detail or "wall time" in detail, detail
-    assert stdout_of(run_python(api, 'print("still here")')) == "still here"
+    assert stdout_of(run_python(api_info, 'print("still here")')) == "still here"
 
 
 #: Run inside the executor's container: what it holds now, and the shared memory no job's count shows.
@@ -334,81 +335,81 @@ SHMEM_NOW = (
 )
 
 
-def test_the_running_executor_holds_no_shared_memory_outside_any_jobs_count(executor: str, api: httpx.Client) -> None:
+def test_the_running_executor_holds_no_shared_memory_outside_any_jobs_count(
+    executor: str, api_info: dict[str, Any]
+) -> None:
     """R90: the baseline the watchdog bounds, on the real stack: none idle, and none after a job that used numpy."""
     for _ in range(2):
         hidden, charged, margin = (int(word) for word in docker("exec", executor, "python", "-c", SHMEM_NOW).split())
         assert hidden < margin // 4, (hidden, charged)
-        assert stdout_of(run_python(api, "import numpy\nprint(int(numpy.ones(10).sum()))")) == "10"
+        assert stdout_of(run_python(api_info, "import numpy\nprint(int(numpy.ones(10).sum()))")) == "10"
 
 
-def test_memory_hog_is_killed_with_a_clear_message(api: httpx.Client) -> None:
+def test_memory_hog_is_killed_with_a_clear_message(api_info: dict[str, Any]) -> None:
     """More than the job's memory ends the job, and the answer says it was memory."""
-    hog = run_python(api, "blob = bytearray(8 * 1024 ** 3)\nprint(len(blob))")
+    hog = run_python(api_info, "blob = bytearray(8 * 1024 ** 3)\nprint(len(blob))")
 
-    assert "memory" in hog.text.lower()
-    assert stdout_of(run_python(api, 'print("still here")')) == "still here"
+    assert "memory" in json.dumps(hog).lower()
+    assert stdout_of(run_python(api_info, 'print("still here")')) == "still here"
 
 
-def test_wall_time_limit(api: httpx.Client) -> None:
+def test_wall_time_limit(api_info: dict[str, Any]) -> None:
     """A job that never ends is stopped at its wall time, and the answer says so."""
-    sleeper = run_python(api, "import time\ntime.sleep(10_000)")
+    sleeper = run_python(api_info, "import time\ntime.sleep(10_000)")
 
-    assert "wall time" in sleeper.text.lower()
+    assert "wall time" in json.dumps(sleeper).lower()
 
 
-def test_code_that_ignores_its_soft_limit_is_killed_at_the_wall_time(api: httpx.Client) -> None:
+def test_code_that_ignores_its_soft_limit_is_killed_at_the_wall_time(api_info: dict[str, Any]) -> None:
     """The runner's own limit rides on ``SIGALRM``; code that ignores the signal is stopped by the executor (R40).
 
-    The answer is the executor's, through the api: the job ran past its wall time, the test stack's 20 s.
+    The answer is the executor's, through the api: the job ran past its wall time, Ghostwriter's 20 s on the stack.
     """
     code = "import signal, time\nsignal.signal(signal.SIGALRM, signal.SIG_IGN)\ntime.sleep(10_000)"
-    stubborn = run_python(api, code)
+    stubborn = run_python(api_info, code)
 
-    assert (stubborn.status_code, stubborn.json()) == (
-        422,
-        {"detail": "the code could not be completed: the job ran past its wall time of 20 s"},
-    )
-    assert stdout_of(run_python(api, 'print("still here")')) == "still here"
+    assert (stubborn["isError"], stubborn["structuredContent"]) == (True, {"reason": "not_completed"}), stubborn
+    assert stubborn["content"] == [
+        {"type": "text", "text": "the code could not be completed: the job ran past its wall time of 20 s"}
+    ]
+    assert stdout_of(run_python(api_info, 'print("still here")')) == "still here"
 
 
-def _upload(api: httpx.Client, name: str, data: bytes, *, user: str = "user-a", chat: str = "chat-1") -> str:
-    """Upload a synthetic file into a chat; return the name the workspace gave it."""
-    answer = api.post(
-        "/files/upload",
-        params={"directory": f"/workspace/{chat}"},
-        headers={"X-User-Id": user, "X-Session-Id": chat},
-        files={"file": (name, data)},
+def _upload(api_info: dict[str, Any], name: str, data: bytes, *, user: str = "user-a", chat: str = "chat-1") -> str:
+    """Upload a synthetic file into a chat as Ghostwriter does; return the name the workspace gave it."""
+    params = {"directory": f"/workspace/{chat}"}
+    answer = ghostwriter(
+        api_info, "POST", "/files/upload", chat=chat, user=user, params=params, files={"file": (name, data)}
     )
     assert answer.status_code == 200, answer.text
     return str(answer.json()["path"]).rsplit("/", 1)[1]
 
 
-def test_absolute_virtual_paths_work_in_python(api: httpx.Client) -> None:
+def test_absolute_virtual_paths_work_in_python(api_info: dict[str, Any]) -> None:
     """``/workspace/<chat>/x`` is the job's own copy of ``x``, through the image's ``/workspace`` link."""
-    name = _upload(api, "quarterly-figures.csv", b"quarter,figure\nq1,10\nq2,32\n")
+    name = _upload(api_info, "quarterly-figures.csv", b"quarter,figure\nq1,10\nq2,32\n")
     code = f"import pandas as pd\nprint(pd.read_csv({f'/workspace/chat-1/{name}'!r})['figure'].sum())"
-    assert stdout_of(run_python(api, code)) == "42"
+    assert stdout_of(run_python(api_info, code)) == "42"
 
 
-def test_a_failing_read_shows_only_virtual_paths(api: httpx.Client) -> None:
+def test_a_failing_read_shows_only_virtual_paths(api_info: dict[str, Any]) -> None:
     """The traceback of a file that is not there names it as the code did, never the job's real folder."""
     code = "import pandas as pd, pathlib\nprint(pathlib.Path.cwd())\npd.read_csv('/workspace/chat-1/missing.csv')"
-    answer = run_python(api, code)
-    assert answer.status_code == 200, answer.text
-    body = answer.json()
+    answer = run_python(api_info, code)
+    assert answer["isError"] is False, answer
+    body = answer["structuredContent"]
     assert body["stdout"].strip() == "/workspace/chat-1"
     assert body["stderr"].rstrip().endswith("No such file or directory: '/workspace/chat-1/missing.csv'")
-    assert "/data" not in answer.text
-    assert "hint" not in body
+    assert "/data" not in json.dumps(answer)
+    assert body["hint"] is None
 
 
-def test_another_chats_files_are_not_there_and_the_answer_says_why(api: httpx.Client) -> None:
+def test_another_chats_files_are_not_there_and_the_answer_says_why(api_info: dict[str, Any]) -> None:
     """A file of the user's other chat is not in this job; the answer tells the model only this chat's are."""
-    name = _upload(api, "other-chat.csv", b"a,b\n1,2\n", chat="chat-2")
-    answer = run_python(api, f"open({f'/workspace/chat-2/{name}'!r})")
-    assert answer.status_code == 200, answer.text
-    body = answer.json()
+    name = _upload(api_info, "other-chat.csv", b"a,b\n1,2\n", chat="chat-2")
+    answer = run_python(api_info, f"open({f'/workspace/chat-2/{name}'!r})")
+    assert answer["isError"] is False, answer
+    body = answer["structuredContent"]
     assert "FileNotFoundError" in body["stderr"]
     assert "only this chat's files are available" in body["hint"].lower()
 
@@ -416,24 +417,28 @@ def test_another_chats_files_are_not_there_and_the_answer_says_why(api: httpx.Cl
 # --- the template tools, end to end ------------------------------------------------------------------------------
 
 TEMPLATES_CHAT = "chat-templates"
-TEMPLATE_HEADERS = {"X-User-Id": "user-a", "X-Session-Id": TEMPLATES_CHAT}
 
 
-def _template_tool(api: httpx.Client, tool: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Call a template tool in the templates' chat, and take its answer."""
-    answer = api.post(f"/tools/{tool}", json=body, headers=TEMPLATE_HEADERS)
-    assert answer.status_code == 200, answer.text
-    return answer.json()
+def _tool(api_info: dict[str, Any], chat: str, tool: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Call a workspace tool through Ghostwriter's door in ``chat``, and take its answer without its ``outputs``.
+
+    The fields the answer leaves empty are left out too, as the tool's own measure leaves them.
+    """
+    answer = mcp_result(ghostwriter_mcp(api_info, tool, body, chat=chat, user="user-a"))
+    assert answer["isError"] is False, answer
+    return {
+        name: value for name, value in answer["structuredContent"].items() if name != "outputs" and value is not None
+    }
 
 
-def _download(api: httpx.Client, path: str) -> bytes:
-    """Fetch a file's bytes through the file browser."""
-    answer = api.get("/files/view", params={"path": path}, headers=TEMPLATE_HEADERS)
+def _download(api_info: dict[str, Any], chat: str, path: str) -> bytes:
+    """Fetch a file's bytes through Ghostwriter's view of ``chat``."""
+    answer = ghostwriter(api_info, "GET", "/files/view", chat=chat, user="user-a", params={"path": path})
     assert answer.status_code == 200, answer.text
     return answer.content
 
 
-def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, tmp_path: Path) -> None:
+def test_templates_are_inspected_and_filled_in_the_executor(api_info: dict[str, Any], tmp_path: Path) -> None:
     """A Word form, the same as a .dotx, a {{ }} document and a workbook: inspected and filled by real jobs (R45).
 
     The jobs run as slot uids with a read-only root and no network, in the shipped image, so this also proves that
@@ -445,11 +450,12 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
         "summary.xlsx": mt.make_placeholder_xlsx(tmp_path / "summary.xlsx"),
     }
     built["form.dotx"] = mt.as_dotx(built["form.docx"], tmp_path / "form.dotx")
-    names = {name: _upload(api, name, path.read_bytes(), chat=TEMPLATES_CHAT) for name, path in built.items()}
+    names = {name: _upload(api_info, name, path.read_bytes(), chat=TEMPLATES_CHAT) for name, path in built.items()}
     where = {name: f"/workspace/{TEMPLATES_CHAT}/{stored}" for name, stored in names.items()}
 
     kinds = {
-        name: _template_tool(api, "inspect_template", {"path": path})["template_kind"] for name, path in where.items()
+        name: _tool(api_info, TEMPLATES_CHAT, "inspect_template", {"path": path})["template_kind"]
+        for name, path in where.items()
     }
     assert kinds == {
         "form.docx": "content_controls",
@@ -465,10 +471,10 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
         "approved": {"value": True, "source": {"kind": "assistant"}},
     }
     for name in ("form.docx", "form.dotx"):
-        filled = _template_tool(api, "fill_template", {"path": where[name], "values": form})
+        filled = _tool(api_info, TEMPLATES_CHAT, "fill_template", {"path": where[name], "values": form})
         assert filled["path"].endswith(".docx"), filled
         assert (filled["filled"], filled["warnings"]) == (3, [])
-        document = Document(io.BytesIO(_download(api, filled["path"])))
+        document = Document(io.BytesIO(_download(api_info, TEMPLATES_CHAT, filled["path"])))
         rows = [[cell.text for cell in row.cells] for row in document.tables[-1].rows]
         assert rows[0] == ["field", "value", "source kind", "reference"]
         assert rows[1] == ["customer", "Invented Harbour Ltd", "user", "said in the chat"]
@@ -477,8 +483,8 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
         "customer": {"value": "Invented Harbour Ltd", "source": said},
         "rows": {"value": [{"item": "Dredging", "total": 118}], "source": {"kind": "assistant"}},
     }
-    filled = _template_tool(api, "fill_template", {"path": where["letter.docx"], "values": letter})
-    document = Document(io.BytesIO(_download(api, filled["path"])))
+    filled = _tool(api_info, TEMPLATES_CHAT, "fill_template", {"path": where["letter.docx"], "values": letter})
+    document = Document(io.BytesIO(_download(api_info, TEMPLATES_CHAT, filled["path"])))
     assert document.paragraphs[0].text == "Customer: Invented Harbour Ltd"
     assert [cell.text for cell in document.tables[0].rows[1].cells] == ["Dredging", "118"]
 
@@ -486,9 +492,9 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
         "total": {"value": 469.5, "source": {"kind": "assistant"}},
         "rows": {"value": [["Dredging", 118], ["Piers", "=1+1"]], "source": {"kind": "assistant"}},
     }
-    filled = _template_tool(api, "fill_template", {"path": where["summary.xlsx"], "values": summary})
+    filled = _tool(api_info, TEMPLATES_CHAT, "fill_template", {"path": where["summary.xlsx"], "values": summary})
     assert filled["path"] == f"/workspace/{TEMPLATES_CHAT}/summary-filled.xlsx"
-    book = openpyxl.load_workbook(io.BytesIO(_download(api, filled["path"])))
+    book = openpyxl.load_workbook(io.BytesIO(_download(api_info, TEMPLATES_CHAT, filled["path"])))
     sheet = book["Summary"]
     assert (sheet["B2"].value, sheet["A6"].value, sheet["B7"].value) == (469.5, "Dredging", "=1+1")
     assert sheet["B7"].data_type == "s"
@@ -498,24 +504,19 @@ def test_templates_are_inspected_and_filled_in_the_executor(api: httpx.Client, t
 # --- the output tools, end to end --------------------------------------------------------------------------------
 
 OUTPUTS_CHAT = "chat-outputs"
-OUTPUT_HEADERS = {"X-User-Id": "user-a", "X-Session-Id": OUTPUTS_CHAT}
 
 
-def _output_tool(api: httpx.Client, tool: str, body: dict[str, Any]) -> dict[str, Any]:
+def _output_tool(api_info: dict[str, Any], tool: str, body: dict[str, Any]) -> dict[str, Any]:
     """Call an output tool in the outputs' chat, and take its answer."""
-    answer = api.post(f"/tools/{tool}", json=body, headers=OUTPUT_HEADERS)
-    assert answer.status_code == 200, answer.text
-    return answer.json()
+    return _tool(api_info, OUTPUTS_CHAT, tool, body)
 
 
-def _fetched(api: httpx.Client, path: str) -> bytes:
-    """Fetch a file's bytes from the outputs' chat through the file browser."""
-    answer = api.get("/files/view", params={"path": path}, headers=OUTPUT_HEADERS)
-    assert answer.status_code == 200, answer.text
-    return answer.content
+def _fetched(api_info: dict[str, Any], path: str) -> bytes:
+    """Fetch a file's bytes from the outputs' chat."""
+    return _download(api_info, OUTPUTS_CHAT, path)
 
 
-def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> None:
+def test_tables_and_documents_are_written_in_the_executor(api_info: dict[str, Any]) -> None:
     """A workbook, a CSV file and a Word document, each written by a real job and read back from the workspace (R45).
 
     The jobs run as slot uids with a read-only root and no network, in the shipped image, so this also proves that
@@ -524,10 +525,10 @@ def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> 
     columns = ["item", "total", "note"]
     rows = [["Dredging", 118, "=1+1"], ["Piers", 351.5, "Grüße"], ["Total", None]]
     workbook = _output_tool(
-        api, "write_table", {"name": "quarterly-figures", "format": "xlsx", "columns": columns, "rows": rows}
+        api_info, "write_table", {"name": "quarterly-figures", "format": "xlsx", "columns": columns, "rows": rows}
     )
     assert workbook == {"path": f"/workspace/{OUTPUTS_CHAT}/quarterly-figures.xlsx", "rows": 3}
-    sheet = openpyxl.load_workbook(io.BytesIO(_fetched(api, workbook["path"])))["Sheet1"]
+    sheet = openpyxl.load_workbook(io.BytesIO(_fetched(api_info, workbook["path"])))["Sheet1"]
     assert [[cell.value for cell in row] for row in sheet.iter_rows()] == [
         columns,
         ["Dredging", 118, "=1+1"],
@@ -539,11 +540,11 @@ def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> 
     assert sheet.freeze_panes == "A2"
 
     table = _output_tool(
-        api, "write_table", {"name": "quarterly-figures", "format": "csv", "columns": columns, "rows": rows}
+        api_info, "write_table", {"name": "quarterly-figures", "format": "csv", "columns": columns, "rows": rows}
     )
     assert table["path"] == f"/workspace/{OUTPUTS_CHAT}/quarterly-figures.csv"
     assert "1 cell" in table["hint"]
-    raw = _fetched(api, table["path"])
+    raw = _fetched(api_info, table["path"])
     assert raw.startswith(b"\xef\xbb\xbf")
     assert raw.decode("utf-8-sig").splitlines() == [
         "item,total,note",
@@ -556,9 +557,9 @@ def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> 
         "# Quarterly report\n\nDredging **118**.\n\n- north pier\n- south pier\n\n"
         "| Item | Total |\n|---|---|\n| Piers | 351 |\n"
     )
-    written = _output_tool(api, "write_document", {"name": "report", "format": "docx", "markdown": markdown})
+    written = _output_tool(api_info, "write_document", {"name": "report", "format": "docx", "markdown": markdown})
     assert written == {"path": f"/workspace/{OUTPUTS_CHAT}/report.docx"}
-    document = Document(io.BytesIO(_fetched(api, written["path"])))
+    document = Document(io.BytesIO(_fetched(api_info, written["path"])))
     assert [(p.style.name if p.style is not None else "", p.text) for p in document.paragraphs] == [
         ("Heading 1", "Quarterly report"),
         ("Normal", "Dredging 118."),
@@ -571,12 +572,12 @@ def test_tables_and_documents_are_written_in_the_executor(api: httpx.Client) -> 
     ]
 
 
-def test_the_retention_dry_run_runs_in_the_api_container(api_info: dict[str, Any], api: httpx.Client) -> None:
+def test_the_retention_dry_run_runs_in_the_api_container(api_info: dict[str, Any]) -> None:
     """What ``make retention-dry-run`` runs, in the shipped api image as uid 10001 on a read-only root: counts only.
 
     The test stack's volume is its own, so a fresh upload is there to be counted as kept.
     """
-    name = _upload(api, "retention-dry-run-sample.txt", b"synthetic", chat="chat-retention")
+    name = _upload(api_info, "retention-dry-run-sample.txt", b"synthetic", chat="chat-retention")
     printed = docker("exec", api_info["Id"], "python", "-m", "workbench.api.retention", "dry-run")
     assert "nothing is recorded, deleted or changed" in printed
     assert "Files are deleted 7 days after they were made." in printed
@@ -707,27 +708,6 @@ axes.bar(table["author"], table["posts"])
 figure.savefig("out/chart.png")
 """
 
-#: Run in the api: the files of each caller's workspaces that hold the marker, and Open WebUI's folders of the chat.
-WHERE_IT_LIES = r"""
-import glob, json, os, stat, sys
-chat, marker = sys.argv[1], sys.argv[2].encode()
-def holding(root):
-    found = []
-    for folder, _, names in os.walk(root):
-        for name in names:
-            path = os.path.join(folder, name)
-            if stat.S_ISREG(os.lstat(path).st_mode):
-                with open(path, "rb") as f:
-                    if marker in f.read():
-                        found.append(os.path.relpath(path, root))
-    return sorted(found)
-print(json.dumps({
-    "ghostwriter": holding("/data/workspaces/ghostwriter"),
-    "open-webui": holding("/data/workspaces/open-webui"),
-    "open-webui chats": glob.glob(f"/data/workspaces/open-webui/*/{chat}"),
-}))
-"""
-
 #: Run in the api: what is left of one Ghostwriter chat on the volume and in the database, read-only.
 LEFT_OF_THE_CHAT = r"""
 import json, os, sqlite3, sys
@@ -758,37 +738,6 @@ def _audit_events(container: str) -> list[dict[str, Any]]:
     """Read a container's audit events so far: the JSON lines of its standard output."""
     lines = docker("logs", container).splitlines()
     return [event for line in lines if line.startswith("{") and "operation" in (event := json.loads(line))]
-
-
-def test_ghostwriters_files_are_apart_from_open_webuis(
-    api: httpx.Client, api_info: dict[str, Any], executor: str
-) -> None:
-    """The same user id in both callers: Ghostwriter's upload is in its own workspace, and Open WebUI finds none of it.
-
-    Open WebUI's workspace of that user has no such chat, the chat lists empty and the file's path is not found, though
-    the request names that very chat. On the volume, the file lies in Ghostwriter's chat folder and nowhere else.
-    """
-    path = f"/workspace/{CHAT_A}/quarterly-figures.csv"
-    uploaded = _ghostwriter_upload(api_info, chat=CHAT_A, user="user-a").json()
-    assert (uploaded["path"], uploaded["size"]) == (path, len(FIGURES))
-    own = ghostwriter(api_info, "GET", "/files/view", chat=CHAT_A, user="user-a", params={"path": path})
-    assert (own.status_code, own.content) == (200, FIGURES)
-
-    open_webui = {"X-User-Id": "user-a", "X-Session-Id": CHAT_A}
-    workspace = api.get("/files/list", params={"directory": "/workspace"}, headers=open_webui)
-    assert workspace.status_code == 200, workspace.text
-    assert CHAT_A not in [entry["name"] for entry in workspace.json()["entries"]]
-    listed = api.get("/files/list", params={"directory": f"/workspace/{CHAT_A}"}, headers=open_webui)
-    assert (listed.status_code, listed.json()["entries"]) == (200, [])
-    viewed = api.get("/files/view", params={"path": path}, headers=open_webui)
-    assert (viewed.status_code, viewed.json()) == NOT_FOUND
-
-    lies = json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", WHERE_IT_LIES, CHAT_A, GHOSTWRITER_MARKER))
-    assert lies == {
-        "ghostwriter": [f"user-a/{CHAT_A}/quarterly-figures.csv"],
-        "open-webui": [],
-        "open-webui chats": [],
-    }
 
 
 def test_another_chats_path_is_not_found(api_info: dict[str, Any]) -> None:

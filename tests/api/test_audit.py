@@ -94,7 +94,7 @@ def log(stream: Stream) -> Iterator[AuditLog]:
 @pytest.fixture
 def alice() -> Principal:
     """A synthetic user."""
-    return Principal("open-webui", "user-a", "chat-1")
+    return Principal("ghostwriter", "user-a", "chat-1")
 
 
 def test_record_writes_a_verifiable_chain(log: AuditLog, stream: Stream, alice: Principal) -> None:
@@ -110,7 +110,7 @@ def test_record_writes_a_verifiable_chain(log: AuditLog, stream: Stream, alice: 
     assert last["service"] == SERVICE
     assert last["actor"] == {"user": "user-a", "via": "service"}
     assert last["target"] == {"kind": "file", "ids": ["f1"], "count": 1, "container": "chat:chat-1"}
-    assert last["criteria"] == {"caller": "open-webui"}
+    assert last["criteria"] == {"caller": "ghostwriter"}
     assert "parent_event_id" not in last
     assert "purpose" not in last
 
@@ -134,7 +134,7 @@ def test_chain_starts_with_the_start_event_and_the_config(log: AuditLog, stream:
 
 def test_config_event_carries_no_secret(stream: Stream) -> None:
     """The caller key never reaches the stream: the config holds limits and periods only."""
-    settings = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="api")
+    settings = load_settings({"GHOSTWRITER_WORKBENCH_KEY": KEY}, role="api")
     log = AuditLog(AuditEmitter(SERVICE, "0.0.1", stream=stream, heartbeat_interval_s=0))
 
     log.start(
@@ -145,11 +145,11 @@ def test_config_event_carries_no_secret(stream: Stream) -> None:
             "workspace_max_mb": settings.workspace_max_mb,
         }
     )
-    log.record("read", Principal("open-webui", "user-a", "chat-1"), file_ids=["f1"])
+    log.record("view", Principal("ghostwriter", "user-a", "chat-1"), file_ids=["f1"])
     log.close()
 
     assert KEY not in stream.raw
-    assert settings.open_webui_key == KEY
+    assert settings.ghostwriter_key == KEY
     assert verify_chain(stream.events()).ok
 
 
@@ -178,7 +178,7 @@ def test_write_failure_propagates(log: AuditLog, stream: Stream, alice: Principa
     stream.failing = True
 
     with pytest.raises(AuditWriteError):
-        log.record("read", alice, file_ids=["f1"])
+        log.record("view", alice, file_ids=["f1"])
     with pytest.raises(AuditWriteError):
         log.record_system("delete", "retention.sweep", file_ids=["f1"])
 
@@ -189,7 +189,7 @@ def test_caller_is_always_in_the_criteria_and_cannot_be_overridden(
     """Extra criteria are kept beside ``caller``, which always names the authenticated caller."""
     log.record("read_document", alice, file_ids=["f1"], criteria={"pages": 3, "caller": "someone-else"})
 
-    assert stream.events()[-1]["criteria"] == {"caller": "open-webui", "pages": 3}
+    assert stream.events()[-1]["criteria"] == {"caller": "ghostwriter", "pages": 3}
 
 
 def test_caller_survives_the_criteria_limit(log: AuditLog, stream: Stream, alice: Principal) -> None:
@@ -199,7 +199,7 @@ def test_caller_survives_the_criteria_limit(log: AuditLog, stream: Stream, alice
     log.record("search_files", alice, criteria=many)
 
     criteria = stream.events()[-1]["criteria"]
-    assert criteria["caller"] == "open-webui"
+    assert criteria["caller"] == "ghostwriter"
     assert len(criteria) == 32
 
 
@@ -234,7 +234,7 @@ def test_a_denial_has_no_target(log: AuditLog, stream: Stream, alice: Principal)
 
     last = stream.events()[-1]
     assert "target" not in last
-    assert (last["outcome"], last["criteria"]) == ("denied", {"caller": "open-webui", "refused": "purpose_required"})
+    assert (last["outcome"], last["criteria"]) == ("denied", {"caller": "ghostwriter", "refused": "purpose_required"})
     assert "request_id" not in last
 
 
@@ -260,7 +260,7 @@ def test_check_denies_only_a_required_action(log: AuditLog, stream: Stream, alic
     denied = stream.events()[-1]
     assert (denied["action"], denied["operation"], denied["outcome"]) == ("disclose", "file.view", "denied")
     assert "target" not in denied and "purpose" not in denied
-    assert denied["criteria"] == {"caller": "open-webui", "refused": "purpose_required", "container": "chat:chat-1"}
+    assert denied["criteria"] == {"caller": "ghostwriter", "refused": "purpose_required", "container": "chat:chat-1"}
     assert denied["request_id"] == "req-1"
     before = len(stream.events())
     strict.check("upload", alice)
@@ -367,7 +367,7 @@ def test_open_writes_to_the_selected_stream_under_the_service_name(
     capsys: pytest.CaptureFixture[str], alice: Principal
 ) -> None:
     """Without ``AUDIT_OUTPUT`` the chain goes to stdout, as the service ``workbench`` at the given version."""
-    settings = load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="api")
+    settings = load_settings({"GHOSTWRITER_WORKBENCH_KEY": KEY}, role="api")
     log = AuditLog.open(settings, "9.9.9")
 
     log.start({"retention_days": settings.retention_days})
@@ -388,7 +388,7 @@ def test_open_writes_to_the_selected_stream_under_the_service_name(
 def test_open_refuses_an_unknown_output() -> None:
     """An ``AUDIT_OUTPUT`` that names no mode stops startup instead of writing nowhere."""
     settings = dataclasses.replace(
-        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": KEY}, role="api"), audit_output="zz-nowhere"
+        load_settings({"GHOSTWRITER_WORKBENCH_KEY": KEY}, role="api"), audit_output="zz-nowhere"
     )
 
     with pytest.raises(ValueError, match="unknown AUDIT_OUTPUT"):
@@ -412,7 +412,7 @@ def test_201_ids_are_one_event_and_one_continuation(log: AuditLog, stream: Strea
     assert primary["event_id"] == event_id
     assert (primary["action"], primary["operation"]) == ("query", "tool.search_files")
     assert primary["target"] == {"kind": "file", "ids": ids[:200], "count": 201, "container": "chat:chat-1"}
-    assert primary["criteria"] == {"caller": "open-webui", "regex": False, "max_hits": 50}
+    assert primary["criteria"] == {"caller": "ghostwriter", "regex": False, "max_hits": 50}
     assert (more["action"], more["operation"], more["outcome"]) == ("query", "tool.search_files.ids", "ok")
     assert more["parent_event_id"] == event_id
     assert more["actor"] == primary["actor"]

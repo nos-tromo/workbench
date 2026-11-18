@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
-from tests.api.conftest import HD, HG, PG, AuditLines, put, unrecorded
+from tests.api.conftest import FORMER, HD, HG, PG, AuditLines, put, unrecorded
 from tests.api.mcp_calls import acall, error, refused, result, rpc
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import call as inline_call
@@ -352,9 +352,9 @@ def test_a_source_in_another_chat_is_refused(
     assert [o["name"] for o in filled["structuredContent"]["outputs"]] == ["form-filled.docx"]
 
 
-def test_open_webuis_files_are_not_ghostwriters(client: TestClient, store: Store, fake_executor: Local) -> None:
-    """Open WebUI's file in a chat of the same name and user is not Ghostwriter's."""
-    put(store, "q.csv", CSV)
+def test_a_former_callers_files_are_not_ghostwriters(client: TestClient, store: Store, fake_executor: Local) -> None:
+    """A file another caller left in a chat of the same name and user is not Ghostwriter's."""
+    put(store, "q.csv", CSV, p=FORMER)
     r = acall(client, "read_document", {"path": f"{CHAT}/q.csv"})
     assert refused(r) == {"reason": "refused"}
     assert result(r)["content"][0]["text"] == "not found"

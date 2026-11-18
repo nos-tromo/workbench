@@ -67,8 +67,8 @@ def anyio_backend() -> str:
 
 
 def user(name: str, chat: str = "chat-1") -> Principal:
-    """A synthetic user of Open WebUI."""
-    return Principal("open-webui", name, chat)
+    """A synthetic user of Ghostwriter's, called with no limits of its caller's."""
+    return Principal("ghostwriter", name, chat)
 
 
 def sample_result(
@@ -244,7 +244,7 @@ async def test_full_queue_refuses_at_once(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """One slot and room for one waiter: the third call is refused without waiting."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b", "open-webui/user-c"}
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_max=1)
     first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -263,7 +263,7 @@ async def test_full_queue_refuses_at_once(
 
 async def test_wait_timeout(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
     """A job that waits longer than ``queue_wait_s`` for a slot is refused, and gives its place up."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_wait_s=1)
     first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -285,7 +285,7 @@ async def test_one_job_per_user_others_proceed(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """User A's second job waits for the first, and does not take a slot the other user needs."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, jobs_per_user=1)
     a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -317,7 +317,7 @@ async def test_the_same_user_id_of_another_caller_is_another_user(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """The limit is per caller and user, as the workspaces are."""
-    executor.hold = {"open-webui/user-a", "docint/user-a"}
+    executor.hold = {"ghostwriter/user-a", "docint/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, jobs_per_user=1)
     one = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     other = asyncio.create_task(queue.submit(Principal("docint", "user-a", "chat-1"), "run_python", ARGS, []))
@@ -330,7 +330,7 @@ async def test_a_cancelled_waiter_gives_its_place_up(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A client that goes away while its job waits leaves no waiter and no held slot behind."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1, queue_max=1)
     first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -351,7 +351,7 @@ async def test_a_cancelled_running_job_frees_its_slot_and_is_recorded(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A client that goes away mid-job releases its slot, and the job record does not stay ``running``."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=1)
     running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -384,7 +384,7 @@ async def test_one_user_cannot_fill_the_queue(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """A user has ``queue_max // executor_slots`` calls waiting; the next is refused at once, theirs only."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b", "open-webui/user-c"}
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_max=4, jobs_per_user=1)
     a1 = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -410,7 +410,7 @@ async def test_the_users_share_of_the_queue_is_at_least_one(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """With more slots than queue places the share rounds up to one, and a waiter that leaves gives it back."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=4, queue_max=2, jobs_per_user=1)
     first = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -434,7 +434,7 @@ async def test_the_default_share_is_four_waiting_calls(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """16 places over 4 slots: one running and four waiting calls of a user, and the sixth is refused."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics)
     running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, []))
     await until(lambda: executor.running == 1)
@@ -462,7 +462,7 @@ async def test_the_request_carries_the_users_place_and_the_limits(
     assert req.job_id == job.id
     assert JOB_ID.fullmatch(job.id)
     assert (req.tool, req.args) == ("run_python", ARGS)
-    assert (req.caller, req.user_id, req.chat_id) == ("open-webui", "user-a", "chat-9")
+    assert (req.caller, req.user_id, req.chat_id) == ("ghostwriter", "user-a", "chat-9")
     assert req.input_files == ["a.xlsx", "sub/b.docx"]
     assert (req.limits.wall_s, req.limits.cpu_s, req.limits.memory_mb, req.limits.file_mb) == (30, 30, 512, 7)
     assert req.max_chars == 4 * 1024
@@ -939,7 +939,7 @@ async def test_a_failed_job_record_does_not_hide_a_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A client that goes away is still cancelled, its slot is freed and its staging folder cleared."""
-    executor.hold = {"open-webui/user-a"}
+    executor.hold = {"ghostwriter/user-a"}
     break_finish(store, monkeypatch)
     queue = queue_for(settings, executor, store, metrics, executor_slots=1)
     running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], KEEP))
@@ -1244,7 +1244,7 @@ def request_for(job_id: str = "a" * 32) -> JobRequest:
             "job_id": job_id,
             "tool": "run_python",
             "args": ARGS,
-            "caller": "open-webui",
+            "caller": "ghostwriter",
             "user_id": "user-a",
             "chat_id": "chat-1",
             "input_files": [],
@@ -1668,7 +1668,7 @@ async def test_inline_data_the_protocol_refuses_is_refused_before_a_turn_or_a_jo
 async def test_a_capped_caller_runs_at_most_its_slots_and_leaves_room_for_others(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Four docint users, two slots of its own: two run, two wait without a global slot, and Open WebUI still runs."""
+    """Four docint users, two slots of its own: two run, two wait without a global slot, and Ghostwriter still runs."""
     executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(4)}
     queue = queue_for(settings, executor, store, metrics)
     calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(4)]
@@ -1677,7 +1677,7 @@ async def test_a_capped_caller_runs_at_most_its_slots_and_leaves_room_for_others
         _, result, _ = await queue.submit(user("user-a"), "run_python", ARGS, [])
     assert result.status == "ok"
     assert executor.running == 2
-    assert [r.caller for r in executor.requests] == ["docint", "docint", "open-webui"]
+    assert [r.caller for r in executor.requests] == ["docint", "docint", "ghostwriter"]
     executor.gate.set()
     await asyncio.gather(*calls)
     assert len(executor.requests) == 5
@@ -1688,7 +1688,7 @@ async def test_the_callers_waiting_calls_are_capped_across_many_users(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """Docint's users are pseudonyms each: 2 run, 8 wait (2 * 16 // 4), the 11th is refused, and places come back."""
-    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)} | {"open-webui/user-a"}
+    executor.hold = {f"docint/{docint_user(n).user_id}" for n in range(10)} | {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics)
     calls = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in range(10)]
     await until(lambda: executor.running == 2 and sample(metrics, "workbench_queue_length") == 8)
@@ -1714,7 +1714,7 @@ async def test_a_per_call_wait_replaces_the_queue_wait(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
     """The queue waits 60 s, the call 1 s: it is refused after its own wait, and gives the caller's slot back."""
-    executor.hold = {"open-webui/user-a", "open-webui/user-b"}
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b"}
     queue = queue_for(settings, executor, store, metrics, executor_slots=2, queue_wait_s=60)
     held = [asyncio.create_task(queue.submit(user(name), "run_python", ARGS, [])) for name in ("user-a", "user-b")]
     await until(lambda: executor.running == 2)
@@ -2087,13 +2087,13 @@ async def test_inline_data_past_the_line_is_too_large_and_not_sent(
     assert record is not None and record.status == "error"
 
 
-async def test_open_webui_is_never_capped(
+async def test_a_call_without_caller_limits_is_never_capped(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Docint's gate holds docint alone: four Open WebUI users run at once while docint's calls wait for a slot."""
+    """Docint's gate holds docint alone: four users of a call without limits run at once while docint's wait."""
     queue = queue_for(settings, executor, store, metrics)
     await run_inline(queue, Takes(settings))
-    executor.hold = {f"open-webui/user-{n}" for n in range(4)}
+    executor.hold = {f"ghostwriter/user-{n}" for n in range(4)}
     others = [asyncio.create_task(queue.submit(user(f"user-{n}"), "run_python", ARGS, [])) for n in range(4)]
     await until(lambda: executor.running == 4)
     waiting = [asyncio.create_task(run_inline(queue, Takes(settings), docint_user(n))) for n in (2, 3)]

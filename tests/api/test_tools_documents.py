@@ -18,7 +18,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CHAT, HG, HG_B, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CHAT, FORMER, HG, HG_B, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_jobs import FakeClient
 from workbench.api.audit import AuditLog
@@ -455,7 +455,7 @@ def test_search_files_sends_every_file_of_the_chat_newest_first(
         quota_bytes=100,
         record=unrecorded,
     )
-    put(store, "open-webuis.txt")
+    put(store, "former-callers.txt", p=FORMER)
     executor.payload = hits((f"{CHAT}/new.docx", "paragraph 1", "match here"))
     answer = answered(find(client, "match", regex=True, max_hits=5))
     (req,) = executor.requests

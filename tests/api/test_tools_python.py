@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from tests.api.conftest import CHAT, HG, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CHAT, FORMER, HG, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
@@ -129,7 +129,7 @@ def test_every_file_of_the_chat_goes_to_the_job_newest_first(
     put(store, "elsewhere.txt", directory="/workspace/chat-2", p=Principal("ghostwriter", "user-a", "chat-2"))
     theirs = Principal("ghostwriter", "user-b", "chat-1")
     store.add_upload(theirs, CHAT, "theirs.txt", io.BytesIO(b"x"), max_bytes=10, quota_bytes=100, record=unrecorded)
-    put(store, "open-webuis.txt")
+    put(store, "former-callers.txt", p=FORMER)
     answered(run(client, "print('hello')"))
     (req,) = fake_executor.requests
     assert req.tool == "run_python"

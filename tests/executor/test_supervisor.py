@@ -47,7 +47,7 @@ ROOT_ON_LINUX = LINUX and os.geteuid() == 0
 #: Root in the executor image (its ``/workspace`` link), never a bare host: the tests that change ``/dev/zero`` need it.
 IN_THE_IMAGE = ROOT_ON_LINUX and Path("/workspace").is_symlink()
 ME = (os.getuid(), os.getgid())
-CALLER, USER, CHAT = "open-webui", "user-a", "chat-1"
+CALLER, USER, CHAT = "ghostwriter", "user-a", "chat-1"
 MB = 1024 * 1024
 
 PRELUDE = """\

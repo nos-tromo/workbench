@@ -14,7 +14,7 @@ from typing import override
 
 import pytest
 
-from tests.api.conftest import PG, unrecorded
+from tests.api.conftest import FORMER, PG, unrecorded
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
@@ -66,13 +66,13 @@ def store(tmp_path: Path, workspaces: Workspaces, clock: Clock) -> Store:
 @pytest.fixture
 def alice() -> Principal:
     """The first synthetic user."""
-    return Principal("open-webui", "user-a", "chat-1")
+    return Principal("ghostwriter", "user-a", "chat-1")
 
 
 @pytest.fixture
 def bob() -> Principal:
     """A second synthetic user of the same caller."""
-    return Principal("open-webui", "user-b", "chat-1")
+    return Principal("ghostwriter", "user-b", "chat-1")
 
 
 def put(
@@ -108,7 +108,7 @@ def test_upload_streams_to_disk_and_records_metadata(
         alice, "/workspace/chat-1", "q.xlsx", io.BytesIO(b"x" * 10), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded
     )
     assert (rec.kind, rec.size, rec.virtual_path) == ("upload", 10, "/workspace/chat-1/q.xlsx")
-    assert (rec.caller, rec.user_id, rec.chat_id, rec.name) == ("open-webui", "user-a", "chat-1", "q.xlsx")
+    assert (rec.caller, rec.user_id, rec.chat_id, rec.name) == ("ghostwriter", "user-a", "chat-1", "q.xlsx")
     assert rec.job_id is None
     assert rec.created_at == clock.now
     assert len(rec.id) == 32
@@ -258,7 +258,7 @@ def test_quota_counts_all_chats_of_the_user(store: Store, alice: Principal, work
             record=unrecorded,
         )
     assert disk_names(workspaces.resolve(alice, "/workspace/chat-2")) == []
-    assert store.files_in_chat(Principal("open-webui", "user-a", "chat-2")) == []
+    assert store.files_in_chat(Principal("ghostwriter", "user-a", "chat-2")) == []
     assert store.usage(alice) == 60
     store.add_upload(
         alice, "/workspace/chat-2", "b.bin", io.BytesIO(b"x" * 40), max_bytes=MAX, quota_bytes=100, record=unrecorded
@@ -848,7 +848,7 @@ def test_move_into_a_folder_and_into_another_chat(store: Store, alice: Principal
     assert (elsewhere.chat_id, elsewhere.name) == ("chat-2", "q.xlsx")
     assert workspaces.resolve(alice, elsewhere.virtual_path).read_bytes() == b"content"
     assert store.files_in_chat(alice) == []
-    assert store.files_in_chat(Principal("open-webui", "user-a", "chat-2")) == [elsewhere]
+    assert store.files_in_chat(Principal("ghostwriter", "user-a", "chat-2")) == [elsewhere]
     assert store.usage(alice) == 7
 
 
@@ -1163,7 +1163,7 @@ def test_remove_refuses_a_path_that_is_now_a_link(
 def test_add_job_records_the_run_and_finish_job_its_status(store: Store, alice: Principal, clock: Clock) -> None:
     """A new job is ``running``; finishing it stores the final status."""
     job = store.add_job(alice, "run_python")
-    assert (job.caller, job.user_id, job.chat_id, job.tool) == ("open-webui", "user-a", "chat-1", "run_python")
+    assert (job.caller, job.user_id, job.chat_id, job.tool) == ("ghostwriter", "user-a", "chat-1", "run_python")
     assert (job.status, job.created_at, len(job.id)) == ("running", clock.now, 32)
     assert store.get_job(alice, job.id) == job
     store.finish_job(job.id, "ok")
@@ -1179,7 +1179,7 @@ def test_get_job_is_scoped_to_caller_and_user(store: Store, alice: Principal, bo
         store.get_job(Principal("other-caller", "user-a", "chat-1"), job.id)
     with pytest.raises(NotFound):
         store.get_job(alice, "0" * 32)
-    assert store.get_job(Principal("open-webui", "user-a", "chat-9"), job.id) == job
+    assert store.get_job(Principal("ghostwriter", "user-a", "chat-9"), job.id) == job
 
 
 def test_due_jobs_and_forget_jobs(store: Store, alice: Principal, bob: Principal, clock: Clock) -> None:
@@ -1300,9 +1300,9 @@ def test_a_chat_delete_never_slips_between_a_jobs_check_and_its_row(
 
 
 def test_the_hold_is_the_deleted_chats_alone(store: Store) -> None:
-    """Another chat of the user, and Open WebUI's chat of the same user id and chat id, still take jobs and uploads."""
+    """Another chat of the user, and a former caller's chat of the same ids, still take jobs and uploads."""
     store.delete_chat(PG, unrecorded)
-    for p in (Principal("open-webui", "user-a", "chat-1"), dataclasses.replace(PG, chat_id="chat-2")):
+    for p in (FORMER, dataclasses.replace(PG, chat_id="chat-2")):
         assert store.add_job(p, "run_python").chat_id == p.chat_id
         assert put(store, p, "q.csv", directory=f"/workspace/{p.chat_id}").chat_id == p.chat_id
 

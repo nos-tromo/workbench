@@ -38,7 +38,7 @@ def _fields(**overrides: Any) -> dict[str, Any]:
         "job_id": JOB_ID,
         "tool": "echo",
         "args": {"x": 1, "text": "line one\nline two"},
-        "caller": "open-webui",
+        "caller": "ghostwriter",
         "user_id": "user-a",
         "chat_id": "chat-1",
         "input_files": ["quarterly-figures.xlsx", "reports/summary.docx"],
@@ -127,7 +127,7 @@ def test_malformed_lines_are_value_errors() -> None:
 def test_a_request_names_the_user_root_its_chat_folder_lies_in() -> None:
     """The executor finds the chat folder below ``<caller>/<user-id>``, so the request carries both."""
     request = _request()
-    assert (request.caller, request.user_id, request.chat_id) == ("open-webui", "user-a", "chat-1")
+    assert (request.caller, request.user_id, request.chat_id) == ("ghostwriter", "user-a", "chat-1")
 
 
 @pytest.mark.parametrize(
