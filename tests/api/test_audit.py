@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import HG
 from tests.api.conftest import KEY as CALLER_KEY
+from tests.api.mcp_calls import acall, answered
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_inline import body as inline_body
 from tests.api.test_tools_inline import call as inline_call
@@ -308,7 +309,8 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
     """Every audited operation runs, on files whose names the user and the model chose; none of the names is recorded.
 
     The names, the template's field and the model's values all carry one telling word, and every key of
-    ``OPERATIONS`` must have been recorded, so the test cannot pass by recording nothing.
+    ``OPERATIONS`` must have been recorded, so the test cannot pass by recording nothing. The tools run as Ghostwriter
+    calls them; the terminal door's own file routes still run with its key.
     """
     executor = Scripted(settings.data_dir)
     app = create_app(
@@ -317,37 +319,39 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
     word = "salaries"
     h = {"Authorization": f"Bearer {CALLER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
     with TestClient(app) as client:
-        for name, data in ((f"{word}-of-user-b.csv", b"a,b\n"), (f"{word}-form.docx", b"PK")):
-            where = {"directory": "/workspace/chat-1"}
-            assert (
-                client.post("/files/upload", params=where, headers=h, files={"file": (name, data)}).status_code == 200
-            )
+        where = {"directory": "/workspace/chat-1"}
+        for headers in (h, HG):
+            for name, data in ((f"{word}-of-user-b.csv", b"a,b\n"), (f"{word}-form.docx", b"PK")):
+                uploaded = client.post("/files/upload", params=where, headers=headers, files={"file": (name, data)})
+                assert uploaded.status_code == 200
         csv, form = f"/workspace/chat-1/{word}-of-user-b.csv", f"/workspace/chat-1/{word}-form.docx"
-        for route in ("view", "read", "display"):
+        for route in ("read", "display"):
             assert client.get(f"/files/{route}", params={"path": csv}, headers=h).status_code == 200
+        assert client.get("/files/view", params={"path": csv}, headers=HG).status_code == 200
         executor.payload = {"path": csv, "kind": "csv", "parts": [], "total_parts": 0, "pages_without_text": []}
         executor.payload["truncated"] = False
-        assert client.post("/tools/read_document", json={"path": csv}, headers=h).status_code == 200
+        answered(acall(client, "read_document", {"path": csv}))
         executor.payload = {"hits": [], "truncated": False, "files_searched": 2, "unsupported_files": 0}
-        assert client.post("/tools/search_files", json={"query": word}, headers=h).status_code == 200
+        answered(acall(client, "search_files", {"query": word}))
         executor.files = {f"{word}-chart.png": b"png"}
         executor.payload = {"stdout": "", "stderr": "", "truncated": False}
-        assert client.post("/tools/run_python", json={"code": f"print('{word}')"}, headers=h).status_code == 200
+        answered(acall(client, "run_python", {"code": f"print('{word}')"}))
         executor.files = {}
         executor.payload = {"template_kind": "none", "fields": [], "total": 0, "truncated": False}
-        assert client.post("/tools/inspect_template", json={"path": form}, headers=h).status_code == 200
+        answered(acall(client, "inspect_template", {"path": form}))
         executor.files = {f"{word}-filled.docx": b"PK"}
         executor.payload = {"filled": [word], "unfilled": [], "warnings": []}
         values = {word: {"value": word, "source": {"kind": "assistant"}}}
-        body = {"path": form, "values": values, "output_name": f"{word}-filled.docx"}
-        assert client.post("/tools/fill_template", json=body, headers=h).status_code == 200
+        answered(acall(client, "fill_template", {"path": form, "values": values, "output_name": f"{word}-filled.docx"}))
         executor.files = {f"{word}-table.csv": b"a"}
         executor.payload = {}
-        table = {"name": f"{word}-table", "format": "csv", "columns": [word], "rows": [[word]]}
-        assert client.post("/tools/write_table", json=table, headers=h).status_code == 200
+        answered(
+            acall(
+                client, "write_table", {"name": f"{word}-table", "format": "csv", "columns": [word], "rows": [[word]]}
+            )
+        )
         executor.files = {f"{word}-notes.md": b"#"}
-        document = {"name": f"{word}-notes", "format": "md", "markdown": word}
-        assert client.post("/tools/write_document", json=document, headers=h).status_code == 200
+        answered(acall(client, "write_document", {"name": f"{word}-notes", "format": "md", "markdown": word}))
         executor.files = {f"{word}-inline.csv": b"a\n"}
         executor.payload = {"stdout": word, "stderr": "", "truncated": False}
         inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
@@ -355,7 +359,7 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         assert client.delete("/files/delete", params={"path": csv}, headers=h).status_code == 200
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
-        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 1}
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 7}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

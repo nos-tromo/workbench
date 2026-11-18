@@ -1,7 +1,7 @@
 """Ghostwriter's workspace tools on the MCP door: the eight tools, their outputs and previews, its chat and its limits.
 
 The executor runs the real runners in this process (:class:`~tests.api.test_tools_templates.Local`); a test that needs
-another answer scripts it. The wire is ``tests/api/test_mcp.py``'s, sent with Ghostwriter's headers.
+another answer scripts it. The wire is ``tests/api/mcp_calls.py``'s, sent with Ghostwriter's headers.
 """
 
 import concurrent.futures
@@ -23,8 +23,9 @@ from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
 from tests.api.conftest import HD, HG, PG, AuditLines, H, put, unrecorded
+from tests.api.mcp_calls import acall, error, refused, result, rpc
 from tests.api.test_jobs import sample, until
-from tests.api.test_mcp import Headers, error, refused, result, rpc
+from tests.api.test_mcp import call as inline_call
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.api.test_tools_templates import Local
@@ -81,13 +82,6 @@ GUARDED: Final[dict[str, tuple[str, dict[str, Any]]]] = {
     "write_table": ("collect", TABLE),
     "write_document": ("collect", {"name": "notes", "format": "md", "markdown": "# Hafen"}),
 }
-
-
-def acall(
-    client: TestClient, tool: str, arguments: dict[str, Any] | None = None, *, headers: Headers = HG, **options: Any
-) -> httpx2.Response:
-    """Call a tool on the MCP door as Ghostwriter does, on the modern revision."""
-    return rpc(client, "tools/call", {"name": tool, "arguments": arguments or {}}, headers=headers, **options)
 
 
 def keep(store: Store, p: Principal, name: str, data: bytes = CSV) -> FileRecord:
@@ -420,7 +414,7 @@ def test_ghostwriters_waiting_calls_are_capped_across_many_users(
 ) -> None:
     """Ghostwriter's users are pseudonyms each: 2 run, 8 wait (2 * 16 // 4), the 11th is refused at once.
 
-    Open WebUI's user still runs meanwhile, on a slot Ghostwriter's cap leaves free.
+    docint's call still runs meanwhile, on a slot Ghostwriter's cap leaves free.
     """
     executor = Scripted(settings.data_dir)
     executor.payload = ran()
@@ -443,14 +437,13 @@ def test_ghostwriters_waiting_calls_are_capped_across_many_users(
                 portal.call(held)
                 eleventh = acall(client, "run_python", {"code": "print(1)"}, headers={**HG, "X-User-Id": "user-10"})
                 assert refused(eleventh) == {"reason": "queue_full"}
-                other = client.post("/tools/run_python", json={"code": "print(1)"}, headers=H)
-                assert other.status_code == 200, other.text
+                assert result(inline_call(client))["isError"] is False
                 assert executor.running == 2
             finally:
                 portal.call(executor.gate.set)
             answers = [result(done.result(timeout=scaled(10))) for done in calls]
     assert [answer["isError"] for answer in answers] == [False] * 10
-    assert sorted(req.caller for req in executor.requests) == ["ghostwriter"] * 10 + ["open-webui"]
+    assert sorted(req.caller for req in executor.requests) == ["docint"] + ["ghostwriter"] * 10
 
 
 def test_the_terminal_door_asks_for_no_previews_and_no_caller_cap(

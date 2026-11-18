@@ -25,7 +25,10 @@ DOCINT_KEY = "d" * 32
 HD = {"Authorization": f"Bearer {DOCINT_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 GHOSTWRITER_KEY = "a" * 32
 HG = {"Authorization": f"Bearer {GHOSTWRITER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
+HG_B = {**HG, "X-User-Id": "user-b"}
 PG = Principal("ghostwriter", "user-a", "chat-1", confined=True)
+#: Ghostwriter's user and chat, unconfined: to lay out folders below its chat, which no call of its can make.
+PG_SETUP = Principal("ghostwriter", "user-a", "chat-1")
 H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 H_B = {**H, "X-User-Id": "user-b"}
 KEY_ONLY = {"Authorization": f"Bearer {KEY}"}
@@ -40,10 +43,10 @@ def unrecorded(*_: object) -> None:
     """Record nothing: for files a test puts in the store directly, where no event is under test."""
 
 
-def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT) -> FileRecord:
-    """Store ``data`` as ``name`` for the synthetic user, without going through the api."""
+def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT, p: Principal = ME) -> FileRecord:
+    """Store ``data`` as ``name`` for the synthetic user, by Open WebUI unless ``p`` names another caller."""
     return store.add_upload(
-        ME, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
+        p, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
     )
 
 

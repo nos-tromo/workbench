@@ -1,4 +1,4 @@
-"""The ``inspect_template`` and ``fill_template`` tools through the api.
+"""The ``inspect_template`` and ``fill_template`` tools on the MCP door, as Ghostwriter calls them.
 
 The job runs the real runner in this process (:class:`Local`), in a folder made as the supervisor makes one from the
 files the request names, so a filled file is a real one; a test that needs another answer scripts it. The runners
@@ -16,11 +16,25 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, override
 
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CHAT, KEY, ME, AuditLines, H, put, unrecorded
+from tests.api.conftest import CHAT, HG, PG, AuditLines, put, unrecorded
+from tests.api.mcp_calls import (
+    Headers,
+    acall,
+    answered,
+    error,
+    raw_call,
+    refusal,
+    refused,
+    result,
+    rpc,
+    sent_size,
+    unavailable,
+)
 from tests.api.test_jobs import FakeClient, KeepAll
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
@@ -28,7 +42,6 @@ from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue, RequestTooLarge
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.openapi import TOOL_TAG
 from workbench.api.routing import MAX_DEPTH
 from workbench.api.store import Store
 from workbench.config import Settings
@@ -121,7 +134,7 @@ def small(settings: Settings, store: Store, audit: AuditLog, executor: Local) ->
 def stored(store: Store, tmp_path: Path, name: str, build: Callable[..., Path], **where: Any) -> FileRecord:
     """Build a file at test time and store it as an upload of the chat."""
     built = build(tmp_path / "built" / name) if not where else build(tmp_path / "built" / name, **where)
-    return put(store, name, built.read_bytes())
+    return put(store, name, built.read_bytes(), p=PG)
 
 
 @pytest.fixture(autouse=True)
@@ -130,18 +143,18 @@ def built(tmp_path: Path) -> None:
     (tmp_path / "built").mkdir()
 
 
-def inspect(client: TestClient, path: str, headers: dict[str, str] = H) -> Any:
-    """Call ``inspect_template`` the way Open WebUI does."""
-    return client.post("/tools/inspect_template", json={"path": path}, headers=headers)
+def inspect(client: TestClient, path: str, headers: Headers = HG) -> httpx2.Response:
+    """Call ``inspect_template`` as Ghostwriter does, on the MCP door."""
+    return acall(client, "inspect_template", {"path": path}, headers=headers)
 
 
-def fill(client: TestClient, path: str, values: dict[str, Any], headers: dict[str, str] = H, **more: Any) -> Any:
-    """Call ``fill_template``; a value given bare gets the assistant as its source."""
+def fill(client: TestClient, path: str, values: dict[str, Any], headers: Headers = HG, **more: Any) -> httpx2.Response:
+    """Call ``fill_template`` on the MCP door; a value given bare gets the assistant as its source."""
     given = {
         key: value if isinstance(value, dict) and "source" in value else {"value": value, "source": ASSISTANT}
         for key, value in values.items()
     }
-    return client.post("/tools/fill_template", json={"path": path, "values": given, **more}, headers=headers)
+    return acall(client, "fill_template", {"path": path, "values": given, **more}, headers=headers)
 
 
 def events(audit_lines: AuditLines, tool: str) -> list[dict[str, Any]]:
@@ -150,8 +163,8 @@ def events(audit_lines: AuditLines, tool: str) -> list[dict[str, Any]]:
 
 
 def outputs(store: Store) -> list[FileRecord]:
-    """The files tools made in the chat."""
-    return [rec for rec in store.files_in_chat(ME) if rec.kind == "output"]
+    """The files tools made in Ghostwriter's chat."""
+    return [rec for rec in store.files_in_chat(PG) if rec.kind == "output"]
 
 
 def test_the_local_executor_reads_the_previews_a_job_asks_for(
@@ -163,8 +176,8 @@ def test_the_local_executor_reads_the_previews_a_job_asks_for(
     asked, unasked = KeepAll(), KeepAll()
 
     async def run() -> None:
-        await queue.submit(ME, "write_table", args, [], asked, previews=True)
-        await queue.submit(ME, "write_table", {**args, "name": "other.csv"}, [], unasked)
+        await queue.submit(PG, "write_table", args, [], asked, previews=True)
+        await queue.submit(PG, "write_table", {**args, "name": "other.csv"}, [], unasked)
 
     asyncio.run(run())
 
@@ -184,17 +197,15 @@ def test_inspect_answers_the_fields_and_records_a_query(
 ) -> None:
     """The template alone goes to the job; the answer names it by the store's path; one query event by its id."""
     form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    put(store, "other.txt")
-    r = inspect(client, f"{CHAT}/form.docx")
-    assert r.status_code == 200, r.text
-    body = r.json()
+    put(store, "other.txt", p=PG)
+    body = answered(inspect(client, f"{CHAT}/form.docx"))
     assert body["path"] == f"{CHAT}/form.docx"
     assert body["template_kind"] == "content_controls"
     assert [f["name"] for f in body["fields"]] == ["customer", "report_date", "status", "approved", "summary"]
     assert body["truncated"] is False
     (req,) = fake_executor.requests
     assert (req.tool, req.input_files) == ("inspect_template", ["form.docx"])
-    assert req.args == {"path": "form.docx", "budget_s": 90}
+    assert req.args == {"path": "form.docx", "budget_s": 86}
     (event,) = events(audit_lines, "inspect_template")
     assert (event["action"], event["target"]["ids"], event["outcome"]) == ("query", [form.id], "ok")
 
@@ -202,7 +213,7 @@ def test_inspect_answers_the_fields_and_records_a_query(
 def test_inspect_none_carries_the_hint(client: TestClient, store: Store, tmp_path: Path) -> None:
     """A document without fields: kind none, and the hint for the user."""
     stored(store, tmp_path, "plain.docx", mk.make_docx)
-    body = inspect(client, f"{CHAT}/plain.docx").json()
+    body = answered(inspect(client, f"{CHAT}/plain.docx"))
     assert (body["template_kind"], body["fields"]) == ("none", [])
     assert "version 1 cannot fill" in body["hint"]
 
@@ -212,10 +223,10 @@ def test_other_files_are_refused_before_any_job(
     client: TestClient, store: Store, fake_executor: Local, name: str
 ) -> None:
     """Only .docx, .dotx and .xlsx; the answer names them, and nothing is sent."""
-    put(store, name, b"PK")
+    put(store, name, b"PK", p=PG)
     for r in (inspect(client, f"{CHAT}/{name}"), fill(client, f"{CHAT}/{name}", {"x": "y"})):
-        assert r.status_code == 422
-        detail = r.json()["detail"]
+        reason, detail = refusal(r)
+        assert reason == "refused"
         assert detail.startswith("unsupported_template: ")
         for ext in (".docx", ".dotx", ".xlsx"):
             assert ext in detail
@@ -223,12 +234,12 @@ def test_other_files_are_refused_before_any_job(
 
 
 def test_another_users_template_is_not_found(client: TestClient, store: Store, tmp_path: Path) -> None:
-    """A path outside the caller's own files is a 404, as for every tool."""
-    theirs = Principal("open-webui", "user-b", "chat-1")
+    """A path outside the caller's own files is not found, as for every tool."""
+    theirs = Principal("ghostwriter", "user-b", "chat-1")
     data = mt.make_controls_docx(tmp_path / "built" / "form.docx").read_bytes()
     store.add_upload(theirs, CHAT, "form.docx", io.BytesIO(data), max_bytes=10**7, quota_bytes=10**8, record=unrecorded)
-    assert inspect(client, f"{CHAT}/form.docx").status_code == 404
-    assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).status_code == 404
+    assert refusal(inspect(client, f"{CHAT}/form.docx")) == ("refused", "not found")
+    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": "x"})) == ("refused", "not found")
 
 
 def test_an_inspection_is_cut_at_the_result_limit(
@@ -238,10 +249,8 @@ def test_an_inspection_is_cut_at_the_result_limit(
     controls = [mt.text_control(f"field_{n:03d}") for n in range(60)]
     stored(store, tmp_path, "many.docx", mt.make_controls_body, controls=controls)
     with small(settings, store, audit, fake_executor) as client:
-        r = inspect(client, f"{CHAT}/many.docx")
-    assert r.status_code == 200
-    assert len(r.content) <= 1024
-    body = r.json()
+        body = answered(inspect(client, f"{CHAT}/many.docx"))
+    assert sent_size(body) <= 1024
     assert body["truncated"] is True
     assert f"{len(body['fields'])} of 60 fields" in body["hint"]
 
@@ -260,9 +269,8 @@ def test_fill_writes_a_new_file_and_records_a_modify(
         "report_date": {"value": "2026-03-07", "source": {"kind": "file", "path": f"{CHAT}/q.pdf", "page": 2}},
         "approved": True,
     }
-    r = fill(client, f"{CHAT}/form.docx", values)
-    assert r.status_code == 200, r.text
-    assert r.json() == {
+    answer = answered(fill(client, f"{CHAT}/form.docx", values))
+    assert {key: value for key, value in answer.items() if key != "outputs"} == {
         "path": f"{CHAT}/form-filled.docx",
         "filled": 3,
         "unfilled": ["status", "summary"],
@@ -279,11 +287,12 @@ def test_fill_writes_a_new_file_and_records_a_modify(
     }
     (made,) = outputs(store)
     assert (made.name, made.job_id) == ("form-filled.docx", req.job_id)
+    assert [output["id"] for output in answer["outputs"]] == [made.id]
     (event,) = events(audit_lines, "fill_template")
     assert event["action"] == "modify"
     assert event["target"]["ids"] == [form.id, pdf.id, made.id]
     assert event["criteria"] == {
-        "caller": "open-webui",
+        "caller": "ghostwriter",
         "filled_by_source": {"file": 1, "job": 0, "user": 1, "assistant": 1},
     }
     raw = json.dumps(audit_lines())
@@ -296,8 +305,8 @@ def test_a_name_that_is_taken_gets_a_number_and_the_answer_names_the_stored_file
 ) -> None:
     """The store adds the number; the model hears the name the file has."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    put(store, "form-filled.docx")
-    assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).json()["path"] == f"{CHAT}/form-filled (1).docx"
+    put(store, "form-filled.docx", p=PG)
+    assert answered(fill(client, f"{CHAT}/form.docx", {"customer": "x"}))["path"] == f"{CHAT}/form-filled (1).docx"
 
 
 def test_the_default_name_of_a_long_multibyte_template_is_cut_to_a_valid_name(
@@ -305,10 +314,8 @@ def test_the_default_name_of_a_long_multibyte_template_is_cut_to_a_valid_name(
 ) -> None:
     """A name may have 255 bytes: 83 euro signs and .docx are 254, so the default name is cut by bytes, not length."""
     template = "€" * 83 + ".docx"
-    put(store, template, mt.make_controls_docx(tmp_path / "built" / "form.docx").read_bytes())
-    r = fill(client, f"{CHAT}/{template}", {"customer": "x"})
-    assert r.status_code == 200, r.text
-    name = r.json()["path"].rsplit("/", 1)[1]
+    put(store, template, mt.make_controls_docx(tmp_path / "built" / "form.docx").read_bytes(), p=PG)
+    name = answered(fill(client, f"{CHAT}/{template}", {"customer": "x"}))["path"].rsplit("/", 1)[1]
     assert name == "€" * 81 + "-filled.docx"
     assert len(name.encode()) == 255
 
@@ -319,7 +326,7 @@ def test_a_form_field_that_could_not_be_filled_is_not_counted_as_filled(
     """A form field that runs over a paragraph break is unfilled, and the event does not count its source."""
     stored(store, tmp_path, "split.docx", mt.make_split_form_field_docx)
     values = {"name": {"value": "x", "source": {"kind": "user"}}, "city": "y"}
-    body = fill(client, f"{CHAT}/split.docx", values).json()
+    body = answered(fill(client, f"{CHAT}/split.docx", values))
     assert (body["filled"], body["unfilled"]) == (1, ["name"])
     (event,) = events(audit_lines, "fill_template")
     assert event["criteria"]["filled_by_source"] == {"file": 0, "job": 0, "user": 0, "assistant": 1}
@@ -338,51 +345,62 @@ def test_the_runners_mirrored_bounds_are_the_apis() -> None:
 def test_a_dotx_template_is_filled_into_a_docx(client: TestClient, store: Store, tmp_path: Path) -> None:
     """The default name and any name given end in .docx."""
     path = mt.as_dotx(mt.make_controls_docx(tmp_path / "built" / "a.docx"), tmp_path / "built" / "form.dotx")
-    put(store, "form.dotx", path.read_bytes())
-    assert fill(client, f"{CHAT}/form.dotx", {"customer": "x"}).json()["path"] == f"{CHAT}/form-filled.docx"
+    put(store, "form.dotx", path.read_bytes(), p=PG)
+    assert answered(fill(client, f"{CHAT}/form.dotx", {"customer": "x"}))["path"] == f"{CHAT}/form-filled.docx"
     named = fill(client, f"{CHAT}/form.dotx", {"customer": "x"}, output_name="for-the-board.docx")
-    assert named.json()["path"] == f"{CHAT}/for-the-board.docx"
-    assert fill(client, f"{CHAT}/form.dotx", {"customer": "x"}, output_name="x.dotx").status_code == 422
+    assert answered(named)["path"] == f"{CHAT}/for-the-board.docx"
+    refused_name = fill(client, f"{CHAT}/form.dotx", {"customer": "x"}, output_name="x.dotx")
+    assert refusal(refused_name) == ("refused", "output_name must be a plain file name ending in .docx")
 
 
-@pytest.mark.parametrize("name", ["summary.xls", "summary", "../summary.xlsx", "a/b.xlsx", "", "x" * 300 + ".xlsx"])
+@pytest.mark.parametrize(
+    ("name", "reason"),
+    [
+        ("summary.xls", "refused"),
+        ("summary", "refused"),
+        ("../summary.xlsx", "refused"),
+        ("a/b.xlsx", "refused"),
+        ("", "refused"),
+        ("x" * 300 + ".xlsx", "invalid_arguments"),
+    ],
+)
 def test_an_output_name_must_be_a_plain_name_with_the_outputs_extension(
-    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, name: str
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, name: str, reason: str
 ) -> None:
-    """Anything else is a 422, and nothing runs."""
+    """Anything else is refused, past its bound already as an argument, and nothing runs."""
     stored(store, tmp_path, "summary.xlsx", mt.make_placeholder_xlsx)
-    r = fill(client, f"{CHAT}/summary.xlsx", {"total": 1}, output_name=name)
-    assert r.status_code == 422
+    assert refused(fill(client, f"{CHAT}/summary.xlsx", {"total": 1}, output_name=name))["reason"] == reason
     assert fake_executor.requests == []
 
 
 def test_a_workbook_is_filled_into_a_workbook(client: TestClient, store: Store, tmp_path: Path) -> None:
     """The default name keeps the extension; the warnings come through."""
     stored(store, tmp_path, "summary.xlsx", mt.make_placeholder_xlsx)
-    body = fill(client, f"{CHAT}/summary.xlsx", {"total": 1, "colour": "blue"}).json()
+    body = answered(fill(client, f"{CHAT}/summary.xlsx", {"total": 1, "colour": "blue"}))
     assert body["path"] == f"{CHAT}/summary-filled.xlsx"
     assert body["unfilled"] == ["customer", "rows"]
     assert any("colour" in warning for warning in body["warnings"])
 
 
 def test_sources_must_exist(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:
-    """Each source the api or the job cannot find is a 422 that names the field.
+    """Each source the api or the job cannot find is refused, naming the field.
 
     A missing file, another user's or another chat's job, a job that is no finished run_python run, and a page past
     the end; none of the answers says whether a job exists for someone else.
     """
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     stored(store, tmp_path, "q.pdf", lambda path: mk.make_pdf(path, ["one", "two"]))
-    put(store, "elsewhere.pdf", directory="/workspace/chat-2")
-    mine = store.add_job(ME, "run_python")
+    other_chat_p = Principal("ghostwriter", "user-a", "chat-2")
+    put(store, "elsewhere.pdf", directory="/workspace/chat-2", p=other_chat_p)
+    mine = store.add_job(PG, "run_python")
     store.finish_job(mine.id, "ok")
-    theirs = store.add_job(Principal("open-webui", "user-b", "chat-1"), "run_python")
+    theirs = store.add_job(Principal("ghostwriter", "user-b", "chat-1"), "run_python")
     store.finish_job(theirs.id, "ok")
-    other_chat = store.add_job(Principal("open-webui", "user-a", "chat-2"), "run_python")
+    other_chat = store.add_job(other_chat_p, "run_python")
     store.finish_job(other_chat.id, "ok")
-    failed = store.add_job(ME, "run_python")
+    failed = store.add_job(PG, "run_python")
     store.finish_job(failed.id, "error")
-    reading = store.add_job(ME, "read_document")
+    reading = store.add_job(PG, "read_document")
     store.finish_job(reading.id, "ok")
 
     def job(job_id: str) -> dict[str, Any]:
@@ -404,9 +422,8 @@ def test_sources_must_exist(client: TestClient, store: Store, fake_executor: Loc
     }
     answers: dict[str, str] = {}
     for case, value in refused.items():
-        r = fill(client, f"{CHAT}/form.docx", {"customer": value})
-        assert r.status_code == 422, (case, r.text)
-        detail = r.json()["detail"]
+        reason, detail = refusal(fill(client, f"{CHAT}/form.docx", {"customer": value}))
+        assert reason == "refused", case
         assert detail.startswith("invalid_source: customer: "), (case, detail)
         answers[case] = detail
     shapes = {
@@ -416,8 +433,7 @@ def test_sources_must_exist(client: TestClient, store: Store, fake_executor: Loc
     assert len(shapes) == 1
     assert "page 99" in answers["page 99"]
     assert outputs(store) == []
-    ok = fill(client, f"{CHAT}/form.docx", {"customer": job(mine.id)})
-    assert ok.status_code == 200, ok.text
+    answered(fill(client, f"{CHAT}/form.docx", {"customer": job(mine.id)}))
 
 
 def test_the_files_a_fill_names_go_to_the_job_once(
@@ -428,16 +444,18 @@ def test_the_files_a_fill_names_go_to_the_job_once(
     stored(store, tmp_path, "quarterly-figures.xlsx", mk.make_xlsx)
     cited = {"kind": "file", "path": f"{CHAT}/quarterly-figures.xlsx", "sheet": "Sheet1", "cell": "B2"}
     values = {"customer": {"value": "x", "source": cited}, "summary": {"value": "y", "source": cited}}
-    assert fill(client, f"{CHAT}/form.docx", values).status_code == 200
+    answered(fill(client, f"{CHAT}/form.docx", values))
     assert fake_executor.requests[0].input_files == ["form.docx", "quarterly-figures.xlsx"]
 
 
-def test_a_value_the_field_does_not_take_is_the_runners_422(client: TestClient, store: Store, tmp_path: Path) -> None:
+def test_a_value_the_field_does_not_take_is_the_runners_refusal(
+    client: TestClient, store: Store, tmp_path: Path
+) -> None:
     """The runner's text, naming the field; no file is made."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    r = fill(client, f"{CHAT}/form.docx", {"status": "pending"})
-    assert r.status_code == 422
-    assert r.json()["detail"].startswith('invalid_value: status is a drop-down and takes one of: "open", "closed"')
+    reason, detail = refusal(fill(client, f"{CHAT}/form.docx", {"status": "pending"}))
+    assert reason == "refused"
+    assert detail.startswith('invalid_value: status is a drop-down and takes one of: "open", "closed"')
     assert outputs(store) == []
 
 
@@ -446,8 +464,7 @@ def test_outputs_whose_fill_cannot_be_recorded_are_removed(
 ) -> None:
     """As with an upload: a file that could not be recorded does not stay."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    unavailable(fill(client, f"{CHAT}/form.docx", {"customer": "x"}))
     assert outputs(store) == []
 
 
@@ -459,11 +476,11 @@ def test_an_ok_answer_that_cannot_be_read_keeps_no_output_and_is_recorded_as_an_
     fake_executor.files = {"form-filled.docx": b"PK"}
     fake_executor.payload = {"filled": "all"}
     r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert (r.status_code, r.json()) == (500, {"detail": "the tool returned an answer that could not be read"})
+    assert refusal(r) == ("refused", "the tool returned an answer that could not be read")
     assert outputs(store) == []
     (event,) = events(audit_lines, "fill_template")
     assert (event["action"], event["outcome"], event["target"]["ids"]) == ("modify", "error", [form.id])
-    assert event["criteria"] == {"caller": "open-webui", "outputs": 0}
+    assert event["criteria"] == {"caller": "ghostwriter", "outputs": 0}
 
 
 def test_a_fill_whose_output_was_not_kept_says_so(
@@ -473,9 +490,9 @@ def test_a_fill_whose_output_was_not_kept_says_so(
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.payload = {"filled": ["customer"], "unfilled": [], "warnings": []}
     fake_executor.message = "dropped 1 output: not the job's own file"
-    r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert r.status_code == 500
-    assert "dropped 1 output" in r.json()["detail"]
+    reason, detail = refusal(fill(client, f"{CHAT}/form.docx", {"customer": "x"}))
+    assert reason == "refused"
+    assert "dropped 1 output" in detail
     (event,) = events(audit_lines, "fill_template")
     assert (event["outcome"], event["criteria"]["outputs"]) == ("error", 0)
 
@@ -495,11 +512,11 @@ def test_the_filled_file_is_recorded_before_it_is_a_file_of_the_chat(
 
     def look(text: str, /) -> int:
         if '"tool.fill_template"' in text:
-            seen.append([rec.name for rec in store.files_in_chat(ME)])
+            seen.append([rec.name for rec in store.files_in_chat(PG)])
         return write(text)
 
     monkeypatch.setattr(audit_stream, "write", look)
-    assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).status_code == 200
+    answered(fill(client, f"{CHAT}/form.docx", {"customer": "x"}))
     assert seen == [["form.docx"]]
     (event,) = events(audit_lines, "fill_template")
     (new,) = outputs(store)
@@ -512,9 +529,8 @@ def test_unknown_names_the_model_sends_never_cost_the_filled_file(
     """Eight value names of 255 characters that are no field: one warning, within its bound; the file stays."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     unknown = {f"{n}" + "u" * 254: "y" for n in range(8)}
-    r = fill(client, f"{CHAT}/form.docx", {"customer": "x", **unknown})
-    assert r.status_code == 200, r.text
-    assert all(len(warning) <= 2000 for warning in r.json()["warnings"])
+    body = answered(fill(client, f"{CHAT}/form.docx", {"customer": "x", **unknown}))
+    assert all(len(warning) <= 2000 for warning in body["warnings"])
     assert [rec.name for rec in outputs(store)] == ["form-filled.docx"]
     assert len(events(audit_lines, "fill_template")) == 1
 
@@ -526,9 +542,7 @@ def test_a_runners_answer_over_the_apis_bounds_is_cut_never_a_500(
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.files = {"form-filled.docx": b"PK"}
     fake_executor.payload = {"filled": ["customer"], "unfilled": [], "warnings": ["w" * 5000]}
-    r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert r.status_code == 200, r.text
-    assert r.json()["warnings"] == ["w" * 2000]
+    assert answered(fill(client, f"{CHAT}/form.docx", {"customer": "x"}))["warnings"] == ["w" * 2000]
     assert [rec.name for rec in outputs(store)] == ["form-filled.docx"]
 
     def field(name: str, location: str = "body, paragraph 1") -> dict[str, Any]:
@@ -542,29 +556,30 @@ def test_a_runners_answer_over_the_apis_bounds_is_cut_never_a_500(
         "truncated": False,
         "hint": "h" * 3000,
     }
-    r = inspect(client, f"{CHAT}/form.docx")
-    assert r.status_code == 200, r.text
-    body = r.json()
+    body = answered(inspect(client, f"{CHAT}/form.docx"))
     assert [(f["name"], len(f["location"])) for f in body["fields"]] == [("short", 300)]
     assert len(body["hint"]) <= 2000
 
 
-def test_a_busy_executor_is_a_503(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:
+def test_a_busy_executor_is_executor_busy(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
     """Nothing ran; retry later."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.status = "busy"
-    assert fill(client, f"{CHAT}/form.docx", {"customer": "x"}).json() == {"detail": "busy, retry later"}
-    assert inspect(client, f"{CHAT}/form.docx").status_code == 503
+    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": "x"})) == ("executor_busy", "busy, retry later")
+    assert refused(inspect(client, f"{CHAT}/form.docx"))["reason"] == "executor_busy"
 
 
-def test_a_job_past_its_time_is_a_422(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:
+def test_a_job_past_its_time_is_refused_with_its_reason(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
     """The executor's reason, as for the reading tools."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     fake_executor.status = "timeout"
     fake_executor.message = "the job ran past its wall time of 120 s"
-    r = fill(client, f"{CHAT}/form.docx", {"customer": "x"})
-    assert (r.status_code, r.json()["detail"]) == (
-        422,
+    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": "x"})) == (
+        "refused",
         "the file could not be processed: the job ran past its wall time of 120 s",
     )
 
@@ -586,52 +601,39 @@ def test_a_job_past_its_time_is_a_422(client: TestClient, store: Store, fake_exe
     ],
     ids=["no values", "no source", "unknown kind", "long note", "long name", "1001 values", "no path", "no job id"],
 )
-def test_a_body_out_of_bounds_is_a_422_and_nothing_runs(
+def test_arguments_out_of_bounds_are_invalid_arguments_and_nothing_runs(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, body: dict[str, Any]
 ) -> None:
     """At most 1000 values, names of 255 characters, notes of 1000; every value with a source of a known kind."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    assert client.post("/tools/fill_template", json=body, headers=H).status_code == 422
+    assert refused(acall(client, "fill_template", body))["reason"] == "invalid_arguments"
     assert fake_executor.requests == []
 
 
-def test_a_request_too_large_for_the_executor_is_a_422(client: TestClient, store: Store, tmp_path: Path) -> None:
+def test_a_request_too_large_for_the_executor_is_too_large(client: TestClient, store: Store, tmp_path: Path) -> None:
     """The protocol's line bounds the rest."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     values = {f"f{n}": "x" * 2000 for n in range(600)}
-    assert fill(client, f"{CHAT}/form.docx", values).json() == {"detail": "request too large"}
+    assert refusal(fill(client, f"{CHAT}/form.docx", values)) == ("too_large", "request too large")
 
 
-def test_the_tools_are_in_the_schema_with_typed_parameters(app: FastAPI, client: TestClient) -> None:
-    """Both carry the tool tag and an operationId; every field of every body model has an explicit type."""
-    doc = client.get("/openapi.json", headers={"Authorization": f"Bearer {KEY}"}).json()
-    schemas = doc["components"]["schemas"]
+def test_the_tools_are_listed_with_typed_parameters(client: TestClient) -> None:
+    """Both are listed with a description for the model; every field of every argument model has an explicit type."""
+    tools = {t["name"]: t for t in result(rpc(client, "tools/list", headers=HG))["tools"]}
     for name in ("inspect_template", "fill_template"):
-        operation = doc["paths"][f"/tools/{name}"]["post"]
-        assert operation["operationId"] == name
-        assert operation["tags"] == [TOOL_TAG]
-        assert "Args:" not in operation["description"]
-    fill_description = doc["paths"]["/tools/fill_template"]["post"]["description"]
+        assert "Args:" not in tools[name]["description"]
+    fill_description = tools["fill_template"]["description"]
     for phrase in ("inspect_template first", "every value needs a source", "job_id", "run_python"):
         assert phrase in fill_description, phrase
-    assert "fill_template" in doc["paths"]["/tools/inspect_template"]["post"]["description"]
-    bodies = [
-        s
-        for n, s in schemas.items()
-        if n.startswith(("FillTemplate", "InspectTemplate", "FieldValue")) or n.endswith("Source")
-    ]
+    assert "fill_template" in tools["inspect_template"]["description"]
+    fill_schema = tools["fill_template"]["inputSchema"]
+    bodies = [tools["inspect_template"]["inputSchema"], fill_schema, *fill_schema["$defs"].values()]
     assert len(bodies) >= 7
     for schema in bodies:
         for field, spec in schema["properties"].items():
             assert "type" in spec, (schema["title"], field)
             assert spec.get("description", "").strip(), (schema["title"], field)
-    assert schemas["FillTemplateRequest"]["required"] == ["path", "values"]
-
-
-def test_the_tools_need_the_callers_key(client: TestClient) -> None:
-    """No key, no tool."""
-    assert client.post("/tools/inspect_template", json={"path": f"{CHAT}/a.docx"}).status_code == 401
-    assert client.post("/tools/fill_template", json={"path": f"{CHAT}/a.docx", "values": {}}).status_code == 401
+    assert fill_schema["required"] == ["path", "values"]
 
 
 # --- what a body may hold -----------------------------------------------------------------------------------------
@@ -643,15 +645,25 @@ def nested_json(depth: int) -> str:
 
 
 def fill_body(value_json: str) -> str:
-    """A ``fill_template`` body for ``form.docx`` whose one value is the JSON text given: three levels above it."""
+    """``fill_template``'s arguments for ``form.docx`` whose one value is the JSON text given: three levels above it."""
     value = f'{{"value": {value_json}, "source": {{"kind": "assistant"}}}}'
     return f'{{"path": "{CHAT}/form.docx", "values": {{"x": {value}}}}}'
+
+
+def fill_call(client: TestClient, value_json: str) -> httpx2.Response:
+    """Call ``fill_template`` with :func:`fill_body`'s arguments, two levels below the message: in its ``params``."""
+    return raw_call(client, "fill_template", fill_body(value_json))
+
+
+def too_deep(r: httpx2.Response) -> None:
+    """Check the door's one answer to a message nested past the depth limit."""
+    assert error(r, 400, -32600)["error"]["message"] == "request nested too deeply"
 
 
 @pytest.mark.parametrize(
     ("depth", "past_the_parser"), [(300, False), (20_000, True)], ids=["past the serializer", "past the parser"]
 )
-def test_a_value_nested_too_deeply_is_a_422_and_nothing_runs(
+def test_a_value_nested_too_deeply_is_refused_and_nothing_runs(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, depth: int, past_the_parser: bool
 ) -> None:
     """A list of lists of lists was a 500 when the job was encoded; it is refused as read, with one short answer.
@@ -664,22 +676,21 @@ def test_a_value_nested_too_deeply_is_a_422_and_nothing_runs(
     if past_the_parser:
         with pytest.raises(RecursionError):
             json.loads(body)
-    r = client.post("/tools/fill_template", content=body, headers={**H, "Content-Type": "application/json"})
-    assert (r.status_code, r.json()) == (422, {"detail": "request nested too deeply"})
+    too_deep(fill_call(client, nested_json(depth)))
     assert fake_executor.requests == []
 
 
-def test_a_body_as_deep_as_allowed_reaches_the_job(
+def test_arguments_as_deep_as_allowed_reach_the_job(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
 ) -> None:
-    """The limit is the body's own depth, objects and arrays together: one level more is refused, this many is not."""
+    """The limit is the message's own depth, objects and arrays together: one level more is refused, this many is not.
+
+    The arguments sit two levels below the message, in ``params``, so a value may nest two levels less than in a body.
+    """
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    headers = {**H, "Content-Type": "application/json"}
-    deepest = client.post("/tools/fill_template", content=fill_body(nested_json(MAX_DEPTH - 3)), headers=headers)
-    assert deepest.json() != {"detail": "request nested too deeply"}
+    result(fill_call(client, nested_json(MAX_DEPTH - 5)))
     assert len(fake_executor.requests) == 1
-    deeper = client.post("/tools/fill_template", content=fill_body(nested_json(MAX_DEPTH - 2)), headers=headers)
-    assert deeper.json() == {"detail": "request nested too deeply"}
+    too_deep(fill_call(client, nested_json(MAX_DEPTH - 4)))
 
 
 def test_a_request_as_deep_as_the_api_takes_is_one_the_executor_reads() -> None:
@@ -689,7 +700,7 @@ def test_a_request_as_deep_as_the_api_takes_is_one_the_executor_reads() -> None:
         job_id="0" * 32,
         tool="fill_template",
         args={"values": args},
-        caller="open-webui",
+        caller="ghostwriter",
         user_id="user-a",
         chat_id="chat-1",
         input_files=[],
@@ -699,15 +710,17 @@ def test_a_request_as_deep_as_the_api_takes_is_one_the_executor_reads() -> None:
     assert decode_request(encode(req)) == req
 
 
-def test_a_422_cuts_what_it_names_of_the_request(client: TestClient, store: Store, fake_executor: Local) -> None:
+def test_invalid_arguments_cut_what_they_name_of_the_request(
+    client: TestClient, store: Store, fake_executor: Local
+) -> None:
     """The field and the message are kept, cut where they would quote a long part of the request: a key, a tag."""
     key, tag = "harbour-key-" * 500, "harbour-tag-" * 500
     values = {key: {"value": 1, "source": ASSISTANT}, "x": {"value": 1, "source": {"kind": tag}}}
-    r = client.post("/tools/fill_template", json={"path": f"{CHAT}/form.docx", "values": values}, headers=H)
-    assert r.status_code == 422
-    errors = r.json()["detail"]
-    assert {error["type"] for error in errors} == {"string_too_long", "union_tag_invalid"}
-    assert len(r.text) < 2000
+    r = acall(client, "fill_template", {"path": f"{CHAT}/form.docx", "values": values})
+    structured = refused(r)
+    assert structured["reason"] == "invalid_arguments"
+    assert {error["type"] for error in structured["detail"]} == {"string_too_long", "union_tag_invalid"}
+    assert len(result(r)["content"][0]["text"]) < 2000
     assert key[:400] not in r.text and tag[:400] not in r.text
     assert fake_executor.requests == []
 
@@ -719,7 +732,7 @@ UNKNOWN_KIND = (
 
 
 @pytest.mark.parametrize("size", [300, 301])
-def test_a_422_keeps_300_characters_of_a_part_and_cuts_the_301st(
+def test_invalid_arguments_keep_300_characters_of_a_part_and_cut_the_301st(
     client: TestClient, fake_executor: Local, size: int
 ) -> None:
     """A location part or a message of 300 characters is whole; one more, and it is its first 300 and `` [cut]``."""
@@ -728,12 +741,12 @@ def test_a_422_keeps_300_characters_of_a_part_and_cuts_the_301st(
     message = UNKNOWN_KIND.format(tag)
     assert len(message) == size
     values = {key: {"value": 1, "source": ASSISTANT}, "x": {"value": 1, "source": {"kind": tag}}}
-    r = client.post("/tools/fill_template", json={"path": f"{CHAT}/form.docx", "values": values}, headers=H)
-    assert r.status_code == 422
-    by_type = {error["type"]: error for error in r.json()["detail"]}
+    structured = refused(acall(client, "fill_template", {"path": f"{CHAT}/form.docx", "values": values}))
+    assert structured["reason"] == "invalid_arguments"
+    by_type = {error["type"]: error for error in structured["detail"]}
     shown_key = key if size == 300 else key[:300] + " [cut]"
     shown_message = message if size == 300 else message[:300] + " [cut]"
-    assert by_type["string_too_long"]["loc"] == ["body", "values", shown_key, "[key]"]
+    assert by_type["string_too_long"]["loc"] == ["values", shown_key, "[key]"]
     assert by_type["union_tag_invalid"]["msg"] == shown_message
     assert fake_executor.requests == []
 
@@ -746,13 +759,13 @@ def test_an_inspection_refusal_quoting_the_template_is_recorded_by_its_code_alon
 ) -> None:
     """The real runner quotes the line that does not compile; the event holds the code ``invalid_template`` only."""
     form = stored(store, tmp_path, "form.docx", mt.make_jinja_docx, extra="{% if salaries_of_user_b %}never closed")
-    r = inspect(client, f"{CHAT}/form.docx")
-    assert r.status_code == 422
-    assert r.json()["detail"].startswith("invalid_template: ")
-    assert "salaries_of_user_b" in r.json()["detail"]
+    reason, detail = refusal(inspect(client, f"{CHAT}/form.docx"))
+    assert reason == "refused"
+    assert detail.startswith("invalid_template: ")
+    assert "salaries_of_user_b" in detail
     (event,) = events(audit_lines, "inspect_template")
     assert (event["action"], event["outcome"], event["target"]["ids"]) == ("query", "error", [form.id])
-    assert event["criteria"] == {"caller": "open-webui", "refused": "invalid_template"}
+    assert event["criteria"] == {"caller": "ghostwriter", "refused": "invalid_template"}
     assert "salaries" not in json.dumps(audit_lines())
 
 
@@ -761,13 +774,13 @@ def test_a_fill_refusal_quoting_the_drop_downs_entries_is_recorded_by_its_code_a
 ) -> None:
     """The real runner names the drop-down's entries; the event holds the template's id and ``invalid_value``."""
     form = stored(store, tmp_path, "form.docx", mt.make_controls_docx)
-    r = fill(client, f"{CHAT}/form.docx", {"status": "pending"})
-    assert r.status_code == 422
-    assert '"open", "closed"' in r.json()["detail"]
+    reason, detail = refusal(fill(client, f"{CHAT}/form.docx", {"status": "pending"}))
+    assert reason == "refused"
+    assert '"open", "closed"' in detail
     assert outputs(store) == []
     (event,) = events(audit_lines, "fill_template")
     assert (event["action"], event["outcome"], event["target"]["ids"]) == ("modify", "error", [form.id])
-    assert event["criteria"] == {"caller": "open-webui", "outputs": 0, "refused": "invalid_value"}
+    assert event["criteria"] == {"caller": "ghostwriter", "outputs": 0, "refused": "invalid_value"}
     assert "closed" not in json.dumps(audit_lines())
 
 
@@ -782,4 +795,5 @@ def test_a_template_refusal_whose_record_cannot_be_written_never_reaches_the_mod
         if tool == "inspect_template"
         else fill(client, f"{CHAT}/form.docx", {"x": 1})
     )
-    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    unavailable(r)
+    assert "approved" not in r.text

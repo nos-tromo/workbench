@@ -1,4 +1,4 @@
-"""The file browser Open WebUI calls through its proxy, and the ``list_files`` and ``display_file`` tools.
+"""The file browser Open WebUI calls through its proxy, the ``display_file`` tool, and ``list_files`` on the MCP door.
 
 Every read or change of content is one audit event naming the file by id; no answer and no log line carries a
 file name, a path or a user id.
@@ -21,12 +21,12 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import CHAT, H_B, KEY_ONLY, ME, MIB, AuditLines, H, put, tick
+from tests.api.conftest import CHAT, H_B, HG, HG_B, KEY_ONLY, ME, MIB, PG, PG_SETUP, AuditLines, H, put, tick
+from tests.api.mcp_calls import acall, answered, rpc, sent_size
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.body_limit import BodyLimit
 from workbench.api.main import create_app
-from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import NotFound, StorageFull, Store
 from workbench.config import Settings
 from workbench.models import FileRecord
@@ -1269,7 +1269,6 @@ BROWSER_ROUTES: list[tuple[str, str, dict[str, Any]]] = [
     ("DELETE", "/files/delete?path=/workspace/chat-1/a.txt", {}),
     ("POST", "/files/mkdir", {"json": {"path": "/workspace/chat-1/x"}}),
     ("POST", "/files/move", {"json": {"source": "/workspace/chat-1/a.txt", "destination": "/workspace/chat-1/b.txt"}}),
-    ("POST", "/tools/list_files", {}),
 ]
 
 
@@ -1311,59 +1310,25 @@ def test_display_of_a_file_in_a_folder_gives_its_base_name(client: TestClient) -
     }
 
 
-# --- the tools in the schema -------------------------------------------------------------------------------------
+# --- the list_files tool ----------------------------------------------------------------------------------------
 
 
-def test_list_files_tool_is_in_the_schema(app: FastAPI, client: TestClient) -> None:
-    """Exactly the tools there are, each with an operationId set on its route, and every parameter typed."""
-    doc = client.get("/openapi.json", headers=KEY_ONLY).json()
-    assert {op["operationId"] for item in doc["paths"].values() for op in item.values()} == {
-        "list_files",
-        "display_file",
-        "read_document",
-        "search_files",
-        "run_python",
-        "inspect_template",
-        "fill_template",
-        "write_table",
-        "write_document",
-    }
-    tools = [r for r in iter_route_contexts(app.routes) if TOOL_TAG in (r.tags or [])]
-    assert {r.operation_id for r in tools} == {
-        "list_files",
-        "display_file",
-        "read_document",
-        "search_files",
-        "run_python",
-        "inspect_template",
-        "fill_template",
-        "write_table",
-        "write_document",
-    }
-    assert doc["paths"]["/tools/list_files"]["post"]["operationId"] == "list_files"
-    display = doc["paths"]["/files/display"]["get"]
-    assert display["operationId"] == "display_file"
-    assert [(p["name"], p["in"], p["required"], p["schema"]["type"]) for p in display["parameters"]] == [
-        ("path", "query", True, "string")
-    ]
-    for item in doc["paths"].values():
-        for op in item.values():
-            assert op["description"].strip()
-            assert "Args:" not in op["description"]
-            assert "Returns:" not in op["description"]
-
-
-def test_list_files_tool_lists_the_chats_files(client: TestClient, audit_lines: AuditLines) -> None:
+def test_list_files_tool_lists_the_chats_files(client: TestClient, store: Store, audit_lines: AuditLines) -> None:
     """The model sees this chat's files with their paths, sizes, kinds and dates, and nothing of other chats."""
-    upload(client, "q.csv", b"a,b\n")
-    client.post("/files/mkdir", json={"path": f"{CHAT}/reports"}, headers=H)
-    upload(client, "notes.txt", b"hello", directory=f"{CHAT}/reports")
-    upload(client, "elsewhere.txt", b"other chat", directory="/workspace/chat-2")
-    no_body = client.post("/tools/list_files", headers=H)
-    empty_body = client.post("/tools/list_files", json={}, headers=H)
-    assert no_body.status_code == empty_body.status_code == 200
-    assert no_body.json() == empty_body.json()
-    files = no_body.json()["files"]
+    upload(client, "q.csv", b"a,b\n", headers=HG)
+    store.mkdir(PG, f"{CHAT}/reports")
+    put(store, "notes.txt", b"hello", directory=f"{CHAT}/reports", p=PG_SETUP)
+    put(
+        store,
+        "elsewhere.txt",
+        b"other chat",
+        directory="/workspace/chat-2",
+        p=dataclasses.replace(PG_SETUP, chat_id="chat-2"),
+    )
+    no_arguments = answered(rpc(client, "tools/call", {"name": "list_files"}, headers=HG))
+    empty_arguments = answered(acall(client, "list_files", {}))
+    assert no_arguments == empty_arguments
+    files = no_arguments["files"]
     assert [(f["path"], f["size"], f["kind"]) for f in files] == [
         (f"{CHAT}/reports/notes.txt", 5, "upload"),
         (f"{CHAT}/q.csv", 4, "upload"),
@@ -1371,9 +1336,9 @@ def test_list_files_tool_lists_the_chats_files(client: TestClient, audit_lines: 
     for f in files:
         assert set(f) == {"path", "size", "modified", "kind"}
         assert datetime.fromisoformat(f["modified"]).tzinfo is not None
-    assert set(no_body.json()) == {"files", "truncated"}
-    assert no_body.json()["truncated"] is False
-    assert file_operations(audit_lines) == ["file.upload"] * 3
+    assert set(no_arguments) == {"files", "truncated", "hint", "outputs"}
+    assert (no_arguments["truncated"], no_arguments["hint"], no_arguments["outputs"]) == (False, None, [])
+    assert file_operations(audit_lines) == ["file.upload"]
 
 
 def test_list_files_is_capped_at_the_result_limit(
@@ -1382,11 +1347,10 @@ def test_list_files_is_capped_at_the_result_limit(
     """The newest files come first until the answer would pass ``result_max_kb``; the oldest are left out."""
     tick(store, monkeypatch)
     for i in range(40):
-        put(store, f"file-{i:02d}.txt")
-    r = limited_client.post("/tools/list_files", headers=H)
-    body = r.json()
+        put(store, f"file-{i:02d}.txt", p=PG)
+    body = answered(acall(limited_client, "list_files"))
     shown = [f["path"] for f in body["files"]]
-    assert len(r.content) <= 1024
+    assert sent_size(body) <= 1024
     assert body["truncated"] is True
     assert shown == [f"{CHAT}/file-{39 - i:02d}.txt" for i in range(len(shown))]
     assert shown[0] == f"{CHAT}/file-39.txt"
@@ -1404,8 +1368,8 @@ def test_list_files_lists_the_newest_first_and_breaks_ties_by_name(
     seconds = iter([1_000_001.0, 1_000_003.0, 1_000_002.0, 1_000_003.0, 1_000_003.0])
     monkeypatch.setattr(store, "_clock", lambda: next(seconds))
     for name in ("oldest.txt", "tie-b.txt", "middle.txt", "tie-c.txt", "tie-a.txt"):
-        put(store, name)
-    files = client.post("/tools/list_files", headers=H).json()["files"]
+        put(store, name, p=PG)
+    files = answered(acall(client, "list_files"))["files"]
     assert [f["path"] for f in files] == [
         f"{CHAT}/tie-a.txt",
         f"{CHAT}/tie-b.txt",
@@ -1417,11 +1381,11 @@ def test_list_files_lists_the_newest_first_and_breaks_ties_by_name(
 
 def test_list_files_says_nothing_is_cut_when_all_fit(client: TestClient, store: Store) -> None:
     """A list that fits is whole, and has no hint."""
-    put(store, "a.txt")
-    put(store, "b.txt")
-    body = client.post("/tools/list_files", headers=H).json()
+    put(store, "a.txt", p=PG)
+    put(store, "b.txt", p=PG)
+    body = answered(acall(client, "list_files"))
     assert body["truncated"] is False
-    assert "hint" not in body
+    assert body["hint"] is None
     assert len(body["files"]) == 2
 
 
@@ -1432,10 +1396,9 @@ def test_list_files_cap_holds_at_every_length(
     tick(store, monkeypatch)
     cut_seen = False
     for count in range(1, 26):
-        put(store, f"file-{count:02d}.txt")
-        r = limited_client.post("/tools/list_files", headers=H)
-        body = r.json()
-        assert len(r.content) <= 1024, count
+        put(store, f"file-{count:02d}.txt", p=PG)
+        body = answered(acall(limited_client, "list_files"))
+        assert sent_size(body) <= 1024, count
         assert body["files"][0]["path"] == f"{CHAT}/file-{count:02d}.txt", count
         assert body["truncated"] is (len(body["files"]) < count), count
         cut_seen = cut_seen or body["truncated"]
@@ -1448,29 +1411,29 @@ def test_list_files_cap_holds_at_every_length(
 def test_list_files_cap_counts_bytes_not_characters(limited_client: TestClient, store: Store) -> None:
     """Names with umlauts take two bytes a character in the answer, and the limit is in bytes."""
     for i in range(20):
-        put(store, f"{'\u00dc' * 60}-{i:02d}.txt")
-    r = limited_client.post("/tools/list_files", headers=H)
-    assert len(r.content) <= 1024
-    assert r.json()["truncated"] is True
+        put(store, f"{'\u00dc' * 60}-{i:02d}.txt", p=PG)
+    body = answered(acall(limited_client, "list_files"))
+    assert sent_size(body) <= 1024
+    assert body["truncated"] is True
 
 
 def test_list_files_cap_may_show_no_file_at_all(limited_client: TestClient, store: Store) -> None:
     """A single entry larger than the limit is left out, and the hint still counts it."""
-    put(store, "\x01" * 190 + ".txt")
-    body = limited_client.post("/tools/list_files", headers=H).json()
+    put(store, "\x01" * 190 + ".txt", p=PG)
+    body = answered(acall(limited_client, "list_files"))
     assert body["files"] == []
     assert body["truncated"] is True
     assert older_hint(1, 1) in body["hint"]
 
 
 def test_list_files_tool_is_empty_for_a_new_chat_and_other_users(client: TestClient, store: Store) -> None:
-    """Nothing is made by asking, and another user's files are not listed."""
-    nothing: dict[str, Any] = {"files": [], "truncated": False}
-    assert client.post("/tools/list_files", headers=H).json() == nothing
-    put(store, "q.csv")
-    assert client.post("/tools/list_files", headers=H_B).json() == nothing
-    assert client.post("/tools/list_files", headers={**H, "X-Session-Id": "chat-2"}).json() == nothing
-    assert len(client.post("/tools/list_files", headers=H).json()["files"]) == 1
+    """Nothing is made by asking, and another user's files, or another chat's, are not listed."""
+    nothing: dict[str, Any] = {"files": [], "truncated": False, "hint": None, "outputs": []}
+    assert answered(acall(client, "list_files")) == nothing
+    put(store, "q.csv", p=PG)
+    assert answered(acall(client, "list_files", headers=HG_B)) == nothing
+    assert answered(acall(client, "list_files", headers={**HG, "X-Session-Id": "chat-2"})) == nothing
+    assert len(answered(acall(client, "list_files"))["files"]) == 1
 
 
 @pytest.mark.parametrize(
