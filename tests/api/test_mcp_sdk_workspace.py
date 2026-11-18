@@ -15,8 +15,7 @@ from fastapi import FastAPI
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
-from tests.api.conftest import GHOSTWRITER_KEY
-from tests.api.test_files import AuditLines
+from tests.api.conftest import GHOSTWRITER_KEY, AuditLines
 from tests.api.test_mcp_sdk_client import served
 from tests.api.test_tools_templates import Local
 from tests.callers import EIGHT

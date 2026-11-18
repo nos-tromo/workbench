@@ -20,8 +20,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY, unrecorded
-from tests.api.test_files import CHAT, ME, AuditLines, H, put
+from tests.api.conftest import CHAT, KEY, ME, AuditLines, H, put, unrecorded
 from tests.api.test_jobs import FakeClient, KeepAll
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt

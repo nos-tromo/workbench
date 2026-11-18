@@ -1,6 +1,7 @@
 """Fixtures for the api tests: the real app on a throwaway data volume, audit lines kept in memory."""
 
 import io
+import itertools
 import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -15,7 +16,7 @@ from workbench.api.audit import SERVICE, AuditLog
 from workbench.api.main import create_app
 from workbench.api.store import Store
 from workbench.config import Settings, load_settings
-from workbench.models import Principal
+from workbench.models import FileRecord, Principal
 from workbench.paths import Workspaces
 from workbench.utils.audit_event import AuditEmitter
 
@@ -25,10 +26,31 @@ HD = {"Authorization": f"Bearer {DOCINT_KEY}", "X-User-Id": "user-a", "X-Session
 GHOSTWRITER_KEY = "a" * 32
 HG = {"Authorization": f"Bearer {GHOSTWRITER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 PG = Principal("ghostwriter", "user-a", "chat-1", confined=True)
+H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
+H_B = {**H, "X-User-Id": "user-b"}
+KEY_ONLY = {"Authorization": f"Bearer {KEY}"}
+CHAT = "/workspace/chat-1"
+ME = Principal("open-webui", "user-a", "chat-1")
+MIB = 1024 * 1024
+
+AuditLines = Callable[[], list[dict[str, Any]]]
 
 
 def unrecorded(*_: object) -> None:
     """Record nothing: for files a test puts in the store directly, where no event is under test."""
+
+
+def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT) -> FileRecord:
+    """Store ``data`` as ``name`` for the synthetic user, without going through the api."""
+    return store.add_upload(
+        ME, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
+    )
+
+
+def tick(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store's clock advance one second per file, so no two files have the same age."""
+    seconds = itertools.count(1_000_000)
+    monkeypatch.setattr(store, "_clock", lambda: float(next(seconds)))
 
 
 @pytest.fixture

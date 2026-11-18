@@ -20,9 +20,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.types import Message
 
-from tests.api.conftest import KEY
+from tests.api.conftest import CHAT, KEY, H
 from tests.api.raising_app import PATH, RefusingStore
-from tests.api.test_files import CHAT, H
 from workbench.api.audit import AuditLog
 from workbench.api.errors import QuietErrors
 from workbench.api.main import create_app

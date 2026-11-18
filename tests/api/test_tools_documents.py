@@ -18,8 +18,7 @@ from fastapi import FastAPI
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY, unrecorded
-from tests.api.test_files import CHAT, H_B, ME, AuditLines, H, put, tick
+from tests.api.conftest import CHAT, H_B, KEY, ME, AuditLines, H, put, tick, unrecorded
 from tests.api.test_jobs import FakeClient
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue

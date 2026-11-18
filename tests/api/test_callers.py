@@ -12,8 +12,7 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HD, KEY, PG
-from tests.api.test_files import put
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HD, KEY, PG, put
 from tests.callers import EIGHT
 from workbench.api import auth
 from workbench.api.audit import AuditLog

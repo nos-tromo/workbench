@@ -18,8 +18,7 @@ from docx import Document
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY
-from tests.api.test_files import CHAT, ME, AuditLines, H, put
+from tests.api.conftest import CHAT, KEY, ME, AuditLines, H, put
 from tests.api.test_tools_templates import Local
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue

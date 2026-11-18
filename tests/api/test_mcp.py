@@ -22,8 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, HD, KEY
-from tests.api.test_files import AuditLines
+from tests.api.conftest import DOCINT_KEY, HD, KEY, AuditLines
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.conftest import scaled

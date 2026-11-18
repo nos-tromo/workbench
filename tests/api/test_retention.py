@@ -22,8 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import KEY, unrecorded
-from tests.api.test_files import ME, AuditLines
+from tests.api.conftest import KEY, ME, AuditLines, unrecorded
 from tests.api.test_jobs import KEEP, FakeClient, until
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog

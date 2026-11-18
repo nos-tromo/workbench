@@ -17,8 +17,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.api import test_tools_python as python_tests
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY
-from tests.api.test_files import AuditLines, H
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, KEY, AuditLines, H
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.callers import EIGHT

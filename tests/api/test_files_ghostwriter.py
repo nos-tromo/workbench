@@ -14,8 +14,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HG, KEY, PG, unrecorded
-from tests.api.test_files import H, put
+from tests.api.conftest import DOCINT_KEY, GHOSTWRITER_KEY, HG, KEY, PG, H, put, unrecorded
 from tests.api.test_tools_documents import Scripted
 from workbench.api.audit import AuditLog
 from workbench.api.auth import require_file_caller

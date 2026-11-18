@@ -21,8 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from tests.api.conftest import KEY, unrecorded
-from tests.api.test_files import CHAT, ME, AuditLines, H, put, tick
+from tests.api.conftest import CHAT, KEY, ME, AuditLines, H, put, tick, unrecorded
 from tests.api.test_tools_documents import Scripted
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog

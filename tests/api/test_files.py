@@ -8,7 +8,6 @@ import asyncio
 import dataclasses
 import errno
 import io
-import itertools
 import json
 import logging
 from collections.abc import Callable, Iterator
@@ -22,7 +21,7 @@ from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
-from tests.api.conftest import KEY, unrecorded
+from tests.api.conftest import CHAT, H_B, KEY_ONLY, ME, MIB, AuditLines, H, put, tick
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.body_limit import BodyLimit
@@ -30,17 +29,8 @@ from workbench.api.main import create_app
 from workbench.api.openapi import TOOL_TAG
 from workbench.api.store import NotFound, StorageFull, Store
 from workbench.config import Settings
-from workbench.models import FileRecord, Principal
+from workbench.models import FileRecord
 from workbench.paths import PathError, Workspaces
-
-H = {"Authorization": f"Bearer {KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
-H_B = {**H, "X-User-Id": "user-b"}
-KEY_ONLY = {"Authorization": f"Bearer {KEY}"}
-CHAT = "/workspace/chat-1"
-ME = Principal("open-webui", "user-a", "chat-1")
-MIB = 1024 * 1024
-
-AuditLines = Callable[[], list[dict[str, Any]]]
 
 
 def upload(
@@ -48,13 +38,6 @@ def upload(
 ) -> Any:
     """Upload ``data`` as ``name`` the way Open WebUI's file browser does."""
     return client.post("/files/upload", params={"directory": directory}, headers=headers, files={"file": (name, data)})
-
-
-def put(store: Store, name: str, data: bytes = b"x", *, directory: str = CHAT) -> FileRecord:
-    """Store ``data`` as ``name`` for the synthetic user, without going through the api."""
-    return store.add_upload(
-        ME, directory, name, io.BytesIO(data), max_bytes=100 * MIB, quota_bytes=1000 * MIB, record=unrecorded
-    )
 
 
 def file_operations(audit_lines: AuditLines) -> list[str]:
@@ -65,12 +48,6 @@ def file_operations(audit_lines: AuditLines) -> list[str]:
 def server_log(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     """The log records of the app and its server; the test client's own request lines are left out."""
     return [record for record in caplog.records if not record.name.startswith("httpx")]
-
-
-def tick(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the store's clock advance one second per file, so no two files have the same age."""
-    seconds = itertools.count(1_000_000)
-    monkeypatch.setattr(store, "_clock", lambda: float(next(seconds)))
 
 
 def older_hint(left: int, total: int) -> str:

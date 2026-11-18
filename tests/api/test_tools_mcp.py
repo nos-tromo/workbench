@@ -22,8 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
-from tests.api.conftest import HD, HG, PG, unrecorded
-from tests.api.test_files import AuditLines, H, put
+from tests.api.conftest import HD, HG, PG, AuditLines, H, put, unrecorded
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import Headers, error, refused, result, rpc
 from tests.api.test_tools_documents import Scripted
