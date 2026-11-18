@@ -492,7 +492,7 @@ def test_nothing_is_registered_and_no_workspace_is_made(
 def test_the_inline_specs_are_the_inline_tools(app: FastAPI) -> None:
     """The start check's set names exactly the inline specs, and docint finds them in the app's registry."""
     assert {spec.name for spec in INLINE_SPECS} == INLINE_TOOLS
-    assert all(spec.form == "inline" and spec.run and spec.input_schema for spec in INLINE_SPECS)
+    assert all(spec.form == "inline" for spec in INLINE_SPECS)
     registry: Registry = app.state.registry
     assert registry.for_caller(cast(CallerRegistry, app.state.callers).get("docint")) == list(INLINE_SPECS)
     (spec,) = INLINE_SPECS

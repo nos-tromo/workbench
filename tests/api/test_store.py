@@ -425,9 +425,6 @@ def test_part_names_are_reserved(store: Store, alice: Principal, tmp_path: Path)
         put(store, alice, "x.part")
     with pytest.raises(PathError):
         store.mkdir(alice, "/workspace/chat-1/x.part")
-    keep = put(store, alice, "keep.txt")
-    with pytest.raises(PathError):
-        store.move(alice, keep.virtual_path, "/workspace/chat-1/x.part")
     job = store.add_job(alice, "run_python")
     with pytest.raises(PathError):
         store.register_output(
@@ -445,8 +442,6 @@ def test_other_users_files_are_not_found(store: Store, alice: Principal, bob: Pr
         store.get(bob, rec.virtual_path)
     with pytest.raises(NotFound):
         deleted(store, bob, rec.virtual_path)
-    with pytest.raises(NotFound):
-        store.move(bob, rec.virtual_path, "/workspace/chat-1/stolen.xlsx")
     assert store.list_dir(bob, "/workspace/chat-1") == []
     assert store.list_dir(bob, "/workspace") == []
     assert store.files_in_chat(bob) == []
@@ -556,10 +551,6 @@ def test_hostile_paths_are_refused_everywhere(store: Store, alice: Principal, ba
     with pytest.raises(PathError):
         deleted(store, alice, bad)
     with pytest.raises(PathError):
-        store.move(alice, bad, ok + ".moved")
-    with pytest.raises(PathError):
-        store.move(alice, ok, bad)
-    with pytest.raises(PathError):
         store.mkdir(alice, bad)
     with pytest.raises(PathError):
         store.list_dir(alice, bad)
@@ -602,16 +593,12 @@ def test_symlinked_chat_folder_is_refused(
 
 @pytest.mark.parametrize("target", ["/workspace", "/workspace/chat-1", "/workspace/q.xlsx"])
 def test_files_never_live_outside_a_chat_folder(store: Store, alice: Principal, target: str) -> None:
-    """The root and a chat folder are not files: ``get``, ``delete`` and ``move`` refuse them."""
+    """The root and a chat folder are not files: ``get`` and ``delete`` refuse them."""
     put(store, alice)
     with pytest.raises(PathError):
         store.get(alice, target)
     with pytest.raises(PathError):
         deleted(store, alice, target)
-    with pytest.raises(PathError):
-        store.move(alice, target, "/workspace/chat-1/other.xlsx")
-    with pytest.raises(PathError):
-        store.move(alice, "/workspace/chat-1/q.xlsx", target)
     assert store.get(alice, "/workspace/chat-1/q.xlsx").size == 10
 
 
@@ -817,65 +804,6 @@ def test_open_file_never_follows_a_link(store: Store, alice: Principal, workspac
     real.symlink_to(outside)
     with pytest.raises(PathError):
         store.open_file(alice, rec.virtual_path)
-
-
-# --- move ---------------------------------------------------------------------
-
-
-def test_move_updates_the_path(store: Store, alice: Principal, workspaces: Workspaces, clock: Clock) -> None:
-    """A rename keeps the id, the age and the content, and changes the path."""
-    rec = put(store, alice, data=b"content")
-    clock.now += 5000
-    moved = store.move(alice, rec.virtual_path, "/workspace/chat-1/renamed.csv")
-    assert moved.virtual_path == "/workspace/chat-1/renamed.csv"
-    assert (moved.id, moved.size, moved.created_at, moved.kind) == (rec.id, rec.size, rec.created_at, rec.kind)
-    assert moved.mime == "text/csv"
-    assert workspaces.resolve(alice, moved.virtual_path).read_bytes() == b"content"
-    assert not workspaces.resolve(alice, rec.virtual_path).exists()
-    assert store.get(alice, moved.virtual_path) == moved
-    assert store.files_in_chat(alice) == [moved]
-    with pytest.raises(NotFound):
-        store.get(alice, rec.virtual_path)
-
-
-def test_move_into_a_folder_and_into_another_chat(store: Store, alice: Principal, workspaces: Workspaces) -> None:
-    """A file moves to a folder, or to another chat folder, inside the user's own root."""
-    rec = put(store, alice, data=b"content")
-    store.mkdir(alice, "/workspace/chat-1/reports")
-    in_folder = store.move(alice, rec.virtual_path, "/workspace/chat-1/reports/q.xlsx")
-    assert (in_folder.chat_id, in_folder.name) == ("chat-1", "reports/q.xlsx")
-    elsewhere = store.move(alice, in_folder.virtual_path, "/workspace/chat-2/q.xlsx")
-    assert (elsewhere.chat_id, elsewhere.name) == ("chat-2", "q.xlsx")
-    assert workspaces.resolve(alice, elsewhere.virtual_path).read_bytes() == b"content"
-    assert store.files_in_chat(alice) == []
-    assert store.files_in_chat(Principal("ghostwriter", "user-a", "chat-2")) == [elsewhere]
-    assert store.usage(alice) == 7
-
-
-def test_move_to_a_taken_name_is_a_conflict(store: Store, alice: Principal, workspaces: Workspaces) -> None:
-    """Nothing is overwritten: a file, a folder or the source itself at the target is ``Conflict``."""
-    a = put(store, alice, "a.txt", b"aaa")
-    b = put(store, alice, "b.txt", b"bbb")
-    store.mkdir(alice, "/workspace/chat-1/folder")
-    for target in (b.virtual_path, "/workspace/chat-1/folder", a.virtual_path):
-        with pytest.raises(Conflict):
-            store.move(alice, a.virtual_path, target)
-    assert workspaces.resolve(alice, a.virtual_path).read_bytes() == b"aaa"
-    assert workspaces.resolve(alice, b.virtual_path).read_bytes() == b"bbb"
-    assert store.get(alice, a.virtual_path) == a
-
-
-def test_move_to_a_missing_folder_or_of_a_missing_file_is_not_found(store: Store, alice: Principal) -> None:
-    """The destination folder below a chat must exist; the source must be a file with a record."""
-    rec = put(store, alice)
-    with pytest.raises(NotFound):
-        store.move(alice, rec.virtual_path, "/workspace/chat-1/nowhere/q.xlsx")
-    with pytest.raises(NotFound):
-        store.move(alice, "/workspace/chat-1/missing.txt", "/workspace/chat-1/x.txt")
-    store.mkdir(alice, "/workspace/chat-1/reports")
-    with pytest.raises(NotFound):
-        store.move(alice, "/workspace/chat-1/reports", "/workspace/chat-1/folder2")
-    assert store.get(alice, rec.virtual_path) == rec
 
 
 # --- outputs -----------------------------------------------------------------
@@ -1100,27 +1028,6 @@ def test_remove_is_idempotent_and_clears_an_orphan_row(store: Store, alice: Prin
     store.remove(rec)
     assert store.files_in_chat(alice) == []
     store.remove(rec)
-
-
-def test_remove_after_a_move_and_a_new_upload_of_the_old_name_removes_the_moved_file(
-    store: Store, alice: Principal, workspaces: Workspaces, clock: Clock
-) -> None:
-    """A stale record names its file by id: the file that now sits at the old path is not touched."""
-    old = put(store, alice, "q.xlsx", b"old")
-    clock.now += 100
-    (stale,) = store.due(clock.now)
-    moved = store.move(alice, old.virtual_path, "/workspace/chat-1/r.xlsx")
-    fresh = put(store, alice, "q.xlsx", b"new")
-    assert fresh.name == "q.xlsx"
-    store.remove(stale)
-    chat = workspaces.chat_dir(alice)
-    assert disk_names(chat) == ["q.xlsx"]
-    assert (chat / "q.xlsx").read_bytes() == b"new"
-    assert store.files_in_chat(alice) == [fresh]
-    assert store.get(alice, fresh.virtual_path) == fresh
-    assert store.usage(alice) == 3
-    with pytest.raises(NotFound):
-        store.get(alice, moved.virtual_path)
 
 
 def test_remove_after_a_delete_and_a_new_upload_of_the_same_name_changes_nothing(

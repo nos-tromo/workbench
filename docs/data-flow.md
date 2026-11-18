@@ -166,8 +166,8 @@ and Ghostwriter with the purpose and request id they send, and the time and
 tool of each run.
 
 **Categories of data subjects.** The users of docint and Ghostwriter (as
-pseudonyms), and every person named in the files or data they
-send or in the values the model writes.
+pseudonyms), and every person named in the files or data they send or in
+the values the model writes.
 
 **Where data flows.** These are the flows, as facts:
 

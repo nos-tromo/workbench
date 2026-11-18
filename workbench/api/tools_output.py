@@ -4,10 +4,10 @@ Each makes one new file of the chat from the model's values: a table as an Excel
 a Word file written from Markdown or as the Markdown itself. The runners (:mod:`workbench.executor.runners.outputs`)
 write the file in the executor; the job is given no file. Here the api checks the request before a job is sent: the
 file's name, and a table by the rules of :mod:`workbench.tables` (the sheet's name, every cell's place, its length, a
-number within Excel's range), which the runner checks again with the same functions; a refusal is a 422 that names the
-field, or the row and the column counted from 1, and costs no job. A number that is not finite must be refused here:
-the request goes to the executor as JSON, which has no NaN or infinity. A Markdown table wider than Word's 63 columns
-is refused by the runner, which parses the Markdown, before it writes anything.
+number within Excel's range), which the runner checks again with the same functions; a refusal (``refused`` on the MCP
+door) names the field, or the row and the column counted from 1, and costs no job. A number that is not finite must be
+refused here: the request goes to the executor as JSON, which has no NaN or infinity. A Markdown table wider than
+Word's 63 columns is refused by the runner, which parses the Markdown, before it writes anything.
 
 Each is recorded as a ``collect`` of the new file, by its id, before the file becomes visible; ``write_table`` with how
 many rows and columns the table has. Never a name, a column's name or a value. A new file whose event cannot be written

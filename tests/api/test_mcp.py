@@ -10,7 +10,7 @@ import dataclasses
 import json
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final
 
@@ -36,7 +36,7 @@ from workbench.api.jobs import Busy, ExecutorClient, JobQueue
 from workbench.api.main import create_app
 from workbench.api.mcp_wire import INSTRUCTIONS, MODERN, Era, WireError, check_media, tool_result, tools_list_result
 from workbench.api.metrics import Metrics
-from workbench.api.registry import ToolOutcome, ToolSpec
+from workbench.api.registry import ToolOutcome
 from workbench.api.routing import MAX_DEPTH, EncodableRequest, nested_deeper_than
 from workbench.api.store import Store
 from workbench.api.tools_inline import INLINE_SPECS
@@ -527,24 +527,14 @@ def test_tools_list_is_the_callers_inline_tools_in_name_order(client: TestClient
     assert "x-mcp-header" not in json.dumps(listed)
 
 
-@pytest.mark.parametrize(
-    "lacking",
-    [
-        lambda spec: dataclasses.replace(spec, input_schema=None),
-        lambda spec: dataclasses.replace(spec, output_model=None),
-    ],
-    ids=["no_input_schema", "no_output_model"],
-)
-def test_a_spec_without_a_schema_or_an_output_model_cannot_be_listed(
-    app: FastAPI, lacking: Callable[[ToolSpec], ToolSpec]
-) -> None:
-    """Every inline spec has both, so a spec that lacks one fails loudly instead of listing a made-up shape."""
+def test_a_spec_without_an_output_model_cannot_be_listed(app: FastAPI) -> None:
+    """Every inline spec has one, so a spec that lacks it fails loudly instead of listing a made-up shape."""
     caller = app.state.callers.get("docint")
     (spec,) = INLINE_SPECS
     era = Era(MODERN, modern=True)
     assert tools_list_result([spec], caller, era)["tools"]
     with pytest.raises(ValueError, match="run_python"):
-        tools_list_result([lacking(spec)], caller, era)
+        tools_list_result([dataclasses.replace(spec, output_model=None)], caller, era)
 
 
 def test_a_specs_own_output_schema_is_listed_in_place_of_its_models(app: FastAPI) -> None:

@@ -119,14 +119,13 @@ in `tests/api/golden/`). The eight: `list_files`, `read_document`,
   text block carries no previews and is not re-cut after `outputs`; 5 s of the
   wall (`PREVIEW_RESERVE_S`) are kept for the previews.
 
-Adding a tool touches: its row in `tool_table.WORKSPACE_TABLE` and a name in
-`registry.WORKSPACE_TOOLS`, or for an inline tool its spec in
-`tools_inline.INLINE_SPECS` and a name in `registry.INLINE_TOOLS`; its runner and
-`jobs.TOOLS`, if it runs in the executor; `audit.OPERATIONS`, if it is recorded;
-`docs/permissions.md` and `docs/audit.md` (`tests/test_docs.py` fails without
-them); and the golden `tools/list` files, edited on purpose, never regenerated.
-The start check refuses a caller's tool list that names a tool of another file
-form.
+Adding a tool touches: its row in `tool_table.WORKSPACE_TABLE`, or for an
+inline tool its spec in `tools_inline.INLINE_SPECS` and a name in
+`registry.INLINE_TOOLS`; its runner and `jobs.TOOLS`, if it runs in the
+executor; `audit.OPERATIONS`, if it is recorded; `docs/permissions.md` and
+`docs/audit.md` (`tests/test_docs.py` fails without them); and the golden
+`tools/list` files, edited on purpose, never regenerated. The start check
+refuses a caller's tool list that names a tool of another file form.
 
 Every router is built with `route_class=EncodableRoute`
 (`workbench/api/routing.py`: a JSON body read within a depth limit, lone

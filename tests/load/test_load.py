@@ -5,6 +5,8 @@ queue and the executor do under that load, apart from any model: how long a job 
 then holds it, how many jobs run at once, what is refused, and how much memory the executor uses against its limit.
 Each job holds 200 MB for 2 s, well inside the stack's 20 s wall time. Half the users come through Ghostwriter's door,
 half through docint's: each caller has slots of its own, fewer than the executor's, and the two together fill them.
+Refusals are expected: a call waits at most ``MCP_QUEUE_WAIT_S`` (5 s) for its turn, so a job that finds no slot by
+then comes back busy (``wait_timeout``, or ``queue_full``).
 
 Three clocks are in play. The test's own times its calls. The api records when it admitted a job (``created_at`` of
 the job's record), and the job prints when its code began and ended; both are the containers' clock, which is set
