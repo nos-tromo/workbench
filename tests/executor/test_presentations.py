@@ -311,6 +311,12 @@ def properties(paragraph: Any) -> list[str]:
     return [] if pPr is None else [child.tag.split("}")[1] for child in pPr]
 
 
+def indent(paragraph: Any) -> tuple[str | None, str | None]:
+    """The ``marL`` and ``indent`` of a paragraph's ``a:pPr``, ``None`` where it says none."""
+    pPr = paragraph._p.find(qn("a:pPr"))
+    return (None, None) if pPr is None else (pPr.get("marL"), pPr.get("indent"))
+
+
 def test_bullets_keep_their_levels() -> None:
     """Nested bullets are levels 0, 1 and 2, and a deeper one stays at 2; a bullet takes the master's own."""
     frame = text_frame()
@@ -330,6 +336,19 @@ def test_a_plain_paragraph_has_no_bullet() -> None:
     assert properties(first) == ["buNone"]
     assert properties(second) == []
     assert (first.text, second.text) == ("Intro", "a")
+    assert indent(first) == ("0", "0")
+    assert indent(second) == (None, None)
+
+
+def test_paragraphs_outside_a_list_do_not_hang() -> None:
+    """A heading, code line, quote and rule drop the master's hanging indent, as a plain paragraph does.
+
+    The extra paragraph of a list item keeps its level's indent, as it is part of the item.
+    """
+    frame = text_frame()
+    text.write_markdown(frame, "# h\n\n```\nc\n```\n\n> q\n\n---\n\n- a\n\n  more")
+    assert [indent(paragraph) for paragraph in frame.paragraphs] == [("0", "0")] * 4 + [(None, None)] * 2
+    assert properties(frame.paragraphs[-1]) == ["buNone"]
 
 
 def test_a_numbered_list_counts_from_its_start() -> None:
@@ -345,6 +364,29 @@ def test_a_numbered_list_counts_from_its_start() -> None:
     for paragraph in frame.paragraphs:
         numbering = paragraph._p.find(f"{qn('a:pPr')}/{qn('a:buAutoNum')}")
         assert dict(numbering.attrib) == {"type": "arabicPeriod"}
+
+
+@pytest.mark.parametrize(
+    ("markdown", "start"),
+    [
+        ("0. a\n1. b", None),
+        ("1. a", None),
+        ("2. a", "2"),
+        ("32767. a", "32767"),
+        ("32768. a", None),
+        ("99999. a\n100000. b", None),
+        ("999999999. a", None),
+    ],
+)
+def test_a_start_outside_powerpoints_range_is_not_written(markdown: str, start: str | None) -> None:
+    """``startAt`` is 1 to 32767; a list that starts elsewhere says no start, so the file stays valid."""
+    frame = text_frame()
+    text.write_markdown(frame, markdown)
+    for paragraph in frame.paragraphs:
+        numbering = paragraph._p.find(f"{qn('a:pPr')}/{qn('a:buAutoNum')}")
+        assert numbering is not None
+        assert numbering.get("startAt") == start
+        assert numbering.get("type") == "arabicPeriod"
 
 
 def test_a_list_nested_in_a_numbered_item_is_a_level_deeper() -> None:

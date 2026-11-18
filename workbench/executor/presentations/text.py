@@ -5,11 +5,12 @@ The model writes the text of a slide as Markdown: bullets, numbered items, bold 
 in a place of a given width, so a block that is too long can be shrunk before it is written.
 
 A list item's bullet is the master's own: a bullet item carries no bullet property, so the frame's list style gives it
-its bullet, indent and size at its level. A paragraph that is not an item says ``a:buNone``, and a numbered item
-``a:buAutoNum``. The levels are the lists' depth, at most :data:`MAX_LEVEL`. Everything else the Markdown can say is
-text: a heading is a bold paragraph, a code block its lines as paragraphs, a quote its text, an image its alternative
-text, a link its text and address in parentheses, inline code its text, and a table or HTML what was typed. Nothing here
-logs or names a path: the text is the user's content.
+its bullet, indent and size at its level. A paragraph outside a list says ``a:buNone`` with no margin and no hanging
+indent, and a numbered item ``a:buAutoNum``. The levels are the lists' depth, at most :data:`MAX_LEVEL`. Everything
+else the Markdown can say is text: a heading is a bold paragraph, a code block its lines as paragraphs, a quote its
+text, an image its alternative text, a link its text and address in parentheses, inline code its text, and a table or
+HTML what was typed. Nothing here logs
+or names a path: the text is the user's content.
 """
 
 import math
@@ -29,6 +30,9 @@ RULE: Final = "—" * 3
 _INDENT_CHARS: Final = 4
 
 _NUMBERING: Final = "arabicPeriod"
+
+#: The numbers ``startAt`` can say (``ST_TextBulletStartAtNum``); CommonMark's list starts reach 999999999.
+_START_AT: Final = range(1, 32768)
 
 
 @dataclass(frozen=True)
@@ -135,7 +139,7 @@ class _Writer:
             if current.ordered:
                 _bullet(paragraph, "buAutoNum", start=current.start)
         else:
-            _bullet(paragraph, "buNone")
+            _bullet(paragraph, "buNone", flat=current is None)
         self._begin(level)
         return paragraph
 
@@ -244,22 +248,29 @@ class _Writer:
                 self.code(token.content)
 
 
-def _bullet(paragraph: Any, kind: str, *, start: int = 1) -> None:
+def _bullet(paragraph: Any, kind: str, *, start: int = 1, flat: bool = False) -> None:
     """Set a paragraph's bullet: none, or an automatic number.
 
     Args:
         paragraph: The python-pptx paragraph, whose ``a:pPr`` has no other child yet.
         kind: ``buNone`` or ``buAutoNum``.
-        start: The number a numbered list starts at; said only when it is not 1.
+        start: The number a numbered list starts at; said only when it is in :data:`_START_AT` and not 1. A list that
+            starts outside it is numbered from 1, as a file with another ``startAt`` would not be valid.
+        flat: Whether the paragraph has no margin and no hanging indent, as PowerPoint writes a paragraph without a
+            bullet; otherwise it keeps the master's, which is the list item's.
     """
     from pptx.oxml.xmlchemy import OxmlElement
 
     element = OxmlElement(f"a:{kind}")
     if kind == "buAutoNum":
         element.set("type", _NUMBERING)
-        if start != 1:
+        if start != 1 and start in _START_AT:
             element.set("startAt", str(start))
-    paragraph._p.get_or_add_pPr().append(element)
+    properties = paragraph._p.get_or_add_pPr()
+    if flat:
+        properties.set("marL", "0")
+        properties.set("indent", "0")
+    properties.append(element)
 
 
 def write_markdown(frame: Any, markdown: str) -> Written:
