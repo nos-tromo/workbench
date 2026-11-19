@@ -116,10 +116,16 @@ class InspectTemplateRequest(BaseModel):
     """Body of ``inspect_template``.
 
     Attributes:
-        path: The template's absolute path.
+        path: The template's absolute path, or ``None`` for the plain slide master.
     """
 
-    path: str = Field(min_length=1, max_length=1024, description=_PATH)
+    path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description=f"{_PATH} Leave it out for the plain slide master.",
+        json_schema_extra=_STRING,
+    )
 
 
 class TemplateField(BaseModel):
@@ -189,7 +195,7 @@ class TemplateInfo(BaseModel):
     """What ``inspect_template`` answers.
 
     Attributes:
-        path: The template's path.
+        path: The template's path; ``None`` for the plain slide master.
         template_kind: The kind of template, ``none``, or ``slide_master``.
         fields: Its fields, each name once; empty for a slide master.
         layouts: A slide master's layouts; ``None`` for any other template.
@@ -198,7 +204,7 @@ class TemplateInfo(BaseModel):
         hint: What to tell the user, or what is not listed.
     """
 
-    path: str = Field(description="The template's path.")
+    path: str | None = Field(description="The template's path; null for the plain slide master.")
     template_kind: Literal["content_controls", "form_fields", "placeholders", "mixed", "none", "slide_master"] = Field(
         description=(
             "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs; slide_master: a "
@@ -627,12 +633,13 @@ async def inspect_template(
 ) -> TemplateInfo:
     """List a template's fields, or a slide master's layouts, in the executor and answer, cut to the result limit.
 
-    The job runs in the chat folder the template lives in, with that one file as its input. The job is recorded by
-    the template's id once it has answered and before anything of the answer goes out, a refusal as ``error`` with its
-    code; never a layout's name, which is the template's content.
+    The job runs in the chat folder the template lives in, with that one file as its input; without a path it lists
+    the plain master's layouts, a job with no input. The job is recorded by the template's id, or by none, once it has
+    answered and before anything of the answer goes out, a refusal as ``error`` with its code; never a layout's name,
+    which is the template's content.
 
     Args:
-        body: The template's path.
+        body: The template's path, or none for the plain master.
         p: The caller, user and chat.
         settings: The api's settings; ``result_max_kb`` caps the answer.
         store: The file store.
@@ -642,16 +649,19 @@ async def inspect_template(
     Returns:
         The kind of template and its fields, or a slide master's layouts and example slides.
     """
-    rec = await run_in_threadpool(store.get, p, body.path)
-    _output_extension(rec.name, inspecting=True)
-    args = {"path": rec.name, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
-    _, result, _ = await jobs.submit(p, "inspect_template", args, [rec.name])
-    await run_in_threadpool(
-        record_answer, audit, "inspect_template", p, [rec.id], {}, result, _Inspected, result.result
-    )
+    budget: dict[str, Any] = {"budget_s": max(1, settings.job_wall_s * 3 // 4)}
+    if body.path is None:
+        rec = None
+        _, result, _ = await jobs.submit(p, "inspect_template", budget, [])
+    else:
+        rec = await run_in_threadpool(store.get, p, body.path)
+        _output_extension(rec.name, inspecting=True)
+        _, result, _ = await jobs.submit(p, "inspect_template", {"path": rec.name, **budget}, [rec.name])
+    used = [] if rec is None else [rec.id]
+    await run_in_threadpool(record_answer, audit, "inspect_template", p, used, {}, result, _Inspected, result.result)
     found = _parse(_Inspected, _payload(result, "file"))
     answer = TemplateInfo(
-        path=rec.virtual_path,
+        path=None if rec is None else rec.virtual_path,
         template_kind=found.template_kind,
         fields=found.fields,
         layouts=found.layouts,

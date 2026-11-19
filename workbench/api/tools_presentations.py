@@ -1,17 +1,18 @@
 """The presentation tool, ``write_presentation``, a row of :mod:`workbench.api.tool_table`.
 
-A deck is built in a slide master of the chat, a ``.pptx`` or ``.potx``, into one new ``.pptx``: each slide on a layout
-of the master, its blocks in the layout's places, its sources in its speaker notes. The runner
-(:mod:`workbench.executor.runners.presentations`) builds it in the executor; here the api checks what it can before a
-job is sent, so a refusal names its place and costs no job: that the master is a slide master, the new file's name,
-the deck's bounds (:func:`workbench.decks.deck_problem`, which the runner checks again), that each picture is a PNG,
-JPEG or GIF file of the chat within its bytes, and each source as ``fill_template`` checks one. The job is given the
-master, every picture and every file a source names, a picture by its path below the chat folder and its virtual path.
+A deck is built in a slide master of the chat, a ``.pptx`` or ``.potx``, or without one in the plain master the
+executor makes, into one new ``.pptx``: each slide on a layout of the master, its blocks in the layout's places, its
+sources in its speaker notes. The runner (:mod:`workbench.executor.runners.presentations`) builds it in the executor;
+here the api checks what it can before a job is sent, so a refusal names its place and costs no job: that the master
+is a slide master, the new file's name, the deck's bounds (:func:`workbench.decks.deck_problem`, which the runner
+checks again), that each picture is a PNG, JPEG or GIF file of the chat within its bytes, and each source as
+``fill_template`` checks one. The job is given the master, if there is one, every picture and every file a source
+names, a picture by its path below the chat folder and its virtual path.
 
-It is recorded as a ``modify`` before the new file becomes visible, by the ids of the master, the pictures, the source
-files and the new file, with how many slides, tables, charts and pictures the deck has and how many sources of each
-kind; never a slide's text, a layout's name or a file's name. A deck whose event cannot be written is never kept, and
-a job that refused is recorded by the refusal's code alone: a layout's name can be in its message.
+It is recorded as a ``modify`` before the new file becomes visible, by the ids of the master (if there is one), the
+pictures, the source files and the new file, with how many slides, tables, charts and pictures the deck has and how
+many sources of each kind; never a slide's text, a layout's name or a file's name. A deck whose event cannot be written
+is never kept, and a job that refused is recorded by the refusal's code alone: a layout's name can be in its message.
 """
 
 import posixpath
@@ -255,7 +256,7 @@ class WritePresentationRequest(BaseModel):
     """Body of ``write_presentation``.
 
     Attributes:
-        path: The slide master's absolute path.
+        path: The slide master's absolute path; ``None`` for the plain master.
         name: The new file's name.
         slides: The slides, in order.
         include_sources: Whether the speaker notes end with each slide's sources.
@@ -263,7 +264,13 @@ class WritePresentationRequest(BaseModel):
 
     model_config = _REQUEST
 
-    path: str = Field(min_length=1, max_length=1024, description="The slide master's path, as list_files gives it.")
+    path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description="The slide master's path, as list_files gives it; leave it out for the plain master.",
+        json_schema_extra=_shown(type="string", minLength=1, maxLength=1024),
+    )
     name: str = Field(min_length=1, max_length=MAX_NAME, description="The new file's name; .pptx is added if missing.")
     slides: list[SlideSpec] = Field(description="The slides, in order.")
     include_sources: bool = Field(default=True, description="Put each slide's sources in its speaker notes.")
@@ -458,8 +465,12 @@ async def write_presentation(
 ) -> BuiltPresentation:
     """Build a deck in a slide master in the executor, into a new ``.pptx`` of its chat, and answer with it.
 
+    Without a master the deck is built in the plain one, which the executor makes
+    (:func:`workbench.executor.presentations.master.plain_master`), in the call's chat.
+
     Args:
-        body: The master, the new file's name, the slides and whether the notes end with the sources.
+        body: The master, or none for the plain master; the new file's name, the slides and whether the notes end
+            with the sources.
         p: The caller, user and chat.
         settings: The api's settings; ``job_wall_s`` gives the time limit, ``result_max_kb`` caps the answer.
         store: The file store.
@@ -473,25 +484,28 @@ async def write_presentation(
         HTTPException: The master, the name, a bound, a picture or a source is refused (422, before any job); the
             runner refused (its 422); the job's answer cannot be read, or its file was not kept (500).
     """
-    rec = await run_in_threadpool(store.get, p, body.path)
-    _master(rec)
+    rec = None if body.path is None else await run_in_threadpool(store.get, p, body.path)
+    if rec is not None:
+        _master(rec)
     name = _output_name(body.name, "pptx")
     dumped: list[dict[str, Any]] = body.model_dump(mode="json", exclude_none=True)["slides"]
     problem = await run_in_threadpool(deck_problem, dumped)
     if problem is not None:
         raise HTTPException(status_code=422, detail=f"invalid_value: {problem}")
-    slides, pictures, files = await run_in_threadpool(_slides, store, p, rec.chat_id, body.slides, dumped)
-    inputs = list(dict.fromkeys([rec.name, *(picture.name for picture in pictures), *(file.name for file in files)]))
+    given: list[FileRecord] = [] if rec is None else [rec]
+    chat_id = p.chat_id if rec is None else rec.chat_id
+    slides, pictures, files = await run_in_threadpool(_slides, store, p, chat_id, body.slides, dumped)
+    inputs = list(dict.fromkeys(file.name for file in [*given, *pictures, *files]))
     if len(inputs) > MAX_INPUT_FILES:
-        raise HTTPException(status_code=422, detail=f"the slides name more than {MAX_INPUT_FILES - 1} files")
-    args = {
-        "path": rec.name,
+        raise HTTPException(status_code=422, detail=f"the slides name more than {MAX_INPUT_FILES - len(given)} files")
+    args: dict[str, Any] = {"path": rec.name} if rec is not None else {}
+    args |= {
         "name": name,
         "slides": slides,
         "include_sources": body.include_sources,
         "budget_s": max(1, settings.job_wall_s * 3 // 4),
     }
-    used = list(dict.fromkeys([rec.id, *(picture.id for picture in pictures), *(file.id for file in files)]))
+    used = list(dict.fromkeys(file.id for file in [*given, *pictures, *files]))
     criteria = _criteria(body.slides)
 
     def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:

@@ -292,6 +292,22 @@ def test_inspect_answers_a_slide_masters_layouts(
     assert "Titel und Inhalt" not in json.dumps(audit_lines())
 
 
+@pytest.mark.parametrize("arguments", [{}, {"path": None}])
+def test_inspect_without_a_path_answers_the_plain_master(
+    client: TestClient, fake_executor: Local, audit_lines: AuditLines, arguments: dict[str, Any]
+) -> None:
+    """No file is looked up or sent: the plain master's nine layouts, no path, and a query event naming no file."""
+    body = answered(acall(client, "inspect_template", arguments, headers=HG))
+    assert (body["path"], body["template_kind"], body["slides"], body["truncated"]) == (None, "slide_master", 0, False)
+    assert [layout["name"] for layout in body["layouts"]][:2] == ["Title Slide", "Title and Content"]
+    assert len(body["layouts"]) == 9
+    (req,) = fake_executor.requests
+    assert (req.tool, req.input_files, req.args) == ("inspect_template", [], {"budget_s": 86})
+    (event,) = events(audit_lines, "inspect_template")
+    assert (event["action"], event["outcome"]) == ("query", "ok")
+    assert "ids" not in event["target"] and event["target"]["count"] == 0
+
+
 def test_inspect_answers_a_potx_too(client: TestClient, store: Store, tmp_path: Path) -> None:
     """A ``.potx`` is the same master under the template content type: the same answer."""
 

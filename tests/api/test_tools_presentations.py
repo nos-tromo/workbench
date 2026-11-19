@@ -69,8 +69,8 @@ def call(client: TestClient, arguments: dict[str, Any]) -> httpx2.Response:
     return acall(client, "write_presentation", arguments, headers=HG)
 
 
-def deck(*slides: dict[str, Any], path: str = f"{CHAT}/master.pptx", **more: Any) -> dict[str, Any]:
-    """The arguments of a deck named ``harbour-deck`` in ``master.pptx``."""
+def deck(*slides: dict[str, Any], path: str | None = f"{CHAT}/master.pptx", **more: Any) -> dict[str, Any]:
+    """The arguments of a deck named ``harbour-deck`` in ``master.pptx``, or in the given ``path``."""
     return {"path": path, "name": "harbour-deck", "slides": list(slides), **more}
 
 
@@ -229,6 +229,42 @@ def test_a_job_source_must_be_a_finished_run_python_run_of_the_chat(
     assert event["criteria"]["sources_by_kind"] == {"file": 0, "job": 1, "user": 0, "assistant": 0}
 
 
+def test_a_deck_without_a_master_is_built_in_the_plain_one(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """Without a path: no master is looked up or sent, the job gets the picture and the source, the event names them."""
+    pdf = stored(store, tmp_path, "harbour-report.pdf", lambda path: mk.make_pdf(path, ["one", "two"]))
+    picture = png_output(store, tmp_path)
+    slide = {
+        "layout": "Picture with Caption",
+        "title": "Invented harbour review",
+        "content": [{"image": picture.virtual_path}, "Invented quay walls"],
+        "sources": [{"kind": "file", "path": pdf.virtual_path, "page": 1}],
+    }
+    arguments = {key: value for key, value in deck(slide).items() if key != "path"}
+    answer = answered(call(client, arguments))
+    (new,) = [rec for rec in outputs(store) if rec.name.endswith(".pptx")]
+    assert (answer["path"], answer["slides"], answer["warnings"]) == (f"{CHAT}/harbour-deck.pptx", 1, [])
+    (req,) = fake_executor.requests
+    assert req.input_files == ["chart.png", "harbour-report.pdf"]
+    assert "path" not in req.args
+    _, data = store.open_file(PG, new.virtual_path)
+    with data:
+        built_deck = Presentation(io.BytesIO(data.read()))
+    assert (built_deck.slide_width, built_deck.slide_height) == (12192000, 6858000)
+    (event,) = events(audit_lines, "write_presentation")
+    assert (event["action"], event["outcome"]) == ("modify", "ok")
+    assert event["target"]["ids"] == [picture.id, pdf.id, new.id]
+    assert event["criteria"]["images"] == 1
+
+
+def test_a_null_path_is_the_plain_master(client: TestClient, fake_executor: Local) -> None:
+    """``path: null`` is the same as no path."""
+    answered(call(client, deck({"layout": 1, "title": "Invented harbour review"}, path=None)))
+    (req,) = fake_executor.requests
+    assert (req.input_files, "path" in req.args) == ([], False)
+
+
 # --- refusals before a job ------------------------------------------------------------------------------------------
 
 
@@ -327,6 +363,7 @@ def test_another_users_master_is_not_found(client: TestClient, store: Store, tmp
         deck({"layout": 2}, theme="dark"),
         deck({"layout": 2, "content": [{"image": "/" + "x" * 1024 + ".png"}]}),
         {**deck({"layout": 2}), "path": "/" + "x" * 1024 + ".pptx"},
+        {**deck({"layout": 2}), "path": ""},
         {"path": f"{CHAT}/master.pptx", "slides": [{"layout": 2}]},
     ],
     ids=[
@@ -343,6 +380,7 @@ def test_another_users_master_is_not_found(client: TestClient, store: Store, tmp
         "unknown argument",
         "a long image path",
         "a long master path",
+        "an empty master path",
         "no name",
     ],
 )
@@ -547,10 +585,13 @@ def test_ghostwriter_is_offered_write_presentation(client: TestClient) -> None:
         "card in the chat",
         "title and subtitle are plain text, not Markdown",
         '"" leaves a place empty',
+        "Without path",
+        "plain 16:9 master",
     ):
         assert phrase in description, phrase
     schema = tool["inputSchema"]
-    assert schema["required"] == ["path", "name", "slides"]
+    assert schema["required"] == ["name", "slides"]
+    assert schema["properties"]["path"]["type"] == "string"
     assert schema["additionalProperties"] is False
     for model, body in [("WritePresentationRequest", schema), *schema["$defs"].items()]:
         for field, spec in body["properties"].items():

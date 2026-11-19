@@ -72,8 +72,9 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "table) and location. template_kind none means version 1 cannot fill the file: tell the user what it "
             "needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, "
             "numbered, with each layout's places in reading order (role, about how many lines and characters fit) and "
-            "whether it has a footer; build a deck in one with write_presentation. A very long list is cut: truncated "
-            "is then true."
+            "whether it has a footer; build a deck in one with write_presentation. Without path, it lists the layouts "
+            "of the plain 16:9 master write_presentation uses when the user gave none. A very long list is cut: "
+            "truncated is then true."
         ),
         input_model=tools_templates.InspectTemplateRequest,
         output_model=tools_templates.TemplateInfo,
@@ -170,7 +171,8 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         title="Build a slide deck in a slide master",
         description=(
             "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. "
-            "Call inspect_template on the master first. Then show the user the outline (each slide's title, layout "
+            "Without path, the deck is built in a plain 16:9 master. Call inspect_template on the master first "
+            "(without path for the plain one). Then show the user the outline (each slide's title, layout "
             "number and name, key points, figures and sources) and call this tool only in a later message, after they "
             "agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its "
             "places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first "

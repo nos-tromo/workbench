@@ -403,21 +403,27 @@
     {
       "name": "inspect_template",
       "title": "List the fields of a template or the layouts of a slide master",
-      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, numbered, with each layout's places in reading order (role, about how many lines and characters fit) and whether it has a footer; build a deck in one with write_presentation. A very long list is cut: truncated is then true.",
+      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, numbered, with each layout's places in reading order (role, about how many lines and characters fit) and whether it has a footer; build a deck in one with write_presentation. Without path, it lists the layouts of the plain 16:9 master write_presentation uses when the user gave none. A very long list is cut: truncated is then true.",
       "inputSchema": {
-        "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path.",
+        "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path, or ``None`` for the plain slide master.",
         "properties": {
           "path": {
-            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
-            "maxLength": 1024,
-            "minLength": 1,
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it. Leave it out for the plain slide master.",
             "title": "Path",
             "type": "string"
           }
         },
-        "required": [
-          "path"
-        ],
         "title": "InspectTemplateRequest",
         "type": "object"
       },
@@ -678,9 +684,16 @@
         },
         "properties": {
           "path": {
-            "description": "The template's path.",
-            "title": "Path",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The template's path; null for the plain slide master.",
+            "title": "Path"
           },
           "template_kind": {
             "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs; slide_master: a .pptx or .potx, whose layouts are listed in layouts.",
@@ -1852,7 +1865,7 @@
     {
       "name": "write_presentation",
       "title": "Build a slide deck in a slide master",
-      "description": "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. Call inspect_template on the master first. Then show the user the outline (each slide's title, layout number and name, key points, figures and sources) and call this tool only in a later message, after they agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this conversation (make a chart image with run_python, or prefer a native chart); \"\" leaves a place empty. A slide's title and subtitle are plain text, not Markdown. At most 30 slides. Footers and slide numbers come from the master; the master's own slides are left out. Each slide's sources go into its speaker notes. To change a deck, read it with read_document and write it again. The user sees the new file as a card in the chat.",
+      "description": "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. Without path, the deck is built in a plain 16:9 master. Call inspect_template on the master first (without path for the plain one). Then show the user the outline (each slide's title, layout number and name, key points, figures and sources) and call this tool only in a later message, after they agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this conversation (make a chart image with run_python, or prefer a native chart); \"\" leaves a place empty. A slide's title and subtitle are plain text, not Markdown. At most 30 slides. Footers and slide numbers come from the master; the master's own slides are left out. Each slide's sources go into its speaker notes. To change a deck, read it with read_document and write it again. The user sees the new file as a card in the chat.",
       "inputSchema": {
         "$defs": {
           "AssistantSource": {
@@ -2167,7 +2180,7 @@
         "additionalProperties": false,
         "properties": {
           "path": {
-            "description": "The slide master's path, as list_files gives it.",
+            "description": "The slide master's path, as list_files gives it; leave it out for the plain master.",
             "maxLength": 1024,
             "minLength": 1,
             "type": "string"
@@ -2192,7 +2205,6 @@
           }
         },
         "required": [
-          "path",
           "name",
           "slides"
         ],
