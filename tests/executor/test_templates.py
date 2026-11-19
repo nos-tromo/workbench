@@ -255,12 +255,16 @@ def test_only_the_innermost_controls_are_fields(job: Job) -> None:
 
 @pytest.mark.parametrize("name", ["macro.docm", "macro.xlsm", "model.xltx", "notes.txt"])
 def test_other_files_are_not_templates(job: Job, name: str) -> None:
-    """Only ``.docx``, ``.dotx``, ``.xlsx`` and the ``.pptx`` and ``.potx`` slide masters are; the answer says so."""
+    """Only ``.docx``, ``.dotx``, ``.xlsx`` and the ``.pptx`` and ``.potx`` slide masters are; the answer says so.
+
+    It says what cannot be done with the file: an inspection, or a fill.
+    """
     job.path(name).write_bytes(b"PK")
     error = job.inspect(name)["error"]
-    assert error.startswith("unsupported_template: ")
+    assert error.startswith(f"unsupported_template: .{name.rsplit('.', 1)[1]} cannot be inspected here; ")
     for ext in (".docx", ".dotx", ".xlsx", ".pptx", ".potx"):
         assert ext in error
+    assert " cannot be filled here; " in job.fill(name, {"x": "y"})["error"]
 
 
 def test_a_damaged_template_is_unreadable(job: Job) -> None:

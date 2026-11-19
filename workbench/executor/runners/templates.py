@@ -72,11 +72,12 @@ _NO_FIELDS: Final = (
 )
 
 
-def _family(path: Path) -> str:
+def _family(path: Path, *, inspecting: bool = False) -> str:
     """Name a template's type by its extension.
 
     Args:
         path: The file.
+        inspecting: Whether it is to be inspected, not filled, which the refusal says.
 
     Returns:
         ``docx``, ``xlsx`` or ``pptx``.
@@ -88,7 +89,8 @@ def _family(path: Path) -> str:
     family = TEMPLATES.get(ext)
     if family is None:
         shown = ext or "a file without an extension"
-        raise Refusal("unsupported_template", f"{shown} cannot be filled here; {NOT_A_TEMPLATE}")
+        done = "inspected" if inspecting else "filled"
+        raise Refusal("unsupported_template", f"{shown} cannot be {done} here; {NOT_A_TEMPLATE}")
     return family
 
 
@@ -378,7 +380,7 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
     def work() -> dict[str, Any]:
         path, _ = job_input(args, ctx)
-        family = _family(path)
+        family = _family(path, inspecting=True)
         if family == "pptx":
             from workbench.executor.presentations import master
 

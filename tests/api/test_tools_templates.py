@@ -222,12 +222,14 @@ def test_inspect_none_carries_the_hint(client: TestClient, store: Store, tmp_pat
 def test_other_files_are_refused_before_any_job(
     client: TestClient, store: Store, fake_executor: Local, name: str
 ) -> None:
-    """Only .docx, .dotx and .xlsx; the answer names them, and nothing is sent."""
+    """Only .docx, .dotx and .xlsx; the answer names them and what cannot be done with the file, and nothing is sent."""
     put(store, name, b"PK", p=PG)
-    for r in (inspect(client, f"{CHAT}/{name}"), fill(client, f"{CHAT}/{name}", {"x": "y"})):
+    own = f".{name.rsplit('.', 1)[1]}"
+    answers = {"inspected": inspect(client, f"{CHAT}/{name}"), "filled": fill(client, f"{CHAT}/{name}", {"x": "y"})}
+    for done, r in answers.items():
         reason, detail = refusal(r)
         assert reason == "refused"
-        assert detail.startswith("unsupported_template: ")
+        assert detail.startswith(f"unsupported_template: {own} cannot be {done} here; ")
         for ext in (".docx", ".dotx", ".xlsx"):
             assert ext in detail
     assert fake_executor.requests == []

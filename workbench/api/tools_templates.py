@@ -420,9 +420,9 @@ def _output_extension(name: str, *, inspecting: bool = False) -> str:
     filled = TEMPLATE_FILES.get(ext)
     if filled is None:
         shown = ext or "a file without an extension"
-        taken = _NOT_INSPECTABLE if inspecting else _NOT_A_TEMPLATE
+        done, taken = ("inspected", _NOT_INSPECTABLE) if inspecting else ("filled", _NOT_A_TEMPLATE)
         raise HTTPException(
-            status_code=422, detail=_clean(f"unsupported_template: {shown} cannot be filled here; {taken}")
+            status_code=422, detail=_clean(f"unsupported_template: {shown} cannot be {done} here; {taken}")
         )
     return filled
 
