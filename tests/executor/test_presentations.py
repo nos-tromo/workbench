@@ -1190,7 +1190,7 @@ def test_a_table_takes_the_size_that_fits_its_place(job: Job, count: int, size: 
     mt.make_master(job.path("master.pptx"))
     rows = [["Invented column", "Invented value"], *[[f"Invented {number}"] for number in range(count - 1)]]
     warnings = job.write([{"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]}])["warnings"]
-    assert warnings == ([] if fits else ["slide 1: the table may not fit; split it over two slides"])
+    assert warnings == ([] if fits else ["slide 1, block 1: the table may not fit; split it over two slides"])
     shape = next(shape for shape in job.deck().slides[0].shapes if shape.has_table)
     table = shape.table
     assert len(table.rows) == count
@@ -1222,7 +1222,7 @@ def test_a_tables_wrapped_cells_count_in_its_height(job: Job) -> None:
             {"layout": TITLE_AND_CONTENT, "content": [{"table": paragraphs}]},
         ]
     )["warnings"]
-    assert warnings == ["slide 2: the table may not fit; split it over two slides"]
+    assert warnings == ["slide 2, block 1: the table may not fit; split it over two slides"]
     wrapped, crowded, broken = (next(shape for shape in slide.shapes if shape.has_table) for slide in job.deck().slides)
     room = place_of(TITLE_AND_CONTENT).shape.height
 

@@ -264,7 +264,7 @@ def fill(
         filled.add(place.idx)
         if not isinstance(block, str):
             if not place_block(on_slide, block, images, where, warnings):
-                warnings.append(f"slide {number}: the table may not fit; split it over two slides")
+                warnings.append(f"{where}: the table may not fit; split it over two slides")
             continue
         frame = on_slide.shape.text_frame
         written = text.write_markdown(frame, block)
