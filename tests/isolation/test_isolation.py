@@ -576,6 +576,42 @@ def test_a_deck_is_built_in_the_sandbox(api_info: dict[str, Any], tmp_path: Path
     )
 
 
+def test_a_deck_without_a_master_is_built_in_the_plain_one(api_info: dict[str, Any]) -> None:
+    """With no master in the chat, the job reads python-pptx's own master from the read-only image and widens it."""
+    chat = "chat-plain-deck"
+    inspected = _tool(api_info, chat, "inspect_template", {})
+    assert "path" not in inspected  # null, which the helper leaves out
+    assert (inspected["template_kind"], inspected["slides"]) == ("slide_master", 0)
+    assert len(inspected["layouts"]) == 9
+
+    slides = [
+        {"layout": "Title Slide", "title": "Invented harbour review", "subtitle": "Invented quarter"},
+        {
+            "layout": "Two Content",
+            "title": "Invented tonnes",
+            "content": [
+                "- Invented north pier\n- Invented south pier",
+                {
+                    "chart": {
+                        "type": "pie",
+                        "categories": ["Invented north", "Invented south"],
+                        "series": {"t": [12, 7]},
+                    }
+                },
+            ],
+            "notes": "Invented speaker note",
+        },
+    ]
+    built = _tool(api_info, chat, "write_presentation", {"name": "plain-deck", "slides": slides})
+    assert built == {"path": f"/workspace/{chat}/plain-deck.pptx", "slides": 2, "warnings": []}
+
+    deck: Any = Presentation(io.BytesIO(_download(api_info, chat, built["path"])))
+    assert (deck.slide_width, deck.slide_height) == (12192000, 6858000)
+    assert [slide.slide_layout.name for slide in deck.slides] == ["Title Slide", "Two Content"]
+    assert deck.slides[1].notes_slide.notes_text_frame.text == "Invented speaker note"
+    assert deck.core_properties.last_modified_by == ""
+
+
 # --- the output tools, end to end --------------------------------------------------------------------------------
 
 OUTPUTS_CHAT = "chat-outputs"
