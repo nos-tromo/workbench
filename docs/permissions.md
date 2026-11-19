@@ -13,7 +13,7 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the eight) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the nine) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
@@ -47,20 +47,21 @@ Every tool that runs in the executor also leaves a job record (see
 | `read_document` | one file, as a copy in a job | nothing | `query` / `tool.read_document` | a job record |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
 | `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
-| `inspect_template` | one template, as a copy in a job | nothing | `query` / `tool.inspect_template` | a job record |
+| `inspect_template` | one template or slide master, as a copy in a job | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
 | `write_document` | nothing of the chat: the Markdown comes in the call | one new `.docx` or `.md` in the chat | `collect` / `tool.write_document` | the new file and a job record |
-| `write_presentation` | the slide master, every picture a slide shows and every file a slide's source names, as copies in a job | one new `.pptx` in the master's chat; the master is not changed | `modify` / `tool.write_presentation` | the new file and a job record |
+| `write_presentation` | the slide master (`.pptx` or `.potx`), every picture of the chat a slide shows (PNG, JPEG or GIF) and every file a slide's source names, as copies in a job | one new `.pptx` in the master's chat (a `.potx` master gives a `.pptx`); the master, the pictures and the sources are not changed | `modify` / `tool.write_presentation` | the new file and a job record |
 | `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
 
-The eight tools answer Ghostwriter with `outputs` besides their own answer: the
+The nine tools answer Ghostwriter with `outputs` besides their own answer: the
 id of each file the call wrote and, for a csv or xlsx file, a preview of it.
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
 `read_document`, `search_files`, `run_python`),
 `workbench/api/tools_templates.py` (`inspect_template`, `fill_template`),
-`workbench/api/tools_output.py` (`write_table`, `write_document`).
+`workbench/api/tools_output.py` (`write_table`, `write_document`),
+`workbench/api/tools_presentations.py` (`write_presentation`).
 
 ### File routes
 
@@ -103,7 +104,8 @@ path answers `404` to a caller with the key, and `401` to anyone without it.
   Ghostwriter is held to it: a path in another chat answers `404`, as a file
   that does not exist (`workbench/api/store.py:Store._locate`). So:
   - `list_files`, `search_files` and `run_python` see only the request's chat;
-  - `fill_template` takes file sources only from the template's chat.
+  - `fill_template` and `write_presentation` take file sources only from the
+    template's or master's chat, and `write_presentation` its pictures too.
 - Files exist only inside chat folders. A file directly under `/workspace`
   cannot be made there, and `/workspace` and a chat folder are never the
   target of a file operation (`workbench/api/store.py:Store._file_target`).
@@ -133,9 +135,9 @@ chat for its user (`DELETE /files/chat`), or by retention after the period
   other (`workbench/api/tools.py:record_answer`, `OutputKeeper`).
 - A refusal is recorded too, as `error` with `refused: <code>`. Its message
   goes to the model and can quote the file: a workbook's sheet names, a line of
-  a template, a drop-down's entries, the sheets and range of a value's source.
-  The event holds the code alone, and if it cannot be written the model gets
-  `audit unavailable`, never the refusal.
+  a template, a drop-down's entries, the sheets and range of a value's source,
+  the layouts of a slide master. The event holds the code alone, and if it
+  cannot be written the model gets `audit unavailable`, never the refusal.
 - `run_python` names the files the job was given and the files it made; a fill
   or a write names its new file. Each is recorded before any file it made
   becomes visible. A new file the model is not told of (the answer could not be
@@ -174,6 +176,26 @@ things, the limits that matter to users:
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
+- A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place
+  of its layout. A text block holds at most 2000 characters, a title 300, a
+  subtitle 500 and the speaker notes 5000. A table holds at most 30 rows (the
+  header counts), 10 columns and 500 characters a cell; a chart at most 50
+  categories and 10 series, a value or null for each category, and a pie one
+  series of values that are not negative. A deck shows at most 20 pictures (PNG,
+  JPEG or GIF files of the chat, each at most 10 MiB and 40 megapixels, 30 MiB
+  together) and a slide cites at most 20 sources. The api checks every bound
+  before it sends a job, so a deck over one is a `422` that names the slide and
+  the block, with no job and no event, and the runner checks them again
+  (`workbench/decks.py`). Text that may not fit its place is shrunk to 60 % at
+  most, and a warning names the slide when that does not do (the answer's
+  `warnings`).
+- A slide master's example slides never reach the new deck. They are removed,
+  with the custom shows and sections that name them and the thumbnail and
+  `docProps/app.xml` that show or list them; the deck takes the master's theme,
+  layouts, media and core properties. A master whose layouts or master slide link
+  to its own slides is refused (`invalid_template`), a macro-enabled
+  presentation or a slide show too (`unsupported_template`), and `fill_template`
+  refuses a slide master and names `write_presentation`.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
   newest 1000 files of the chat; answers are cut at `WORKBENCH_RESULT_MAX_KB`
   and say how to go on; `read_document` does no OCR and lists pages without a

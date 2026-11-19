@@ -57,11 +57,11 @@ The `container` is the chat folder the files live in.
 | `fill_template` | `modify` / `tool.fill_template` | the template, every file a value's source names, and the new file | `filled_by_source`: how many fields each kind of source filled (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 | `write_table` | `collect` / `tool.write_table` | the new file | `rows`, `columns`: the table's size; `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 | `write_document` | `collect` / `tool.write_document` | the new file | `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
-| `write_presentation` | `modify` / `tool.write_presentation` | the slide master, every picture, every file a slide's source names, and the new file | `slides`, `tables`, `charts`, `images`: the deck's counts; `sources_by_kind`: how many sources of each kind its slides cite (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
+| `write_presentation` | `modify` / `tool.write_presentation` | the slide master, every picture, every file a slide's source names (each once), and the new file | `slides`, `tables`, `charts`, `images`: the deck's counts, a picture shown twice counting twice; `sources_by_kind`: how many sources of each kind its slides cite (`file`, `job`, `user`, `assistant`); `outputs: 0` on an `error` | before the new file is visible: `ok`, or `error` (below), which keeps no file |
 
 An event about more than 200 files is followed by continuation events under
 `<operation>.ids` (`tool.search_files.ids`, `tool.run_python.ids`,
-`tool.fill_template.ids`), each naming up to 200 more of its files (see
+`tool.fill_template.ids`, `tool.write_presentation.ids`), each naming up to 200 more of its files (see
 [Long lists of files](#long-lists-of-files)).
 
 Every tool job whose answer reached the api is recorded, whatever the answer
@@ -74,8 +74,8 @@ own: `storage_full` when the data volume is below its free-space floor,
 `hidden_memory` when the container held shared memory no job's count showed
 and every running job was stopped), never its message. The
 message goes to the model and can quote the file: a workbook's sheet names, a
-template's line, a drop-down's entries, a source's sheets and range. Since it
-discloses content, it is recorded like a read. If the event cannot be written,
+template's line, a drop-down's entries, a source's sheets and range, a slide
+master's layouts. Since it discloses content, it is recorded like a read. If the event cannot be written,
 the answer is `audit unavailable`, never the refusal.
 
 A tool that makes files writes a second, `error` event, with `outputs` counting
@@ -105,16 +105,18 @@ as `dropped`.
   a body too large (`413`), a missing or invalid user (`400`), a body that does
   not validate (`422`), a full queue (`queue_full`), a file that does not exist
   (`404`).
-- A tool call refused before its job ran (an invalid name, a source that is not
-  in the chat), and a job whose answer never reached the api (see
+- A tool call refused before its job ran (an invalid name, a source or a
+  picture that is not in the chat, a deck over its bounds), and a job whose
+  answer never reached the api (see
   [permissions.md](permissions.md#which-runs-are-audited)).
 
 ### What is never recorded
 
 No event holds a file's content, a file name or a path, a search query, code,
-a value the model wrote, Markdown, a template's field names, the text a tool
-returned, the data a call brings, or a digest of it, or the message of a refusal
-(only its code). The api's audit methods take file ids and counts and no name
+a value the model wrote, Markdown, a template's field names, a slide's text or
+speaker notes, a layout's name, the text a tool returned, the data a call
+brings, or a digest of it, or the message of a refusal (only its code). The
+api's audit methods take file ids and counts and no name
 (`workbench/api/audit.py`). The criteria are flags and counts.
 
 ### Long lists of files
@@ -130,8 +132,9 @@ on more files is split, never cut (ADR 0003):
   `container`, `target.count` the number of its own ids, and no `criteria`.
 
 No event sets `ids_truncated`. `search_files` and `run_python`, which can be
-given up to 1000 files, and `fill_template` with many file sources can need
-continuations (`workbench/api/audit.py:AuditLog._emit`, with the shared
+given up to 1000 files, can need continuations, and so can `fill_template` with
+many file sources and `write_presentation` with many pictures and source files
+(`workbench/api/audit.py:AuditLog._emit`, with the shared
 `audit_runtime.id_chunks`). Retention never does: its batches are of at most
 200 files.
 

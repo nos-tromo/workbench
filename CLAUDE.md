@@ -25,10 +25,11 @@ tools run on users' files, so that no app runs a code sandbox or office tooling
 of its own ("tool execution is shared, never embedded"). Ghostwriter connects
 through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
 reads and searches them, runs Python over them, inspects and fills report
-templates, and writes tables and documents, through eight typed tools. Every
-file is recorded in the audit trail by id and deleted `WORKBENCH_RETENTION_DAYS`
-(7) days after it was made. docint, the second caller, comes in through the
-same door and runs Python over data that comes with the call.
+templates, builds presentations in a slide master, and writes tables and
+documents, through nine typed tools. Every file is recorded in the audit trail
+by id and deleted `WORKBENCH_RETENTION_DAYS` (7) days after it was made.
+docint, the second caller, comes in through the same door and runs Python over
+data that comes with the call.
 
 workbench holds compute tools only. Data tools stay with the data's owner:
 docint's search stays in docint, and workbench never joins `data-net`.
@@ -39,7 +40,9 @@ build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`; version 2's are
 `docs/superpowers/plans/2026-11-15-workbench-v2.md`; v0.3.0's are deploy's spec
 `docs/superpowers/specs/2026-11-16-ghostwriter-design.md` and its plan
 `docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`; v0.5.0's is
-deploy's spec `docs/superpowers/specs/2026-11-17-open-webui-retirement-design.md`.
+deploy's spec `docs/superpowers/specs/2026-11-17-open-webui-retirement-design.md`;
+v0.6.0's are `docs/superpowers/specs/2026-11-18-write-presentation-design.md` and
+`docs/superpowers/plans/2026-11-18-write-presentation.md`.
 Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
@@ -85,8 +88,10 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
 Shared modules: `workbench/config.py` (settings for both roles),
 `workbench/paths.py` (virtual paths, ids, file names), `workbench/protocol.py`
 (the job request and answer, one JSON line each), `workbench/layout.py` (names
-on the volume), `workbench/tables.py` (table rules both sides apply). The
-executor imports nothing of the api.
+on the volume), `workbench/tables.py` (table rules both sides apply),
+`workbench/decks.py` (the bounds of a deck, which the api checks before a job and
+the runner checks again, as with `tables.py`). The executor imports nothing of
+the api.
 
 ## The tool core and the doors
 
@@ -94,25 +99,40 @@ executor imports nothing of the api.
 `workbench/api/tool_table.py:WORKSPACE_TABLE`: its name, a description written
 for the model, the models of its arguments and its answer, and the function that
 runs it. The door tells each caller the tools it may call (`tools/list`, frozen
-in `tests/api/golden/`). The eight: `list_files`, `read_document`,
+in `tests/api/golden/`). The nine: `list_files`, `read_document`,
 `search_files`, `run_python`, `inspect_template`, `fill_template`,
-`write_table`, `write_document`.
+`write_table`, `write_document`, `write_presentation`.
 
 - `workbench/api/tools.py`: `list_files`, `read_document`, `search_files`,
   `run_python`, and the helpers the other tool modules share.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
-  template and output tools. A new tool gets a module of its own.
+  template and output tools. A new tool gets a module of its own, as
+  `workbench/api/tools_presentations.py` (`write_presentation`) has: it checks the
+  master, the name, every deck bound, each picture and each source before a job,
+  so a refusal names its slide and block and costs no job.
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, view, the
   chat delete).
 - `workbench/executor/runners/`: one runner per tool that needs file content
-  (`RUNNERS`). `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made
-  and settles its record.
+  (`RUNNERS`); `presentations.py` is `write_presentation`'s.
+  `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
+  its record.
+- `workbench/executor/presentations/`: what the runners of a slide master use.
+  `master.py` reads the layouts and their places (`inspect_template`) and opens a
+  `.pptx` or `.potx`; `deck.py` removes the master's example slides and builds
+  the slides; `blocks.py` fills a place with a table, a chart or a picture;
+  `text.py` writes Markdown into a text frame. A deck keeps the master's theme,
+  layouts, media and core properties and none of its example slides, its
+  thumbnail or its `docProps/app.xml`; a master that links to its own slides is
+  refused (`invalid_template`).
+  `workbench/executor/readers/ooxml.py` gives a template (`.dotx`, `.potx`) the
+  content type of a document or a presentation so that a library opens it, and
+  tells a macro-enabled presentation or a slide show, which are refused.
 - `workbench/api/registry.py`: every tool as a `ToolSpec` of its form
   (`workspace` or `inline`), and what a caller may call. `tools_inline.py` holds
   the inline tools (`run_python` on data that comes with the call, outputs
   returned and never kept). `mcp.py` is the MCP door's dispatch and
   `mcp_wire.py` its wire rules, with no I/O.
-- `workbench/api/tools_mcp.py`: Ghostwriter's eight workspace tools on `/mcp`,
+- `workbench/api/tools_mcp.py`: Ghostwriter's nine workspace tools on `/mcp`,
   each calling its row's function. A call's `structuredContent` is the
   function's answer plus `outputs`, each file it wrote with its id and, for csv
   and xlsx, a preview that `workbench/executor/preview.py` reads in the job. The
@@ -122,10 +142,14 @@ in `tests/api/golden/`). The eight: `list_files`, `read_document`,
 Adding a tool touches: its row in `tool_table.WORKSPACE_TABLE`, or for an
 inline tool its spec in `tools_inline.INLINE_SPECS` and a name in
 `registry.INLINE_TOOLS`; its runner and `jobs.TOOLS`, if it runs in the
-executor; `audit.OPERATIONS`, if it is recorded; `docs/permissions.md` and
-`docs/audit.md` (`tests/test_docs.py` fails without them); and the golden
-`tools/list` files, edited on purpose, never regenerated. The start check
-refuses a caller's tool list that names a tool of another file form.
+executor; `audit.OPERATIONS`, if it is recorded;
+`config.GHOSTWRITER_DEFAULT_TOOLS`, the `GHOSTWRITER_WORKBENCH_TOOLS` default in
+`docker/compose.yaml` and the tool list of `.env.example` (the three agree;
+`tests/test_config.py` and `tests/test_compose_defaults.py` read them);
+`docs/permissions.md` and `docs/audit.md` (`tests/test_docs.py` fails without
+them); and the golden `tools/list` files, edited on purpose, never regenerated.
+The start check refuses a caller's tool list that names a tool of another file
+form.
 
 Every router is built with `route_class=EncodableRoute`
 (`workbench/api/routing.py`: a JSON body read within a depth limit, lone
@@ -141,7 +165,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
 wall cap and running-job cap) and `ghostwriter` (`/mcp` and four file routes,
-workspace files, the eight tools, its own caps, confined to its chat). The key
+workspace files, the nine tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
 
