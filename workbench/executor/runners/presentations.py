@@ -96,7 +96,8 @@ def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Build a deck in a slide master into a new ``.pptx`` in ``out/``.
 
     Args:
-        args: ``path`` (the master, relative to the chat folder); ``name`` (the new file's, with ``.pptx``);
+        args: ``path`` (the master, relative to the chat folder; left out for the plain master,
+            :func:`~workbench.executor.presentations.master.plain_master`); ``name`` (the new file's, with ``.pptx``);
             ``slides`` (each a ``layout`` and, optionally, ``title``, ``subtitle``, ``content``, ``notes`` and
             ``sources``; a file source's ``path`` is relative to the chat folder and ``virtual`` is how the notes
             name it; an image block's ``image`` is relative to the chat folder too, its ``virtual`` left aside);
@@ -116,11 +117,14 @@ def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         if why is not None:
             raise Refusal("invalid_value", why)
         output = _output(args, ctx)
-        path, _ = job_input(args, ctx)
-        if path.suffix.lower() not in MASTERS:
-            shown = path.suffix.lower() or "a file without an extension"
-            raise Refusal("unsupported_template", f"{NOT_A_MASTER}; {shown} is not one")
-        prs = master.open_master(path, ctx)
+        if args.get("path") is None:
+            prs = master.plain_master()
+        else:
+            path, _ = job_input(args, ctx)
+            if path.suffix.lower() not in MASTERS:
+                shown = path.suffix.lower() or "a file without an extension"
+                raise Refusal("unsupported_template", f"{NOT_A_MASTER}; {shown} is not one")
+            prs = master.open_master(path, ctx)
         warned: list[str] = []
         count = deck.build(prs, args, ctx, warned)
         prs.save(str(output))

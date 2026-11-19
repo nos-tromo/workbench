@@ -64,19 +64,22 @@ class Job:
         """Where an input of that name lies."""
         return self.ctx.work_dir / name
 
-    def inspect(self, name: str) -> dict[str, Any]:
-        """Run ``inspect_template`` on an input."""
-        return RUNNERS["inspect_template"]({"path": name, "budget_s": 30}, self.ctx)
+    def inspect(self, name: str | None) -> dict[str, Any]:
+        """Run ``inspect_template`` on an input, or on the plain master when ``name`` is ``None``."""
+        args: dict[str, Any] = {"budget_s": 30} if name is None else {"path": name, "budget_s": 30}
+        return RUNNERS["inspect_template"](args, self.ctx)
 
     def with_max_chars(self, max_chars: int) -> "Job":
         """The same folder with another result limit."""
         return Job(JobContext(self.ctx.work_dir, self.ctx.out_dir, CHAT, max_chars, self.ctx.file_mb))
 
     def write(
-        self, slides: list[dict[str, Any]], *, path: str = "master.pptx", name: str = "deck.pptx", **extra: Any
+        self, slides: list[dict[str, Any]], *, path: str | None = "master.pptx", name: str = "deck.pptx", **extra: Any
     ) -> dict[str, Any]:
-        """Run ``write_presentation`` on a master of the job."""
-        args = {"path": path, "name": name, "slides": slides, "budget_s": 30, **extra}
+        """Run ``write_presentation`` on a master of the job, or on the plain master when ``path`` is ``None``."""
+        args = {"name": name, "slides": slides, "budget_s": 30, **extra}
+        if path is not None:
+            args["path"] = path
         return RUNNERS["write_presentation"](args, self.ctx)
 
     def deck(self, name: str = "deck.pptx") -> Any:
@@ -1561,3 +1564,87 @@ def test_a_deck_of_every_block_kind_has_parts_of_their_own(job: Job) -> None:
     for slide in reopened.slides:
         ids = [shape.shape_id for shape in slide.shapes]
         assert len(ids) == len(set(ids))
+
+
+# --- the plain master ---------------------------------------------------------------------------------------------
+
+WIDE = 12192000
+HIGH = 6858000
+PLAIN_LAYOUTS = [
+    "Title Slide",
+    "Title and Content",
+    "Section Header",
+    "Two Content",
+    "Comparison",
+    "Title Only",
+    "Blank",
+    "Content with Caption",
+    "Picture with Caption",
+]
+
+
+def test_the_plain_master_is_inspected_without_a_path(job: Job) -> None:
+    """Without a path, the inspection lists the plain master's nine layouts; it has no example slides."""
+    answer = job.inspect(None)
+    assert answer["template_kind"] == "slide_master"
+    assert (answer["slides"], answer["total"], answer["truncated"]) == (0, 9, False)
+    assert [layout["name"] for layout in answer["layouts"]] == PLAIN_LAYOUTS
+    assert [place["role"] for place in answer["layouts"][PICTURE_WITH_CAPTION - 1]["places"]] == ["picture", "text"]
+
+
+def test_the_plain_master_is_wide_and_every_shape_fits_it() -> None:
+    """The plain master is 16:9, each shape of its master and layouts within the slide, wider than python-pptx's own."""
+    prs = master.plain_master()
+    assert (prs.slide_width, prs.slide_height) == (WIDE, HIGH)
+    for part in [prs.slide_masters[0], *prs.slide_layouts]:
+        for shape in part.shapes:
+            assert 0 <= shape.left and shape.left + shape.width <= WIDE
+            assert 0 <= shape.top and shape.top + shape.height <= HIGH
+    plain = master.layouts(prs)[TITLE_AND_CONTENT - 1].places[0]
+    narrow = master.layouts(Presentation())[TITLE_AND_CONTENT - 1].places[0]
+    assert plain.lines == narrow.lines
+    assert plain.chars > narrow.chars
+
+
+def test_each_plain_master_is_a_fresh_one() -> None:
+    """A deck built in one plain master leaves the next one as it was."""
+    first = master.plain_master()
+    first.slides.add_slide(first.slide_layouts[0])
+    assert len(master.plain_master().slides) == 0
+
+
+def test_a_deck_is_built_in_the_plain_master(job: Job) -> None:
+    """Without a path, every block kind goes into the plain master's places, with notes and slide numbers."""
+    job.path("figure.png").write_bytes(mk._png(16, 8))
+    slides: list[dict[str, Any]] = [
+        {"layout": TITLE_SLIDE, "title": "Invented harbour review", "subtitle": "A synthetic year"},
+        {"layout": "Title and Content", "title": "Invented tonnage", "content": ["- North pier\n- South pier"]},
+        {
+            "layout": TWO_CONTENT,
+            "title": "Invented figures",
+            "content": [{"table": [["Invented pier"], [12]]}, chart("column", TONNES)],
+        },
+        {"layout": PICTURE_WITH_CAPTION, "title": "Invented view", "content": [image("figure.png"), "Invented"]},
+    ]
+    slides[1]["notes"] = "Invented note"
+    slides[1]["sources"] = [{"kind": "assistant"}]
+    assert job.write(slides, path=None) == {"slides": 4, "warnings": []}
+    deck_ = job.deck()
+    assert (deck_.slide_width, deck_.slide_height) == (WIDE, HIGH)
+    assert [slide.slide_layout.name for slide in deck_.slides] == [PLAIN_LAYOUTS[i - 1] for i in (1, 2, 4, 9)]
+    second = deck_.slides[1]
+    assert second.notes_slide.notes_text_frame.text == "Invented note\n\nSources:\nassistant"
+    for number, slide in enumerate(deck_.slides, 1):
+        found = kinds(slide)
+        field = found[PP_PLACEHOLDER.SLIDE_NUMBER]._element.find(f".//{qn('a:fld')}")
+        assert field.find(qn("a:t")).text == str(number)
+        assert PP_PLACEHOLDER.DATE not in found and PP_PLACEHOLDER.FOOTER not in found
+    assert {MSO_SHAPE_TYPE.TABLE, MSO_SHAPE_TYPE.CHART} <= {shape.shape_type for shape in deck_.slides[2].shapes}
+    assert deck_.slides[3].placeholders[1]._element.tag == qn("p:pic")
+
+
+def test_a_deck_in_the_plain_master_names_no_one(job: Job) -> None:
+    """The plain master's own core properties, which name python-pptx's author, are not carried into a deck."""
+    job.write([{"layout": TITLE_SLIDE, "title": "Invented"}], path=None)
+    core = job.deck().core_properties
+    assert (core.title, core.author, core.last_modified_by, core.revision) == ("", "", "", 1)

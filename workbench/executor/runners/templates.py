@@ -368,17 +368,23 @@ def inspect_template(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """List the fields of a template, with their types, a drop-down's entries and where they sit; or a master's layouts.
 
     Args:
-        args: ``path``, relative to the chat folder; ``budget_s``, the seconds the work may take.
+        args: ``path``, relative to the chat folder, left out for the plain master
+            (:func:`workbench.executor.presentations.master.plain_master`); ``budget_s``, the seconds the work may take.
         ctx: The job's surroundings.
 
     Returns:
         ``template_kind``, ``fields``, ``total`` (fields there are), ``truncated`` and, when it applies, ``hint``;
-        for a slide master, ``template_kind`` ``slide_master``, ``layouts``, ``slides``, ``total`` (layouts there are)
-        and ``truncated`` (:func:`workbench.executor.presentations.master.inspect`); or an ``error`` result.
+        for a slide master, the plain one too, ``template_kind`` ``slide_master``, ``layouts``, ``slides``, ``total``
+        (layouts there are) and ``truncated`` (:func:`workbench.executor.presentations.master.inspect`); or an
+        ``error`` result.
     """
     budget = float(args.get("budget_s", _DEFAULT_BUDGET_S))
 
     def work() -> dict[str, Any]:
+        if args.get("path") is None:
+            from workbench.executor.presentations import master
+
+            return master.inspect(master.plain_master(), FIELDS_ROOM * ctx.max_chars)
         path, _ = job_input(args, ctx)
         family = _family(path, inspecting=True)
         if family == "pptx":

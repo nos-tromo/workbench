@@ -16,8 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal
 
+from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.oxml.ns import qn
+from pptx.util import Emu
 
 from workbench import decks
 from workbench.executor import readers
@@ -57,6 +59,11 @@ _LINE_HEIGHT: Final = 1.2
 
 #: How far apart, in EMU, the tops of places in one row may be (0.1 inch): they are read left to right.
 ROW_SPREAD: Final = 91440
+
+#: The plain master's slide width in EMU: 16:9 at python-pptx's height of 7.5 inches.
+PLAIN_WIDTH: Final = Emu(12192000)
+#: The layouts of python-pptx's master that the plain master leaves out: their text runs from top to bottom.
+_VERTICAL: Final = frozenset({"Title and Vertical Text", "Vertical Title and Text"})
 
 _LEVEL_ONE_SIZE: Final = f"{qn('p:txBody')}/{qn('a:lstStyle')}/{qn('a:lvl1pPr')}/{qn('a:defRPr')}"
 _BODY_PR: Final = f"{qn('p:txBody')}/{qn('a:bodyPr')}"
@@ -125,6 +132,31 @@ def open_master(path: Path, ctx: JobContext) -> Any:
         return library(lambda: open_presentation(path))
     except readers.UnsupportedFormat as exc:
         raise Refusal("unsupported_template", f"the master is {exc}") from None
+
+
+def plain_master() -> Any:
+    """Open the plain master, which a deck is built in when the user gave none: python-pptx's own, made 16:9.
+
+    It is python-pptx's default presentation (the Office theme, no slides), read from the library's files in the image,
+    never from a chat. Its two layouts of vertical text are left out, so it has nine; its master and layouts are
+    widened from 4:3 to :data:`PLAIN_WIDTH`, each shape's left edge and width scaled alike.
+
+    Returns:
+        A new python-pptx presentation each time.
+    """
+    prs = Presentation()
+    slide_master = prs.slide_masters[0]
+    for layout in [layout for layout in slide_master.slide_layouts if layout.name in _VERTICAL]:
+        slide_master.slide_layouts.remove(layout)
+    scale = PLAIN_WIDTH / (prs.slide_width or PLAIN_WIDTH)
+    for part in [slide_master, *slide_master.slide_layouts]:
+        for offset in part._element.iter(qn("a:off")):
+            offset.set("x", str(round(int(offset.get("x")) * scale)))
+        for extent in part._element.iter(qn("a:ext")):
+            if extent.get("cx") is not None:
+                extent.set("cx", str(round(int(extent.get("cx")) * scale)))
+    prs.slide_width = PLAIN_WIDTH
+    return prs
 
 
 def layouts(prs: Any) -> list[Layout]:
