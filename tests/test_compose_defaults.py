@@ -44,12 +44,13 @@ CALLER_DEFAULTS = {
 }
 
 #: Ghostwriter's variables in the api's environment: the key, its tools and its two limits.
-EIGHT_LIST = (
-    "list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document"
+TOOLS_LIST = (
+    "list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document,"
+    "write_presentation"
 )
 GHOSTWRITER_DEFAULTS = {
     "GHOSTWRITER_WORKBENCH_KEY": "",
-    "GHOSTWRITER_WORKBENCH_TOOLS": EIGHT_LIST,
+    "GHOSTWRITER_WORKBENCH_TOOLS": TOOLS_LIST,
     "GHOSTWRITER_WORKBENCH_WALL_S": "120",
     "GHOSTWRITER_WORKBENCH_SLOTS": "2",
 }
@@ -565,8 +566,8 @@ def test_the_ghostwriter_lines_of_env_example() -> None:
     assert lines[lines.index("# WORKBENCH_RETENTION_DAYS=7") - 1] == "# [shared: ghostwriter]"
     assert not any(line.startswith("GHOSTWRITER_WORKBENCH_KEY=") for line in lines)
     assert not any("[required]" in line for line in lines if not line.startswith("#   "))
-    assert f"# GHOSTWRITER_WORKBENCH_TOOLS={EIGHT_LIST}" in lines
-    assert set(EIGHT_LIST.split(",")) == GHOSTWRITER_DEFAULT_TOOLS
+    assert f"# GHOSTWRITER_WORKBENCH_TOOLS={TOOLS_LIST}" in lines
+    assert set(TOOLS_LIST.split(",")) == GHOSTWRITER_DEFAULT_TOOLS
     assert "# --- ghostwriter ---" in lines
 
 

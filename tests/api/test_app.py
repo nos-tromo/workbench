@@ -15,7 +15,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from tests.api.conftest import CHAT, DOCINT_KEY, GHOSTWRITER_KEY, HG
 from tests.api.mcp_calls import send
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from workbench.api import auth
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CallerRegistry, KeyGate
@@ -264,7 +264,7 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "workspace_max_mb": settings.workspace_max_mb,
         "callers": [
             {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
-            {"name": "ghostwriter", "door": "mcp", "tools": sorted(EIGHT), "wall_s": 120, "slots": 2},
+            {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 2},
         ],
         "require_purpose": [],
     }

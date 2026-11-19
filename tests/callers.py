@@ -1,7 +1,7 @@
 """Values the tests of several callers share."""
 
 #: Ghostwriter's tools by default: every workspace tool.
-EIGHT = frozenset(
+GHOSTWRITER_TOOLS = frozenset(
     {
         "list_files",
         "read_document",
@@ -11,5 +11,6 @@ EIGHT = frozenset(
         "fill_template",
         "write_table",
         "write_document",
+        "write_presentation",
     }
 )

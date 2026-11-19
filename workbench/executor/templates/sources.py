@@ -30,7 +30,7 @@ HEADER: Final = ["field", "value", "source kind", "reference"]
 TITLE: Final = "Sources"
 
 _CELL: Final = re.compile(r"([A-Za-z]{1,3})([1-9]\d{0,6})")
-_PAGED: Final = frozenset({".pdf", ".pptx"})
+_PAGED: Final = frozenset({".pdf", ".pptx", ".potx"})
 _SHEETS: Final = frozenset({".xlsx", ".xlsm", ".ods"})
 
 
@@ -194,7 +194,7 @@ def check(values: Mapping[str, Mapping[str, Any]], ctx: JobContext) -> dict[str,
         if page is not None:
             pages = files.pages(name, source)
             if not 1 <= int(page) <= pages:
-                noun = "slides" if str(source["path"]).lower().endswith(".pptx") else "pages"
+                noun = "slides" if str(source["path"]).lower().endswith((".pptx", ".potx")) else "pages"
                 raise Refusal(
                     "invalid_source", f"{name}: {source['virtual']} has {pages} {noun}; page {page} is not one of them"
                 )

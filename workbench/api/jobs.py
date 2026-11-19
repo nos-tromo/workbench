@@ -239,6 +239,7 @@ TOOLS: Final = frozenset(
         "fill_template",
         "write_table",
         "write_document",
+        "write_presentation",
     }
 )
 

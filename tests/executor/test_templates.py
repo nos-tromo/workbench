@@ -18,7 +18,9 @@ from lxml import etree
 
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
+from workbench.executor.readers import UnsupportedFormat
 from workbench.executor.runners import RUNNERS, JobContext
+from workbench.executor.runners.templates import NOT_A_TEMPLATE, answered
 
 JOB_ID = "0123456789abcdef0123456789abcdef"
 CHAT = "chat-1"
@@ -253,12 +255,16 @@ def test_only_the_innermost_controls_are_fields(job: Job) -> None:
 
 @pytest.mark.parametrize("name", ["macro.docm", "macro.xlsm", "model.xltx", "notes.txt"])
 def test_other_files_are_not_templates(job: Job, name: str) -> None:
-    """Only ``.docx``, ``.dotx`` and ``.xlsx`` are templates; the answer says so."""
+    """Only ``.docx``, ``.dotx``, ``.xlsx`` and the ``.pptx`` and ``.potx`` slide masters are; the answer says so.
+
+    It says what cannot be done with the file: an inspection, or a fill.
+    """
     job.path(name).write_bytes(b"PK")
     error = job.inspect(name)["error"]
-    assert error.startswith("unsupported_template: ")
-    for ext in (".docx", ".dotx", ".xlsx"):
+    assert error.startswith(f"unsupported_template: .{name.rsplit('.', 1)[1]} cannot be inspected here; ")
+    for ext in (".docx", ".dotx", ".xlsx", ".pptx", ".potx"):
         assert ext in error
+    assert " cannot be filled here; " in job.fill(name, {"x": "y"})["error"]
 
 
 def test_a_damaged_template_is_unreadable(job: Job) -> None:
@@ -944,3 +950,17 @@ def test_slides_count_as_pages_and_a_sheet_name_is_found_whatever_its_case(job: 
     error = job.fill("form.docx", {"customer": _file_source(job, "depths.ods", sheet="Depths", cell="C3")})["error"]
     assert error.startswith("invalid_source: customer: C3 lies outside the cells of sheet 'Depths'")
     assert "from A1 to B2" in error
+
+
+# --- the helpers the presentation runner shares -------------------------------------------------------------------
+
+
+def test_an_unsupported_format_is_told_what_the_caller_says() -> None:
+    """A format the work cannot open is told why, then the templates there are, or what the caller says instead."""
+
+    def unsupported() -> dict[str, Any]:
+        raise UnsupportedFormat("an invented format")
+
+    assert answered(unsupported, 5) == {"error": f"unsupported_template: an invented format; {NOT_A_TEMPLATE}"}
+    told = answered(unsupported, 5, unsupported="an invented hint")
+    assert told == {"error": "unsupported_template: an invented format; an invented hint"}

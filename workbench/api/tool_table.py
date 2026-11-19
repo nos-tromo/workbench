@@ -1,9 +1,10 @@
 """The workspace tools, one row each: what the MCP door tells the model of every tool, and what runs it.
 
 A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
-and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates` and
-:mod:`workbench.api.tools_output`). :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the
-registry. A new workspace tool is a row here.
+and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`,
+:mod:`workbench.api.tools_output` and :mod:`workbench.api.tools_presentations`).
+:func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the registry. A new workspace tool is a row
+here.
 """
 
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
-from workbench.api import tools, tools_output, tools_templates
+from workbench.api import tools, tools_output, tools_presentations, tools_templates
 from workbench.tables import MAX_WORD_COLUMNS
 
 
@@ -44,7 +45,8 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         title="Fill a report template into a new file",
         description=(
             "Fill a report template of this conversation into a new file; the template itself is not changed, and a "
-            ".dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each "
+            ".dotx becomes a .docx. A slide master (.pptx or .potx) is not filled with this: build a deck in it with "
+            "write_presentation. Call inspect_template first and agree the values with the user. values maps each "
             "field's name to its value and its source, and every value needs a source: kind file (the path of a file "
             "of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell "
             "such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed "
@@ -60,7 +62,7 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
     ),
     WorkspaceTool(
         name="inspect_template",
-        title="List the fields of a report template",
+        title="List the fields of a template or the layouts of a slide master",
         description=(
             "List the fields of a report template in this conversation, so you can plan the fill with the user before "
             "you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form "
@@ -68,7 +70,11 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name "
             "(give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, "
             "table) and location. template_kind none means version 1 cannot fill the file: tell the user what it "
-            "needs, as hint says. A very long list is cut: truncated is then true."
+            "needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, "
+            "numbered, with each layout's places in reading order (role, about how many lines and characters fit) and "
+            "whether it has a footer; build a deck in one with write_presentation. Without path, it lists the layouts "
+            "of the plain 16:9 master write_presentation uses when the user gave none. A very long list is cut: "
+            "truncated is then true."
         ),
         input_model=tools_templates.InspectTemplateRequest,
         output_model=tools_templates.TemplateInfo,
@@ -91,7 +97,7 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         title="Read a file of this conversation as text",
         description=(
             "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
-            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
+            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
             "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
             "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
             "call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
@@ -159,6 +165,27 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools_output.WriteDocumentRequest,
         output_model=tools_output.WrittenDocument,
         function=tools_output.write_document,
+    ),
+    WorkspaceTool(
+        name="write_presentation",
+        title="Build a slide deck in a slide master",
+        description=(
+            "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. "
+            "Without path, the deck is built in a plain 16:9 master. Call inspect_template on the master first "
+            "(without path for the plain one). Then show the user the outline (each slide's title, layout "
+            "number and name, key points, figures and sources) and call this tool only in a later message, after they "
+            "agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its "
+            "places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first "
+            "row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this "
+            'conversation (make a chart image with run_python, or prefer a native chart); "" leaves a place empty. '
+            "A slide's title and subtitle are plain text, not Markdown. At most 30 slides. Footers and slide numbers "
+            "come from the master; the master's own slides are left out. Each slide's sources go into its speaker "
+            "notes. To change a deck, read it with read_document and write it again. The user sees the new file as a "
+            "card in the chat."
+        ),
+        input_model=tools_presentations.WritePresentationRequest,
+        output_model=tools_presentations.BuiltPresentation,
+        function=tools_presentations.write_presentation,
     ),
     WorkspaceTool(
         name="write_table",

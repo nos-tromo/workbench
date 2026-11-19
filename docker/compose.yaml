@@ -108,7 +108,7 @@ services:
       DOCINT_WORKBENCH_SLOTS: ${DOCINT_WORKBENCH_SLOTS:-2}
       # Ghostwriter: the same four.
       GHOSTWRITER_WORKBENCH_KEY: ${GHOSTWRITER_WORKBENCH_KEY:-}
-      GHOSTWRITER_WORKBENCH_TOOLS: ${GHOSTWRITER_WORKBENCH_TOOLS:-list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document}
+      GHOSTWRITER_WORKBENCH_TOOLS: ${GHOSTWRITER_WORKBENCH_TOOLS:-list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document,write_presentation}
       GHOSTWRITER_WORKBENCH_WALL_S: ${GHOSTWRITER_WORKBENCH_WALL_S:-120}
       GHOSTWRITER_WORKBENCH_SLOTS: ${GHOSTWRITER_WORKBENCH_SLOTS:-2}
       # Colon-less, so an empty value set in .env requires no purpose.

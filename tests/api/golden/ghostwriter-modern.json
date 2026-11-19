@@ -3,7 +3,7 @@
     {
       "name": "fill_template",
       "title": "Fill a report template into a new file",
-      "description": "Fill a report template of this conversation into a new file; the template itself is not changed, and a .dotx becomes a .docx. Call inspect_template first and agree the values with the user. values maps each field's name to its value and its source, and every value needs a source: kind file (the path of a file of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; include_sources false leaves it out. The user sees the new file as a card in the chat.",
+      "description": "Fill a report template of this conversation into a new file; the template itself is not changed, and a .dotx becomes a .docx. A slide master (.pptx or .potx) is not filled with this: build a deck in it with write_presentation. Call inspect_template first and agree the values with the user. values maps each field's name to its value and its source, and every value needs a source: kind file (the path of a file of this conversation as list_files gives it, with page for a PDF page or PPTX slide, or sheet and cell such as B7 for a workbook), job (the job_id of the run_python run that computed it: every computed figure cites its job_id), user (the user said it; note says where) or assistant (you wrote it). Types: text and rich_text take a string or a number, date YYYY-MM-DD, dropdown one of its options, checkbox true or false, table a list of rows (each a list of values in a workbook). Fields without a value are listed in unfilled. The new file ends with a Sources table (a Sources sheet in a workbook) naming each value's source; include_sources false leaves it out. The user sees the new file as a card in the chat.",
       "inputSchema": {
         "$defs": {
           "AssistantSource": {
@@ -402,27 +402,67 @@
     },
     {
       "name": "inspect_template",
-      "title": "List the fields of a report template",
-      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. A very long list is cut: truncated is then true.",
+      "title": "List the fields of a template or the layouts of a slide master",
+      "description": "List the fields of a report template in this conversation, so you can plan the fill with the user before you call fill_template. Templates are Word .docx and .dotx files with content controls or legacy form fields, Word .docx files with {{ field }} placeholders (loops and conditions too), and Excel .xlsx files with {{ field }} cells and {{ table:name }} cells where a table grows downwards. Each field has its name (give its value under it), kind, type (text, rich_text, date, dropdown with its options, checkbox, table) and location. template_kind none means version 1 cannot fill the file: tell the user what it needs, as hint says. PowerPoint .pptx and .potx files are slide masters: their layouts are listed, numbered, with each layout's places in reading order (role, about how many lines and characters fit) and whether it has a footer; build a deck in one with write_presentation. Without path, it lists the layouts of the plain 16:9 master write_presentation uses when the user gave none. A very long list is cut: truncated is then true.",
       "inputSchema": {
-        "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path.",
+        "description": "Body of ``inspect_template``.\n\nAttributes:\n    path: The template's absolute path, or ``None`` for the plain slide master.",
         "properties": {
           "path": {
-            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
-            "maxLength": 1024,
-            "minLength": 1,
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it. Leave it out for the plain slide master.",
             "title": "Path",
             "type": "string"
           }
         },
-        "required": [
-          "path"
-        ],
         "title": "InspectTemplateRequest",
         "type": "object"
       },
       "outputSchema": {
         "$defs": {
+          "LayoutPlace": {
+            "description": "One place of a slide layout, which one block of a slide fills.\n\nAttributes:\n    role: What it takes: text, content (text, a table, a chart or a picture), picture, table or chart.\n    lines: About how many lines fit.\n    chars: About how many characters fit on a line.",
+            "properties": {
+              "role": {
+                "description": "What it takes: text, content (text, a table, a chart or a picture), picture, table or chart.",
+                "enum": [
+                  "text",
+                  "content",
+                  "picture",
+                  "table",
+                  "chart"
+                ],
+                "title": "Role",
+                "type": "string"
+              },
+              "lines": {
+                "description": "About how many lines fit at the font size the place inherits.",
+                "title": "Lines",
+                "type": "integer"
+              },
+              "chars": {
+                "description": "About how many characters fit on a line.",
+                "title": "Chars",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "role",
+              "lines",
+              "chars"
+            ],
+            "title": "LayoutPlace",
+            "type": "object"
+          },
           "OutputRef": {
             "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
             "properties": {
@@ -472,6 +512,55 @@
               "preview"
             ],
             "title": "OutputRef",
+            "type": "object"
+          },
+          "SlideLayout": {
+            "description": "One layout of a slide master.\n\nAttributes:\n    number: Its number, from 1, over all the master's layouts.\n    name: Its name, as the file has it.\n    title: Whether it has a title.\n    subtitle: Whether it has a subtitle.\n    places: Its places in reading order: top, then left.\n    footer: Whether it has a date, footer or slide number.",
+            "properties": {
+              "number": {
+                "description": "Its number, from 1: a slide names its layout by it.",
+                "title": "Number",
+                "type": "integer"
+              },
+              "name": {
+                "description": "Its name, as the file has it; it may be empty or shared.",
+                "maxLength": 100,
+                "title": "Name",
+                "type": "string"
+              },
+              "title": {
+                "description": "Whether it has a title.",
+                "title": "Title",
+                "type": "boolean"
+              },
+              "subtitle": {
+                "description": "Whether it has a subtitle.",
+                "title": "Subtitle",
+                "type": "boolean"
+              },
+              "places": {
+                "description": "Its places in reading order, top then left; a block fills each.",
+                "items": {
+                  "$ref": "#/$defs/LayoutPlace"
+                },
+                "title": "Places",
+                "type": "array"
+              },
+              "footer": {
+                "description": "Whether it has a date, a footer or a slide number.",
+                "title": "Footer",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "number",
+              "name",
+              "title",
+              "subtitle",
+              "places",
+              "footer"
+            ],
+            "title": "SlideLayout",
             "type": "object"
           },
           "TablePreview": {
@@ -595,33 +684,70 @@
         },
         "properties": {
           "path": {
-            "description": "The template's path.",
-            "title": "Path",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The template's path; null for the plain slide master.",
+            "title": "Path"
           },
           "template_kind": {
-            "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs.",
+            "description": "The kind of fields it has; none: version 1 cannot fill it, and hint says what it needs; slide_master: a .pptx or .potx, whose layouts are listed in layouts.",
             "enum": [
               "content_controls",
               "form_fields",
               "placeholders",
               "mixed",
-              "none"
+              "none",
+              "slide_master"
             ],
             "title": "Template Kind",
             "type": "string"
           },
           "fields": {
-            "description": "Its fields, in document order, each name once.",
+            "description": "Its fields, in document order, each name once; empty for a slide master.",
             "items": {
               "$ref": "#/$defs/TemplateField"
             },
             "title": "Fields",
             "type": "array"
           },
+          "layouts": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/SlideLayout"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "A slide master's layouts, numbered from 1; null for any other template.",
+            "title": "Layouts"
+          },
+          "slides": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The example slides the file already has; a deck leaves them out. Null for any other template.",
+            "title": "Slides"
+          },
           "truncated": {
             "default": false,
-            "description": "True if some fields are not listed.",
+            "description": "True if some fields or layouts are not listed.",
             "title": "Truncated",
             "type": "boolean"
           },
@@ -856,7 +982,7 @@
     {
       "name": "read_document",
       "title": "Read a file of this conversation as text",
-      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
+      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
       "inputSchema": {
         "description": "Body of ``read_document``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Where to start reading, or ``None`` for the start.",
         "properties": {
@@ -1733,6 +1859,497 @@
           "path"
         ],
         "title": "WrittenDocumentWithOutputs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "write_presentation",
+      "title": "Build a slide deck in a slide master",
+      "description": "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. Without path, the deck is built in a plain 16:9 master. Call inspect_template on the master first (without path for the plain one). Then show the user the outline (each slide's title, layout number and name, key points, figures and sources) and call this tool only in a later message, after they agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this conversation (make a chart image with run_python, or prefer a native chart); \"\" leaves a place empty. A slide's title and subtitle are plain text, not Markdown. At most 30 slides. Footers and slide numbers come from the master; the master's own slides are left out. Each slide's sources go into its speaker notes. To change a deck, read it with read_document and write it again. The user sees the new file as a card in the chat.",
+      "inputSchema": {
+        "$defs": {
+          "AssistantSource": {
+            "description": "A value the model wrote itself.\n\nAttributes:\n    kind: ``assistant``.",
+            "properties": {
+              "kind": {
+                "const": "assistant",
+                "description": "assistant: you wrote the value yourself.",
+                "title": "Kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "AssistantSource",
+            "type": "object"
+          },
+          "ChartBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "chart": {
+                "$ref": "#/$defs/ChartSpec",
+                "description": "The chart.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "chart"
+            ],
+            "type": "object"
+          },
+          "ChartSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "description": "bar: horizontal bars; column: vertical bars.",
+                "enum": [
+                  "bar",
+                  "column",
+                  "line",
+                  "pie"
+                ],
+                "type": "string"
+              },
+              "categories": {
+                "description": "Axis labels, or a pie's slices.",
+                "items": {
+                  "type": [
+                    "string",
+                    "number"
+                  ]
+                },
+                "type": "array"
+              },
+              "series": {
+                "additionalProperties": {
+                  "items": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "type": "array"
+                },
+                "description": "Each series' name to a value per category, or null; a pie has one.",
+                "type": "object"
+              }
+            },
+            "required": [
+              "type",
+              "categories",
+              "series"
+            ],
+            "type": "object"
+          },
+          "FileSource": {
+            "description": "A value read in a file of the conversation.\n\nAttributes:\n    kind: ``file``.\n    path: The file's absolute path.\n    page: The page of a PDF, or the slide of a presentation.\n    sheet: The sheet of a workbook.\n    cell: The cell of that sheet, such as ``B7``.",
+            "properties": {
+              "kind": {
+                "const": "file",
+                "description": "file: the value was read in a file of this conversation.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path, for example /workspace/<chat>/report.docx, as list_files gives it.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "title": "Path",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The page of a PDF or the slide of a PPTX it is on.",
+                "title": "Page",
+                "type": "integer"
+              },
+              "sheet": {
+                "anyOf": [
+                  {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The sheet of an XLSX or ODS it is on.",
+                "title": "Sheet",
+                "type": "string"
+              },
+              "cell": {
+                "anyOf": [
+                  {
+                    "maxLength": 20,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The cell of that sheet, such as B7.",
+                "title": "Cell",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "path"
+            ],
+            "title": "FileSource",
+            "type": "object"
+          },
+          "ImageBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "description": "The path of a PNG, JPEG or GIF of this conversation.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "alt": {
+                "description": "Its alternative text.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "image"
+            ],
+            "type": "object"
+          },
+          "JobSource": {
+            "description": "A value a ``run_python`` run computed.\n\nAttributes:\n    kind: ``job``.\n    job_id: The run's ``job_id``.",
+            "properties": {
+              "kind": {
+                "const": "job",
+                "description": "job: the value was computed by a run_python run.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "job_id": {
+                "description": "The job_id run_python answered with.",
+                "maxLength": 64,
+                "minLength": 1,
+                "title": "Job Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "job_id"
+            ],
+            "title": "JobSource",
+            "type": "object"
+          },
+          "SlideSpec": {
+            "additionalProperties": false,
+            "properties": {
+              "layout": {
+                "description": "Its number or name, as inspect_template lists it.",
+                "type": [
+                  "integer",
+                  "string"
+                ]
+              },
+              "title": {
+                "description": "Its title.",
+                "type": "string"
+              },
+              "subtitle": {
+                "description": "Its subtitle.",
+                "type": "string"
+              },
+              "content": {
+                "description": "One block a place of the layout, in its order.",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "$ref": "#/$defs/TableBlock"
+                    },
+                    {
+                      "$ref": "#/$defs/ChartBlock"
+                    },
+                    {
+                      "$ref": "#/$defs/ImageBlock"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "notes": {
+                "description": "Its speaker notes.",
+                "type": "string"
+              },
+              "sources": {
+                "description": "Where its content comes from.",
+                "items": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/FileSource"
+                    },
+                    {
+                      "$ref": "#/$defs/JobSource"
+                    },
+                    {
+                      "$ref": "#/$defs/UserSource"
+                    },
+                    {
+                      "$ref": "#/$defs/AssistantSource"
+                    }
+                  ]
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "layout"
+            ],
+            "type": "object"
+          },
+          "TableBlock": {
+            "additionalProperties": false,
+            "properties": {
+              "table": {
+                "description": "Rows of cells; the first is the header.",
+                "items": {
+                  "items": {
+                    "type": [
+                      "string",
+                      "number",
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "table"
+            ],
+            "type": "object"
+          },
+          "UserSource": {
+            "description": "A value the user stated.\n\nAttributes:\n    kind: ``user``.\n    note: Where or how the user said it.",
+            "properties": {
+              "kind": {
+                "const": "user",
+                "description": "user: the user stated the value in the chat.",
+                "title": "Kind",
+                "type": "string"
+              },
+              "note": {
+                "anyOf": [
+                  {
+                    "maxLength": 1000,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Where or how the user said it.",
+                "title": "Note",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "title": "UserSource",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "The slide master's path, as list_files gives it; leave it out for the plain master.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "name": {
+            "description": "The new file's name; .pptx is added if missing.",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "slides": {
+            "description": "The slides, in order.",
+            "items": {
+              "$ref": "#/$defs/SlideSpec"
+            },
+            "type": "array"
+          },
+          "include_sources": {
+            "default": true,
+            "description": "Put each slide's sources in its speaker notes.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "slides"
+        ],
+        "type": "object"
+      },
+      "outputSchema": {
+        "$defs": {
+          "OutputRef": {
+            "description": "A file the call wrote, by reference: never its bytes.\n\nAttributes:\n    id: The file's id.\n    path: Its absolute path.\n    name: Its name, as it was written.\n    mime: Its media type.\n    size: Its size in bytes.\n    preview: The header and first rows of a csv or xlsx file, or ``None``.",
+            "properties": {
+              "id": {
+                "description": "The file's id.",
+                "title": "Id",
+                "type": "string"
+              },
+              "path": {
+                "description": "The file's absolute path; use it as is in other tools.",
+                "title": "Path",
+                "type": "string"
+              },
+              "name": {
+                "description": "The file's name, as it was written.",
+                "title": "Name",
+                "type": "string"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "title": "Mime",
+                "type": "string"
+              },
+              "size": {
+                "description": "Its size in bytes.",
+                "title": "Size",
+                "type": "integer"
+              },
+              "preview": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TablePreview"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The header and first rows of a csv or xlsx file, else null."
+              }
+            },
+            "required": [
+              "id",
+              "path",
+              "name",
+              "mime",
+              "size",
+              "preview"
+            ],
+            "title": "OutputRef",
+            "type": "object"
+          },
+          "TablePreview": {
+            "additionalProperties": false,
+            "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
+            "properties": {
+              "columns": {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "title": "Columns",
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "maxItems": 20,
+                  "type": "array"
+                },
+                "maxItems": 5,
+                "title": "Rows",
+                "type": "array"
+              },
+              "row_count": {
+                "anyOf": [
+                  {
+                    "maximum": 100000,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Row Count"
+              },
+              "truncated": {
+                "title": "Truncated",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "columns",
+              "rows",
+              "row_count",
+              "truncated"
+            ],
+            "title": "TablePreview",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "path": {
+            "description": "The new file's path; the user sees it as a card in the chat.",
+            "title": "Path",
+            "type": "string"
+          },
+          "slides": {
+            "description": "How many slides the deck has.",
+            "title": "Slides",
+            "type": "integer"
+          },
+          "warnings": {
+            "description": "What to tell the user about the deck, such as text that may not fit.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
+            "type": "array"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/$defs/OutputRef"
+            },
+            "title": "Outputs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "slides",
+          "warnings"
+        ],
+        "title": "BuiltPresentationWithOutputs",
         "type": "object"
       }
     },

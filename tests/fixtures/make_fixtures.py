@@ -31,15 +31,16 @@ OLE_MAGIC = bytes.fromhex("d0cf11e0a1b11ae1")
 _MIB = 1024 * 1024
 
 
-def _png(size: int = 8) -> bytes:
-    """A small grey PNG, written by hand so no imaging library is needed."""
-    rows = b"".join(b"\x00" + b"\x80" * size for _ in range(size))
+def _png(size: int = 8, height: int | None = None) -> bytes:
+    """A small grey PNG, written by hand so no imaging library is needed: ``size`` wide, square unless ``height``."""
+    tall = size if height is None else height
+    rows = b"".join(b"\x00" + b"\x80" * size for _ in range(tall))
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
 
-    header = struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0)
+    header = struct.pack(">IIBBBBB", size, tall, 8, 0, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 

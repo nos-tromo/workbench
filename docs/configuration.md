@@ -31,7 +31,7 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 | `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and four file routes. The same rules; unset, Ghostwriter's door is off. |
-| `GHOSTWRITER_WORKBENCH_TOOLS` | the eight workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. |
+| `GHOSTWRITER_WORKBENCH_TOOLS` | the nine workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
 | `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 

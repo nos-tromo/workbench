@@ -133,6 +133,12 @@ def test_unknown_types_are_octet_stream(store: Store, alice: Principal) -> None:
     assert put(store, alice, "Q.DOCX").mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
+def test_office_templates_have_their_types() -> None:
+    """A template is served under its own type, not as an opaque download."""
+    assert store_module._mime("deck.potx") == "application/vnd.openxmlformats-officedocument.presentationml.template"
+    assert store_module._mime("form.dotx") == "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+
+
 def test_the_upload_may_name_a_chat_other_than_the_principals(
     store: Store, alice: Principal, workspaces: Workspaces
 ) -> None:

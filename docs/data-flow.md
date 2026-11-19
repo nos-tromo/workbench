@@ -21,8 +21,10 @@ record of processing and the impact assessment.
   the executor in the job's request. What becomes of them:
   - paths, search queries and Python code end with the job: workbench keeps
     none of them past it;
-  - table values (`write_table`), Markdown (`write_document`) and the values of
-    a template fill (`fill_template`) become the content of a new file, and
+  - table values (`write_table`), Markdown (`write_document`), the values of a
+    template fill (`fill_template`) and the slides of a deck
+    (`write_presentation`: titles, text, tables, chart values, speaker notes)
+    become the content of a new file, and
     the name the model gives a new file (`name`, `output_name`, or a file
     `run_python` writes into `out/`) becomes that file's name in the database
     and on the volume. Both are kept like every other file, for
@@ -33,6 +35,27 @@ record of processing and the impact assessment.
   chat (`workbench/api/tools_templates.py:_sources`). By default the filled file
   ends with a table of the sources; the call can leave it out
   (`include_sources: false`).
+- **A deck's slides, sources and pictures.** `write_presentation` builds a deck
+  in the user's slide master, or without one in the plain master, from the
+  slides the model wrote
+  (`workbench/api/tools_presentations.py`). A slide's text, tables and chart
+  values are file content, as are its speaker notes. Its sources go into the
+  notes, after the model's own notes, under a line `Sources:`, one line a
+  source as `<kind>: <reference>` (`file: ` and the file's path in the chat
+  with its page, sheet or cell, `job: ` and a job's id, `user: ` and the user's
+  note), or as the kind alone (`user` without a note, `assistant`). The call can
+  leave them out (`include_sources: false`). A picture of the chat that a slide
+  shows is copied into the deck, which then holds its bytes. The master's
+  theme, layouts and media are carried into the new file;
+  its example slides, its thumbnail, `docProps/app.xml` and the parts that name
+  who edited it or commented on it (`ppt/authors.xml`, `ppt/commentAuthors.xml`,
+  `ppt/changesInfos/`, `ppt/revisionInfo.xml`) are not. Of its core properties
+  (`docProps/core.xml`) only the language is kept: the deck has no title,
+  subject, keywords, comments, category, author, last editor, identifier,
+  status or version, it is revision 1, and it was made and modified when it was
+  built. The master, the pictures and the files a source names are only read.
+  The plain master is python-pptx's own, read from the executor image: no file
+  of a chat is in it (`workbench/executor/presentations/master.py:plain_master`).
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
   checks, topic listings), which can hold special categories of data, with the
@@ -160,10 +183,10 @@ operator (deploy ADR 0003, "Consequences").
 sends with a call (passages of its documents), which workbench cannot know in
 advance: documents, spreadsheets, e-mails, presentations, and what is in them.
 That can include special categories of personal data. Also what the model
-writes into new files (table values, Markdown, template values) and their
-names. Besides: file names, chat ids, the user and session pseudonyms of docint
-and Ghostwriter with the purpose and request id they send, and the time and
-tool of each run.
+writes into new files (table values, Markdown, template values, slide content)
+and their names. Besides: file names, chat ids, the user and session pseudonyms
+of docint and Ghostwriter with the purpose and request id they send, and the
+time and tool of each run.
 
 **Categories of data subjects.** The users of docint and Ghostwriter (as
 pseudonyms), and every person named in the files or data they send or in

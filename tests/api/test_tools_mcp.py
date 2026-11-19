@@ -1,4 +1,4 @@
-"""Ghostwriter's workspace tools on the MCP door: the eight tools, their outputs and previews, its chat and its limits.
+"""Ghostwriter's workspace tools on the MCP door: the nine tools, their outputs and previews, its chat and its limits.
 
 The executor runs the real runners in this process (:class:`~tests.api.test_tools_templates.Local`); a test that needs
 another answer scripts it. The wire is ``tests/api/mcp_calls.py``'s, sent with Ghostwriter's headers.
@@ -28,7 +28,7 @@ from tests.api.test_mcp import call as inline_call
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.api.test_tools_templates import Local
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from tests.conftest import scaled
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import OPERATIONS, AuditLog
@@ -78,6 +78,7 @@ GUARDED: Final[dict[str, tuple[str, dict[str, Any]]]] = {
     ),
     "write_table": ("collect", TABLE),
     "write_document": ("collect", {"name": "notes", "format": "md", "markdown": "# Hafen"}),
+    "write_presentation": ("modify", {"path": f"{CHAT}/master.pptx", "name": "deck", "slides": [{"layout": 1}]}),
 }
 
 
@@ -124,10 +125,10 @@ def spy_submit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, 
 # --- tools/list and server/discover --------------------------------------------------------------------------------
 
 
-def test_the_ghostwriter_lists_its_eight_tools_in_name_order(client: TestClient) -> None:
-    """The eight workspace tools, by name; each takes an object and answers its own model plus ``outputs``."""
+def test_the_ghostwriter_lists_its_nine_tools_in_name_order(client: TestClient) -> None:
+    """The nine workspace tools, by name; each takes an object and answers its own model plus ``outputs``."""
     tools = result(rpc(client, "tools/list", headers=HG))["tools"]
-    assert [t["name"] for t in tools] == sorted(EIGHT)
+    assert [t["name"] for t in tools] == sorted(GHOSTWRITER_TOOLS)
     for tool in tools:
         assert set(tool) == {"name", "title", "description", "inputSchema", "outputSchema"}
         assert tool["inputSchema"]["type"] == "object", tool["name"]
@@ -138,13 +139,13 @@ def test_the_ghostwriter_lists_its_eight_tools_in_name_order(client: TestClient)
 
 
 def test_each_tool_has_its_own_schemas(client: TestClient) -> None:
-    """Every tool is bound to its own models: no two of the eight share an input or an output schema."""
+    """Every tool is bound to its own models: no two of the nine share an input or an output schema."""
     tools = {t["name"]: t for t in result(rpc(client, "tools/list", headers=HG))["tools"]}
     assert tools["list_files"]["inputSchema"]["properties"] == {}
     assert {"name", "rows"} <= set(tools["write_table"]["inputSchema"]["properties"])
     for key in ("inputSchema", "outputSchema"):
         schemas = {json.dumps(tool[key], sort_keys=True) for tool in tools.values()}
-        assert len(schemas) == len(EIGHT), key
+        assert len(schemas) == len(GHOSTWRITER_TOOLS), key
 
 
 def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> None:
@@ -187,6 +188,7 @@ def test_every_answer_holds_to_the_output_schema_it_lists(
     """
     schemas = {t["name"]: t["outputSchema"] for t in result(rpc(client, "tools/list", headers=HG))["tools"]}
     form = keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
+    master = keep(store, PG, "master.pptx", mt.make_master(tmp_path / "master.pptx").read_bytes())
     keep(store, PG, "q.csv")
     assistant = {"kind": "assistant"}
     calls: list[tuple[str, dict[str, Any]]] = [
@@ -197,13 +199,14 @@ def test_every_answer_holds_to_the_output_schema_it_lists(
         ("fill_template", {"path": form.virtual_path, "values": {"customer": {"value": "x", "source": assistant}}}),
         ("write_table", TABLE),
         ("write_document", {"name": "notes", "format": "md", "markdown": "# Hafen"}),
+        ("write_presentation", {"path": master.virtual_path, "name": "deck", "slides": [{"layout": 1}]}),
     ]
     answers = {tool: result(acall(client, tool, arguments)) for tool, arguments in calls}
     fake_executor.payload = ran("ok")
     fake_executor.files = {"chart.png": PNG, "counts.csv": CSV}
     fake_executor.previews = {"counts.csv": PREVIEW}
     answers["run_python"] = result(acall(client, "run_python", {"code": "print('ok')"}))
-    assert set(answers) == EIGHT
+    assert set(answers) == GHOSTWRITER_TOOLS
     for tool, answer in answers.items():
         assert answer["isError"] is False, tool
         validator = jsonschema.Draft202012Validator(schemas[tool])
@@ -356,7 +359,7 @@ def test_a_former_callers_files_are_not_ghostwriters(client: TestClient, store: 
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("name", sorted(EIGHT))
+@pytest.mark.parametrize("name", sorted(GHOSTWRITER_TOOLS))
 async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
     name: str, settings: Settings, store: Store, audit: AuditLog
 ) -> None:
@@ -364,7 +367,7 @@ async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
     (spec,) = [spec for spec in workspace_tools() if spec.name == name]
     env = ToolEnv(
         p=PG_SETUP,
-        caller=Caller("ghostwriter", GHOSTWRITER_KEY, EIGHT),
+        caller=Caller("ghostwriter", GHOSTWRITER_KEY, GHOSTWRITER_TOOLS),
         settings=settings,
         store=store,
         audit=audit,
@@ -499,10 +502,10 @@ def strict_client(settings: Settings, store: Store, audit: AuditLog, executor: L
 
 
 def test_the_guard_covers_every_recorded_workspace_tool() -> None:
-    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other seven, each under its recorded action."""
-    assert set(EIGHT) - set(OPERATIONS) == {"list_files"}
+    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other eight, each under its recorded action."""
+    assert set(GHOSTWRITER_TOOLS) - set(OPERATIONS) == {"list_files"}
     assert {tool: action for tool, (action, _) in GUARDED.items()} == {
-        tool: OPERATIONS[tool][0] for tool in EIGHT - {"list_files"}
+        tool: OPERATIONS[tool][0] for tool in GHOSTWRITER_TOOLS - {"list_files"}
     }
 
 
@@ -520,6 +523,7 @@ def test_a_stated_purpose_and_request_id_reach_the_tool_event(
     caplog.set_level(logging.DEBUG)
     keep(store, PG, "q.csv")
     keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
+    keep(store, PG, "master.pptx", mt.make_master(tmp_path / "master.pptx").read_bytes())
     if tool == "run_python":
         fake_executor.payload = ran("1")
     _, arguments = GUARDED[tool]

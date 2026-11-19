@@ -16,6 +16,7 @@ import pytest
 
 from tests.conftest import scaled
 from tests.fixtures import make_fixtures as fx
+from tests.fixtures import make_templates as mt
 from workbench.executor import readers
 from workbench.executor.readers import DocumentText, NoSuchPart, ReadTimeout, UnreadableFile, UnsupportedFormat, sheet
 from workbench.executor.readers import text as txt
@@ -350,6 +351,27 @@ def test_a_slide_without_text_is_listed_not_returned(tmp_path: Path) -> None:
     doc = read(path)
     assert labels(doc) == ["slide 2"]
     assert doc.pages_without_text == [1]
+
+
+def test_a_potx_is_read_as_its_slides(tmp_path: Path) -> None:
+    """A ``.potx`` is a presentation under another content type; its slides read as the ``.pptx``'s do."""
+    deck = fx.make_pptx(tmp_path / "status.pptx")
+    template = mt.as_potx(deck, tmp_path / "status.potx")
+    doc = read(template)
+    assert doc.kind == "pptx"
+    assert [(p.label, p.text) for p in doc.parts] == [(p.label, p.text) for p in read(deck).parts]
+    assert [(p.label, p.text) for p in readers.units(template)] == [(p.label, p.text) for p in readers.units(deck)]
+    assert readers.count_pages(template) == 2
+
+
+@pytest.mark.parametrize("name", ["macros.pptx", "macros.potx"])
+def test_a_macro_enabled_presentation_is_refused(tmp_path: Path, name: str) -> None:
+    """A presentation that may carry macros is neither read nor counted, whatever its extension says."""
+    macro = mt.as_macro_pptx(fx.make_pptx(tmp_path / "status.pptx"), tmp_path / name)
+    with pytest.raises(UnsupportedFormat, match=r"macro-enabled presentation or a slide show; save it as \.pptx"):
+        read(macro)
+    with pytest.raises(UnsupportedFormat, match="macro-enabled"):
+        list(readers.units(macro))
 
 
 # --- OpenDocument ----------------------------------------------------------------------------------------------

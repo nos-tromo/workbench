@@ -36,6 +36,7 @@ EXPECTED_OPERATIONS = {
     "fill_template": ("modify", "tool.fill_template"),
     "write_table": ("collect", "tool.write_table"),
     "write_document": ("collect", "tool.write_document"),
+    "write_presentation": ("modify", "tool.write_presentation"),
     "chat_delete": ("delete", "chat.delete"),
 }
 
@@ -344,13 +345,22 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         )
         executor.files = {f"{word}-notes.md": b"#"}
         answered(acall(client, "write_document", {"name": f"{word}-notes", "format": "md", "markdown": word}))
+        master = {"file": (f"{word}-master.pptx", b"PK")}
+        assert client.post("/files/upload", params=where, headers=HG, files=master).status_code == 200
+        executor.files = {f"{word}-deck.pptx": b"PK"}
+        executor.payload = {"slides": 1, "warnings": [word]}
+        picture = {"image": f"/workspace/chat-1/{word}-chart.png", "alt": word}
+        slide = {"layout": word, "title": word, "content": [word, picture], "notes": word}
+        cited = {**slide, "sources": [{"kind": "user", "note": word}, {"kind": "file", "path": csv}]}
+        deck = {"path": f"/workspace/chat-1/{word}-master.pptx", "name": f"{word}-deck", "slides": [cited]}
+        answered(acall(client, "write_presentation", deck))
         executor.files = {f"{word}-inline.csv": b"a\n"}
         executor.payload = {"stdout": word, "stderr": "", "truncated": False}
         inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
         assert len(inline_call(client, inline).blocks) == 1
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
-        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 7}
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 9}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

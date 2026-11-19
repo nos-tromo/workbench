@@ -2,11 +2,14 @@
 
 Every builder writes one file and returns its path. All text is invented. Word templates are made with
 python-docx, their content controls and legacy form fields written as WordprocessingML with lxml; workbooks with
-openpyxl.
+openpyxl; slide masters with python-pptx, the parts it does not write as PresentationML with lxml.
 """
 
+import datetime as dt
+import io
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from docx import Document
 from docx.document import Document as DocumentObject
@@ -14,6 +17,20 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml import parse_xml
 from docx.text.paragraph import Paragraph
 from openpyxl import Workbook
+from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.opc.constants import CONTENT_TYPE as CT
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.oxml import serialize_part_xml
+from pptx.opc.package import Part
+from pptx.opc.packuri import PackURI
+from pptx.oxml import parse_xml as parse_pml
+from pptx.oxml.ns import qn
+from pptx.util import Inches
+
+from tests.fixtures import make_fixtures as mk
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
@@ -25,6 +42,55 @@ PLACEHOLDER_STYLE = "PlaceholderText"
 #: The style, header text and protection a filled template keeps.
 BODY_STYLE = "Report Body"
 HEADER_TEXT = "Invented Harbour Office"
+
+P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+EXTENDED = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+VT = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
+
+#: The footer every layout of a master shows, and what each example slide's title starts with (then its number).
+MASTER_FOOTER = "Synthetic Ltd · internal"
+EXAMPLE_TITLE = "Invented example slide"
+
+#: The extension of ``ppt/presentation.xml`` that holds PowerPoint's sections.
+SECTIONS_URI = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
+
+#: Who made a master with a history, who edited it and commented on it, and in which language it is.
+MASTER_AUTHOR = "Invented Author"
+MASTER_EDITOR = "Invented Editor"
+MASTER_LANGUAGE = "de-DE"
+
+#: The parts in which PowerPoint keeps who edited a file and commented on it, each with the relationship of the
+#: presentation to it and its content type, as PowerPoint writes them.
+HISTORY_PARTS: dict[str, tuple[str, str, str]] = {
+    "/ppt/authors.xml": (
+        "http://schemas.microsoft.com/office/2018/10/relationships/authors",
+        "application/vnd.ms-powerpoint.authors+xml",
+        '<p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author '
+        f'id="{{00000000-0000-0000-0000-000000000002}}" name="{MASTER_EDITOR}" initials="IE" userId="{MASTER_EDITOR}" '
+        'providerId="None"/></p188:authorLst>',
+    ),
+    "/ppt/commentAuthors.xml": (
+        RT.COMMENT_AUTHORS,
+        CT.PML_COMMENT_AUTHORS,
+        f'<p:cmAuthorLst xmlns:p="{P}"><p:cmAuthor id="1" name="{MASTER_EDITOR}" initials="IE" lastIdx="1" '
+        'clrIdx="0"/></p:cmAuthorLst>',
+    ),
+    "/ppt/changesInfos/changesInfo1.xml": (
+        "http://schemas.microsoft.com/office/2016/11/relationships/changesInfo",
+        "application/vnd.ms-powerpoint.changesinfo+xml",
+        '<pc:chgInfo xmlns:pc="http://schemas.microsoft.com/office/powerpoint/2013/main/command"><pc:docChgLst>'
+        f'<pc:chgData name="{MASTER_EDITOR}" userId="{MASTER_EDITOR}" providerId="None"/></pc:docChgLst></pc:chgInfo>',
+    ),
+    "/ppt/revisionInfo.xml": (
+        "http://schemas.microsoft.com/office/2015/10/relationships/revisionInfo",
+        "application/vnd.ms-powerpoint.revisioninfo+xml",
+        '<p1510:revInfo xmlns:p1510="http://schemas.microsoft.com/office/powerpoint/2015/10/main"><p1510:revLst>'
+        '<p1510:client id="{00000000-0000-0000-0000-000000000003}" v="1" dt="2001-02-03T04:05:06.000"/>'
+        "</p1510:revLst></p1510:revInfo>",
+    ),
+}
 
 
 def _xml(text: str) -> object:
@@ -273,6 +339,58 @@ def as_dotx(docx: Path, target: Path) -> Path:
     return target
 
 
+def _retyped(source: Path, target: Path, old: bytes, new: bytes) -> Path:
+    """Copy an Office package with one content type replaced in ``[Content_Types].xml``.
+
+    Args:
+        source: The package.
+        target: Where to write the copy.
+        old: The content type to replace.
+        new: What it becomes.
+
+    Returns:
+        ``target``.
+    """
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(old, new)
+            out.writestr(item, data)
+    return target
+
+
+def as_potx(pptx: Path, target: Path) -> Path:
+    """Copy a presentation as a ``.potx`` template: the same parts under the template content type.
+
+    Args:
+        pptx: A presentation.
+        target: Where to write the template.
+
+    Returns:
+        ``target``.
+    """
+    return _retyped(pptx, target, b"presentationml.presentation.main+xml", b"presentationml.template.main+xml")
+
+
+def as_macro_pptx(pptx: Path, target: Path) -> Path:
+    """Copy a presentation under the content type of a macro-enabled one, as a ``.pptx`` that cannot be opened as such.
+
+    Args:
+        pptx: A presentation.
+        target: Where to write the copy.
+
+    Returns:
+        ``target``.
+    """
+    return _retyped(
+        pptx,
+        target,
+        b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+        b"application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+    )
+
+
 def make_jinja_docx(path: Path, *, extra: str | None = None) -> Path:
     """Write a Word document with ``{{ }}`` placeholders.
 
@@ -332,3 +450,127 @@ def make_placeholder_xlsx(path: Path, *, blocker: str | None = None) -> Path:
         sheet[blocker] = "kept"
     book.save(str(path))
     return path
+
+
+def make_master(
+    path: Path,
+    *,
+    footer: str = MASTER_FOOTER,
+    examples: int = 2,
+    hidden_footer: bool = False,
+    duplicate_name: bool = False,
+    history: bool = False,
+) -> Path:
+    """Write a slide master: python-pptx's default presentation and its eleven layouts, as a user's master looks.
+
+    Layout 2 is named "Titel und Inhalt", and every layout's footer placeholder holds ``footer``. The example slides
+    are titled ``EXAMPLE_TITLE`` and their number: the first, on "Title Only", has speaker notes, a picture and a
+    column chart; the others, on "Titel und Inhalt", a line of text. A custom show names slide 1, a section holds
+    every slide and the slide show runs the custom show; ``docProps/app.xml`` lists the slides' titles, and
+    ``docProps/thumbnail.jpeg`` (python-pptx's own) is kept, as PowerPoint writes them.
+
+    Args:
+        path: Where to write it.
+        footer: The footer text of every layout.
+        examples: How many example slides it has; with none, no custom show or section either.
+        hidden_footer: Turn the footer, slide number and date off on the master (``p:hf``).
+        duplicate_name: Name layouts 3 and 4 both "Zwei Inhalte".
+        history: Give it the history a user's master has (:func:`_history`).
+
+    Returns:
+        ``path``.
+    """
+    deck: Any = Presentation()
+    layouts = deck.slide_layouts
+    layouts[1].name = "Titel und Inhalt"
+    if duplicate_name:
+        layouts[2].name = layouts[3].name = "Zwei Inhalte"
+    for layout in layouts:
+        for placeholder in layout.placeholders:
+            if placeholder.placeholder_format.type == PP_PLACEHOLDER.FOOTER:
+                placeholder.text_frame.text = footer
+    for number in range(1, examples + 1):
+        slide = deck.slides.add_slide(layouts[5] if number == 1 else layouts[1])
+        slide.shapes.title.text = f"{EXAMPLE_TITLE} {number}"
+        if number > 1:
+            slide.placeholders[1].text = "Invented example text"
+            continue
+        slide.notes_slide.notes_text_frame.text = "Invented speaker notes of the example."
+        slide.shapes.add_picture(io.BytesIO(mk._png()), Inches(0.5), Inches(1.5), Inches(2), Inches(2))
+        data = CategoryChartData()
+        data.categories = ["North pier", "South pier"]
+        data.add_series("Invented tonnes", (12, 7))
+        slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(3), Inches(1.5), Inches(5), Inches(4), data)
+    if examples:
+        _custom_show_and_section(deck)
+    if hidden_footer:
+        styles = deck.slide_master._element.find(qn("p:txStyles"))
+        styles.addprevious(parse_pml(f'<p:hf xmlns:p="{P}" ftr="0" sldNum="0" dt="0"/>'))
+    if history:
+        _history(deck)
+    deck.save(str(path))
+    return path
+
+
+def _history(deck: Any) -> None:
+    """Give a master the history PowerPoint keeps: core properties of its own, and who edited it and commented on it.
+
+    The core properties have the first example slide's title, a subject, keywords, comments, a category, an identifier,
+    a status and a version, ``MASTER_AUTHOR`` as the author and ``MASTER_EDITOR`` as the last editor, dates of 2001
+    and revision 42, in ``MASTER_LANGUAGE``; each of ``HISTORY_PARTS`` names ``MASTER_EDITOR`` or a client of its own.
+    """
+    core = deck.core_properties
+    core.title = f"{EXAMPLE_TITLE} 1"
+    core.subject = "Invented subject"
+    core.keywords = "Invented keywords"
+    core.comments = "Invented comments"
+    core.category = "Invented category"
+    core.identifier = "Invented identifier"
+    core.content_status = "Invented status"
+    core.version = "Invented version"
+    core.author = MASTER_AUTHOR
+    core.last_modified_by = MASTER_EDITOR
+    core.created = core.modified = core.last_printed = dt.datetime(2001, 2, 3, 4, 5, 6)
+    core.revision = 42
+    core.language = MASTER_LANGUAGE
+    for name, (reltype, content_type, xml) in HISTORY_PARTS.items():
+        blob = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n{xml}'.encode()
+        deck.part.relate_to(Part(PackURI(name), content_type, deck.part.package, blob), reltype)
+
+
+def _custom_show_and_section(deck: Any) -> None:
+    """Add a custom show of slide 1 and a section of every slide to ``ppt/presentation.xml``, where PowerPoint does.
+
+    The slide show runs the custom show (``ppt/presProps.xml``), and ``docProps/app.xml`` lists the slides' titles.
+    """
+    titles = [slide.shapes.title.text for slide in deck.slides]
+    shown = "".join(f"<vt:lpstr>{title}</vt:lpstr>" for title in ["Office Theme", *titles])
+    deck.part.package.part_related_by(RT.EXTENDED_PROPERTIES).blob = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="{EXTENDED}" xmlns:vt="{VT}">'
+        f"<Application>Microsoft Office PowerPoint</Application><Slides>{len(titles)}</Slides><HeadingPairs>"
+        '<vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Theme</vt:lpstr></vt:variant><vt:variant>'
+        "<vt:i4>1</vt:i4></vt:variant><vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant>"
+        f'<vt:i4>{len(titles)}</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="'
+        f'{len(titles) + 1}" baseType="lpstr">{shown}</vt:vector></TitlesOfParts></Properties>'
+    ).encode()
+    properties = deck.part.part_related_by(RT.PRES_PROPS)
+    settings = parse_pml(properties.blob)
+    settings.insert(
+        0, parse_pml(f'<p:showPr xmlns:p="{P}" showNarration="1"><p:present/><p:custShow id="0"/></p:showPr>')
+    )
+    properties.blob = serialize_part_xml(settings)
+    root = deck.part._element
+    slides = root.find(qn("p:sldIdLst"))
+    show = parse_pml(
+        f'<p:custShowLst xmlns:p="{P}" xmlns:r="{R}"><p:custShow name="Invented short show" id="0"><p:sldLst>'
+        f'<p:sld r:id="{slides[0].get(qn("r:id"))}"/></p:sldLst></p:custShow></p:custShowLst>'
+    )
+    root.find(qn("p:notesSz")).addnext(show)
+    ids = "".join(f'<p14:sldId id="{entry.get("id")}"/>' for entry in slides)
+    root.append(
+        parse_pml(
+            f'<p:extLst xmlns:p="{P}"><p:ext uri="{SECTIONS_URI}"><p14:sectionLst xmlns:p14="{P14}">'
+            '<p14:section name="Invented section" id="{00000000-0000-0000-0000-000000000001}">'
+            f"<p14:sldIdLst>{ids}</p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst>"
+        )
+    )

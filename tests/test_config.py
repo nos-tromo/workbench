@@ -5,7 +5,7 @@ from typing import Literal
 
 import pytest
 
-from tests.callers import EIGHT
+from tests.callers import GHOSTWRITER_TOOLS
 from workbench.config import GHOSTWRITER_DEFAULT_TOOLS, NO_CALLER_KEY, ConfigError, Settings, load_settings
 
 KEY = "k" * 32
@@ -28,7 +28,7 @@ def test_defaults_match_the_spec() -> None:
     assert (s.docint_tools, s.docint_wall_s, s.docint_slots) == (frozenset({"run_python"}), 60, 2)
     assert s.require_purpose == frozenset()
     assert s.ghostwriter_key == A
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (EIGHT, 120, 2)
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 2)
 
 
 def test_every_variable_is_read_by_its_exact_name() -> None:
@@ -273,10 +273,10 @@ def test_the_ghostwriter_key_alone_starts_the_api() -> None:
 
 
 def test_the_ghostwriter_defaults() -> None:
-    """With only Ghostwriter's key set, it may use the eight tools, for 120 seconds, two jobs at once."""
+    """With only Ghostwriter's key set, it may use the nine tools, for 120 seconds, two jobs at once."""
     s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (EIGHT, 120, 2)
-    assert GHOSTWRITER_DEFAULT_TOOLS == EIGHT
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 2)
+    assert GHOSTWRITER_DEFAULT_TOOLS == GHOSTWRITER_TOOLS
 
 
 @pytest.mark.parametrize("env", [{}, {"GHOSTWRITER_WORKBENCH_KEY": "  "}, {"GHOSTWRITER_WORKBENCH_KEY": "a" * 31}])
@@ -315,12 +315,12 @@ def test_the_ghostwriter_rules_wait_for_its_key() -> None:
 
 
 def test_the_ghostwriter_tool_list_is_a_comma_list() -> None:
-    """Entries are stripped and blank ones dropped; a blank list means the eight tools."""
+    """Entries are stripped and blank ones dropped; a blank list means the nine tools."""
     env = {"GHOSTWRITER_WORKBENCH_KEY": A}
     assert load_settings({**env, "GHOSTWRITER_WORKBENCH_TOOLS": " list_files , ,"}, role="api").ghostwriter_tools == (
         frozenset({"list_files"})
     )
-    assert load_settings({**env, "GHOSTWRITER_WORKBENCH_TOOLS": ""}, role="api").ghostwriter_tools == EIGHT
+    assert load_settings({**env, "GHOSTWRITER_WORKBENCH_TOOLS": ""}, role="api").ghostwriter_tools == GHOSTWRITER_TOOLS
 
 
 def test_require_purpose_is_parsed_and_checked() -> None:
