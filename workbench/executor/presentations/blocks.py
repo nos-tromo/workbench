@@ -19,6 +19,7 @@ layout's name may be in one, as the model needs it, and nothing here logs.
 
 import dataclasses
 import io
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -64,10 +65,11 @@ CHART_TYPES: Final = {
 #: The content types a picture may have, read from its header.
 IMAGE_CONTENT: Final = frozenset({CT.PNG, CT.JPEG, CT.GIF})
 
-#: The sizes a table's text steps down through, largest first, until its rows fit its place; and a line's height, as
-#: a multiple of the size.
+#: The sizes a table's text steps down through, largest first, until its rows fit its place; and a line's height and
+#: a character's width, as multiples of the size, as :func:`~.master.capacity` takes them.
 TABLE_SIZES: Final = (Pt(18), Pt(16), Pt(14), Pt(12), Pt(10))
 LINE_HEIGHT: Final = 1.2
+CHAR_WIDTH: Final = 0.5
 
 #: ``normAutofit``'s ``fontScale``, in thousandths of a percent: the full size, and the least that text is shrunk to.
 FULL_SCALE: Final = 100_000
@@ -330,9 +332,10 @@ def place_table(place: Place, rows: Sequence[Sequence[Any]]) -> tuple[bool, bool
     """Write a native table into a table or content place: its first row the header, the table style's own.
 
     A row shorter than the widest is filled with empty cells. The text takes the largest of :data:`TABLE_SIZES` at which
-    the rows fit the place's height, each row at its natural height: a line of :data:`LINE_HEIGHT` times the size, and
-    its cells' top and bottom margins (python-pptx's, or a cell's own). A row is never stretched, so a short table is
-    short; one that does not fit even at the smallest size keeps that size.
+    the rows fit the place's height, each row at its natural height, as PowerPoint grows a row to its text: the lines of
+    its cell that needs most (:func:`_cell_lines`), each :data:`LINE_HEIGHT` times the size, and its cells' top and
+    bottom margins (python-pptx's, or a cell's own). A row is never stretched, so a short table is short; one that does
+    not fit even at the smallest size keeps that size.
 
     Args:
         place: The place on the slide.
@@ -345,28 +348,54 @@ def place_table(place: Place, rows: Sequence[Sequence[Any]]) -> tuple[bool, bool
     room = int(place.shape.height or 0)
     frame = TablePlaceholder(place.shape._element, place.shape._parent).insert_table(len(rows), width)
     table = frame.table
-    margins = [
-        max(cell.margin_top + cell.margin_bottom for cell in table.rows[index].cells) for index in range(len(rows))
-    ]
-
-    def heights(size: Length) -> list[int]:
-        return [int(size * LINE_HEIGHT) + margin for margin in margins]
-
-    size = next((size for size in TABLE_SIZES if sum(heights(size)) <= room), TABLE_SIZES[-1])
     replaced = False
-    for index, (values, height) in enumerate(zip(rows, heights(size), strict=True)):
-        row = table.rows[index]
-        row.height = Emu(height)
-        for cell, value in zip(row.cells, [*values, *[None] * (width - len(values))], strict=True):
+    texts: list[list[str]] = []
+    for values in rows:
+        texts.append([])
+        for value in [*values, *[None] * (width - len(values))]:
             written, changed = xml_safe("" if value is None else shown(value))
             replaced |= changed
-            cell.text = written
+            texts[-1].append(written)
+    widths = [int(column.width) for column in table.columns]
+    lined = [table.rows[index] for index in range(len(rows))]
+    margins = [max(cell.margin_top + cell.margin_bottom for cell in row.cells) for row in lined]
+
+    def heights(size: Length) -> list[int]:
+        found: list[int] = []
+        for row, written, margin in zip(lined, texts, margins, strict=True):
+            lines = max(
+                _cell_lines(said, column - cell.margin_left - cell.margin_right, size)
+                for cell, said, column in zip(row.cells, written, widths, strict=True)
+            )
+            found.append(int(lines * size * LINE_HEIGHT) + margin)
+        return found
+
+    size = next((size for size in TABLE_SIZES if sum(heights(size)) <= room), TABLE_SIZES[-1])
+    for row, written, height in zip(lined, texts, heights(size), strict=True):
+        row.height = Emu(height)
+        for cell, said in zip(row.cells, written, strict=True):
+            cell.text = said
             for paragraph in cell.text_frame.paragraphs:
                 for run in paragraph.runs:
                     run.font.size = size
                 Font(paragraph._p.get_or_add_endParaRPr()).size = size
     frame.height = Emu(sum(heights(size)))
     return replaced, frame.height <= room
+
+
+def _cell_lines(said: str, width: int, size: Length) -> int:
+    """Estimate the lines a cell's text takes at a size, as :func:`~.master.capacity` measures a line.
+
+    Args:
+        said: The cell's text; each line of it is a paragraph.
+        width: The cell's width less its left and right margins, in EMU.
+        size: The font size.
+
+    Returns:
+        The sum, over the paragraphs, of the lines each takes: its characters over a line's, rounded up, at least 1.
+    """
+    chars = max(1, int(width / (CHAR_WIDTH * size)))
+    return sum(max(1, math.ceil(len(paragraph) / chars)) for paragraph in said.split("\n"))
 
 
 def place_chart(place: Place, chart: Mapping[str, Any]) -> bool:

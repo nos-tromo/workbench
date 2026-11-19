@@ -1104,6 +1104,40 @@ def test_a_table_takes_the_size_that_fits_its_place(job: Job, count: int, size: 
         assert shape.height < place_of(TITLE_AND_CONTENT).shape.height // 2
 
 
+def test_a_tables_wrapped_cells_count_in_its_height(job: Job) -> None:
+    """A cell wraps at its column: a row is as high as its cell of most lines, and the size steps down to fit them.
+
+    Three columns of 3 in in a place of 4.95 in: an 80-character cell takes four lines at 18 and 16 pt (22 and 25
+    characters a line) but three at 14 pt (28), where six such rows fit; a cell's paragraphs each take their own.
+    """
+    mt.make_master(job.path("master.pptx"))
+    rows = [[("Invented harbour figure " * 4)[:80], "Invented", "Invented"] for _ in range(6)]
+    many = [["Invented header", "Invented", "Invented"]]
+    many += [[("Invented quay wall " * 11)[:200], "Invented", "Invented"] for _ in range(9)]
+    paragraphs = [["Invented a", "Invented b"], ["Invented one\nInvented two\nInvented three", "Invented c"]]
+    warnings = job.write(
+        [
+            {"layout": TITLE_AND_CONTENT, "content": [{"table": rows}]},
+            {"layout": TITLE_AND_CONTENT, "content": [{"table": many}]},
+            {"layout": TITLE_AND_CONTENT, "content": [{"table": paragraphs}]},
+        ]
+    )["warnings"]
+    assert warnings == ["slide 2: the table may not fit; split it over two slides"]
+    wrapped, crowded, broken = (next(shape for shape in slide.shapes if shape.has_table) for slide in job.deck().slides)
+    room = place_of(TITLE_AND_CONTENT).shape.height
+
+    def lines(count: int, size: int) -> int:
+        return int(count * Pt(size) * 1.2) + 2 * Inches(0.05)
+
+    cells = [cell for row in wrapped.table.rows for cell in row.cells]
+    assert {run.font.size for cell in cells for run in cell.text_frame.paragraphs[0].runs} == {Pt(14)}
+    assert [row.height for row in wrapped.table.rows] == [lines(3, 14)] * 6
+    assert wrapped.height == lines(3, 14) * 6 <= room
+    assert [row.height for row in crowded.table.rows] == [lines(1, 10), *[lines(5, 10)] * 9]
+    assert crowded.height > room
+    assert [row.height for row in broken.table.rows] == [lines(1, 18), lines(3, 18)]
+
+
 def test_a_tables_values_are_shown_as_text(job: Job) -> None:
     """A number, a bool and null are shown as text, the null empty; a character XML cannot hold is replaced."""
     mt.make_master(job.path("master.pptx"))
