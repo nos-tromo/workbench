@@ -39,11 +39,13 @@ record of processing and the impact assessment.
   in the user's slide master from the slides the model wrote
   (`workbench/api/tools_presentations.py`). A slide's text, tables and chart
   values are file content, as are its speaker notes. Its sources go into the
-  notes, after the model's own notes, one line a source: a file's path in the
-  chat with its page, sheet or cell, a job's id, the user's note, or the word
-  `assistant`. The call can leave them out (`include_sources: false`). A picture
-  of the chat that a slide shows is copied into the deck, which then holds its
-  bytes. The master's theme, layouts and media are carried into the new file;
+  notes, after the model's own notes, under a line `Sources:`, one line a
+  source as `<kind>: <reference>` (`file: ` and the file's path in the chat
+  with its page, sheet or cell, `job: ` and a job's id, `user: ` and the user's
+  note), or as the kind alone (`user` without a note, `assistant`). The call can
+  leave them out (`include_sources: false`). A picture of the chat that a slide
+  shows is copied into the deck, which then holds its bytes. The master's
+  theme, layouts and media are carried into the new file;
   its example slides, its thumbnail, `docProps/app.xml` and the parts that name
   who edited it or commented on it (`ppt/authors.xml`, `ppt/commentAuthors.xml`,
   `ppt/changesInfos/`, `ppt/revisionInfo.xml`) are not. Of its core properties
