@@ -107,6 +107,7 @@ def test_headers_that_are_not_ascii_are_refused_not_crashed(client: TestClient) 
         "/docs",
         "/redoc",
         "/openapi",
+        "/openapi.json",
     ],
 )
 def test_unknown_paths_are_not_found(client: TestClient, path: str) -> None:

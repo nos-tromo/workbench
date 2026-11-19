@@ -57,8 +57,9 @@ def test_an_mcp_caller_finds_nothing_but_its_door(client: TestClient, method: st
 
 @pytest.mark.parametrize("path", ["/healthz", "/metrics"])
 def test_the_service_routes_stay_open_to_every_caller(client: TestClient, path: str) -> None:
-    """The healthcheck and the scraper's route answer whatever key comes with the request."""
+    """The healthcheck and the scraper's route answer whatever key comes with the request, a wrong one too."""
     assert client.get(path, headers=HD).status_code == 200
+    assert client.get(path, headers={"Authorization": "Bearer " + "w" * 43}).status_code == 200
 
 
 def _through_the_gate(settings: Settings, key: str, path: str) -> tuple[list[str], list[Message]]:
@@ -212,11 +213,16 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
 @pytest.mark.parametrize("headers", [HG, HD], ids=["ghostwriter", "docint"])
 @pytest.mark.parametrize(("method", "path"), [("GET", "/nowhere"), ("POST", "/no/such/route"), ("GET", "/files/other")])
 def test_an_unrouted_path_answers_one_404_body_with_either_key(
-    client: TestClient, headers: dict[str, str], method: str, path: str
+    client: TestClient, audit_lines: AuditLines, headers: dict[str, str], method: str, path: str
 ) -> None:
-    """A path no route serves is the door's 404 too, so the text does not tell ``/mcp`` apart from the others."""
+    """A path no route serves is the door's 404 too, so the text does not tell ``/mcp`` apart from the others.
+
+    Nothing is recorded.
+    """
+    started = audit_lines()
     r = client.request(method, path, headers=headers)
     assert (r.status_code, r.json()) == NOT_FOUND
+    assert audit_lines() == started
 
 
 def test_ghostwriters_user_id_with_docints_key_reaches_nothing(client: TestClient, store: Store) -> None:
@@ -236,6 +242,7 @@ def test_ghostwriters_user_id_with_docints_key_reaches_nothing(client: TestClien
         (DOCINT, "/mcp", True),
         (DOCINT, "/mcp/", False),
         (DOCINT, "/files/list", False),
+        (DOCINT, "/other/mcp", False),
         (DOCINT, "/", False),
     ],
 )

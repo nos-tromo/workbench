@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CALL, GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
+from tests.api.conftest import CALL, FORMER, GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
 from tests.api.test_jobs import KEEP, FakeClient, until
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
@@ -175,7 +175,7 @@ def test_a_workspace_left_by_a_former_caller_still_ages_out(
 
     No key opens that folder; retention still records the file by its id, then deletes it and its row.
     """
-    left = Principal("former-caller", "user-a", "chat-1")
+    left = FORMER
     rec = put(store, "quarterly-figures.xlsx", left)
     clock.now = T0 + 7 * DAY + 1
     assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
