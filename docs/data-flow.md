@@ -43,10 +43,14 @@ record of processing and the impact assessment.
   chat with its page, sheet or cell, a job's id, the user's note, or the word
   `assistant`. The call can leave them out (`include_sources: false`). A picture
   of the chat that a slide shows is copied into the deck, which then holds its
-  bytes. The master's theme, layouts, media and `docProps/core.xml` (title,
-  author and dates, if it has them) are carried into the new file; the master's
-  example slides, its thumbnail and `docProps/app.xml` are not. The master, the
-  pictures and the files a source names are only read.
+  bytes. The master's theme, layouts and media are carried into the new file;
+  its example slides, its thumbnail, `docProps/app.xml` and the parts that name
+  who edited it or commented on it (`ppt/authors.xml`, `ppt/commentAuthors.xml`,
+  `ppt/changesInfos/`, `ppt/revisionInfo.xml`) are not. Of its core properties
+  (`docProps/core.xml`) only the language is kept: the deck has no title,
+  subject, keywords, comments, category, author, last editor, identifier,
+  status or version, it is revision 1, and it was made and modified when it was
+  built. The master, the pictures and the files a source names are only read.
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
   checks, topic listings), which can hold special categories of data, with the

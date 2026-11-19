@@ -12,6 +12,7 @@ import struct
 import zipfile
 import zlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -904,7 +905,7 @@ def test_characters_a_deck_cannot_hold_are_replaced_with_a_warning(job: Job) -> 
 
 
 def test_the_metadata_of_the_example_slides_is_dropped(job: Job) -> None:
-    """The thumbnail and ``docProps/app.xml`` (the example slides' titles) go, and the custom show; core.xml stays."""
+    """The thumbnail and ``docProps/app.xml`` (the example slides' titles) go, and the custom show; core.xml is new."""
     with zipfile.ZipFile(mt.make_master(job.path("master.pptx"))) as package:
         assert "docProps/thumbnail.jpeg" in package.namelist()
         assert mt.EXAMPLE_TITLE.encode() in package.read("docProps/app.xml")
@@ -922,6 +923,33 @@ def test_the_metadata_of_the_example_slides_is_dropped(job: Job) -> None:
     settings = etree.fromstring(parts["ppt/presProps.xml"])
     assert settings.find(f"{qn('p:showPr')}/{qn('p:custShow')}") is None
     assert settings.find(f"{qn('p:showPr')}/{qn('p:present')}") is not None
+
+
+def test_the_masters_history_is_reset(job: Job) -> None:
+    """The deck names none of the master's people and none of its slides, and keeps none of its dates.
+
+    The core properties are emptied, revision 1, made and modified now, the language kept; the parts that name who
+    edited the master or commented on it go.
+    """
+    mt.make_master(job.path("master.pptx"), history=True)
+    before = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}])
+    after = datetime.now(UTC).replace(tzinfo=None)
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        parts = {name: package.read(name) for name in package.namelist()}
+    assert [name for name in mt.HISTORY_PARTS if name.lstrip("/") in parts] == []
+    for listing in ("[Content_Types].xml", "ppt/_rels/presentation.xml.rels"):
+        for reltype, content_type, _ in mt.HISTORY_PARTS.values():
+            assert reltype.encode() not in parts[listing]
+            assert content_type.encode() not in parts[listing]
+    said = (mt.MASTER_AUTHOR.encode(), mt.MASTER_EDITOR.encode(), mt.EXAMPLE_TITLE.encode(), b"Invented subject")
+    assert [name for name, data in parts.items() if any(text in data for text in said)] == []
+    core = job.deck().core_properties
+    texts = (core.title, core.subject, core.keywords, core.comments, core.category, core.author, core.last_modified_by)
+    assert (*texts, core.identifier, core.content_status, core.version) == ("",) * 10
+    assert (core.revision, core.last_printed, core.language) == (1, None, mt.MASTER_LANGUAGE)
+    assert core.created == core.modified
+    assert core.created is not None and before <= core.created <= after
 
 
 def link_to_example(prs: Any, index: int) -> None:

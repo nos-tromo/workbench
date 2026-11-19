@@ -192,10 +192,11 @@ things, the limits that matter to users:
 - A slide master's example slides never reach the new deck. They are removed,
   with the custom shows and sections that name them and the thumbnail and
   `docProps/app.xml` that show or list them; the deck takes the master's theme,
-  layouts, media and core properties. A master whose layouts or master slide link
-  to its own slides is refused (`invalid_template`), a macro-enabled
-  presentation or a slide show too (`unsupported_template`), and `fill_template`
-  refuses a slide master and names `write_presentation`.
+  layouts and media, none of the parts that name who edited or commented on the
+  master, and of its core properties only the language. A master whose layouts
+  or master slide link to its own slides is refused (`invalid_template`), a
+  macro-enabled presentation or a slide show too (`unsupported_template`), and
+  `fill_template` refuses a slide master and names `write_presentation`.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
   newest 1000 files of the chat; answers are cut at `WORKBENCH_RESULT_MAX_KB`
   and say how to go on; `read_document` does no OCR and lists pages without a

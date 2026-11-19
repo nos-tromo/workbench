@@ -5,6 +5,7 @@ python-docx, their content controls and legacy form fields written as Wordproces
 openpyxl; slide masters with python-pptx, the parts it does not write as PresentationML with lxml.
 """
 
+import datetime as dt
 import io
 import zipfile
 from pathlib import Path
@@ -20,8 +21,11 @@ from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.opc.constants import CONTENT_TYPE as CT
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.opc.oxml import serialize_part_xml
+from pptx.opc.package import Part
+from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml as parse_pml
 from pptx.oxml.ns import qn
 from pptx.util import Inches
@@ -51,6 +55,42 @@ EXAMPLE_TITLE = "Invented example slide"
 
 #: The extension of ``ppt/presentation.xml`` that holds PowerPoint's sections.
 SECTIONS_URI = "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}"
+
+#: Who made a master with a history, who edited it and commented on it, and in which language it is.
+MASTER_AUTHOR = "Invented Author"
+MASTER_EDITOR = "Invented Editor"
+MASTER_LANGUAGE = "de-DE"
+
+#: The parts in which PowerPoint keeps who edited a file and commented on it, each with the relationship of the
+#: presentation to it and its content type, as PowerPoint writes them.
+HISTORY_PARTS: dict[str, tuple[str, str, str]] = {
+    "/ppt/authors.xml": (
+        "http://schemas.microsoft.com/office/2018/10/relationships/authors",
+        "application/vnd.ms-powerpoint.authors+xml",
+        '<p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author '
+        f'id="{{00000000-0000-0000-0000-000000000002}}" name="{MASTER_EDITOR}" initials="IE" userId="{MASTER_EDITOR}" '
+        'providerId="None"/></p188:authorLst>',
+    ),
+    "/ppt/commentAuthors.xml": (
+        RT.COMMENT_AUTHORS,
+        CT.PML_COMMENT_AUTHORS,
+        f'<p:cmAuthorLst xmlns:p="{P}"><p:cmAuthor id="1" name="{MASTER_EDITOR}" initials="IE" lastIdx="1" '
+        'clrIdx="0"/></p:cmAuthorLst>',
+    ),
+    "/ppt/changesInfos/changesInfo1.xml": (
+        "http://schemas.microsoft.com/office/2016/11/relationships/changesInfo",
+        "application/vnd.ms-powerpoint.changesinfo+xml",
+        '<pc:chgInfo xmlns:pc="http://schemas.microsoft.com/office/powerpoint/2013/main/command"><pc:docChgLst>'
+        f'<pc:chgData name="{MASTER_EDITOR}" userId="{MASTER_EDITOR}" providerId="None"/></pc:docChgLst></pc:chgInfo>',
+    ),
+    "/ppt/revisionInfo.xml": (
+        "http://schemas.microsoft.com/office/2015/10/relationships/revisionInfo",
+        "application/vnd.ms-powerpoint.revisioninfo+xml",
+        '<p1510:revInfo xmlns:p1510="http://schemas.microsoft.com/office/powerpoint/2015/10/main"><p1510:revLst>'
+        '<p1510:client id="{00000000-0000-0000-0000-000000000003}" v="1" dt="2001-02-03T04:05:06.000"/>'
+        "</p1510:revLst></p1510:revInfo>",
+    ),
+}
 
 
 def _xml(text: str) -> object:
@@ -419,6 +459,7 @@ def make_master(
     examples: int = 2,
     hidden_footer: bool = False,
     duplicate_name: bool = False,
+    history: bool = False,
 ) -> Path:
     """Write a slide master: python-pptx's default presentation and its eleven layouts, as a user's master looks.
 
@@ -434,6 +475,7 @@ def make_master(
         examples: How many example slides it has; with none, no custom show or section either.
         hidden_footer: Turn the footer, slide number and date off on the master (``p:hf``).
         duplicate_name: Name layouts 3 and 4 both "Zwei Inhalte".
+        history: Give it the history a user's master has (:func:`_history`).
 
     Returns:
         ``path``.
@@ -464,8 +506,36 @@ def make_master(
     if hidden_footer:
         styles = deck.slide_master._element.find(qn("p:txStyles"))
         styles.addprevious(parse_pml(f'<p:hf xmlns:p="{P}" ftr="0" sldNum="0" dt="0"/>'))
+    if history:
+        _history(deck)
     deck.save(str(path))
     return path
+
+
+def _history(deck: Any) -> None:
+    """Give a master the history PowerPoint keeps: core properties of its own, and who edited it and commented on it.
+
+    The core properties have the first example slide's title, a subject, keywords, comments, a category, an identifier,
+    a status and a version, ``MASTER_AUTHOR`` as the author and ``MASTER_EDITOR`` as the last editor, dates of 2001
+    and revision 42, in ``MASTER_LANGUAGE``; each of ``HISTORY_PARTS`` names ``MASTER_EDITOR`` or a client of its own.
+    """
+    core = deck.core_properties
+    core.title = f"{EXAMPLE_TITLE} 1"
+    core.subject = "Invented subject"
+    core.keywords = "Invented keywords"
+    core.comments = "Invented comments"
+    core.category = "Invented category"
+    core.identifier = "Invented identifier"
+    core.content_status = "Invented status"
+    core.version = "Invented version"
+    core.author = MASTER_AUTHOR
+    core.last_modified_by = MASTER_EDITOR
+    core.created = core.modified = core.last_printed = dt.datetime(2001, 2, 3, 4, 5, 6)
+    core.revision = 42
+    core.language = MASTER_LANGUAGE
+    for name, (reltype, content_type, xml) in HISTORY_PARTS.items():
+        blob = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n{xml}'.encode()
+        deck.part.relate_to(Part(PackURI(name), content_type, deck.part.package, blob), reltype)
 
 
 def _custom_show_and_section(deck: Any) -> None:

@@ -16,6 +16,7 @@ both name the slide, never a path of the job. Nothing here logs: a slide's text 
 import copy
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, Final
@@ -42,6 +43,21 @@ _SECTION_LIST: Final = "{http://schemas.microsoft.com/office/powerpoint/2010/mai
 #: The package's relationships to what describes its slides: the thumbnail, a picture of the first, and the extended
 #: properties, which count them and list their titles.
 _SLIDE_METADATA: Final = frozenset({RT.THUMBNAIL, RT.EXTENDED_PROPERTIES})
+
+#: The presentation's relationships to the parts that name who edited the master or commented on it: the authors of
+#: PowerPoint's comments (``ppt/authors.xml``) and of its older ones (``ppt/commentAuthors.xml``), its changes
+#: (``ppt/changesInfos/``) and its revisions (``ppt/revisionInfo.xml``).
+_EDITORS: Final = frozenset(
+    {
+        "http://schemas.microsoft.com/office/2018/10/relationships/authors",
+        RT.COMMENT_AUTHORS,
+        "http://schemas.microsoft.com/office/2016/11/relationships/changesInfo",
+        "http://schemas.microsoft.com/office/2015/10/relationships/revisionInfo",
+    }
+)
+
+#: The one core property a deck keeps of its master's.
+_LANGUAGE: Final = qn("dc:language")
 _LINKED: Final = (
     "the master links to its own slides (a link on a layout or the master); remove the links or save it without slides"
 )
@@ -51,14 +67,15 @@ _SUBTITLES: Final = frozenset({PP_PLACEHOLDER.SUBTITLE})
 
 
 def remove_slides(prs: Any) -> None:
-    """Remove the slides a master has, and what in the package points at them or describes them.
+    """Remove the slides a master has, and what in the package points at them, describes them or names its people.
 
     The custom shows and PowerPoint's sections go first: they name slides, and dropping a slide's relationship would
     leave them pointing at nothing (or, for a section, at a new slide that is given the old one's id). The slide show
     then runs no custom show (:func:`_run_no_custom_show`). The thumbnail and the extended properties
-    (``docProps/app.xml``) are dropped, as they show or list the master's slides; the core properties are the master's
-    own and stay. A part is saved only while a relationship reaches it, and ``[Content_Types].xml`` is written from the
-    parts saved, so neither is left there.
+    (``docProps/app.xml``) are dropped, as they show or list the master's slides, and the parts that name who edited
+    the master or commented on it (:data:`_EDITORS`); the core properties are the deck's own
+    (:func:`_reset_core_properties`). A part is saved only while a relationship reaches it, and ``[Content_Types].xml``
+    is written from the parts saved, so none is left there.
 
     Args:
         prs: The presentation, open.
@@ -67,6 +84,10 @@ def remove_slides(prs: Any) -> None:
     for rid, relationship in list(package._rels.items()):
         if relationship.reltype in _SLIDE_METADATA:
             package.drop_rel(rid)
+    for rid, relationship in list(prs.part.rels.items()):
+        if relationship.reltype in _EDITORS:
+            prs.part.drop_rel(rid)
+    _reset_core_properties(prs)
     _run_no_custom_show(prs)
     root = prs.part._element
     for shows in root.findall(qn("p:custShowLst")):
@@ -87,6 +108,27 @@ def remove_slides(prs: Any) -> None:
     for rid in dict.fromkeys(ids):
         if rid in prs.part.rels:
             prs.part.drop_rel(rid)
+
+
+def _reset_core_properties(prs: Any) -> None:
+    """Give the deck core properties of its own: none of the master's texts, names or dates, its language kept.
+
+    A master's core properties name people (its author and last editor) and may hold an example slide's title, so its
+    title, subject, keywords, comments, category, author, last editor, identifier, status, version and last printing
+    all go; the deck is revision 1, made and modified now (UTC).
+
+    Args:
+        prs: The presentation, open.
+    """
+    core = prs.core_properties
+    element = core._element
+    for child in list(element):
+        if child.tag != _LANGUAGE:
+            element.remove(child)
+    now = datetime.now(UTC)
+    core.revision = 1
+    core.created = now
+    core.modified = now
 
 
 def _run_no_custom_show(prs: Any) -> None:
