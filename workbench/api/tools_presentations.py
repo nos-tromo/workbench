@@ -20,16 +20,28 @@ from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictFloat, StrictInt, StringConstraints
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Discriminator,
+    Field,
+    PlainValidator,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+    Tag,
+)
 from pydantic.json_schema import JsonDict, JsonValue
+from pydantic_core import PydanticCustomError
 
 from workbench.api.audit import AuditLog
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import MAX_HINT, OutputKeeper, _clean, _json_size, _parse, _payload, _readable, judged
-from workbench.api.tools_output import MAX_NAME, Cell, _output_name
+from workbench.api.tools_output import MAX_NAME, _output_name
 from workbench.api.tools_templates import SLIDE_MASTERS, SOURCE_KINDS, Source, _cut_to, _source_spec
 from workbench.config import Settings
-from workbench.decks import IMAGE_TYPES, MAX_IMAGE_BYTES, MAX_IMAGES_BYTES, deck_problem
+from workbench.decks import IMAGE_TYPES, MAX_IMAGE_BYTES, MAX_IMAGES_BYTES, BlockKind, block_kind, deck_problem
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError
 from workbench.protocol import MAX_INPUT_FILES, JobResult
@@ -92,6 +104,29 @@ def _shown(**fixed: JsonValue) -> Callable[[JsonDict], None]:
 _STRING: Final = _shown(type="string")
 
 
+def _cell(value: object) -> object:
+    """Take a table's cell as it came: a string, a number, a bool or ``None``, each kept as its own type.
+
+    One check for every type, so that a bad cell is one error, not one for each type a cell may be.
+
+    Args:
+        value: The cell.
+
+    Returns:
+        The cell, unchanged.
+
+    Raises:
+        PydanticCustomError: It is none of those (``invalid_cell``).
+    """
+    if value is None or isinstance(value, str | int | float):  # a bool is an int
+        return value
+    raise PydanticCustomError("invalid_cell", "a cell is a string, a number, true, false or null")
+
+
+#: A cell of a deck's table; the field's schema says its types.
+TableCell = Annotated[str | int | float | bool | None, PlainValidator(_cell)]
+
+
 class TableBlock(BaseModel):
     """A native table.
 
@@ -101,7 +136,7 @@ class TableBlock(BaseModel):
 
     model_config = _REQUEST
 
-    table: list[list[Cell]] = Field(
+    table: list[list[TableCell]] = Field(
         description="Rows of cells; the first is the header.",
         json_schema_extra=_shown(items={"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}}),
     )
@@ -156,8 +191,37 @@ class ImageBlock(BaseModel):
     alt: str | None = Field(default=None, description="Its alternative text.", json_schema_extra=_STRING)
 
 
-#: One entry of a slide's content: Markdown text, a table, a chart or a picture.
-Block = str | TableBlock | ChartBlock | ImageBlock
+def _block_kind(value: object) -> BlockKind | None:
+    """Tell a block's kind, as the deck's rules tell it: text, or the one key of an object; or a model's own.
+
+    Args:
+        value: A block as it came, or a block model, as it is serialised.
+
+    Returns:
+        ``text``, ``table``, ``chart`` or ``image``; ``None`` for anything else, which is refused as ``invalid_block``.
+    """
+    if isinstance(value, TableBlock):
+        return "table"
+    if isinstance(value, ChartBlock):
+        return "chart"
+    if isinstance(value, ImageBlock):
+        return "image"
+    return block_kind(value)
+
+
+#: One entry of a slide's content: Markdown text, a table, a chart or a picture. Its kind picks the model, so a bad
+#: block is told what is wrong with it as that kind alone.
+Block = Annotated[
+    Annotated[str, Tag("text")]
+    | Annotated[TableBlock, Tag("table")]
+    | Annotated[ChartBlock, Tag("chart")]
+    | Annotated[ImageBlock, Tag("image")],
+    Discriminator(
+        _block_kind,
+        custom_error_type="invalid_block",
+        custom_error_message="a block is Markdown text, or an object with exactly one of table, chart or image",
+    ),
+]
 
 
 class SlideSpec(BaseModel):

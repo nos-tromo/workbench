@@ -366,6 +366,67 @@ def test_an_unknown_key_is_named_in_the_refusal(client: TestClient, store: Store
     } in detail
 
 
+#: Where the second block of the first slide is; and what is no block: not text, or an object without one kind.
+BLOCK: Final = ["slides", 0, "content", 1]
+NOT_BLOCKS: Final[tuple[object, ...]] = (
+    7,
+    None,
+    ["Invented"],
+    {},
+    {"table": [["Invented"]], "chart": {"type": "pie"}},
+    {"caption": "Invented"},
+)
+
+
+@pytest.mark.parametrize(
+    ("block", "wanted"),
+    [
+        (
+            {"chart": {"type": "area", "categories": ["a"], "series": {"s": [1]}}},
+            {
+                "type": "literal_error",
+                "loc": [*BLOCK, "chart", "chart", "type"],
+                "msg": "Input should be 'bar', 'column', 'line' or 'pie'",
+            },
+        ),
+        (
+            {"table": [["Invented a", "Invented b"], ["Invented c", {"value": 1}]]},
+            {
+                "type": "invalid_cell",
+                "loc": [*BLOCK, "table", "table", 1, 1],
+                "msg": "a cell is a string, a number, true, false or null",
+            },
+        ),
+        (
+            {"image": f"{CHAT}/chart.png", "caption": "Invented"},
+            {"type": "extra_forbidden", "loc": [*BLOCK, "image", "caption"], "msg": "Extra inputs are not permitted"},
+        ),
+        *[
+            (
+                bad,
+                {
+                    "type": "invalid_block",
+                    "loc": BLOCK,
+                    "msg": "a block is Markdown text, or an object with exactly one of table, chart or image",
+                },
+            )
+            for bad in NOT_BLOCKS
+        ],
+    ],
+    ids=["a chart of type area", "a bad table cell", "an unknown image key", *["not a block"] * len(NOT_BLOCKS)],
+)
+def test_a_bad_block_is_one_error_at_its_place(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, block: object, wanted: dict[str, Any]
+) -> None:
+    """A block's kind is told by its one key, so a bad block is refused by its own model alone: one error, in place."""
+    stored(store, tmp_path, "master.pptx", mt.make_master)
+    body = refused(call(client, deck({"layout": 4, "content": ["Invented", block]})))
+    assert body["reason"] == "invalid_arguments"
+    assert body["detail"] == [wanted]
+    assert "more_errors" not in body
+    assert fake_executor.requests == []
+
+
 def test_blocks_keep_their_kind(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:
     """A text block stays a string, a table keeps its cells' types, a chart its integer categories."""
     stored(store, tmp_path, "master.pptx", mt.make_master)

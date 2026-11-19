@@ -2061,7 +2061,7 @@
               "content": {
                 "description": "One block a place of the layout, in its order.",
                 "items": {
-                  "anyOf": [
+                  "oneOf": [
                     {
                       "type": "string"
                     },
