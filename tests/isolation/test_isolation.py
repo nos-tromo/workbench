@@ -19,7 +19,11 @@ import httpx
 import openpyxl
 import pytest
 from docx import Document
+from pptx import Presentation
+from pptx.enum.chart import XL_CHART_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_templates as mt
 from tests.isolation.conftest import (
     docker,
@@ -501,6 +505,75 @@ def test_templates_are_inspected_and_filled_in_the_executor(api_info: dict[str, 
     assert (sheet["B2"].value, sheet["A6"].value, sheet["B7"].value) == (469.5, "Dredging", "=1+1")
     assert sheet["B7"].data_type == "s"
     assert [cell.value for cell in book["Sources"][1]] == ["field", "value", "source kind", "reference"]
+
+
+def test_a_deck_is_built_in_the_sandbox(api_info: dict[str, Any], tmp_path: Path) -> None:
+    """A slide master and a picture of the chat become a deck with a chart, a picture and notes, by a real job.
+
+    The job runs as a slot uid with a read-only root and no network, in the shipped image, so this also proves that
+    python-pptx, markdown-it-py and the slide master's own parts are there and work as the job runs them. The deck is
+    opened in the test process, as PowerPoint would open it.
+    """
+    chat = "chat-decks"
+    master = _upload(api_info, "master.pptx", mt.make_master(tmp_path / "master.pptx").read_bytes(), chat=chat)
+    picture = _upload(api_info, "basin.png", mk._png(32), chat=chat)
+    where = f"/workspace/{chat}/{master}"
+
+    inspected = _tool(api_info, chat, "inspect_template", {"path": where})
+    assert inspected["template_kind"] == "slide_master"
+    assert len(inspected["layouts"]) == 11
+
+    slides = [
+        {"layout": 1, "title": "Invented harbour review", "subtitle": "Invented quarter"},
+        {
+            "layout": "Titel und Inhalt",
+            "title": "Invented dredging figures",
+            "content": ["- Invented north pier\n- Invented south pier"],
+            "notes": "Invented speaker note",
+            "sources": [{"kind": "assistant"}],
+        },
+        {
+            "layout": 2,
+            "title": "Invented tonnes",
+            "content": [
+                {
+                    "chart": {
+                        "type": "column",
+                        "categories": ["Invented north pier", "Invented south pier"],
+                        "series": {"Invented tonnes": [12, 7]},
+                    }
+                }
+            ],
+        },
+        {
+            "layout": 2,
+            "title": "Invented basin",
+            "content": [{"image": f"/workspace/{chat}/{picture}", "alt": "Invented picture of the basin"}],
+        },
+    ]
+    built = _tool(api_info, chat, "write_presentation", {"path": where, "name": "harbour-deck", "slides": slides})
+    assert built == {"path": f"/workspace/{chat}/harbour-deck.pptx", "slides": 4, "warnings": []}
+
+    deck: Any = Presentation(io.BytesIO(_download(api_info, chat, built["path"])))
+    assert len(deck.slides) == 4
+    assert [slide.shapes.title.text for slide in deck.slides] == [
+        "Invented harbour review",
+        "Invented dredging figures",
+        "Invented tonnes",
+        "Invented basin",
+    ]
+    charts = [shape.chart for slide in deck.slides for shape in slide.shapes if shape.has_chart]
+    assert [chart.chart_type for chart in charts] == [XL_CHART_TYPE.COLUMN_CLUSTERED]
+    assert list(charts[0].plots[0].categories) == ["Invented north pier", "Invented south pier"]
+    pictures = [shape for slide in deck.slides for shape in slide.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    assert [shape.image.content_type for shape in pictures] == ["image/png"]
+    assert deck.slides[1].notes_slide.notes_text_frame.text == "Invented speaker note\n\nSources:\nassistant"
+    assert not any(
+        mt.EXAMPLE_TITLE in shape.text_frame.text
+        for slide in deck.slides
+        for shape in slide.shapes
+        if shape.has_text_frame
+    )
 
 
 # --- the output tools, end to end --------------------------------------------------------------------------------
