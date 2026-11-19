@@ -545,6 +545,8 @@ def test_ghostwriter_is_offered_write_presentation(client: TestClient) -> None:
         "speaker notes",
         "30 slides",
         "card in the chat",
+        "title and subtitle are plain text, not Markdown",
+        '"" leaves a place empty',
     ):
         assert phrase in description, phrase
     schema = tool["inputSchema"]

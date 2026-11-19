@@ -122,6 +122,8 @@ class _ChartData(CategoryChartData):
 def check_places(layout: Layout, content: Sequence[Any], number: int) -> None:
     """Make sure each block of a slide has a place that takes it: block i goes into place i of the layout.
 
+    A text of nothing but spaces, ``""`` among them, leaves its place empty, whatever the place takes (:func:`fill`).
+
     Args:
         layout: The slide's layout.
         content: The slide's blocks, checked with :func:`workbench.decks.deck_problem`.
@@ -136,7 +138,8 @@ def check_places(layout: Layout, content: Sequence[Any], number: int) -> None:
         kind = decks.block_kind(block)
         if kind is None:  # deck_problem refuses it first
             raise Refusal("invalid_value", f"{where}: a block is text, a table, a chart or an image")
-        if index > len(layout.places) or layout.places[index - 1].role not in ACCEPTS[kind]:
+        empty = isinstance(block, str) and not block.strip()
+        if index > len(layout.places) or (not empty and layout.places[index - 1].role not in ACCEPTS[kind]):
             (own,) = ACCEPTS[kind] - {"content"}
             places = ", ".join(place.role for place in layout.places) or "none"
             name = repr(cut(layout.name, decks.MAX_LAYOUT_NAME)) if layout.name else str(layout.number)

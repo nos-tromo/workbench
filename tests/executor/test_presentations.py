@@ -852,6 +852,27 @@ def test_empty_places_are_removed(job: Job) -> None:
     assert left == {1: "Invented A", 2: "Invented C"}
 
 
+def test_an_empty_string_leaves_any_place_empty(job: Job) -> None:
+    """A title, a subtitle or a block of "" leaves its place empty, whatever the place takes; the place is removed."""
+    mt.make_master(job.path("master.pptx"))
+    answer = job.write(
+        [
+            {"layout": TITLE_SLIDE, "title": "", "subtitle": "Invented subtitle"},
+            {"layout": PICTURE_WITH_CAPTION, "title": "Invented", "subtitle": "", "content": ["", "Invented caption"]},
+        ]
+    )
+    assert answer == {"slides": 2, "warnings": []}
+    first, second = job.deck().slides
+    assert set(kinds(first)) - FOOTERS == {PP_PLACEHOLDER.SUBTITLE}
+    assert kinds(first)[PP_PLACEHOLDER.SUBTITLE].text_frame.text == "Invented subtitle"
+    assert set(kinds(second)) - FOOTERS == {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.BODY}
+    assert kinds(second)[PP_PLACEHOLDER.BODY].text_frame.text == "Invented caption"
+    assert [shape for shape in second.shapes if shape.shape_type == MSO_SHAPE_TYPE.PICTURE] == []
+    error = job.write([{"layout": TITLE_SLIDE, "content": [""]}], name="past.pptx")["error"]
+    wanted = "slide 1, block 1: text goes into a text or content place; layout 'Title Slide' has: none"
+    assert error == f"invalid_value: {wanted}"
+
+
 def test_overflowing_text_is_scaled_and_warned(job: Job) -> None:
     """Bullets of 80 characters, as many as a block holds, shrink to 60 % and are warned of; three short ones do not."""
     mt.make_master(job.path("master.pptx"))

@@ -175,10 +175,11 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "agreed. Each content entry fills one place of the slide's layout, in the order inspect_template lists its "
             "places: Markdown text (bullets with -, up to 3 levels, **bold**, *italic*), {table: rows} with the first "
             "row the header, {chart: {type, categories, series}}, or {image: path} of a PNG, JPEG or GIF of this "
-            "conversation (make a chart image with run_python, or prefer a native chart). At most 30 slides. Footers "
-            "and slide numbers come from the master; the master's own slides are left out. Each slide's sources go "
-            "into its speaker notes. To change a deck, read it with read_document and write it again. The user sees "
-            "the new file as a card in the chat."
+            'conversation (make a chart image with run_python, or prefer a native chart); "" leaves a place empty. '
+            "A slide's title and subtitle are plain text, not Markdown. At most 30 slides. Footers and slide numbers "
+            "come from the master; the master's own slides are left out. Each slide's sources go into its speaker "
+            "notes. To change a deck, read it with read_document and write it again. The user sees the new file as a "
+            "card in the chat."
         ),
         input_model=tools_presentations.WritePresentationRequest,
         output_model=tools_presentations.BuiltPresentation,
