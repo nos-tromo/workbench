@@ -378,8 +378,8 @@ def _tool(spec: "ToolSpec", caller: "Caller") -> dict[str, Any]:
     """One tool as ``tools/list`` names it: its output schema is the spec's own for the caller, else its model's.
 
     Raises:
-        ValueError: The spec has no ``input_schema``, or neither an ``output_schema`` nor an ``output_model``; every
-            spec the MCP door serves has both.
+        ValueError: The spec has neither an ``output_schema`` nor an ``output_model``; every spec the MCP door serves
+            has one.
     """
     if spec.output_schema is not None:
         output = spec.output_schema(caller)
@@ -387,8 +387,8 @@ def _tool(spec: "ToolSpec", caller: "Caller") -> dict[str, Any]:
         output = spec.output_model.model_json_schema()
     else:
         output = None
-    if spec.input_schema is None or output is None:
-        raise ValueError(f"{spec.name} cannot be listed: it has no input schema or no output model")
+    if output is None:
+        raise ValueError(f"{spec.name} cannot be listed: it has no output model")
     return {
         "name": spec.name,
         "title": spec.title,

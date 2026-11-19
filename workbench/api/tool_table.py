@@ -3,7 +3,7 @@
 A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
 and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates` and
 :mod:`workbench.api.tools_output`). :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the
-registry. A new workspace tool is a row here and its name in :data:`~workbench.api.registry.WORKSPACE_TOOLS`.
+registry. A new workspace tool is a row here.
 """
 
 from collections.abc import Callable

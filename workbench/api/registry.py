@@ -21,6 +21,7 @@ from workbench.api.audit import AuditLog
 from workbench.api.audit import PurposeRequired as PurposeRequired
 from workbench.api.jobs import JobQueue
 from workbench.api.store import Store
+from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.config import Settings
 from workbench.models import Principal
 from workbench.utils.audit_event import Purpose
@@ -33,18 +34,7 @@ if TYPE_CHECKING:
 Files = Literal["workspace", "inline"]
 
 #: Every workspace tool, by name: the rows of :data:`~workbench.api.tool_table.WORKSPACE_TABLE`.
-WORKSPACE_TOOLS: Final = frozenset(
-    {
-        "list_files",
-        "read_document",
-        "search_files",
-        "run_python",
-        "inspect_template",
-        "fill_template",
-        "write_table",
-        "write_document",
-    }
-)
+WORKSPACE_TOOLS: Final = frozenset(tool.name for tool in WORKSPACE_TABLE)
 
 #: Every inline tool, by name.
 INLINE_TOOLS: Final = frozenset({"run_python"})
@@ -119,7 +109,7 @@ class ToolSpec:
         output_model: The model of its answer, or ``None``.
         form: Whether it works on a workspace's files or on data that comes with the call.
         run: Runs it on arguments its input model has validated.
-        input_schema: The arguments' JSON schema for a caller, where it depends on the caller.
+        input_schema: The arguments' JSON schema for a caller.
         output_schema: The answer's JSON schema for a caller, in place of ``output_model``'s own.
     """
 
@@ -129,8 +119,8 @@ class ToolSpec:
     input_model: type[BaseModel] | None
     output_model: type[BaseModel] | None
     form: Files
-    run: Callable[[Any, ToolEnv], Awaitable[ToolOutcome]] | None = None
-    input_schema: Callable[["Caller"], dict[str, Any]] | None = None
+    run: Callable[[Any, ToolEnv], Awaitable[ToolOutcome]]
+    input_schema: Callable[["Caller"], dict[str, Any]]
     output_schema: Callable[["Caller"], dict[str, Any]] | None = None
 
 

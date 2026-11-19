@@ -104,9 +104,8 @@ path answers `404` to a caller with the key, and `401` to anyone without it.
   - `list_files`, `search_files` and `run_python` see only the request's chat;
   - `fill_template` takes file sources only from the template's chat.
 - Files exist only inside chat folders. A file directly under `/workspace`
-  cannot be made there, and `/workspace` and a chat
-  folder are never the target of a file operation
-  (`workbench/api/store.py:Store._file_target`).
+  cannot be made there, and `/workspace` and a chat folder are never the
+  target of a file operation (`workbench/api/store.py:Store._file_target`).
 - Uploads are never overwritten by a tool. Every tool result is a new file, and
   a taken name gets a number (`workbench/api/store.py:Store.register_output`).
 

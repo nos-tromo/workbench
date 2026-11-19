@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
-from tests.api.conftest import FORMER, HD, HG, PG, AuditLines, put, unrecorded
+from tests.api.conftest import FORMER, GHOSTWRITER_KEY, HD, HG, PG, PG_SETUP, AuditLines, put, unrecorded
 from tests.api.mcp_calls import acall, error, refused, result, rpc
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import call as inline_call
@@ -32,12 +32,14 @@ from tests.callers import EIGHT
 from tests.conftest import scaled
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import OPERATIONS, AuditLog
+from workbench.api.auth import Caller
 from workbench.api.jobs import Busy, CallLimits, JobQueue
 from workbench.api.main import create_app
 from workbench.api.mcp_wire import INSTRUCTIONS, WORKSPACE_INSTRUCTIONS
 from workbench.api.metrics import Metrics
+from workbench.api.registry import ToolEnv
 from workbench.api.store import Store
-from workbench.api.tools_mcp import PREVIEW_RESERVE_S
+from workbench.api.tools_mcp import PREVIEW_RESERVE_S, workspace_tools
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 
@@ -359,6 +361,27 @@ def test_a_former_callers_files_are_not_ghostwriters(client: TestClient, store: 
     assert refused(r) == {"reason": "refused"}
     assert result(r)["content"][0]["text"] == "not found"
     assert fake_executor.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", sorted(EIGHT))
+async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
+    name: str, settings: Settings, store: Store, audit: AuditLog
+) -> None:
+    """A workspace tool reaches only its chat's files, so it runs for nothing but a principal confined to that chat."""
+    (spec,) = [spec for spec in workspace_tools() if spec.name == name]
+    env = ToolEnv(
+        p=PG_SETUP,
+        caller=Caller("ghostwriter", GHOSTWRITER_KEY, EIGHT),
+        settings=settings,
+        store=store,
+        audit=audit,
+        jobs=None,
+        purpose=None,
+        request_id=None,
+    )
+    with pytest.raises(RuntimeError, match="confined to one chat"):
+        await spec.run(None, env)
 
 
 # --- the limits ----------------------------------------------------------------------------------------------------

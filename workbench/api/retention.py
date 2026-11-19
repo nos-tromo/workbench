@@ -1,13 +1,13 @@
 """Retention: every workspace file is deleted ``WORKBENCH_RETENTION_DAYS`` after it was made, and recorded first.
 
 A file is due once its ``created_at`` lies more than the period back, an upload or an output, whether or not its chat
-still exists; moving a file keeps its time. The api sweeps (:class:`Sweeper`) at start and then every
-``WORKBENCH_RETENTION_INTERVAL_S``, off the event loop. A sweep reads the due files oldest first, in pages of at most
-200, and deletes them in batches of one caller's user. Each batch is first recorded as one ``delete`` /
-``retention.sweep`` event of the system, by file id, with the rule (``period_days``, ``cutoff``), the ``caller``, the
-``owner`` (the caller's opaque user id, never an e-mail or a name) and the ``count``; only then do its files and their
-rows go. A file that cannot be deleted keeps its row, is recorded again with ``outcome: error``, and is tried again by
-the next sweep; this sweep pages on past it, so no number of such files holds up the others.
+still exists. The api sweeps (:class:`Sweeper`) at start and then every ``WORKBENCH_RETENTION_INTERVAL_S``, off the
+event loop. A sweep reads the due files oldest first, in pages of at most 200, and deletes them in batches of one
+caller's user. Each batch is first recorded as one ``delete`` / ``retention.sweep`` event of the system, by file id,
+with the rule (``period_days``, ``cutoff``), the ``caller``, the ``owner`` (the caller's opaque user id, never an e-mail
+or a name) and the ``count``; only then do its files and their rows go. A file that cannot be deleted keeps its row, is
+recorded again with ``outcome: error``, and is tried again by the next sweep; this sweep pages on past it, so no number
+of such files holds up the others.
 
 No deletion without its record: a record that cannot be written ends the process (``os._exit(1)``) before anything
 more is deleted, and ``restart: unless-stopped`` brings the api back; stderr gets the count. The other way round is

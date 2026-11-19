@@ -341,18 +341,6 @@ def test_files_that_keep_failing_never_stall_the_sweep(
     assert {rec.id for rec in store.files_in_chat(PG_SETUP)} == stuck
 
 
-def test_a_file_moved_since_it_was_listed_is_deleted_where_it_is_now(
-    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock
-) -> None:
-    """Moving keeps a file's id and creation time: it is still due, and goes from its new place."""
-    rec = put(store, "draft.docx")
-    store.mkdir(PG_SETUP, "/workspace/chat-1/final")
-    moved = store.move(PG_SETUP, rec.virtual_path, "/workspace/chat-1/final/report.docx")
-    clock.now = T0 + 8 * DAY
-    assert sweeper.sweep_once().deleted == 1
-    assert not on_disk(settings, moved).exists()
-
-
 @pytest.mark.anyio
 async def test_sweep_during_running_job(
     sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, metrics: Metrics, audit_lines: AuditLines
@@ -590,49 +578,6 @@ def test_an_unwritable_record_of_an_orphan_or_staging_halts_with_nothing_removed
     assert path.exists()
 
 
-def test_a_move_in_progress_is_never_taken_for_an_orphan(
-    sweeper: Sweeper,
-    store: Store,
-    settings: Settings,
-    clock: Clock,
-    audit_lines: AuditLines,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A file between a move's rename and its row's commit has no row at its new name, and is never taken for an orphan.
-
-    The store's lock, which the sweep holds to look and remove, keeps the sweep out of that moment.
-    """
-    clock.now = time.time()
-    rec = put(store, "draft.docx")
-    store.mkdir(PG_SETUP, "/workspace/chat-1/final")
-    age(on_disk(settings, rec), 2 * HOUR, clock.now)  # a rename keeps the time, so the moved file looks old
-    renamed, go_on = threading.Event(), threading.Event()
-    replace = os.replace
-
-    def slow(source: Any, target: Any) -> None:
-        replace(source, target)
-        if str(target).endswith("report.docx"):
-            renamed.set()
-            go_on.wait(5)
-
-    monkeypatch.setattr(os, "replace", slow)
-    mover = threading.Thread(
-        target=store.move, args=(PG_SETUP, rec.virtual_path, "/workspace/chat-1/final/report.docx")
-    )
-    mover.start()
-    assert renamed.wait(5)
-    sweeping = threading.Thread(target=sweeper.sweep_once)
-    sweeping.start()
-    time.sleep(0.2)
-    assert sweeping.is_alive()  # waiting for the lock the move holds
-    go_on.set()
-    mover.join(5)
-    sweeping.join(5)
-    assert store.get(PG_SETUP, "/workspace/chat-1/final/report.docx").id == rec.id
-    assert (on_disk(settings, rec).parent / "final" / "report.docx").exists()
-    assert sweeps(audit_lines) == []
-
-
 @pytest.mark.parametrize("way", ["upload", "output"])
 def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
     sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, monkeypatch: pytest.MonkeyPatch, way: str
@@ -672,6 +617,7 @@ def test_a_file_on_its_way_into_an_old_empty_chat_folder_keeps_its_folder(
         staged = settings.data_dir / "staging" / job_id / "chart.png"
         staged.parent.mkdir(parents=True)
         staged.write_bytes(b"\x89PNG")
+        age(staged, 2 * HOUR, clock.now)  # a rename keeps the time: only the lock keeps the sweep off it until its row
     made: list[FileRecord] = []
 
     def arrive() -> None:

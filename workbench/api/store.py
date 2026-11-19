@@ -1016,6 +1016,8 @@ class Store:
     def mkdir(self, p: Principal, path: str) -> str:
         """Make a folder, and its parents; one that exists is left as it is.
 
+        No route or tool makes a folder: the tests lay out folders below a chat with it.
+
         Args:
             p: The caller and user.
             path: ``/workspace/<chat-id>`` or a folder inside it.
@@ -1034,50 +1036,6 @@ class Store:
         with self._lock:  # retention removes empty folders under the same lock
             self._make_dirs(real)
         return self._ws.to_virtual(p, real)
-
-    def move(self, p: Principal, source: str, destination: str) -> FileRecord:
-        """Rename a file, within the user's root.
-
-        The destination is the file's new full path. Its folder must exist, except that a
-        chat folder is made on first use. Nothing is overwritten.
-
-        Args:
-            p: The caller and user.
-            source: The file's current path.
-            destination: The path it should have.
-
-        Returns:
-            The updated record; the id and the creation time are unchanged.
-
-        Raises:
-            PathError: If a path is outside the user's root, is ``/workspace`` or a chat folder,
-                or the new name ends in ``.part``.
-            NotFound: If the user has no such file, or the destination folder is missing.
-            Conflict: If the destination exists.
-        """
-        src_real, src_chat, src_name = self._file_target(p, source)
-        dst_real, dst_chat, dst_name = self._file_target(p, destination)
-        _check_new_name(dst_name.rsplit("/", 1)[-1])
-        with self._lock:
-            rec = self._row(p, src_chat, src_name)
-            src_st = _lstat(src_real)
-            if src_st is None or not stat.S_ISREG(src_st.st_mode):
-                raise NotFound("file not found")
-            self._require_folder(dst_real.parent, [dst_chat, *dst_name.split("/")[:-1]])
-            if _lstat(dst_real) is not None or self._has_row(p, dst_chat, dst_name):
-                raise Conflict("the destination exists")
-            os.replace(src_real, dst_real)
-            moved = dataclasses.replace(rec, chat_id=dst_chat, name=dst_name, mime=_mime(dst_name))
-            try:
-                with self._db() as db:
-                    db.execute(
-                        "UPDATE files SET chat_id = ?, name = ?, mime = ? WHERE id = ?",
-                        (moved.chat_id, moved.name, moved.mime, moved.id),
-                    )
-            except BaseException:
-                os.replace(dst_real, src_real)
-                raise
-        return moved
 
     def usage(self, p: Principal) -> int:
         """Add up the sizes of all the user's files, in every chat.
@@ -1125,8 +1083,8 @@ class Store:
         whose own call's event covers its removal within the same request.
 
         The file is found by ``record.id``, at the path its row has now: a record that
-        went stale (the file was moved or deleted meanwhile) never reaches a file that
-        now sits at its old path.
+        went stale (the file was deleted meanwhile) never reaches a file that now sits
+        at its old path.
 
         Args:
             record: A record, for example one ``due`` returned.
@@ -1238,13 +1196,13 @@ class Store:
         """Remove the files of a user's root that have no record, then the folders left empty, all under the lock.
 
         An orphan is a regular file in a chat folder that has no row and was last changed before ``untouched_before``:
-        the ``<id>.part`` of an upload the api died during, or a file a kill left between its rename into place and
-        its row's commit (``add_upload``, ``register_output``, ``move``). The look and the removal hold the store's
-        lock, which every rename into place holds until its row is committed, so a file on its way in is never taken
-        for one. Each chat folder's orphans are recorded first, by ``record``, still under the lock, at most
-        ``MAX_IDS`` to a record so that no id is cut; those that could not be removed are recorded again as an error.
-        If ``record`` raises, nothing more is removed and the error goes on. Once ``stop`` is set, the sweep ends before
-        its next batch: nothing more is recorded or removed, empty folders included, and the next sweep finds the rest.
+        the ``<id>.part`` of an upload the api died during, or a file a kill left between its rename into place and its
+        row's commit (``add_upload``, ``register_output``). The look and the removal hold the store's lock, which every
+        rename into place holds until its row is committed, so a file on its way in is never taken for one. Each chat
+        folder's orphans are recorded first, by ``record``, still under the lock, at most ``MAX_IDS`` to a record so
+        that no id is cut; those that could not be removed are recorded again as an error. If ``record`` raises, nothing
+        more is removed and the error goes on. Once ``stop`` is set, the sweep ends before its next batch: nothing more
+        is recorded or removed, empty folders included, and the next sweep finds the rest.
 
         Then every folder below the root, deepest first, the chat folders too, and the root itself go if they are
         empty and were last changed before ``untouched_before``. Their ages are taken before anything is removed, so

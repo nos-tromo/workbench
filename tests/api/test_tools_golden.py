@@ -15,12 +15,10 @@ from fastapi.testclient import TestClient
 from tests.api.conftest import HD, HG
 from tests.api.test_mcp import Headers, result, rpc
 from workbench import __version__
-from workbench.api.mcp_wire import MODERN, SERVER_INFO
+from workbench.api.mcp_wire import LEGACY_DEFAULT, MODERN, SERVER_INFO
 
 #: Where the frozen answers are.
 GOLDEN: Final = Path(__file__).parent / "golden"
-#: The legacy revision, as ``initialize`` answers it by default.
-LEGACY: Final = "2025-11-25"
 #: What stands for the server's own version in the files: it moves with every release, the tool list does not.
 VERSION: Final = "<version>"
 
@@ -37,7 +35,7 @@ def frozen(answer: dict[str, Any]) -> str:
     meta = answer.get("_meta")
     if meta is not None:
         assert meta[SERVER_INFO]["version"] == __version__
-        meta[SERVER_INFO] = {**meta[SERVER_INFO], "version": VERSION}
+        answer = {**answer, "_meta": {**meta, SERVER_INFO: {**meta[SERVER_INFO], "version": VERSION}}}
     return json.dumps(answer, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -45,6 +43,6 @@ def frozen(answer: dict[str, Any]) -> str:
 @pytest.mark.parametrize("era", ["modern", "legacy"])
 def test_tools_list_is_frozen(client: TestClient, caller: str, headers: Headers, era: str) -> None:
     """The MCP door lists each caller's tools exactly as it did before the terminal door went."""
-    version = MODERN if era == "modern" else LEGACY
+    version = MODERN if era == "modern" else LEGACY_DEFAULT
     served = frozen(result(rpc(client, "tools/list", version=version, headers=headers)))
     assert served == (GOLDEN / f"{caller}-{era}.json").read_text(encoding="utf-8")

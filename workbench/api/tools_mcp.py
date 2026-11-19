@@ -213,8 +213,11 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
             PurposeRequired: The tool's audit action needs a stated purpose and the call stated none; the ``denied``
                 event is written and nothing runs.
             Busy: The tool needs the queue and the app has none.
+            RuntimeError: The principal is not confined to one chat, as a workspace caller's always is.
             Exception: What the tool raised.
         """
+        if not env.p.confined:
+            raise RuntimeError(f"{key} runs only for a principal confined to one chat")
         settings, caller = env.settings, env.caller
         audit = env.audit.bound(env.purpose, env.request_id, required=settings.require_purpose)
         if key in OPERATIONS:

@@ -153,6 +153,9 @@ What `criteria` and `target` hold depends on what is removed:
 | A job's staging residue: outputs nobody registered, older than an hour | `rule: staging`, `job` (the job's id), `count` of its regular files, and `caller` and `owner` while the job's record exists | `count`, no ids; `container: chat:<chat-id>` while the job's record exists |
 | Orphans of one chat folder: files with no row, older than an hour | `rule: orphan`, `caller`, `owner`, `count` | `ids`: the file ids the names of interrupted uploads carry (`<id>.part`), never a name; `count`; `container: chat:<chat-id>` |
 
+A retention event's `caller` is the caller folder the files sit in, which can
+be a retired caller's, such as `open-webui`.
+
 Files that could not be removed are recorded again with `outcome: error` and
 the same criteria, `count` being how many stayed. They keep their rows and the
 next sweep tries again.

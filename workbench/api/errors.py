@@ -8,10 +8,10 @@ message of these exceptions is a literal written in ``paths.py`` or ``store.py``
 A failed audit write is a 500 of the same kind: the action is not done, and the cause (the
 output stream) is not logged either.
 
-No route raises a job the queue refuses (``Busy``) or a request too large for the executor's
-protocol (``RequestTooLarge``): only tools do, and the MCP door answers both as an ``isError``
-result (:func:`~workbench.api.mcp.call_failure`). Their handlers stay as the app's fallback:
-``Busy`` a 503 with one fixed text, whatever the reason, and ``RequestTooLarge`` a 422.
+No route raises ``Busy`` (the queue refused a job) or ``RequestTooLarge`` (a request too
+large for the executor's protocol): only tools do, and the MCP door answers both as an
+``isError`` result (:func:`~workbench.api.mcp.call_failure`). Their handlers stay as the app's
+fallback: ``Busy`` a 503 with one fixed text, whatever the reason, and ``RequestTooLarge`` a 422.
 
 A call that had to state a purpose and stated none (``PurposeRequired``) is a 428, its ``denied`` event already
 written.

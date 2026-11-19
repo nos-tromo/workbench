@@ -129,7 +129,7 @@ async def _call(request: Request, caller: Caller, params: dict[str, Any]) -> dic
     registry: Registry = request.app.state.registry
     name = params.get("name")
     spec = registry.find(caller, name) if isinstance(name, str) else None
-    if spec is None or spec.run is None or spec.input_model is None:
+    if spec is None or spec.input_model is None:
         raise WireError(400, INVALID_PARAMS, "unknown tool")
     try:
         p = principal_from_headers(caller, request.headers)

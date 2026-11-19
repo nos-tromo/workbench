@@ -18,6 +18,8 @@ from workbench.api.registry import (
     WORKSPACE_TOOLS,
     Files,
     Registry,
+    ToolEnv,
+    ToolOutcome,
     ToolSpec,
     allowed_tools,
 )
@@ -56,7 +58,7 @@ def test_the_workspace_specs_are_the_tables_rows(app: FastAPI) -> None:
     assert {s.name for s in specs} == WORKSPACE_TOOLS
     for spec, tool in zip(specs, WORKSPACE_TABLE, strict=True):
         assert (spec.title, spec.description, spec.form) == (tool.title, tool.description, "workspace")
-        assert spec.run is not None and spec.input_schema is not None and spec.output_schema is not None
+        assert spec.output_schema is not None
         assert spec.output_model is not None and spec.output_model.__bases__ == (tool.output_model,)
     by_name = {tool.name: tool for tool in WORKSPACE_TABLE}
     assert (by_name["run_python"].input_model, by_name["run_python"].output_model) == (RunPythonRequest, PythonRun)
@@ -67,9 +69,23 @@ def test_the_workspace_specs_are_the_tables_rows(app: FastAPI) -> None:
     assert [s.name for s in registry.for_caller(ghostwriter)] == sorted(WORKSPACE_TOOLS)
 
 
+async def _never(_body: Any, _env: ToolEnv) -> ToolOutcome:
+    """A run no test calls: these specs are only found and listed."""
+    raise AssertionError("not run")
+
+
 def _spec(name: str, form: Files) -> ToolSpec:
     """A synthetic spec named ``name``, of the form ``form``."""
-    return ToolSpec(name=name, title=name, description=f"tool {name}", input_model=None, output_model=None, form=form)
+    return ToolSpec(
+        name=name,
+        title=name,
+        description=f"tool {name}",
+        input_model=None,
+        output_model=None,
+        form=form,
+        run=_never,
+        input_schema=lambda _caller: {"type": "object"},
+    )
 
 
 def test_a_caller_sees_the_tools_of_its_form_in_name_order() -> None:
