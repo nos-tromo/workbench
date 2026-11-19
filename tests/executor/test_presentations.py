@@ -23,6 +23,7 @@ from pptx import Presentation
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.oxml import serialize_part_xml
 from pptx.opc.packuri import PackURI
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import nsdecls, qn
@@ -923,6 +924,52 @@ def test_the_metadata_of_the_example_slides_is_dropped(job: Job) -> None:
     settings = etree.fromstring(parts["ppt/presProps.xml"])
     assert settings.find(f"{qn('p:showPr')}/{qn('p:custShow')}") is None
     assert settings.find(f"{qn('p:showPr')}/{qn('p:present')}") is not None
+
+
+def test_the_show_runs_the_whole_deck(job: Job) -> None:
+    """A slide show of a range of the master's slides would start at a slide the deck may not have: it is not kept."""
+
+    def change(prs: Any) -> None:
+        properties = prs.part.part_related_by(RT.PRES_PROPS)
+        settings = parse_xml(properties.blob)
+        shown = settings.find(qn("p:showPr"))
+        shown.replace(shown.find(qn("p:custShow")), parse_xml(f'<p:sldRg {nsdecls("p")} st="2" end="2"/>'))
+        properties.blob = serialize_part_xml(settings)
+
+    resaved(mt.make_master(job.path("master.pptx")), change)
+    assert job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}]) == {"slides": 1, "warnings": []}
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        settings = etree.fromstring(package.read("ppt/presProps.xml"))
+    shown = settings.find(qn("p:showPr"))
+    assert (shown.find(qn("p:sldRg")), shown.find(qn("p:custShow"))) == (None, None)
+    assert shown.find(qn("p:present")) is not None
+
+
+def test_slides_collapsed_in_the_outline_are_forgotten(job: Job) -> None:
+    """The outline view lists the master's slides it collapses, by links of its own: the list and the links go."""
+
+    def change(prs: Any) -> None:
+        view = prs.part.part_related_by(RT.VIEW_PROPS)
+        rid = view.relate_to(prs.slides[1].part, RT.SLIDE)
+        root = parse_xml(view.blob)
+        outline = (
+            f'<p:outlineViewPr {nsdecls("p", "a", "r")}><p:cViewPr><p:scale><a:sx n="33" d="100"/><a:sy n="33" '
+            f'd="100"/></p:scale><p:origin x="0" y="0"/></p:cViewPr><p:sldLst><p:sld r:id="{rid}" collapse="1"/>'
+            "</p:sldLst></p:outlineViewPr>"
+        )
+        root.find(qn("p:slideViewPr")).addnext(parse_xml(outline))
+        view.blob = serialize_part_xml(root)
+
+    resaved(mt.make_master(job.path("master.pptx")), change)
+    assert job.write([{"layout": TITLE_AND_CONTENT, "title": "Invented"}]) == {"slides": 1, "warnings": []}
+    with zipfile.ZipFile(job.ctx.out_dir / "deck.pptx") as package:
+        names = package.namelist()
+        view = etree.fromstring(package.read("ppt/viewProps.xml"))
+    outline = view.find(qn("p:outlineViewPr"))
+    assert outline is not None
+    assert outline.find(qn("p:sldLst")) is None
+    assert "ppt/_rels/viewProps.xml.rels" not in names
+    assert slide_targets(job.ctx.out_dir / "deck.pptx") == ["slides/slide1.xml"]
 
 
 def test_the_masters_history_is_reset(job: Job) -> None:

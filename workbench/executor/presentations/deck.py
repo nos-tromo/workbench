@@ -71,7 +71,8 @@ def remove_slides(prs: Any) -> None:
 
     The custom shows and PowerPoint's sections go first: they name slides, and dropping a slide's relationship would
     leave them pointing at nothing (or, for a section, at a new slide that is given the old one's id). The slide show
-    then runs no custom show (:func:`_run_no_custom_show`). The thumbnail and the extended properties
+    then runs the whole deck (:func:`_show_every_slide`), and the outline view collapses none of the master's slides
+    (:func:`_forget_outline`), whose links would keep them in the package. The thumbnail and the extended properties
     (``docProps/app.xml``) are dropped, as they show or list the master's slides, and the parts that name who edited
     the master or commented on it (:data:`_EDITORS`); the core properties are the deck's own
     (:func:`_reset_core_properties`). A part is saved only while a relationship reaches it, and ``[Content_Types].xml``
@@ -88,7 +89,8 @@ def remove_slides(prs: Any) -> None:
         if relationship.reltype in _EDITORS:
             prs.part.drop_rel(rid)
     _reset_core_properties(prs)
-    _run_no_custom_show(prs)
+    _show_every_slide(prs)
+    _forget_outline(prs)
     root = prs.part._element
     for shows in root.findall(qn("p:custShowLst")):
         root.remove(shows)
@@ -131,9 +133,10 @@ def _reset_core_properties(prs: Any) -> None:
     core.modified = now
 
 
-def _run_no_custom_show(prs: Any) -> None:
-    """Make the slide show run the whole deck: the deck has no custom show, so one the master's show names is gone.
+def _show_every_slide(prs: Any) -> None:
+    """Make the slide show run the whole deck: neither a custom show, as the deck has none, nor a range of slides.
 
+    A range numbers the master's slides, so the show could start at a slide the deck does not have.
     ``ppt/presProps.xml`` is a part python-pptx keeps as bytes; it is parsed, changed and written back.
 
     Args:
@@ -144,11 +147,35 @@ def _run_no_custom_show(prs: Any) -> None:
     except (KeyError, ValueError):  # none, or more than one
         return
     root = parse_xml(properties.blob)
-    shows = root.findall(f"{qn('p:showPr')}/{qn('p:custShow')}")
-    for show in shows:
-        show.getparent().remove(show)
-    if shows:
+    chosen = [*root.findall(f"{qn('p:showPr')}/{qn('p:custShow')}"), *root.findall(f"{qn('p:showPr')}/{qn('p:sldRg')}")]
+    for choice in chosen:
+        choice.getparent().remove(choice)
+    if chosen:
         properties.blob = serialize_part_xml(root)
+
+
+def _forget_outline(prs: Any) -> None:
+    """Leave out the outline view's list of the slides it collapses, with its links to them: they are the master's.
+
+    A slide that ``ppt/viewProps.xml`` still relates to would be saved, hidden, in the deck. That part is one
+    python-pptx keeps as bytes; it is parsed, changed and written back, and its relationships to slides dropped.
+
+    Args:
+        prs: The presentation, open.
+    """
+    try:
+        view = prs.part.part_related_by(RT.VIEW_PROPS)
+    except (KeyError, ValueError):  # none, or more than one
+        return
+    root = parse_xml(view.blob)
+    listed = root.findall(f"{qn('p:outlineViewPr')}/{qn('p:sldLst')}")
+    for slides in listed:
+        slides.getparent().remove(slides)
+    if listed:
+        view.blob = serialize_part_xml(root)
+    for rid, relationship in list(view.rels.items()):
+        if relationship.reltype == RT.SLIDE:
+            view.rels.pop(rid)
 
 
 def resolve(layouts: Sequence[Layout], wanted: int | str, slide: int) -> Layout:
