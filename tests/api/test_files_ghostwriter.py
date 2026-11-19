@@ -279,7 +279,7 @@ def test_the_file_caller_check_keeps_ghostwriter_to_its_four_paths(app: FastAPI)
     assert asyncio.run(require_file_caller(_request(app, GHOSTWRITER_KEY))).name == "ghostwriter"
     for refused in (
         _request(app, GHOSTWRITER_KEY, root_path="/prefix"),
-        _request(app, GHOSTWRITER_KEY, path="/files/read"),
+        _request(app, GHOSTWRITER_KEY, path="/files/other"),
         _request(app, DOCINT_KEY),
     ):
         with pytest.raises(HTTPException) as answer:

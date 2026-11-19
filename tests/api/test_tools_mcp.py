@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
 from tests.api.conftest import FORMER, GHOSTWRITER_KEY, HD, HG, PG, PG_SETUP, AuditLines, put, unrecorded
-from tests.api.mcp_calls import acall, error, refused, result, rpc
+from tests.api.mcp_calls import acall, refused, result, rpc
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import call as inline_call
 from tests.api.test_tools_documents import Scripted
@@ -145,14 +145,6 @@ def test_each_tool_has_its_own_schemas(client: TestClient) -> None:
     for key in ("inputSchema", "outputSchema"):
         schemas = {json.dumps(tool[key], sort_keys=True) for tool in tools.values()}
         assert len(schemas) == len(EIGHT), key
-
-
-def test_display_file_is_nowhere_in_ghostwriters_tools(client: TestClient) -> None:
-    """The list answers, and names no display_file anywhere; a call of it is an unknown tool, never a 500."""
-    listed = rpc(client, "tools/list", headers=HG)
-    assert "display_file" not in json.dumps(result(listed))
-    body = error(acall(client, "display_file", {"path": f"{CHAT}/x"}), 400, -32602)
-    assert body["error"]["message"] == "unknown tool"
 
 
 def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> None:

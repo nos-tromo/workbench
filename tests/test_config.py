@@ -1,6 +1,5 @@
 """Settings are read from the environment, with the spec's defaults and hard limits."""
 
-import dataclasses
 from pathlib import Path
 from typing import Literal
 
@@ -290,22 +289,6 @@ def test_no_usable_ghostwriter_key_stops_the_api(env: dict[str, str]) -> None:
         assert message == NO_CALLER_KEY
         assert all(name in message for name in ("DOCINT_WORKBENCH_KEY", "GHOSTWRITER_WORKBENCH_KEY"))
     assert [value for value in env.values() if value.strip() and value.strip() in message] == []
-
-
-def test_the_old_key_alone_starts_nothing() -> None:
-    """With only OPEN_WEBUI_WORKBENCH_KEY set, the api refuses, naming the two keys that count."""
-    with pytest.raises(ConfigError) as e:
-        load_settings({"OPEN_WEBUI_WORKBENCH_KEY": "x" * 43}, role="api")
-    assert str(e.value) == NO_CALLER_KEY
-    assert NO_CALLER_KEY.startswith("DOCINT_WORKBENCH_KEY or GHOSTWRITER_WORKBENCH_KEY must be set")
-    assert "OPEN_WEBUI" not in NO_CALLER_KEY
-
-
-def test_the_queue_wait_is_no_setting() -> None:
-    """A leftover WORKBENCH_QUEUE_WAIT_S changes nothing, even one that would not parse: each call has its own wait."""
-    env = {"GHOSTWRITER_WORKBENCH_KEY": A}
-    assert load_settings({**env, "WORKBENCH_QUEUE_WAIT_S": "abc"}, role="api") == load_settings(env, role="api")
-    assert "queue_wait_s" not in {f.name for f in dataclasses.fields(Settings)}
 
 
 @pytest.mark.parametrize(

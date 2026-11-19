@@ -42,7 +42,7 @@ def frozen(answer: dict[str, Any]) -> str:
 @pytest.mark.parametrize(("caller", "headers"), [("ghostwriter", HG), ("docint", HD)])
 @pytest.mark.parametrize("era", ["modern", "legacy"])
 def test_tools_list_is_frozen(client: TestClient, caller: str, headers: Headers, era: str) -> None:
-    """The MCP door lists each caller's tools exactly as it did before the terminal door went."""
+    """The MCP door lists each caller's tools exactly as the frozen files hold them."""
     version = MODERN if era == "modern" else LEGACY_DEFAULT
     served = frozen(result(rpc(client, "tools/list", version=version, headers=headers)))
     assert served == (GOLDEN / f"{caller}-{era}.json").read_text(encoding="utf-8")
