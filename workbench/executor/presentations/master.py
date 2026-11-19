@@ -55,6 +55,9 @@ DEFAULT_INSETS: Final = {"lIns": 91440, "rIns": 91440, "tIns": 45720, "bIns": 45
 _CHAR_WIDTH: Final = 0.5
 _LINE_HEIGHT: Final = 1.2
 
+#: How far apart, in EMU, the tops of places in one row may be (0.1 inch): they are read left to right.
+ROW_SPREAD: Final = 91440
+
 _LEVEL_ONE_SIZE: Final = f"{qn('p:txBody')}/{qn('a:lstStyle')}/{qn('a:lvl1pPr')}/{qn('a:defRPr')}"
 _BODY_PR: Final = f"{qn('p:txBody')}/{qn('a:bodyPr')}"
 
@@ -89,7 +92,8 @@ class Layout:
         layout: The python-pptx slide layout.
         title: Whether it has a title or centre title placeholder.
         subtitle: Whether it has a subtitle placeholder.
-        places: Its places in reading order: top, then left.
+        places: Its places in reading order: top, then left, places whose tops are at most :data:`ROW_SPREAD` apart
+            being one row.
         footer: Whether it has a date, footer or slide number placeholder that ``p:hf`` leaves on.
     """
 
@@ -166,16 +170,36 @@ def _layout(number: int, layout: Any, slide_master: Any) -> Layout:
         if role is not None:
             lines, chars = capacity(shape, layout, slide_master)
             places.append(Place(role=role, lines=lines, chars=chars, idx=placeholder.idx, shape=shape))
-    places.sort(key=lambda place: (place.shape.top or 0, place.shape.left or 0))
     return Layout(
         number=number,
         name=layout.name,
         layout=layout,
         title=bool(types & _TITLES),
         subtitle=PP_PLACEHOLDER.SUBTITLE in types,
-        places=tuple(places),
+        places=reading_order(places),
         footer=bool(types & shown_footers(layout, slide_master)),
     )
+
+
+def reading_order(places: list[Place]) -> tuple[Place, ...]:
+    """Put places in reading order: by rows from the top, each row from the left.
+
+    A row is the highest place left and every place whose top is at most :data:`ROW_SPREAD` below it, so places side by
+    side, a few EMU apart in height as a drawn layout has them, are read left to right.
+
+    Args:
+        places: The places of a layout.
+
+    Returns:
+        The places in reading order.
+    """
+    rows: list[list[Place]] = []
+    for place in sorted(places, key=lambda place: place.shape.top or 0):
+        if rows and (place.shape.top or 0) - (rows[-1][0].shape.top or 0) <= ROW_SPREAD:
+            rows[-1].append(place)
+        else:
+            rows.append([place])
+    return tuple(place for row in rows for place in sorted(row, key=lambda place: place.shape.left or 0))
 
 
 def shown_footers(layout: Any, slide_master: Any) -> frozenset[PP_PLACEHOLDER]:

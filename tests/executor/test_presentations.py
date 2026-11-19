@@ -160,6 +160,22 @@ def test_places_are_in_reading_order(job: Job) -> None:
     assert tops == sorted(tops)
 
 
+@pytest.mark.parametrize(("higher", "order"), [(5, [1, 2]), (91440, [1, 2]), (91441, [2, 1])])
+def test_places_side_by_side_are_one_row(job: Job, higher: int, order: list[int]) -> None:
+    """Places whose tops are at most 0.1 in apart are one row, read left to right; further apart, the higher first."""
+    mt.make_master(job.path("master.pptx"))
+
+    def change(prs: Any) -> None:
+        right = prs.slide_layouts[TWO_CONTENT - 1].placeholders.get(idx=2)
+        right.top -= higher
+
+    resaved(job.path("master.pptx"), change)
+    found = master.layouts(master.open_master(job.path("master.pptx"), job.ctx))[TWO_CONTENT - 1]
+    assert [place.idx for place in found.places] == order
+    (left,) = [place for place in found.places if place.idx == 1]
+    assert left.shape.top - next(place for place in found.places if place.idx == 2).shape.top == higher
+
+
 def test_layouts_sharing_a_name_are_both_listed(job: Job) -> None:
     """Two layouts of one name are listed apart, by number; a master without slides has none."""
     mt.make_master(job.path("master.pptx"), duplicate_name=True, examples=0)
@@ -771,6 +787,15 @@ def test_a_name_of_digits_is_a_name_before_a_number(job: Job) -> None:
     found = master.layouts(master.open_master(job.path("master.pptx"), job.ctx))
     assert deck.resolve(found, "2", 1).number == 7
     assert deck.resolve(found, 2, 1).number == 2
+
+
+def test_a_layout_name_is_matched_without_its_outer_spaces(job: Job) -> None:
+    """A layout named "Title Slide " is found by "title slide", and by the name with spaces of its own."""
+    resaved(mt.make_master(job.path("master.pptx")), lambda prs: setattr(prs.slide_layouts[0], "name", "Title Slide "))
+    found = master.layouts(master.open_master(job.path("master.pptx"), job.ctx))
+    for said in ("title slide", "Title Slide ", " TITLE SLIDE"):
+        assert deck.resolve(found, said, 1).number == TITLE_SLIDE
+    assert job.write([{"layout": "Title Slide", "title": "Invented"}])["slides"] == 1
 
 
 def test_notes_end_with_the_sources(job: Job) -> None:

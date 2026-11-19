@@ -179,7 +179,9 @@ def _forget_outline(prs: Any) -> None:
 
 
 def resolve(layouts: Sequence[Layout], wanted: int | str, slide: int) -> Layout:
-    """Find the layout a slide names: by number, or by name ignoring case; a name of digits that names none is a number.
+    """Find the layout a slide names: by number, or by name ignoring case and outer spaces.
+
+    A name of digits that names no layout is a number.
 
     Args:
         layouts: The master's layouts, numbered from 1.
@@ -193,7 +195,8 @@ def resolve(layouts: Sequence[Layout], wanted: int | str, slide: int) -> Layout:
         Refusal: No layout is so named or numbered, or two or more share the name (``invalid_value``).
     """
     if isinstance(wanted, str):
-        named = [layout for layout in layouts if layout.name.casefold() == wanted.casefold()]
+        key = wanted.strip().casefold()
+        named = [layout for layout in layouts if layout.name.strip().casefold() == key]
         if len(named) == 1:
             return named[0]
         if named:
