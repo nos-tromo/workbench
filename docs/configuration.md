@@ -36,10 +36,7 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
 
 The api needs at least one of the two keys, or it refuses to start; two
-callers with the same key stop the start too. A host whose `.env` sets only
-`OPEN_WEBUI_WORKBENCH_KEY` must set `GHOSTWRITER_WORKBENCH_KEY`,
-`DOCINT_WORKBENCH_KEY` or both: the old key is ignored (deploy's
-`docs/runbooks/retire-open-webui.md`).
+callers with the same key stop the start too.
 
 ### The caller key
 

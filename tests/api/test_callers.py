@@ -30,7 +30,7 @@ from workbench.api.auth import (
 from workbench.api.main import create_app
 from workbench.api.registry import WORKSPACE_TOOLS
 from workbench.api.store import Store
-from workbench.config import NO_CALLER_KEY, ConfigError, Settings, load_settings
+from workbench.config import NO_CALLER_KEY, ConfigError, Settings
 from workbench.models import Principal
 
 DOCINT = Caller("docint", DOCINT_KEY, frozenset({"run_python"}), files="inline", wall_s=60, slots=2)
@@ -46,77 +46,13 @@ NOT_FOUND = (404, {"detail": "not found"})
     [
         ("GET", "/files/list"),
         ("POST", "/files/upload"),
-        ("POST", "/tools/run_python"),
-        ("GET", "/openapi.json"),
-        ("GET", "/api/config"),
-        ("GET", "/api/v1/terminals/t/mcp"),
         ("GET", "/nowhere"),
     ],
 )
 def test_an_mcp_caller_finds_nothing_but_its_door(client: TestClient, method: str, path: str) -> None:
-    """With docint's key, no file route, no route that went and no path a proxy might forward is found."""
+    """With docint's key, no file route and no other path is found."""
     r = client.request(method, path, headers=HD)
     assert (r.status_code, r.json()) == NOT_FOUND
-
-
-#: A key set in ``OPEN_WEBUI_WORKBENCH_KEY``, which no caller holds any more.
-OLD_KEY = "o" * 43
-
-#: Every route a caller's key opened, and a path none serves: each answers the old key 401.
-KEYED = [
-    ("POST", "/mcp"),
-    ("GET", f"/files/list?directory={CHAT}"),
-    ("POST", f"/files/upload?directory={CHAT}"),
-    ("GET", f"/files/view?path={CHAT}/q.csv"),
-    ("DELETE", "/files/chat"),
-    ("GET", "/api/config"),
-    ("GET", "/files/cwd"),
-    ("GET", "/nowhere"),
-]
-
-
-def test_the_old_key_beside_ghostwriters_is_a_stranger(
-    settings: Settings, store: Store, audit: AuditLog, audit_lines: AuditLines
-) -> None:
-    """OPEN_WEBUI_WORKBENCH_KEY set beside Ghostwriter's: presenting it is 401 on /mcp and /files/list.
-
-    It is 401 on every path but ``/healthz`` and ``/metrics``, and nothing is recorded; Ghostwriter's key still opens
-    its door, and the registry holds Ghostwriter alone.
-    """
-    env = {
-        "OPEN_WEBUI_WORKBENCH_KEY": OLD_KEY,
-        "GHOSTWRITER_WORKBENCH_KEY": GHOSTWRITER_KEY,
-        "WORKBENCH_DATA_DIR": str(settings.data_dir),
-    }
-    both = load_settings(env, role="api")
-    assert [caller.name for caller in CallerRegistry.from_settings(both).callers] == ["ghostwriter"]
-    put(store, "q.csv", p=PG)
-    old = {**HG, "Authorization": f"Bearer {OLD_KEY}"}
-    with TestClient(create_app(both, store=store, audit=audit)) as client:
-        started = audit_lines()
-        for method, target in KEYED:
-            r = client.request(method, target, headers=old)
-            assert (r.status_code, r.json()) == (401, {"detail": "missing or invalid key"}), (method, target)
-        for path in ("/healthz", "/metrics"):
-            assert client.get(path, headers=old).status_code == 200, path
-        assert audit_lines() == started
-        assert client.get("/files/list", params={"directory": CHAT}, headers=HG).status_code == 200
-
-
-@pytest.mark.parametrize("path", ["/openapi.json", "/api/config", "/files/read", "/tools/run_python"])
-def test_a_removed_path_is_404_for_ghostwriter(
-    app: FastAPI, client: TestClient, audit_lines: AuditLines, path: str
-) -> None:
-    """A removed route answers 404 to Ghostwriter's key, and no tool event is written.
-
-    No route of the app serves the path any more, whichever caller's key comes with the request.
-    """
-    started = audit_lines()
-    for method in ("GET", "POST"):
-        r = client.request(method, path, params={"path": f"{CHAT}/q.csv"}, json={"code": "print(1)"}, headers=HG)
-        assert (r.status_code, r.json()) == NOT_FOUND, method
-    assert audit_lines() == started
-    assert path not in {route.path for route in iter_route_contexts(app.routes)}
 
 
 @pytest.mark.parametrize("path", ["/healthz", "/metrics"])
@@ -178,8 +114,8 @@ def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, 
     ("key", "path", "passes"),
     [
         (GHOSTWRITER_KEY, "/files/upload", True),
-        (GHOSTWRITER_KEY, "/files/read", False),
-        (GHOSTWRITER_KEY, "/tools/run_python", False),
+        (GHOSTWRITER_KEY, "/files/other", False),
+        (GHOSTWRITER_KEY, "/nowhere", False),
         (DOCINT_KEY, "/files/chat", False),
     ],
 )
@@ -274,9 +210,7 @@ def test_without_the_gate_every_keyed_route_refuses_docints_key(app: FastAPI) ->
 
 
 @pytest.mark.parametrize("headers", [HG, HD], ids=["ghostwriter", "docint"])
-@pytest.mark.parametrize(
-    ("method", "path"), [("GET", "/nowhere"), ("POST", "/tools/nothing"), ("GET", "/api/v1/policies")]
-)
+@pytest.mark.parametrize(("method", "path"), [("GET", "/nowhere"), ("POST", "/no/such/route"), ("GET", "/files/other")])
 def test_an_unrouted_path_answers_one_404_body_with_either_key(
     client: TestClient, headers: dict[str, str], method: str, path: str
 ) -> None:
@@ -303,7 +237,6 @@ def test_ghostwriters_user_id_with_docints_key_reaches_nothing(client: TestClien
         (DOCINT, "/mcp/", False),
         (DOCINT, "/files/list", False),
         (DOCINT, "/", False),
-        (DOCINT, "/api/v1/terminals/t/mcp", False),
     ],
 )
 def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: str, allowed: bool) -> None:
@@ -317,17 +250,7 @@ def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: s
         *[(GHOSTWRITER, path, True) for path in ["/mcp", "/files/upload", "/files/view", "/files/list", "/files/chat"]],
         *[
             (GHOSTWRITER, path, False)
-            for path in [
-                "/files/read",
-                "/files/delete",
-                "/files/mkdir",
-                "/files/move",
-                "/files/display",
-                "/files/cwd",
-                "/tools/list_files",
-                "/openapi.json",
-                "/api/config",
-            ]
+            for path in ["/files", "/files/", "/files/other", "/files/listing", "/mcp/", "/nowhere"]
         ],
         (DOCINT, "/files/chat", False),
         (DOCINT, "/files/upload", False),
@@ -397,9 +320,9 @@ def test_two_callers_with_one_key_stop_the_start(settings: Settings, taken: str)
     assert key not in str(refused.value)
 
 
-@pytest.mark.parametrize("tools", [frozenset({"display_file"}), frozenset({"list_files", "nowhere"})])
+@pytest.mark.parametrize("tools", [frozenset({"nowhere"}), frozenset({"list_files", "nowhere"})])
 def test_a_tool_ghostwriters_door_cannot_serve_stops_the_start(settings: Settings, tools: frozenset[str]) -> None:
-    """``display_file``, no tool any more, or another name no tool has on Ghostwriter's list stops the start.
+    """A name no tool has on Ghostwriter's list stops the start.
 
     The message names the variable and the tools it may list, never a name the variable was set to.
     """

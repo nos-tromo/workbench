@@ -154,7 +154,7 @@ What `criteria` and `target` hold depends on what is removed:
 | Orphans of one chat folder: files with no row, older than an hour | `rule: orphan`, `caller`, `owner`, `count` | `ids`: the file ids the names of interrupted uploads carry (`<id>.part`), never a name; `count`; `container: chat:<chat-id>` |
 
 A retention event's `caller` is the caller folder the files sit in, which can
-be a retired caller's, such as `open-webui`.
+be a retired caller's.
 
 Files that could not be removed are recorded again with `outcome: error` and
 the same criteria, `count` being how many stayed. They keep their rows and the

@@ -102,15 +102,11 @@ def test_headers_that_are_not_ascii_are_refused_not_crashed(client: TestClient) 
 @pytest.mark.parametrize(
     "path",
     [
-        "/api/terminals/user/output",
-        "/files/archive",
-        "/system/info",
-        "/files/search",
-        "/files/glob",
+        "/nowhere",
+        "/files/other",
         "/docs",
         "/redoc",
         "/openapi",
-        "/api/v1/policies",
     ],
 )
 def test_unknown_paths_are_not_found(client: TestClient, path: str) -> None:
@@ -121,7 +117,7 @@ def test_unknown_paths_are_not_found(client: TestClient, path: str) -> None:
 
 #: A path no route serves, a route's other method, and routes that read a JSON body.
 GATED = [
-    ("GET", "/files/archive"),
+    ("GET", "/files/other"),
     ("PUT", "/files/upload"),
     ("DELETE", "/files/list"),
     ("POST", "/mcp"),
