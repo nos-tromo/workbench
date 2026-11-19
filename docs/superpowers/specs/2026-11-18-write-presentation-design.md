@@ -24,6 +24,9 @@ reason, never an **(owner)** one.
    there (design).
 7. `write_presentation` is recorded as a `modify`, as `fill_template` is: it reads files of the
    chat (the master, images, sources) (design).
+8. A deck needs no master: without `path`, both tools use the plain master, python-pptx's own
+   (Office theme) widened to 16:9, and `inspect_template` without `path` lists its layouts, so
+   the flow is the same (owner, 2026-11-19).
 
 ## 2. The flow
 
@@ -64,7 +67,7 @@ slide master and names `write_presentation`.
 ## 4. `write_presentation`
 
 ```
-path: str                 the master (.pptx or .potx) as list_files gives it
+path: str                 the master (.pptx or .potx) as list_files gives it; left out: the plain master
 name: str                 the new file's name; .pptx is added if missing
 include_sources: bool     true by default
 slides: 1..30 of
@@ -81,6 +84,16 @@ slides: 1..30 of
 
 A realistic 15-slide deck measures about 6500 characters, about 2200 tokens by Ghostwriter's
 estimate, within its 4000-token answer cap (design).
+
+### The plain master
+
+Without `path`, the executor makes the master itself (`master.plain_master`): python-pptx's
+default presentation from the image, its two layouts of vertical text left out (nine remain:
+Title Slide, Title and Content, Section Header, Two Content, Comparison, Title Only, Blank,
+Content with Caption, Picture with Caption), every shape of its master and layouts widened from
+10 to 13.333 inches (16:9, the left edge and the width scaled). The job gets no master file, the
+event names none, and the deck goes to the request's chat. Its footer is empty and its date a
+field, so a deck shows only the slide numbers.
 
 ### Bounds (`workbench/decks.py`, shared by both sides as `tables.py` is)
 

@@ -36,7 +36,8 @@ record of processing and the impact assessment.
   ends with a table of the sources; the call can leave it out
   (`include_sources: false`).
 - **A deck's slides, sources and pictures.** `write_presentation` builds a deck
-  in the user's slide master from the slides the model wrote
+  in the user's slide master, or without one in the plain master, from the
+  slides the model wrote
   (`workbench/api/tools_presentations.py`). A slide's text, tables and chart
   values are file content, as are its speaker notes. Its sources go into the
   notes, after the model's own notes, under a line `Sources:`, one line a
@@ -53,6 +54,8 @@ record of processing and the impact assessment.
   subject, keywords, comments, category, author, last editor, identifier,
   status or version, it is revision 1, and it was made and modified when it was
   built. The master, the pictures and the files a source names are only read.
+  The plain master is python-pptx's own, read from the executor image: no file
+  of a chat is in it (`workbench/executor/presentations/master.py:plain_master`).
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
   checks, topic listings), which can hold special categories of data, with the

@@ -2,8 +2,8 @@
 
 The nos-tromo federation's shared tool tier. Ghostwriter users drop files into a
 chat; the model reads, searches and analyses them, fills report templates,
-builds presentations in a slide master and writes new tables and documents, all
-through workbench's typed tools. Every
+builds presentations in a slide master (or a plain one) and writes new tables
+and documents, all through workbench's typed tools. Every
 file is opened in a sandbox without network. Uploads, views, tool runs on
 files, new files and chat deletions are recorded in the federation's audit
 trail, by file id; listing files (`list_files` too) is not. Every file is

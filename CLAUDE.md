@@ -25,8 +25,8 @@ tools run on users' files, so that no app runs a code sandbox or office tooling
 of its own ("tool execution is shared, never embedded"). Ghostwriter connects
 through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
 reads and searches them, runs Python over them, inspects and fills report
-templates, builds presentations in a slide master, and writes tables and
-documents, through nine typed tools. Every file is recorded in the audit trail
+templates, builds presentations in a slide master (or a plain one), and writes
+tables and documents, through nine typed tools. Every file is recorded in the audit trail
 by id and deleted `WORKBENCH_RETENTION_DAYS` (7) days after it was made.
 docint, the second caller, comes in through the same door and runs Python over
 data that comes with the call.
@@ -118,12 +118,14 @@ in `tests/api/golden/`). The nine: `list_files`, `read_document`,
   its record.
 - `workbench/executor/presentations/`: what the runners of a slide master use.
   `master.py` reads the layouts and their places (`inspect_template`) and opens a
-  `.pptx` or `.potx`; `deck.py` removes the master's example slides and builds
-  the slides; `blocks.py` fills a place with a table, a chart or a picture;
-  `text.py` writes Markdown into a text frame. A deck keeps the master's theme,
-  layouts, media and core properties and none of its example slides, its
-  thumbnail or its `docProps/app.xml`; a master that links to its own slides is
-  refused (`invalid_template`).
+  `.pptx` or `.potx`, or makes the plain master (`plain_master`: python-pptx's
+  own, nine layouts, widened to 16:9) when the call names none; `deck.py` removes
+  the master's example slides and builds the slides; `blocks.py` fills a place
+  with a table, a chart or a picture; `text.py` writes Markdown into a text
+  frame. A deck keeps the master's theme, layouts and media, of its core
+  properties only the language, and none of its example slides, its thumbnail
+  or its `docProps/app.xml`; a master that links to its own slides is refused
+  (`invalid_template`).
   `workbench/executor/readers/ooxml.py` gives a template (`.dotx`, `.potx`) the
   content type of a document or a presentation so that a library opens it, and
   tells a macro-enabled presentation or a slide show, which are refused.
