@@ -8,25 +8,27 @@ import shutil
 import sqlite3
 import stat
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import override
 
 import pytest
 
-from tests.api.conftest import FORMER, PG, unrecorded
+from tests.api.conftest import FORMER, PG, PG_SETUP, unrecorded
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
     NotFound,
     QuotaExceeded,
+    RendersFull,
     StorageFull,
     Store,
     StoreError,
     TooLarge,
     new_file_id,
 )
-from workbench.models import DirEntry, FileRecord, Principal
+from workbench.models import DerivedRecord, DerivedRole, DerivedSpec, DirEntry, FileRecord, Principal
 from workbench.paths import PathError, Workspaces, check_filename
 
 MAX = 100
@@ -1380,3 +1382,739 @@ def test_an_upload_whose_record_fails_leaves_nothing(store: Store, alice: Princi
         )
     assert disk_names(workspaces.chat_dir(alice)) == []
     assert store.files_in_chat(alice) == []
+
+
+# --- derived files -------------------------------------------------------------------
+
+RENDER = b"synthetic render bytes"
+
+
+def spec(n: int = 1, meta: Mapping[str, object] | None = None, *, role: DerivedRole = "page") -> DerivedSpec:
+    """The spec of a render of the page ``n``."""
+    return DerivedSpec(role, n, "image/jpeg", 10, 20, {} if meta is None else meta)
+
+
+def staged(tmp_path: Path, data: bytes = RENDER, name: str = "render.jpg") -> Path:
+    """Stage a render the way the executor stages an output, each in a staging folder of its own."""
+    return stage(tmp_path, new_file_id(), name, data)
+
+
+def derive(
+    store: Store,
+    tmp_path: Path,
+    source: FileRecord,
+    n: int = 1,
+    *,
+    data: bytes = RENDER,
+    meta: Mapping[str, object] | None = None,
+    quota_bytes: int = 10**9,
+    cap_bytes: int = 10**9,
+) -> DerivedRecord:
+    """Register one render of ``source`` with roomy limits."""
+    return store.register_derived(
+        source,
+        staged(tmp_path, data),
+        spec(n, meta),
+        file_id=new_file_id(),
+        quota_bytes=quota_bytes,
+        cap_bytes=cap_bytes,
+    )
+
+
+def every_derived(store: Store) -> list[DerivedRecord]:
+    """Every render the store holds, whoever's, as retention's stray pass would list them at the end of time."""
+    return store.due_derived(float("inf"), 10**6)
+
+
+def derived_folder(workspaces: Workspaces, p: Principal) -> Path:
+    """The chat's reserved folder, ``.derived``."""
+    return workspaces.chat_dir(p) / ".derived"
+
+
+def test_derived_files_live_under_their_source_and_carry_its_time(
+    store: Store, alice: Principal, workspaces: Workspaces, clock: Clock, tmp_path: Path
+) -> None:
+    """The file is ``.derived/<source id>/<file id>.jpg`` below the chat folder, private, and as old as its source."""
+    source = put(store, alice)
+    clock.now += 500
+    file_id = new_file_id()
+    rec = store.register_derived(
+        source,
+        staged(tmp_path),
+        DerivedSpec("page", 3, "image/jpeg", 10, 20, {"strip": 1, "strips": 2}),
+        file_id=file_id,
+        quota_bytes=QUOTA,
+    )
+    real = workspaces.chat_dir(alice) / ".derived" / source.id / f"{file_id}.jpg"
+    assert real.read_bytes() == RENDER
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    assert stat.S_IMODE(real.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(real.parent.parent.stat().st_mode) == 0o700
+    assert rec == DerivedRecord(
+        id=file_id,
+        source_id=source.id,
+        caller="ghostwriter",
+        user_id="user-a",
+        chat_id="chat-1",
+        role="page",
+        ordinal=3,
+        name=f"{file_id}.jpg",
+        size=len(RENDER),
+        mime="image/jpeg",
+        width=10,
+        height=20,
+        meta={"strip": 1, "strips": 2},
+        created_at=source.created_at,
+    )
+    assert rec.created_at != clock.now
+    assert rec.relative_path == f".derived/{source.id}/{file_id}.jpg"
+    assert (rec.strip, rec.strips) == (1, 2)
+    assert store.derived_of(source) == [rec]
+
+
+def test_a_derived_png_is_a_png_and_another_type_is_refused(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """The extension follows the type; a type that is no render is a path error and the staged file stays."""
+    source = put(store, alice)
+    png = store.register_derived(
+        source,
+        staged(tmp_path, name="render.png"),
+        DerivedSpec("image", 1, "image/png", 5, 5, {}),
+        file_id=new_file_id(),
+        quota_bytes=QUOTA,
+    )
+    assert (png.name.endswith(".png"), png.mime) == (True, "image/png")
+    odd = staged(tmp_path, name="render.gif")
+    with pytest.raises(PathError):
+        store.register_derived(
+            source, odd, DerivedSpec("page", 2, "image/gif", 5, 5, {}), file_id=new_file_id(), quota_bytes=QUOTA
+        )
+    assert odd.exists()
+    assert store.derived_of(source) == [png]
+
+
+def test_a_derived_file_needs_its_source(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A source that was removed takes no render, and the staged file stays."""
+    source = put(store, alice)
+    store.remove(source)
+    render = staged(tmp_path)
+    with pytest.raises(NotFound):
+        store.register_derived(source, render, spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    assert render.exists()
+    assert not derived_folder(workspaces, alice).exists()
+    assert every_derived(store) == []
+
+
+def test_a_derived_file_needs_its_sources_own_owner_and_chat(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """A record that names another owner or chat than its row has is not the source."""
+    source = put(store, alice)
+    for forged in (
+        dataclasses.replace(source, user_id="user-b"),
+        dataclasses.replace(source, caller="former-caller"),
+        dataclasses.replace(source, chat_id="chat-2"),
+    ):
+        render = staged(tmp_path)
+        with pytest.raises(NotFound):
+            store.register_derived(forged, render, spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+        assert render.exists()
+        assert store.derived_of(forged) == []
+    assert every_derived(store) == []
+
+
+def test_a_deleted_chat_takes_no_derived_file(store: Store, tmp_path: Path) -> None:
+    """After the chat's delete the source is gone, and so is any place for a render."""
+    source = put(store, PG)
+    store.delete_chat(PG, lambda ids, outcome: None)
+    render = staged(tmp_path)
+    with pytest.raises(NotFound):
+        store.register_derived(source, render, spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    assert render.exists()
+
+
+def test_a_held_chat_takes_no_derived_file(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """A chat held as deleted is refused even where a source row is still there: the hold is checked under the lock."""
+    source = put(store, alice)
+    store._deleted[(alice.caller, alice.user_id, alice.chat_id)] = store._monotonic() + 100
+    render = staged(tmp_path)
+    with pytest.raises(NotFound):
+        store.register_derived(source, render, spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    assert render.exists()
+
+
+def test_a_source_holds_at_most_its_cap_of_renders(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """Renders past the cap are refused with their own error and stay staged; one that fits exactly is kept."""
+    source = put(store, alice)
+    first = derive(store, tmp_path, source, 1, data=b"x" * 8, cap_bytes=10)
+    over = staged(tmp_path, b"y" * 4)
+    with pytest.raises(RendersFull, match="the renders of this file are at their limit"):
+        store.register_derived(source, over, spec(2), file_id=new_file_id(), quota_bytes=QUOTA, cap_bytes=10)
+    assert over.exists()
+    assert issubclass(RendersFull, store_module.StoreError)
+    last = derive(store, tmp_path, source, 3, data=b"z" * 2, cap_bytes=10)
+    assert store.derived_of(source) == [first, last]
+    other = put(store, alice, "other.pdf")
+    assert derive(store, tmp_path, other, 1, data=b"w" * 10, cap_bytes=10).size == 10  # the cap is each source's own
+
+
+def test_renders_count_against_the_quota(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """The user's usage grows by a render's size; a render past the quota is refused and stays staged."""
+    source = put(store, alice)
+    assert store.usage(alice) == 10
+    rec = derive(store, tmp_path, source, 1, data=b"x" * 7, quota_bytes=20)
+    assert store.usage(alice) == 17
+    over = staged(tmp_path, b"y" * 4)
+    with pytest.raises(QuotaExceeded):
+        store.register_derived(source, over, spec(2), file_id=new_file_id(), quota_bytes=20)
+    assert over.exists()
+    assert store.usage(alice) == 17
+    derive(store, tmp_path, source, 2, data=b"z" * 3, quota_bytes=20)
+    assert store.usage(alice) == 20
+    store.remove_derived(rec)
+    assert store.usage(alice) == 13
+
+
+def test_renders_leave_the_quota_of_other_users_alone(
+    store: Store, alice: Principal, bob: Principal, tmp_path: Path
+) -> None:
+    """Usage is the user's own, renders included."""
+    derive(store, tmp_path, put(store, alice), data=b"x" * 7)
+    assert (store.usage(alice), store.usage(bob)) == (17, 0)
+
+
+def test_an_upload_counts_the_renders_in_its_room(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """An upload that would fit without the renders does not fit with them."""
+    derive(store, tmp_path, put(store, alice), data=b"x" * 50)
+    with pytest.raises(QuotaExceeded):
+        store.add_upload(
+            alice,
+            "/workspace/chat-1",
+            "b.bin",
+            io.BytesIO(b"y" * 41),
+            max_bytes=MAX,
+            quota_bytes=100,
+            record=unrecorded,
+        )
+    store.add_upload(
+        alice, "/workspace/chat-1", "b.bin", io.BytesIO(b"y" * 40), max_bytes=MAX, quota_bytes=100, record=unrecorded
+    )
+
+
+def test_the_same_render_is_refused_twice(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """One role, ordinal, strip and strips make one render; a strip not made yet, or another page, is kept."""
+    source = put(store, alice)
+    first = derive(store, tmp_path, source, 1, meta={"strip": 1, "strips": 2})
+    duplicate = staged(tmp_path)
+    with pytest.raises(Conflict):
+        store.register_derived(
+            source, duplicate, spec(1, {"strip": 1, "strips": 2}), file_id=new_file_id(), quota_bytes=QUOTA
+        )
+    assert duplicate.exists()
+    second = derive(store, tmp_path, source, 1, meta={"strip": 2, "strips": 2})
+    page = derive(store, tmp_path, source, 2, meta={"strip": 1, "strips": 2})
+    assert store.derived_of(source) == [first, second, page]
+
+
+def test_a_missing_strip_is_the_first_of_one(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """``meta`` without ``strip`` and ``strips`` is the whole page: the same as ``strip: 1, strips: 1``."""
+    source = put(store, alice)
+    whole = derive(store, tmp_path, source, 1)
+    assert (whole.strip, whole.strips) == (1, 1)
+    with pytest.raises(Conflict):
+        derive(store, tmp_path, source, 1, meta={"strip": 1, "strips": 1})
+    assert derive(store, tmp_path, source, 1, meta={"strip": 1, "strips": 3}).strips == 3
+
+
+def test_the_same_role_and_ordinal_of_another_source_is_no_conflict(
+    store: Store, alice: Principal, tmp_path: Path
+) -> None:
+    """A source's renders are its own."""
+    one, two = put(store, alice, "a.pdf"), put(store, alice, "b.pdf")
+    derive(store, tmp_path, one, 1)
+    derive(store, tmp_path, two, 1)
+    assert (len(store.derived_of(one)), len(store.derived_of(two))) == (1, 1)
+
+
+def test_a_render_id_is_used_once(store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path) -> None:
+    """A second render under an id a row has is refused, and the first one's file is not touched."""
+    source = put(store, alice)
+    first = derive(store, tmp_path, source, 1)
+    clash = staged(tmp_path, b"other")
+    with pytest.raises(Conflict):
+        store.register_derived(source, clash, spec(2), file_id=first.id, quota_bytes=QUOTA)
+    assert clash.exists()
+    real = workspaces.chat_dir(alice) / first.relative_path
+    assert real.read_bytes() == RENDER
+    assert store.derived_of(source) == [first]
+
+
+def test_a_staged_render_is_checked_as_an_output_is(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """A link or a folder is no render, a missing file is not found, and an id is 32 lowercase hex digits."""
+    source = put(store, alice)
+    target = tmp_path / "elsewhere.jpg"
+    target.write_bytes(b"x")
+    link = tmp_path / "data" / "staging" / "j" / "link.jpg"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(target)
+    folder = tmp_path / "data" / "staging" / "j" / "folder.jpg"
+    folder.mkdir()
+    for bad in (link, folder):
+        with pytest.raises(PathError):
+            store.register_derived(source, bad, spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    with pytest.raises(NotFound):
+        store.register_derived(source, tmp_path / "missing.jpg", spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    with pytest.raises(ValueError, match="32 lowercase hex"):
+        store.register_derived(source, staged(tmp_path), spec(), file_id="../x", quota_bytes=QUOTA)
+    assert target.read_bytes() == b"x"
+    assert every_derived(store) == []
+
+
+def test_a_render_that_cannot_be_inserted_leaves_no_file(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file is renamed first and the row follows; a row that fails takes the file back out."""
+    source = put(store, alice)
+
+    def refuse(*_: object) -> None:
+        raise sqlite3.OperationalError("synthetic failure")
+
+    monkeypatch.setattr(store, "_insert_derived", refuse)
+    with pytest.raises(sqlite3.OperationalError):
+        derive(store, tmp_path, source)
+    assert not any(path.is_file() for path in derived_folder(workspaces, alice).rglob("*"))
+
+
+def test_the_reserved_name_is_refused(store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path) -> None:
+    """No upload or output takes the name of the folder the renders are in, in any case."""
+    for name in (".derived", ".Derived", ".DERIVED"):
+        with pytest.raises(PathError, match="invalid file name"):
+            put(store, alice, name)
+        job = store.add_job(alice, "run_python")
+        with pytest.raises(PathError, match="invalid file name"):
+            store.register_output(
+                alice, stage(tmp_path, job.id, "o.bin"), name, job.id, file_id=new_file_id(), quota_bytes=10**6
+            )
+    assert store.files_in_chat(alice) == []
+
+
+@pytest.mark.parametrize("confined", [True, False])
+@pytest.mark.parametrize(
+    "below",
+    ["", "/{source}", "/{source}/{name}", "/../.derived", "/./sub/../.derived/{source}", "/{source}/../{source}"],
+)
+def test_the_reserved_folder_is_not_found_for_everyone(
+    store: Store, workspaces: Workspaces, tmp_path: Path, confined: bool, below: str
+) -> None:
+    """``get``, ``open_file``, ``list_dir``, ``mkdir`` and an upload's folder never reach ``.derived``."""
+    p = dataclasses.replace(PG_SETUP, confined=confined)
+    source = put(store, PG_SETUP)
+    rec = derive(store, tmp_path, source)
+    path = "/workspace/chat-1/.derived" + below.format(source=source.id, name=rec.name)
+    assert (derived_folder(workspaces, p) / source.id / rec.name).is_file()  # it is there; it is not reachable
+    with pytest.raises(NotFound):
+        store.get(p, path)
+    with pytest.raises(NotFound):
+        store.open_file(p, path)
+    with pytest.raises(NotFound):
+        store.list_dir(p, path)
+    with pytest.raises(NotFound):
+        store.mkdir(p, path)
+    with pytest.raises(NotFound):
+        store.add_upload(p, path, "q.txt", io.BytesIO(b"x"), max_bytes=MAX, quota_bytes=QUOTA, record=unrecorded)
+    assert disk_names(derived_folder(workspaces, p) / source.id) == [rec.name]
+
+
+def test_the_reserved_name_is_refused_below_the_chat_too(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """A folder named ``.derived`` anywhere below a chat is not made and not found; the other names are."""
+    store.mkdir(alice, "/workspace/chat-1/sub")
+    for path in ("/workspace/chat-1/sub/.derived", "/workspace/chat-1/sub/.Derived/x"):
+        with pytest.raises(NotFound):
+            store.mkdir(alice, path)
+    assert disk_names(workspaces.chat_dir(alice)) == ["sub"]
+    assert store.mkdir(alice, "/workspace/chat-1/sub/derived") == "/workspace/chat-1/sub/derived"
+
+
+def test_derived_files_are_hidden(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """The chat's listing, its files and the root's listing know nothing of the renders."""
+    source = put(store, alice)
+    derive(store, tmp_path, source)
+    assert [entry.name for entry in store.list_dir(alice, "/workspace/chat-1")] == [source.name]
+    assert [entry.name for entry in store.list_dir(alice, "/workspace")] == ["chat-1"]
+    assert store.files_in_chat(alice) == [source]
+    assert store.count_files() == 1
+
+
+def test_the_reserved_folder_is_left_out_wherever_it_is_listed(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """A ``.derived`` that exists on disk below a folder, however it came, is not listed either."""
+    store.mkdir(alice, "/workspace/chat-1/sub")
+    (workspaces.chat_dir(alice) / "sub" / ".derived").mkdir()
+    assert store.list_dir(alice, "/workspace/chat-1/sub") == []
+
+
+def test_derived_for_gives_every_row_of_the_sources_and_no_other(
+    store: Store, alice: Principal, bob: Principal, tmp_path: Path
+) -> None:
+    """The rows of several sources at once, each by its own owner and chat."""
+    one, two, theirs = put(store, alice, "a.pdf"), put(store, alice, "b.pdf"), put(store, bob, "a.pdf")
+    rows = [derive(store, tmp_path, one, 1), derive(store, tmp_path, one, 2), derive(store, tmp_path, two, 1)]
+    derive(store, tmp_path, theirs, 1)
+    assert store.derived_for([]) == []
+    assert sorted(store.derived_for([one, two]), key=lambda r: r.id) == sorted(rows, key=lambda r: r.id)
+    assert store.derived_for([one]) == store.derived_of(one) == rows[:2]
+    assert store.derived_for([dataclasses.replace(theirs, user_id="user-a")]) == []
+    assert [r.source_id for r in store.derived_for([theirs])] == [theirs.id]
+
+
+def test_derived_of_is_ordered_by_role_ordinal_and_strips(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """Whatever the order they were made in."""
+    source = put(store, alice)
+    keys: list[tuple[DerivedRole, int, int, int]] = [
+        ("page", 2, 1, 1),
+        ("page", 1, 2, 2),
+        ("page", 1, 2, 1),
+        ("image", 5, 1, 1),
+        ("page", 1, 1, 1),
+    ]
+    made = {
+        key: store.register_derived(
+            source,
+            staged(tmp_path),
+            spec(key[1], {"strip": key[3], "strips": key[2]}, role=key[0]),
+            file_id=new_file_id(),
+            quota_bytes=QUOTA,
+        )
+        for key in keys
+    }
+    ordered: list[tuple[DerivedRole, int, int, int]] = [
+        ("image", 5, 1, 1),
+        ("page", 1, 1, 1),
+        ("page", 1, 2, 1),
+        ("page", 1, 2, 2),
+        ("page", 2, 1, 1),
+    ]
+    assert store.derived_of(source) == [made[key] for key in ordered]
+
+
+def test_open_derived_opens_what_open_file_would(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """The bytes of a render; a link, a missing file or a render whose source is gone is not found."""
+    source = put(store, alice)
+    rec = derive(store, tmp_path, source)
+    with store.open_derived(rec) as src:
+        assert src.read() == RENDER
+    real = workspaces.chat_dir(alice) / rec.relative_path
+    with pytest.raises(NotFound):
+        store.open_derived(dataclasses.replace(rec, chat_id="chat-2"))
+    with pytest.raises(NotFound):
+        store.open_derived(dataclasses.replace(rec, user_id="user-b"))
+    real.unlink()
+    with pytest.raises(NotFound):
+        store.open_derived(rec)
+    target = tmp_path / "elsewhere.jpg"
+    target.write_bytes(b"secret")
+    real.symlink_to(target)
+    with pytest.raises((NotFound, PathError)):
+        store.open_derived(rec)
+
+
+def test_open_derived_needs_the_source_to_be_there(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """A render whose source went, and whose row stayed, is a stray: nobody is served it."""
+    source = put(store, alice)
+    rec = derive(store, tmp_path, source)
+    store.remove(source)
+    with pytest.raises(NotFound):
+        store.open_derived(rec)
+    assert store.due_derived(0) == [rec]
+
+
+def test_a_chat_delete_names_and_takes_its_derived_files(store: Store, workspaces: Workspaces, tmp_path: Path) -> None:
+    """The record gets the files' ids and then the renders'; the renders' rows and folder go with the chat's."""
+    p2 = dataclasses.replace(PG, chat_id="chat-2")
+    source, other = put(store, PG), put(store, p2, directory="/workspace/chat-2")
+    rec = derive(store, tmp_path, source)
+    theirs = derive(store, tmp_path, other)
+    seen: list[tuple[list[str], str, list[str]]] = []
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        seen.append((list(ids), outcome, [r.id for r in every_derived(store)]))
+
+    assert store.delete_chat(PG, record) == 1
+    assert seen == [([source.id, rec.id], "ok", sorted([rec.id, theirs.id]))]
+    assert every_derived(store) == [theirs]
+    assert not (workspaces.user_root(PG) / "chat-1").exists()
+    assert store.derived_of(other) == [theirs]
+    assert (workspaces.user_root(PG) / "chat-2" / theirs.relative_path).is_file()
+
+
+def test_a_chat_delete_takes_the_strays_of_the_chat_too(store: Store, tmp_path: Path) -> None:
+    """A render whose source is already gone is still the chat's, and goes with it, named in the record."""
+    source = put(store, PG)
+    rec = derive(store, tmp_path, source)
+    store.remove(source)
+    seen: list[list[str]] = []
+    assert store.delete_chat(PG, lambda ids, outcome: seen.append(list(ids))) == 0
+    assert seen == [[rec.id]]
+    assert every_derived(store) == []
+
+
+def test_a_chat_delete_that_fails_names_the_renders_again(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same ids, the renders' included, are recorded again as an error."""
+    source = put(store, PG)
+    rec = derive(store, tmp_path, source)
+    seen: list[tuple[list[str], str]] = []
+
+    def refuse(*_: object, **__: object) -> None:
+        raise OSError("synthetic removal failure")
+
+    monkeypatch.setattr(shutil, "rmtree", refuse)
+    with pytest.raises(OSError, match="synthetic removal failure"):
+        store.delete_chat(PG, lambda ids, outcome: seen.append((list(ids), outcome)))
+    assert seen == [([source.id, rec.id], "ok"), ([source.id, rec.id], "error")]
+
+
+def test_remove_takes_the_named_derived_files_and_the_source_together(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """The renders' files, the source's file and every named row go; the empty folders after them."""
+    source = put(store, alice)
+    renders = [derive(store, tmp_path, source, n) for n in (1, 2)]
+    store.remove(source, renders)
+    assert every_derived(store) == []
+    assert store.files_in_chat(alice) == []
+    assert disk_names(workspaces.chat_dir(alice)) == []
+    assert store.usage(alice) == 0
+
+
+def test_remove_takes_only_the_named_derived_files(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A render not named stays, row and file; retention's stray pass finds it, its source being gone."""
+    source = put(store, alice)
+    named, unnamed = derive(store, tmp_path, source, 1), derive(store, tmp_path, source, 2)
+    store.remove(source, [named])
+    folder = derived_folder(workspaces, alice) / source.id
+    assert disk_names(folder) == [unnamed.name]
+    assert every_derived(store) == [unnamed]
+    assert store.due_derived(0) == [unnamed]
+    store.remove_derived(unnamed)
+    assert every_derived(store) == []
+    assert not derived_folder(workspaces, alice).exists()
+
+
+def test_remove_never_takes_a_render_of_another_file_or_user(
+    store: Store, alice: Principal, bob: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A render named with the wrong source stays; so does one the record's owner does not own."""
+    one, two, theirs = put(store, alice, "a.pdf"), put(store, alice, "b.pdf"), put(store, bob, "a.pdf")
+    mine = derive(store, tmp_path, one)
+    other = derive(store, tmp_path, two)
+    stranger = derive(store, tmp_path, theirs)
+    store.remove(one, [mine, other, stranger])
+    assert sorted(r.id for r in every_derived(store)) == sorted([other.id, stranger.id])
+    assert (workspaces.chat_dir(alice) / other.relative_path).is_file()
+    assert (workspaces.chat_dir(bob) / stranger.relative_path).is_file()
+
+
+def test_remove_of_a_source_already_gone_still_takes_the_renders_it_names(
+    store: Store, alice: Principal, tmp_path: Path
+) -> None:
+    """A second delete of one file, naming renders the first left, takes them."""
+    source = put(store, alice)
+    rec = derive(store, tmp_path, source)
+    store.remove(source)
+    store.remove(source, [rec])
+    assert every_derived(store) == []
+
+
+def test_remove_derived_is_one_render_and_idempotent(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """One render's file and row go, the others and the source stay; a second call is fine."""
+    source = put(store, alice)
+    first, second = derive(store, tmp_path, source, 1), derive(store, tmp_path, source, 2)
+    store.remove_derived(first)
+    store.remove_derived(first)
+    assert store.derived_of(source) == [second]
+    assert store.files_in_chat(alice) == [source]
+    assert not (workspaces.chat_dir(alice) / first.relative_path).exists()
+    assert (workspaces.chat_dir(alice) / second.relative_path).is_file()
+
+
+def test_remove_refuses_a_path_that_is_now_a_link_and_deletes_nothing(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A folder of renders swapped for a link is never followed; the source and its rows stay."""
+    source = put(store, alice)
+    rec = derive(store, tmp_path, source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / rec.name).write_bytes(b"not a render")
+    folder = derived_folder(workspaces, alice) / source.id
+    (folder / rec.name).unlink()
+    folder.rmdir()
+    folder.symlink_to(elsewhere)
+    with pytest.raises(PathError):
+        store.remove(source, [rec])
+    assert (elsewhere / rec.name).read_bytes() == b"not a render"
+    assert store.files_in_chat(alice) == [source]
+    assert every_derived(store) == [rec]
+    assert (workspaces.chat_dir(alice) / source.name).is_file()
+
+
+def test_due_derived_lists_by_age_or_by_a_source_that_is_gone(
+    store: Store, alice: Principal, clock: Clock, tmp_path: Path
+) -> None:
+    """In ``(created_at, id)`` order, paged by ``after`` and ``limit``."""
+    clock.now = 1000.0
+    old = put(store, alice, "old.pdf")
+    clock.now = 3000.0
+    new = put(store, alice, "new.pdf")
+    gone = put(store, alice, "gone.pdf")
+    renders = {name: [derive(store, tmp_path, src, n) for n in (1, 2)] for name, src in (("old", old), ("new", new))}
+    stray = derive(store, tmp_path, gone)
+    store.remove(gone)
+    assert store.due_derived(2000.0) == [
+        *sorted(renders["old"], key=lambda r: r.id),
+        stray,
+    ]  # a stray is due at any age
+    due = store.due_derived(3001.0)
+    assert due == sorted([*renders["old"], *renders["new"], stray], key=lambda r: (r.created_at, r.id))
+    assert store.due_derived(500.0) == [stray]
+    page = store.due_derived(3001.0, 2)
+    assert page == due[:2]
+    assert store.due_derived(3001.0, 2, after=(page[-1].created_at, page[-1].id)) == due[2:4]
+    assert store.due_derived(3001.0, 10, after=(due[-1].created_at, due[-1].id)) == []
+
+
+def test_the_orphan_sweep_keeps_derived_files_and_names_orphans_by_id(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A render with its row stays; one without is removed and recorded by the id its name carries."""
+    source = put(store, alice)
+    kept = derive(store, tmp_path, source)
+    chat = workspaces.chat_dir(alice)
+    lost_id = new_file_id()
+    lost = chat / ".derived" / source.id / f"{lost_id}.jpg"
+    lost.write_bytes(b"x")
+    loose = chat / f"{new_file_id()}.jpg"  # no row, and not in the reserved folder: no id to name
+    loose.write_bytes(b"x")
+    seen: list[tuple[str, list[str], int, str]] = []
+
+    def record(chat_id: str, ids: Sequence[str], count: int, outcome: str) -> None:
+        seen.append((chat_id, list(ids), count, outcome))
+
+    outcome = store.sweep_user(
+        "ghostwriter",
+        "user-a",
+        untouched_before=time.time() + 3600,
+        device=os.stat(tmp_path / "data").st_dev,
+        record=record,
+    )
+    assert outcome == (2, 0)
+    assert seen == [("chat-1", [lost_id], 2, "ok")]
+    assert not lost.exists()
+    assert (chat / kept.relative_path).is_file()
+    assert (chat / source.name).is_file()
+    assert store.derived_of(source) == [kept]
+
+
+def test_the_sweep_names_a_render_by_its_id_only_in_its_own_folder(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A file under ``.derived`` that is not ``<source id>/<id>.<ext>`` carries no id."""
+    source = put(store, alice)
+    derive(store, tmp_path, source)
+    chat = workspaces.chat_dir(alice)
+    (chat / ".derived" / "not-a-source").mkdir()
+    (chat / ".derived" / "not-a-source" / f"{new_file_id()}.jpg").write_bytes(b"x")
+    (chat / ".derived" / f"{new_file_id()}.jpg").write_bytes(b"x")
+    (chat / ".derived" / source.id / "notes.jpg").write_bytes(b"x")
+    part_id = new_file_id()
+    (chat / ".derived" / source.id / f"{part_id}.part").write_bytes(b"x")
+    seen: list[tuple[list[str], int]] = []
+    removed, failed = store.sweep_user(
+        "ghostwriter",
+        "user-a",
+        untouched_before=time.time() + 3600,
+        device=os.stat(tmp_path / "data").st_dev,
+        record=lambda chat_id, ids, count, outcome: seen.append((list(ids), count)),
+    )
+    assert (removed, failed) == (4, 0)
+    assert seen == [([part_id], 4)]
+
+
+def test_the_sweep_removes_the_empty_folders_of_renders_that_are_gone(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """``.derived/<source id>`` and ``.derived`` are folders like any other once they are empty and old."""
+    source = put(store, alice)
+    rec = derive(store, tmp_path, source)
+    (workspaces.chat_dir(alice) / rec.relative_path).unlink()
+    store.sweep_user(
+        "ghostwriter",
+        "user-a",
+        untouched_before=time.time() + 3600,
+        device=os.stat(tmp_path / "data").st_dev,
+        record=unrecorded,
+    )
+    assert not derived_folder(workspaces, alice).exists()
+
+
+def test_summarize_due_counts_derived_files(store: Store, alice: Principal, clock: Clock, tmp_path: Path) -> None:
+    """The dry run's counts: renders as old as their sources are due with them."""
+    clock.now = 1000.0
+    old = put(store, alice, "old.pdf")
+    clock.now = 3000.0
+    new = put(store, alice, "new.pdf")
+    derive(store, tmp_path, old)
+    derive(store, tmp_path, new)
+    database = tmp_path / "data" / "workbench.db"
+    summary = store_module.summarize_due(database, 2000.0)
+    assert summary["derived"] == store_module.DueSummary(due=1, oldest=1000.0, newest=1000.0, kept=1)
+    assert summary["upload"].due == 1
+    assert store_module.summarize_due(database, 0.0)["derived"] == store_module.DueSummary(0, None, None, 2)
+
+
+def test_summarize_due_counts_a_stray_as_due(store: Store, alice: Principal, clock: Clock, tmp_path: Path) -> None:
+    """A render whose source is gone is due whatever its age, as ``due_derived`` lists it."""
+    source = put(store, alice)
+    derive(store, tmp_path, source)
+    store.remove(source)
+    summary = store_module.summarize_due(tmp_path / "data" / "workbench.db", 0.0)
+    assert summary["derived"].due == 1
+    assert "upload" not in summary
+
+
+def test_an_existing_database_gains_the_derived_table(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """A database made before renders has no such table: opening it adds one, and the dry run reads it as it is."""
+    database = tmp_path / "data" / "workbench.db"
+    put(store, alice)
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute("DROP TABLE derived")
+        conn.commit()
+    finally:
+        conn.close()
+    summary = store_module.summarize_due(database, 2_000_000.0)
+    assert summary["upload"].due == 1
+    assert "derived" not in summary
+    reopened = Store(database, Workspaces(tmp_path / "data"))
+    source = reopened.files_in_chat(alice)[0]
+    assert derive(reopened, tmp_path, source).source_id == source.id
+
+
+def test_image_types_are_known() -> None:
+    """The picture types a render is made from have their own, whatever the host's ``mime.types`` says."""
+    assert store_module._mime("a.webp") == "image/webp"
+    assert store_module._mime("a.bmp") == "image/bmp"
+    assert store_module._mime("a.tif") == "image/tiff"
+    assert store_module._mime("a.TIFF") == "image/tiff"
+    assert store_module._mime("a.heic") == "image/heic"
+    assert store_module._mime("a.HEIF") == "image/heif"

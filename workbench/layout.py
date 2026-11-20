@@ -17,3 +17,7 @@ JOBS: Final = "jobs"
 
 #: The api's database, in the volume's root.
 DATABASE: Final = "workbench.db"
+
+#: The folder of a chat that holds the renders of its files, ``<chat-id>/.derived/<source-id>/<render>``; the api's. The
+#: name is reserved: no upload, output or folder takes it, and no path of a caller reaches it.
+DERIVED: Final = ".derived"

@@ -16,6 +16,7 @@ def test_the_api_and_the_executor_find_the_layout_by_the_same_names() -> None:
         "jobs",
         "workbench.db",
     )
+    assert layout.DERIVED == ".derived"  # the chat's folder of renders; the store reserves the name
     assert jobs.STAGING is layout.STAGING
     assert prepare_volume.WORKSPACES is layout.WORKSPACES
     assert (supervisor.STAGING, supervisor.JOBS) == (layout.STAGING, layout.JOBS)

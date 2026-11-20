@@ -1,9 +1,16 @@
 """Value types shared across the api."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from workbench.layout import DERIVED
+
 VIRTUAL_ROOT = "/workspace"
+
+#: What a derived file is of its source: ``image`` and ``page`` are the renders of a picture and of a page of a PDF;
+#: the others are reserved by the table's ``CHECK`` for later stages.
+DerivedRole = Literal["image", "page", "pdf", "frame", "transcript", "nextext_jsonl", "nextext_zip"]
 
 
 @dataclass(frozen=True)
@@ -100,3 +107,93 @@ class JobRecord:
     tool: str
     created_at: float
     status: str
+
+
+@dataclass(frozen=True)
+class DerivedSpec:
+    """What a derived file is, as it is registered; the rest of its record the store settles.
+
+    Attributes:
+        role: What it is of its source.
+        ordinal: Its place among the files of that role, from 0.
+        mime: Its media type; ``image/jpeg`` or ``image/png`` for a render.
+        width: Its width in pixels; ``None`` where it has none.
+        height: Its height in pixels; ``None`` where it has none.
+        meta: Small facts about it, stored as JSON: for a strip of a page, ``strip`` and ``strips``.
+    """
+
+    role: DerivedRole
+    ordinal: int
+    mime: str
+    width: int | None
+    height: int | None
+    meta: Mapping[str, object]
+
+
+def _count(meta: Mapping[str, object], key: str) -> int:
+    """Read a whole number of a derived file's facts, ``1`` where it has none.
+
+    Args:
+        meta: The facts.
+        key: ``strip`` or ``strips``.
+
+    Returns:
+        The number, or ``1`` for a missing or no whole number.
+    """
+    value = meta.get(key, 1)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 1
+
+
+@dataclass(frozen=True)
+class DerivedRecord:
+    """One derived file, such as the render of a page, kept for the life of its source file.
+
+    It is bound to its source: it is made old with it, counted in the user's quota, hidden from every listing, and
+    deleted with it. Not hashable, for ``meta`` is a mapping.
+
+    Attributes:
+        id: Opaque file id (``uuid4().hex``); the only thing audit lines name it by.
+        source_id: Id of the file it was made from.
+        caller: Authenticated calling service that owns it, as its source's owner.
+        user_id: The caller's id for the owning end user.
+        chat_id: Chat folder it is in.
+        role: What it is of its source.
+        ordinal: Its place among the files of that role, from 0.
+        name: Its file name, ``<id>.jpg`` or ``<id>.png``.
+        size: Size in bytes.
+        mime: Media type.
+        width: Width in pixels; ``None`` where it has none.
+        height: Height in pixels; ``None`` where it has none.
+        meta: Small facts about it, such as ``strip`` and ``strips``.
+        created_at: Its source's ``created_at``: retention counts from it, so both go together.
+    """
+
+    id: str
+    source_id: str
+    caller: str
+    user_id: str
+    chat_id: str
+    role: DerivedRole
+    ordinal: int
+    name: str
+    size: int
+    mime: str
+    width: int | None
+    height: int | None
+    meta: Mapping[str, object]
+    created_at: float
+
+    @property
+    def relative_path(self) -> str:
+        """Its path below its chat folder: ``.derived/<source-id>/<name>``."""
+        return f"{DERIVED}/{self.source_id}/{self.name}"
+
+    @property
+    def strip(self) -> int:
+        """Which strip of its page it is, counted from 1; ``1`` for a whole page."""
+        return _count(self.meta, "strip")
+
+    @property
+    def strips(self) -> int:
+        """How many strips its page is cut into; ``1`` for a whole page."""
+        return _count(self.meta, "strips")
