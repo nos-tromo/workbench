@@ -168,7 +168,8 @@ class RenderEntry(_Strict):
     """One render the executor made: a picture, or a page or strip of a PDF.
 
     Attributes:
-        name: The file name of the render in the job's output.
+        name: The file name of the render in the job's output: always the one :func:`render_name` gives for the other
+            fields, so the executor's answer cannot name a path, or anything but a render.
         role: ``image`` for a picture, ``page`` for a page of a PDF.
         n: The page, counted from 1; 1 for a picture.
         strip: Which strip of the page this is, counted from 1.
@@ -199,6 +200,20 @@ class RenderEntry(_Strict):
         """
         if self.strip > self.strips:
             raise ValueError("strip is past the last strip")
+        return self
+
+    @model_validator(mode="after")
+    def _name_is_the_one_render_name_gives(self) -> Self:
+        """Refuse a name that is not the one the executor builds, so a path or a long text never gets through.
+
+        Returns:
+            The entry.
+
+        Raises:
+            ValueError: ``name`` differs from ``render_name(n, strip, strips, mime)``.
+        """
+        if self.name != render_name(self.n, self.strip, self.strips, self.mime):
+            raise ValueError("name is not the render's own")
         return self
 
 

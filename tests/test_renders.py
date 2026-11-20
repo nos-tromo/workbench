@@ -14,20 +14,18 @@ def _entry(**fields: Any) -> dict[str, Any]:
     """Build the fields of a valid render entry, with the given ones on top.
 
     Args:
-        **fields: What differs from a whole, valid entry.
+        **fields: What differs from a whole, valid entry. Unless it names the render, the name is the one
+            :func:`renders.render_name` gives for the page, strip and type.
 
     Returns:
         The fields, to pass as keyword arguments to :class:`renders.RenderEntry`.
     """
-    base: dict[str, Any] = {
-        "name": "p0001.jpg",
-        "role": "page",
-        "n": 1,
-        "width": 1131,
-        "height": 1600,
-        "mime": "image/jpeg",
-    }
-    return base | fields
+    base: dict[str, Any] = {"role": "page", "n": 1, "width": 1131, "height": 1600, "mime": "image/jpeg"}
+    entry = base | fields
+    if "name" not in entry and entry["mime"] in renders.SIGNATURES:
+        entry["name"] = renders.render_name(entry["n"], entry.get("strip", 1), entry.get("strips", 1), entry["mime"])
+    entry.setdefault("name", "p0001.jpg")
+    return entry
 
 
 def _facts(**fields: Any) -> dict[str, Any]:
@@ -160,6 +158,32 @@ def test_a_render_entry_refuses_what_is_out_of_bounds(fields: dict[str, Any]) ->
     """An entry is refused for a bad strip, a number, a size, a type, a role or a key it does not declare."""
     with pytest.raises(ValidationError):
         renders.RenderEntry(**_entry(**fields))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"name": "../p0001.jpg"},
+        {"name": "../../etc/passwd"},
+        {"name": "/p0001.jpg"},
+        {"name": "p0001.png"},
+        {"name": "p0002.jpg"},
+        {"name": "p0001-s1of2.jpg"},
+        {"name": "p0001.jpg" + "x" * 1_000_000},
+        {"name": "p0003-s1of2.png", "n": 3, "mime": "image/jpeg", "strips": 2},
+    ],
+)
+def test_a_render_entry_refuses_a_name_that_is_not_the_one_render_name_gives(fields: dict[str, Any]) -> None:
+    """A path, a name of another page, strip or type, and a very long name are all refused."""
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(**fields))
+
+
+def test_a_render_entry_takes_the_name_render_name_gives() -> None:
+    """A whole page and a strip are accepted under their own names."""
+    assert renders.RenderEntry(**_entry(name="p0001.jpg")).name == "p0001.jpg"
+    strip = renders.RenderEntry(**_entry(name="p0003-s1of2.png", n=3, strips=2, mime="image/png"))
+    assert strip.name == "p0003-s1of2.png"
 
 
 def test_a_render_entry_takes_the_widest_it_may() -> None:
