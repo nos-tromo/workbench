@@ -6,6 +6,7 @@ from typing import Final
 from PIL import Image
 
 from workbench.executor.readers import DAMAGED, TOO_BIG, UnreadableFile
+from workbench.executor.render.images import on_white
 from workbench.renders import QUALITY_FLOOR, RENDER_MAX_BYTES, strip_spans
 
 #: How much each pass of the ladder scales the picture down, and how many passes it may make after the first.
@@ -68,7 +69,8 @@ def encode(image: Image.Image, *, lossless: bool, quality: int, subsampling: int
     three times.
 
     Args:
-        image: The picture, ``RGB`` (``L`` is accepted); another mode is converted to ``RGB`` first.
+        image: The picture, ``RGB`` (``L`` is accepted); another mode is converted to ``RGB`` first, one that carries
+            transparency laid on white.
         lossless: Try PNG first.
         quality: The JPEG quality to start from.
         subsampling: The JPEG chroma subsampling, 0 for 4:4:4.
@@ -79,9 +81,9 @@ def encode(image: Image.Image, *, lossless: bool, quality: int, subsampling: int
     Raises:
         UnreadableFile: Nothing fits, or the picture is too large to encode within the memory limit.
     """
-    if image.mode not in ("RGB", "L"):
-        image = image.convert("RGB")
     try:
+        if image.mode not in ("RGB", "L"):
+            image = on_white(image.convert("RGBA") if image.has_transparency_data else image)
         if lossless:
             data = _save(image, "PNG", optimize=False)
             if len(data) < RENDER_MAX_BYTES:

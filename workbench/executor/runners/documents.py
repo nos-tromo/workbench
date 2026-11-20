@@ -93,13 +93,12 @@ def _hint(doc: readers.DocumentText) -> str | None:
     if doc.pages_without_text:
         if doc.kind == "pptx":
             noun, what = "slide", "hold no text (pictures only?)"
-            notes.append(f"{_numbers(noun, doc.pages_without_text)} {what}; read_document does no OCR.")
+            notes.append(f"{_numbers(noun, doc.pages_without_text)} {what}.")
         else:
             noun = "page"
             notes.append(
                 f"{_numbers(noun, doc.pages_without_text)} of those looked at have no text layer (scans or "
-                "pictures). read_document does no OCR: the file needs OCR elsewhere before they can be read. "
-                "Tell the user; do not treat them as blank."
+                "pictures); do not treat them as blank."
             )
     if doc.cut is not None:
         notes.append(f"{doc.cut} is longer than the result limit and is cut; its rest cannot be read by paging.")

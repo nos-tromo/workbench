@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import io
 import logging
 import os
 import shutil
@@ -23,6 +24,7 @@ from typing import Any, override
 
 import pytest
 import yaml
+from PIL import Image
 
 from tests.conftest import scaled
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
@@ -40,6 +42,7 @@ from workbench.executor.supervisor import (
     startup_problem,
 )
 from workbench.protocol import MAX_LINE, InlineFile, JobRequest, JobResult, Limits, OutputFile, decode_result, encode
+from workbench.renders import RenderAnswer, signature_ok
 
 pytestmark = pytest.mark.anyio
 
@@ -2360,6 +2363,46 @@ async def test_as_root_the_image_libraries_load_in_a_slot(root_volume: Path, mon
     assert answer.result["pdf"][3] >= len("Hello world")
     if "photo.heic" in files:
         assert answer.result["heic"] == ["HEIF", 64, 48]
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_photo_and_a_scan_are_prepared_in_a_slot(root_volume: Path) -> None:
+    """``prepare_file``, the real entry point under production's limits and the filter, draws a photo and a scan.
+
+    A JPEG photograph and a three-page PDF (one page a picture only) each end ``ok``; what the job wrote in ``out/`` is
+    staged under the names its answer's entries give, signed and as large as the entries say; and a HEIC photograph is
+    prepared too when ``pillow_heif`` is there to write one.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {
+        "photo.jpg": make_images.make_photo(scratch / "photo.jpg").read_bytes(),
+        "scan.pdf": make_fixtures.make_pdf(scratch / "scan.pdf", ["Hello world", None, "third page"]).read_bytes(),
+    }
+    try:
+        files["photo.heic"] = make_images.make_heic(scratch / "photo.heic").read_bytes()
+    except ModuleNotFoundError:  # no pillow_heif: the HEIC half is skipped, the other two are still tried
+        pass
+    _chat(root_volume, files)
+    limits = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
+    want = {"photo.jpg": ("image", 1, 1), "scan.pdf": ("pdf", 3, 3), "photo.heic": ("image", 1, 1)}
+
+    for name in files:
+        args: dict[str, Any] = {"path": name, "pages": None, "strips": 1, "have": [], "budget_s": 100}
+        request = _request(tool="prepare_file", args=args, input_files=[name], limits=limits)
+
+        answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+        assert answer.status == "ok", (name, answer)
+        result = RenderAnswer.model_validate(answer.result)
+        assert (result.kind, result.total, len(result.renders)) == want[name]
+        assert result.pages_without_text == ([2] if name == "scan.pdf" else [])
+        assert sorted(output.name for output in answer.outputs) == sorted(entry.name for entry in result.renders)
+        staged = {output.name: Path(output.staged_path) for output in answer.outputs}
+        for entry in result.renders:
+            data = staged[entry.name].read_bytes()
+            assert signature_ok(data, entry.mime)
+            assert Image.open(io.BytesIO(data)).size == (entry.width, entry.height)
 
 
 #: The job's half of a barrier the test holds, for two jobs that must look at each other while both run.

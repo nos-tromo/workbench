@@ -240,6 +240,7 @@ TOOLS: Final = frozenset(
         "write_table",
         "write_document",
         "write_presentation",
+        "prepare_file",
     }
 )
 

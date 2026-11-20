@@ -202,8 +202,10 @@ def _upright(image: Image.Image, orientation: int) -> Image.Image:
     return image if method is None else image.transpose(method)
 
 
-def _on_white(image: Image.Image) -> Image.Image:
+def on_white(image: Image.Image) -> Image.Image:
     """Lay a picture on white and return it as RGB, so that transparency never reads as black.
+
+    Also used by :func:`~workbench.executor.render.encode.encode` for a picture it is handed that is not already RGB.
 
     Args:
         image: The picture, ``L``, ``RGB`` or ``RGBA``.
@@ -249,7 +251,7 @@ def normalise(path: Path, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int =
                 image = _convert(source)
                 if image.size != size:
                     image = image.resize(size, Image.Resampling.LANCZOS, reducing_gap=3.0)
-                image = _on_white(_upright(image, orientation))
+                image = on_white(_upright(image, orientation))
                 if image is source:
                     image = (
                         source.copy()

@@ -390,6 +390,7 @@ def test_the_registered_runners() -> None:
         "write_table",
         "write_document",
         "write_presentation",
+        "prepare_file",
     }
 
 

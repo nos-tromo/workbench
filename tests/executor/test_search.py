@@ -629,15 +629,15 @@ def test_a_file_in_a_folder_keeps_its_folder_in_the_path(work: Path) -> None:
     assert read_doc(work, "reports/q1.txt")["path"] == f"/workspace/{CHAT}/reports/q1.txt"
 
 
-def test_a_pdf_with_a_scanned_page_carries_a_hint_about_ocr(work: Path) -> None:
-    """The page is listed, never returned as blank, and the model is told what to say."""
+def test_a_pdf_with_a_scanned_page_carries_a_hint_not_to_call_it_blank(work: Path) -> None:
+    """The page is listed, never returned as blank, and the model is told what to do (it can look at the page)."""
     fx.make_pdf(work / "scan.pdf", ["text on page one", None])
     result = read_doc(work, "scan.pdf")
     assert [p["label"] for p in result["parts"]] == ["page 1"]
     assert result["pages_without_text"] == [2]
-    assert "page 2" in result["hint"]
-    assert "OCR" in result["hint"]
-    assert "do not treat them as blank" in result["hint"]
+    assert result["hint"] == (
+        "page 2 of those looked at have no text layer (scans or pictures); do not treat them as blank."
+    )
 
 
 def test_a_deck_with_a_picture_slide_says_slides_not_pages(work: Path) -> None:
