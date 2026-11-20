@@ -28,6 +28,33 @@ It also removes what interrupted work left behind, and forgets old job records.
 - **Paging past failures.** The sweep goes on past the files it could not
   delete, so no number of them holds up the others (`Store.due`, `after`).
 
+### Renders
+
+A render, the picture or page image workbench makes of a file, is a derived
+file: as old as its source, in the user's quota, reachable through no path.
+
+- **Renders go with their source, in its record.** A batch's event names the
+  batch's file ids and then the ids of their renders (`Store.derived_for`);
+  its criteria keep `count` as the number of files and add `derived`, the
+  number of renders. Each file goes with the renders named for it, and only
+  those (`Store.remove`, `Sweeper._delete`). Past 200 ids the rest goes on a
+  continuation event ([audit.md](audit.md#long-lists-of-files)). A file that
+  could not go is recorded again as an error, with its renders' ids.
+- **Strays and due renders are swept with `rule: derived`.** After the files,
+  the sweep reads every render that is due, oldest first, in pages of at most
+  200: one whose source row is gone (a stray: it was made after its file's
+  record was written, or its file was removed without it), and one made
+  before the cutoff whose file stayed because it could not be deleted
+  (`Store.due_derived`, `Sweeper._sweep_derived`). Each batch of one user is
+  recorded first as `delete` / `retention.sweep` with `rule: derived`, the
+  period, the cutoff, the caller, the owner and the count, by the renders' ids;
+  then each render's file and row go (`Store.remove_derived`). One that cannot
+  be deleted keeps its row, is recorded again as an error, and is passed over
+  like a file. Renders count in the sweep's totals, as strays and as errors.
+- **A render without a row is an orphan.** A file in `.derived/<source-id>/`
+  that has no row (a kill between its rename into place and its row) is
+  swept with the orphans below, named by the id its name carries.
+
 ### No deletion without its record
 
 - A record that cannot be written ends the api process (`os._exit(1)`) before
@@ -55,11 +82,13 @@ halt, once it has been untouched for an hour (`retention.py:FOLDER_GRACE_S`):
   id is left alone.
 - **Orphans.** A regular file in a chat folder that has no row: the
   `<file-id>.part` of an upload the api died during, or a file a kill left
-  between its rename into place and its row. They are recorded per chat folder,
-  at most 200 to a record (`rule: orphan`, by the file ids their names carry,
-  never a name), then removed (`Store.sweep_user`). The look and the removal
-  hold the store's lock, which every rename into place holds until its row is
-  committed, so a file on its way in is never taken for an orphan.
+  between its rename into place and its row; a render without its row in
+  `.derived/<source-id>/<id>.<ext>` is one too, and is named by that id. They
+  are recorded per chat folder, at most 200 to a record (`rule: orphan`, by the
+  file ids their names carry, never a name), then removed (`Store.sweep_user`).
+  The look and the removal hold the store's lock, which every rename into place
+  holds until its row is committed, so a file on its way in is never taken for
+  an orphan.
 
 What could not be removed is recorded again with `outcome: error`.
 
@@ -121,8 +150,10 @@ make retention-dry-run DAYS=3     # preview another period
 
 It runs `python -m workbench.api.retention dry-run [--days N]` in the running
 api container (`docker compose exec`), so the api must be up. It prints what the
-period would delete now: counts and age ranges by kind (`upload`, `output`)
-and in all, never a name, an id, a user or a chat (`retention.py:dry_run`). It
+period would delete now: counts and age ranges by kind (`upload`, `output`,
+`derived`) and in all, never a name, an id, a user or a chat
+(`retention.py:dry_run`). The `derived` line counts renders: the due ones
+(made before the cutoff, or strays, whatever their age) and the kept. It
 reads the database through a read-only connection and records, deletes and
 changes nothing.
 

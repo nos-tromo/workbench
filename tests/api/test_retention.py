@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import CALL, FORMER, GHOSTWRITER_KEY, PG_SETUP, AuditLines, unrecorded
 from tests.api.test_jobs import KEEP, FakeClient, until
+from workbench.api import retention as retention_module
 from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
@@ -32,7 +33,7 @@ from workbench.api.metrics import Metrics
 from workbench.api.retention import Sweeper, SweepReport, main
 from workbench.api.store import NotFound, Store, new_file_id
 from workbench.config import Settings
-from workbench.models import FileRecord, Principal
+from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
 from workbench.paths import Workspaces
 from workbench.utils.audit_event import AuditWriteError
 
@@ -110,6 +111,27 @@ def put(store: Store, name: str, p: Principal = PG_SETUP) -> FileRecord:
     )
 
 
+def render(store: Store, settings: Settings, source: FileRecord, n: int = 1) -> DerivedRecord:
+    """Register a render of the page ``n`` of ``source``, staged as a job leaves one."""
+    folder = settings.data_dir / "staging" / new_file_id()
+    folder.mkdir(parents=True)
+    staged = folder / "render.jpg"
+    staged.write_bytes(b"synthetic render")
+    spec = DerivedSpec("page", n, "image/jpeg", 10, 20, {})
+    return store.register_derived(source, staged, spec, file_id=new_file_id(), quota_bytes=10**9)
+
+
+def render_on_disk(settings: Settings, rec: DerivedRecord) -> Path:
+    """Where a render's bytes are."""
+    chat = settings.data_dir / "workspaces" / rec.caller / rec.user_id / rec.chat_id
+    return chat / ".derived" / rec.source_id / rec.name
+
+
+def every_render(store: Store) -> list[DerivedRecord]:
+    """Every render the store holds, whoever's."""
+    return store.due_derived(float("inf"), 10**6)
+
+
 def sweeps(audit_lines: AuditLines) -> list[dict[str, Any]]:
     """The retention events, in order."""
     return [e for e in audit_lines() if e["operation"] == "retention.sweep"]
@@ -144,9 +166,9 @@ def test_due_files_are_recorded_then_deleted(
     recorded_first: list[bool] = []
     remove = store.remove
 
-    def watched(rec: FileRecord) -> None:
+    def watched(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         recorded_first.append(any(rec.id in e["target"]["ids"] for e in sweeps(audit_lines)))
-        remove(rec)
+        remove(rec, derived)
 
     monkeypatch.setattr(store, "remove", watched)
     assert sweeper.sweep_once() == SweepReport(deleted=3, errors=0)
@@ -161,6 +183,7 @@ def test_due_files_are_recorded_then_deleted(
         "caller": "ghostwriter",
         "owner": "user-a",
         "count": 3,
+        "derived": 0,
     }
     assert store.files_in_chat(PG_SETUP) == [recent]
     assert not any(on_disk(settings, rec).exists() for rec in old)
@@ -234,12 +257,12 @@ def test_failed_removal_is_recorded_as_error(
     clock.now = T0 + 8 * DAY
     remove = store.remove
 
-    def failing(rec: FileRecord) -> None:
+    def failing(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         if rec.id == busy.id:
             raise OSError("synthetic: device busy")
         if rec.id == odd.id:
             raise RuntimeError("synthetic: unexpected")
-        remove(rec)
+        remove(rec, derived)
 
     monkeypatch.setattr(store, "remove", failing)
     with caplog.at_level(logging.WARNING):
@@ -269,10 +292,10 @@ def test_an_error_record_that_cannot_be_written_halts_too(
     clock.now = T0 + 8 * DAY
     remove = store.remove
 
-    def failing(rec: FileRecord) -> None:
+    def failing(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         if rec.id == stuck.id:
             raise OSError("synthetic: device busy")
-        remove(rec)
+        remove(rec, derived)
 
     write = audit_stream.write
 
@@ -330,10 +353,10 @@ def test_files_that_keep_failing_never_stall_the_sweep(
     stuck = {rec.id for rec in made[:200]}
     remove = store.remove
 
-    def failing(rec: FileRecord) -> None:
+    def failing(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         if rec.id in stuck:
             raise OSError("synthetic: read-only")
-        remove(rec)
+        remove(rec, derived)
 
     monkeypatch.setattr(store, "remove", failing)
     clock.now = T0 + 8 * DAY
@@ -1093,11 +1116,11 @@ async def test_a_cancel_after_a_batch_was_recorded_leaves_its_rest_to_be_recorde
     in_hand, go_on = threading.Event(), threading.Event()
     remove = store.remove
 
-    def slow(rec: FileRecord) -> None:
+    def slow(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         if not in_hand.is_set():
             in_hand.set()
             go_on.wait(5)
-        remove(rec)
+        remove(rec, derived)
 
     monkeypatch.setattr(store, "remove", slow)
     task = asyncio.create_task(sweeper.run_forever())
@@ -1115,6 +1138,279 @@ async def test_a_cancel_after_a_batch_was_recorded_leaves_its_rest_to_be_recorde
     assert sorted(first["target"]["ids"]) == sorted(rec.id for rec in made)
     assert sorted(again["target"]["ids"]) == sorted(rec.id for rec in left)
     assert store.files_in_chat(PG_SETUP) == []
+
+
+# --- the renders --------------------------------------------------------------------------------------------------
+
+
+def test_a_due_file_takes_its_renders_in_the_same_record(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One event names the file, then its renders; criteria say how many of each; then every file and row goes."""
+    pdf = put(store, "quarterly-scan.pdf")
+    first, second = render(store, settings, pdf, 1), render(store, settings, pdf, 2)
+    folder = on_disk(settings, pdf).parent / ".derived"
+    assert render_on_disk(settings, first).is_file() and render_on_disk(settings, second).is_file()
+    clock.now = T0 + 8 * DAY
+    recorded_first: list[bool] = []
+    remove = store.remove
+
+    def watched(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
+        named = {rec.id, *(each.id for each in derived)}
+        recorded_first.append(any(named <= set(e["target"]["ids"]) for e in sweeps(audit_lines)))
+        remove(rec, derived)
+
+    monkeypatch.setattr(store, "remove", watched)
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    assert recorded_first == [True]
+    (event,) = sweeps(audit_lines)
+    assert (event["action"], event["outcome"]) == ("delete", "ok")
+    assert event["target"]["ids"] == [pdf.id, first.id, second.id]
+    assert event["criteria"] == {
+        "period_days": 7,
+        "cutoff": iso(T0 + DAY),
+        "caller": "ghostwriter",
+        "owner": "user-a",
+        "count": 1,
+        "derived": 2,
+    }
+    assert store.files_in_chat(PG_SETUP) == []
+    assert every_render(store) == []
+    assert not on_disk(settings, pdf).exists()
+    assert not render_on_disk(settings, first).exists() and not render_on_disk(settings, second).exists()
+    assert not folder.exists()
+    assert "quarterly-scan" not in json_text(audit_lines)
+
+
+def test_a_file_with_renders_beyond_one_events_ids_names_them_all(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """The ids of a file and its 201 renders do not fit one event: the rest goes on a continuation, none is cut."""
+    pdf = put(store, "long-report.pdf")
+    renders = [render(store, settings, pdf, n) for n in range(1, 202)]
+    clock.now = T0 + 8 * DAY
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    events = [e for e in audit_lines() if e["operation"] in {"retention.sweep", "retention.sweep.ids"}]
+    main, *continuations = events
+    assert main["operation"] == "retention.sweep"
+    assert main["criteria"]["count"] == 1 and main["criteria"]["derived"] == 201
+    assert [e["operation"] for e in continuations] == ["retention.sweep.ids"]
+    named = [i for e in events for i in e["target"]["ids"]]
+    assert named == [pdf.id, *(each.id for each in renders)]
+    assert every_render(store) == [] and store.files_in_chat(PG_SETUP) == []
+
+
+def test_renders_of_a_kept_file_are_kept(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """A render is as old as its source: the one of a file inside the period stays, with its bytes."""
+    old = put(store, "old-scan.pdf")
+    old_render = render(store, settings, old)
+    clock.now = T0 + 2 * DAY
+    young = put(store, "young-scan.pdf")
+    kept = render(store, settings, young)
+    clock.now = T0 + 8 * DAY
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    (event,) = sweeps(audit_lines)
+    assert event["target"]["ids"] == [old.id, old_render.id]
+    assert store.files_in_chat(PG_SETUP) == [young]
+    assert store.derived_of(young) == [kept]
+    assert render_on_disk(settings, kept).is_file()
+    assert every_render(store) == [kept]
+
+
+def test_a_render_whose_source_is_gone_is_swept_and_recorded(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stray, whatever its age, is recorded with its rule, by its id, and only then is its file removed."""
+    pdf = put(store, "quarterly-scan.pdf")
+    stray = render(store, settings, pdf)
+    store.remove(pdf)  # the render was not named: its row and its file stay
+    assert every_render(store) == [stray] and render_on_disk(settings, stray).is_file()
+    clock.now = T0 + HOUR  # far inside the period
+    recorded_first: list[bool] = []
+    remove_derived = store.remove_derived
+
+    def watched(rec: DerivedRecord) -> None:
+        recorded_first.append(any(rec.id in e["target"]["ids"] for e in sweeps(audit_lines)))
+        remove_derived(rec)
+
+    monkeypatch.setattr(store, "remove_derived", watched)
+    assert sweeper.sweep_once() == SweepReport(deleted=1, errors=0)
+    assert recorded_first == [True]
+    (event,) = sweeps(audit_lines)
+    assert (event["action"], event["outcome"], event["actor"]) == ("delete", "ok", {"user": None, "via": "system"})
+    assert event["target"]["ids"] == [stray.id]
+    assert event["criteria"] == {
+        "rule": "derived",
+        "period_days": 7,
+        "cutoff": iso(T0 + HOUR - 7 * DAY),
+        "caller": "ghostwriter",
+        "owner": "user-a",
+        "count": 1,
+    }
+    assert every_render(store) == []
+    assert not render_on_disk(settings, stray).exists()
+    assert not (on_disk(settings, pdf).parent / ".derived").exists()
+
+
+def test_strays_are_batched_by_caller_and_user(
+    sweeper: Sweeper, store: Store, settings: Settings, clock: Clock, audit_lines: AuditLines
+) -> None:
+    """Each event is one caller's user; together they name every stray once."""
+    people = [PG_SETUP, Principal("ghostwriter", "user-b", "chat-1"), Principal("docint", "user-a", "chat-1")]
+    strays: dict[str, tuple[str, str]] = {}
+    for who in people:
+        pdf = put(store, "scan.pdf", who)
+        strays[render(store, settings, pdf).id] = (who.caller, who.user_id)
+        store.remove(pdf)
+    assert sweeper.sweep_once() == SweepReport(deleted=3, errors=0)
+    events = sweeps(audit_lines)
+    assert len(events) == 3
+    for event in events:
+        (stray_id,) = event["target"]["ids"]
+        assert (event["criteria"]["caller"], event["criteria"]["owner"]) == strays[stray_id]
+        assert event["criteria"]["rule"] == "derived"
+    assert every_render(store) == []
+
+
+def test_a_file_that_cannot_go_is_recorded_again_with_its_renders(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error record names the file, then its renders; the file keeps its row, and the sweep goes on."""
+    stuck = put(store, "stuck.pdf")
+    clock.now = T0 + 1  # the sweep takes the older first, so the order of the ids is the test's
+    fine = put(store, "fine.pdf")
+    stuck_render, fine_render = render(store, settings, stuck), render(store, settings, fine)
+    clock.now = T0 + 8 * DAY
+    remove = store.remove
+
+    def failing(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
+        if rec.id == stuck.id:
+            raise OSError("synthetic: device busy")
+        remove(rec, derived)
+
+    monkeypatch.setattr(store, "remove", failing)
+    sweeper.sweep_once()
+    ok, error, *rest = sweeps(audit_lines)
+    assert (ok["outcome"], ok["target"]["ids"]) == ("ok", [stuck.id, fine.id, stuck_render.id, fine_render.id])
+    assert (ok["criteria"]["count"], ok["criteria"]["derived"]) == (2, 2)
+    assert (error["outcome"], error["target"]["ids"]) == ("error", [stuck.id, stuck_render.id])
+    assert error["criteria"] == {**ok["criteria"], "count": 1, "derived": 1}
+    assert [rec.id for rec in store.files_in_chat(PG_SETUP)] == [stuck.id]
+    assert not render_on_disk(settings, fine_render).exists()
+    # the stuck file's render is as due as the file: the pass over renders takes it, recorded, and the file stays
+    (stray,) = rest
+    assert (stray["outcome"], stray["criteria"]["rule"], stray["target"]["ids"]) == ("ok", "derived", [stuck_render.id])
+    assert store.files_in_chat(PG_SETUP) == [stuck]
+
+
+def test_a_record_that_cannot_be_written_deletes_no_render(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    broken_audit: None,
+    exits: list[int],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The process ends before the render or its source goes."""
+    pdf = put(store, "quarterly-scan.pdf")
+    first = render(store, settings, pdf)
+    clock.now = T0 + 8 * DAY
+    with pytest.raises(AuditWriteError):
+        sweeper.sweep_once()
+    assert exits == [1]
+    assert store.files_in_chat(PG_SETUP) == [pdf]
+    assert store.derived_of(pdf) == [first]
+    assert on_disk(settings, pdf).exists() and render_on_disk(settings, first).exists()
+    err = capsys.readouterr().err
+    assert "quarterly-scan" not in err and first.id not in err
+
+
+def test_a_record_of_a_stray_that_cannot_be_written_deletes_nothing(
+    sweeper: Sweeper, store: Store, settings: Settings, broken_audit: None, exits: list[int]
+) -> None:
+    """A stray stays, row and bytes, until its record can be written."""
+    pdf = put(store, "quarterly-scan.pdf")
+    stray = render(store, settings, pdf)
+    store.remove(pdf)
+    with pytest.raises(AuditWriteError):
+        sweeper.sweep_once()
+    assert exits == [1]
+    assert every_render(store) == [stray]
+    assert render_on_disk(settings, stray).exists()
+
+
+def test_a_render_that_cannot_be_removed_is_recorded_again_as_an_error(
+    sweeper: Sweeper,
+    store: Store,
+    settings: Settings,
+    clock: Clock,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stray that stays keeps its row and is recorded again; the sweep goes on with the others."""
+    strays = []
+    for n in range(3):
+        clock.now = T0 + n
+        pdf = put(store, f"scan-{n}.pdf")
+        strays.append(render(store, settings, pdf))
+        store.remove(pdf)
+    stuck = strays[1]
+    remove_derived = store.remove_derived
+
+    def failing(rec: DerivedRecord) -> None:
+        if rec.id == stuck.id:
+            raise OSError("synthetic: device busy")
+        remove_derived(rec)
+
+    monkeypatch.setattr(store, "remove_derived", failing)
+    with caplog.at_level(logging.WARNING):
+        assert sweeper.sweep_once() == SweepReport(deleted=2, errors=1)
+    ok, error = sweeps(audit_lines)
+    assert (ok["outcome"], ok["target"]["ids"]) == ("ok", [rec.id for rec in strays])
+    assert (error["outcome"], error["target"]["ids"]) == ("error", [stuck.id])
+    assert error["criteria"] == {**ok["criteria"], "count": 1}
+    assert every_render(store) == [stuck]
+    assert "OSError" in caplog.text and "synthetic" not in caplog.text
+
+
+def test_strays_that_keep_failing_never_stall_the_sweep(
+    sweeper: Sweeper, store: Store, settings: Settings, audit_lines: AuditLines, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep pages on past the strays it could not remove, as it does past files."""
+    source = put(store, "scan.pdf")
+    strays = [render(store, settings, source, n) for n in range(1, 4)]
+    store.remove(source)
+    stuck = {strays[0].id}
+    remove_derived = store.remove_derived
+    monkeypatch.setattr(retention_module, "BATCH", 1)  # a page of one, so the stuck stray comes first
+
+    def failing(rec: DerivedRecord) -> None:
+        if rec.id in stuck:
+            raise OSError("synthetic: read-only")
+        remove_derived(rec)
+
+    monkeypatch.setattr(store, "remove_derived", failing)
+    assert sweeper.sweep_once() == SweepReport(deleted=2, errors=1)
+    assert {rec.id for rec in every_render(store)} == stuck
 
 
 # --- the api ------------------------------------------------------------------------------------------------------
@@ -1146,14 +1442,14 @@ def test_the_api_sweeps_at_start_and_ends_the_sweep_before_its_chain(
     in_hand, go_on, done = threading.Event(), threading.Event(), threading.Event()
     remove = store.remove
 
-    def slow(rec: FileRecord) -> None:
+    def slow(rec: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
         if not in_hand.is_set():
             in_hand.set()
             go_on.wait(5)
-            remove(rec)
+            remove(rec, derived)
             done.set()
             return
-        remove(rec)
+        remove(rec, derived)
 
     monkeypatch.setattr(store, "remove", slow)
     app = create_app(settings, store=store, audit=audit, sweeper=a_sweeper(settings, store, audit, clock, exits))
@@ -1236,6 +1532,33 @@ def test_dry_run_prints_counts_and_ages_only(volume: Path, capsys: pytest.Captur
     assert "With a period of 30 days (preview; configured: 7)" in text
     assert "upload: none due; 3 kept" in text
     assert "output: none due; 1 kept" in text
+
+
+def test_the_dry_run_counts_renders(volume: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Renders have a line of their own, like the other kinds, and count in the total; never a name or an id."""
+    now = time.time()
+    store = Store(volume / "workbench.db", Workspaces(volume), lambda: now - 8 * DAY)
+    who = Principal("ghostwriter", "user-7f3a9c", "chat-5e1b2d")
+    pdf = store.add_upload(
+        who, f"/workspace/{who.chat_id}", "harbour-scan.pdf", io.BytesIO(b"x"), max_bytes=10, quota_bytes=100,
+        record=unrecorded,
+    )  # fmt: skip
+    ids = [pdf.id]
+    for n in (1, 2):
+        folder = volume / "staging" / new_file_id()
+        folder.mkdir(parents=True)
+        (folder / "render.jpg").write_bytes(b"synthetic render")
+        spec = DerivedSpec("page", n, "image/jpeg", 10, 20, {})
+        ids.append(
+            store.register_derived(pdf, folder / "render.jpg", spec, file_id=new_file_id(), quota_bytes=10**9).id
+        )
+    assert main(["dry-run"]) == 0
+    text = capsys.readouterr().out
+    assert "  derived: 2 due now, aged 8.0 days; 0 kept" in text
+    assert "  upload: 1 due now, aged 8.0 days; 0 kept" in text
+    assert "in all: 3 due now; 0 kept" in text
+    assert [secret for secret in [*ids, "harbour-scan", who.user_id, who.chat_id] if secret in text] == []
+    assert len(every_render(store)) == 2
 
 
 @pytest.mark.parametrize("days", ["0", "-1", "x", "1.5", "", "٣"])

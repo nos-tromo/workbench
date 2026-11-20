@@ -135,8 +135,9 @@ No event sets `ids_truncated`. `search_files` and `run_python`, which can be
 given up to 1000 files, can need continuations, and so can `fill_template` with
 many file sources and `write_presentation` with many pictures and source files
 (`workbench/api/audit.py:AuditLog._emit`, with the shared
-`audit_runtime.id_chunks`). Retention never does: its batches are of at most
-200 files.
+`audit_runtime.id_chunks`). Retention's batches are of at most 200 files, but
+a batch names the renders of its files after them, so a record of files with
+many renders can need continuations too.
 
 ## Retention events
 
@@ -153,7 +154,8 @@ What `criteria` and `target` hold depends on what is removed:
 
 | Removed | `criteria` | `target` |
 |---|---|---|
-| Files past the period, one batch of one user | `period_days`, `cutoff` (the moment before which files are due, ISO 8601), `caller`, `owner` (the user id), `count`; no `rule` | `ids` of the batch, at most 200; `count` |
+| Files past the period, one batch of one user | `period_days`, `cutoff` (the moment before which files are due, ISO 8601), `caller`, `owner` (the user id), `count` (files), `derived` (their renders); no `rule` | `ids` of the batch's files, at most 200, then the ids of their renders; `count` is the number of ids |
+| Renders with no source, or due without it staying: one batch of one user | `rule: derived`, `period_days`, `cutoff`, `caller`, `owner`, `count` | `ids` of the renders; `count` |
 | A job's staging residue: outputs nobody registered, older than an hour | `rule: staging`, `job` (the job's id), `count` of its regular files, and `caller` and `owner` while the job's record exists | `count`, no ids; `container: chat:<chat-id>` while the job's record exists |
 | Orphans of one chat folder: files with no row, older than an hour | `rule: orphan`, `caller`, `owner`, `count` | `ids`: the file ids the names of interrupted uploads carry (`<id>.part`), never a name; `count`; `container: chat:<chat-id>` |
 
