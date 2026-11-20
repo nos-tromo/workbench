@@ -26,6 +26,7 @@ import yaml
 
 from tests.conftest import scaled
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
+from tests.fixtures import make_fixtures, make_images
 from workbench.config import Settings, load_settings
 from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
@@ -2309,6 +2310,56 @@ async def test_as_a_slot_the_job_reaches_only_its_own_folder(
     assert (_ids(staged), _mode(staged)) == ((10001, 10001), 0o700)
     assert (_ids(staged / "r.csv"), _mode(staged / "r.csv")) == ((10001, 10001), 0o600)
     assert _entries(root_volume / "jobs") == []
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_the_image_libraries_load_in_a_slot(root_volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pillow, pi-heif and pdfium start, decode and draw under production's limits and the seccomp filter.
+
+    The renders rest on these three libraries, which map memory and start threads of their own; this is the one place
+    that shows they run as a slot, with the address-space limit of 1536 MB, before anything is built on them.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    pdf = make_fixtures.make_pdf(scratch / "doc.pdf", ["Hello world\nsecond line", None])
+    files = {"doc.pdf": pdf.read_bytes()}
+    try:
+        files["photo.heic"] = make_images.make_heic(scratch / "photo.heic").read_bytes()
+    except ModuleNotFoundError:  # no pillow_heif: the HEIC half is skipped, the other two are still tried
+        pass
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        """
+        import resource
+        import pi_heif
+        import pypdfium2
+        from PIL import Image
+
+        result["address_space_mb"] = resource.getrlimit(resource.RLIMIT_AS)[0] // (1024 * 1024)
+        if pathlib.Path("photo.heic").exists():
+            pi_heif.register_heif_opener(decode_threads=1, thumbnails=False, depth_images=False, aux_images=False)
+            with Image.open("photo.heic") as heic:
+                heic.load()
+                result["heic"] = [heic.format, *heic.size]
+        document = pypdfium2.PdfDocument("doc.pdf")
+        page = document[0]
+        drawn = page.render(scale=2).to_pil()
+        result["pdf"] = [len(document), *drawn.size, page.get_textpage().count_chars()]
+        """,
+    )
+    limits = Limits(wall_s=60, cpu_s=60, memory_mb=1536, file_mb=50)
+    request = _request(input_files=sorted(files), limits=limits)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result["address_space_mb"] == 1536
+    # A4 at scale 2: 595.28 x 841.89 points, rounded up.
+    assert answer.result["pdf"][:3] == [2, 1191, 1684]
+    assert answer.result["pdf"][3] >= len("Hello world")
+    if "photo.heic" in files:
+        assert answer.result["heic"] == ["HEIF", 64, 48]
 
 
 #: The job's half of a barrier the test holds, for two jobs that must look at each other while both run.
