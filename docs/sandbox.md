@@ -517,6 +517,35 @@ hosts that have gVisor installed, and it is untested: the start-up checks read
 `/proc` and `/sys` values that gVisor emulates, so try it on the host before
 relying on it.
 
+## What a job can import
+
+Every job runs the executor image's own interpreter and venv,
+`python -I -m workbench.executor.job` (`workbench/executor/supervisor.py`).
+Neither a caller nor a job brings packages of its own:
+
+- **Python 3.12.** The base image is `python:3.12-slim-trixie`, pinned by
+  digest in `docker/Dockerfile.executor`, and `pyproject.toml` allows only
+  `>=3.12,<3.13`.
+- **The standard library and the venv.** The image builds the venv with
+  `uv sync --locked --no-dev --extra executor`. It holds the `executor` extra of
+  `pyproject.toml` (beautifulsoup4, charset-normalizer, cryptography, docxtpl,
+  lxml, markdown-it-py, matplotlib, numpy, odfpy, openpyxl, pandas, pypdf,
+  python-docx, python-pptx, scipy, xlsxwriter) together with what those
+  packages depend on, Pillow and Jinja2 among them. The same venv also carries
+  the project's own dependencies (FastAPI, pydantic, uvicorn and the rest),
+  which a job has no use for.
+- **The exact versions are in `uv.lock`.** Dependabot moves them, so this page
+  names none.
+
+Nothing can be installed: the executor has no network, and the image's root,
+the venv included, is read-only. Every job starts with `MPLBACKEND=Agg` and
+`OPENBLAS_NUM_THREADS` and `OMP_NUM_THREADS` set to 1
+(`workbench/executor/sandbox.py:CLEAN_ENV`).
+
+The tool descriptions name only part of this list. Ghostwriter's `run_python`
+names thirteen packages (`workbench/api/tool_table.py`) and docint's names four
+(`workbench/api/tools_inline.py`). A job can import the rest just the same.
+
 ## Limits of `run_python`
 
 The model's code runs in the job process itself, as a script
