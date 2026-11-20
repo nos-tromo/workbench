@@ -14,8 +14,7 @@ import pypdfium2.raw
 from PIL import Image
 
 from workbench.executor import readers
-from workbench.executor.readers import DAMAGED, TOO_BIG, UnreadableFile
-from workbench.executor.readers.pdf import _ENCRYPTED
+from workbench.executor.readers import DAMAGED, PDF_ENCRYPTED, TOO_BIG, UnreadableFile
 from workbench.renders import PAGE_LONG_SIDE
 
 _NO_PAGES: Final = "the PDF has no pages"
@@ -42,7 +41,7 @@ def open_pdf(path: Path) -> Any:
         pdf = pypdfium2.PdfDocument(path)
     except pypdfium2.PdfiumError as exc:
         if exc.err_code == pypdfium2.raw.FPDF_ERR_PASSWORD:
-            raise UnreadableFile(_ENCRYPTED) from None
+            raise UnreadableFile(PDF_ENCRYPTED) from None
         raise UnreadableFile(DAMAGED) from None
     except MemoryError:
         raise UnreadableFile(TOO_BIG) from None

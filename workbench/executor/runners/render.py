@@ -14,6 +14,7 @@ on first use, so a job that reads a spreadsheet does not import them.
 import io
 import json
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -51,33 +52,40 @@ class _Request:
         pages: The pages to draw, or ``None`` for the first ones.
         strips: How many strips each is cut into, 1 to ``MAX_STRIPS``.
         have: The whole pages the caller already has.
+        facts: Whether to look for the pages of a PDF with no text; ``False`` skips the check and its cost.
     """
 
     pages: list[int] | None
     strips: int
     have: frozenset[int]
+    facts: bool
 
     @classmethod
     def of(cls, args: dict[str, Any]) -> "_Request":
         """Read the arguments of a job.
 
         Args:
-            args: ``pages``, ``strips`` and ``have`` of the job; each may be missing.
+            args: ``pages``, ``strips``, ``have`` and ``facts`` of the job; each may be missing.
 
         Returns:
             The request.
 
         Raises:
-            ValueError: ``strips`` is not 1 to ``MAX_STRIPS``; that is the caller's mistake, never the file's.
+            ValueError: ``strips`` is not 1 to ``MAX_STRIPS``, or ``facts`` is not a bool; that is the caller's
+                mistake, never the file's.
         """
         pages = args.get("pages")
         strips = int(args.get("strips", 1))
         if not 1 <= strips <= MAX_STRIPS:
             raise ValueError(f"strips is 1 to {MAX_STRIPS}")
+        facts = args.get("facts", True)
+        if not isinstance(facts, bool):
+            raise ValueError("facts is true or false")
         return cls(
             pages=None if pages is None else [int(n) for n in pages],
             strips=strips,
             have=frozenset(int(n) for n in args.get("have") or []),
+            facts=facts,
         )
 
     def wanted(self, total: int) -> list[int]:
@@ -225,7 +233,10 @@ def _pdf(path: Path, request: _Request) -> _Facts:
     try:
         total = len(pdf)
         wanted = request.wanted(total)
-        blank, unchecked = pages.pages_without_text(pdf, PAGES_CHECKED_MAX)
+        blank: list[int] = []
+        unchecked = False
+        if request.facts:
+            blank, unchecked = pages.pages_without_text(pdf, PAGES_CHECKED_MAX)
         made: list[_Made] = []
         for n in wanted:
             readers.check()
@@ -291,7 +302,9 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         args: ``path``, relative to the chat folder; ``pages``, the pages to draw or ``None`` for the first
             ``FIRST_PAGES`` (a picture accepts only ``None`` or ``[1]``); ``strips``, 1 to ``MAX_STRIPS``, how many
             strips along the long side each is cut into; ``have``, the whole pages already rendered, which are not
-            drawn again when ``strips`` is 1; and ``budget_s``, the seconds after which the job stops.
+            drawn again when ``strips`` is 1; ``facts``, a bool, default true: ``False`` leaves out the look at every
+            page of a PDF for text (the caller has that already), so ``pages_without_text`` is ``[]`` with no hint
+            about it; and ``budget_s``, the seconds after which the job stops.
         ctx: The job's surroundings.
 
     Returns:
@@ -300,7 +313,8 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         PDF), ``unreadable_file``, ``no_such_part`` or ``read_timeout``, none of which names a path.
 
     Raises:
-        ValueError: ``strips`` is out of range, or more renders are asked for than one job may make.
+        ValueError: ``strips`` is out of range, ``facts`` is not a bool, or more renders are asked for than one job may
+            make.
     """
     name = protocol.check_input_path(str(args["path"]))
     real = ctx.work_dir / name
@@ -356,6 +370,14 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         }
     ).model_dump()
     answer = RenderAnswer.model_validate(_fit(whole, facts.blank, notes, ctx.max_chars)).model_dump()
-    for made, entry in zip(facts.made, entries, strict=True):
-        (ctx.out_dir / entry.name).write_bytes(made.data)
+    written: list[Path] = []
+    try:
+        for made, entry in zip(facts.made, entries, strict=True):
+            written.append(ctx.out_dir / entry.name)  # noted first: a file that was begun is removed too
+            written[-1].write_bytes(made.data)
+    except OSError:  # its text holds the path of the file
+        for path in written:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        return error("unreadable_file", "the renders could not be written")
     return answer

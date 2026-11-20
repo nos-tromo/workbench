@@ -9,6 +9,9 @@ import json
 import math
 import random
 import struct
+import subprocess
+import sys
+import textwrap
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -16,7 +19,7 @@ from pathlib import Path
 from typing import Any, override
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen.canvas import Canvas
 
@@ -30,6 +33,7 @@ from workbench.executor.runners.documents import _hint
 from workbench.renders import (
     IMAGE_QUALITY,
     PAGE_LONG_SIDE,
+    PAGE_QUALITY,
     RENDER_MAX_BYTES,
     RenderAnswer,
     signature_ok,
@@ -633,10 +637,11 @@ class Job:
         have: Sequence[int] = (),
         budget_s: float = 60,
         max_chars: int | None = None,
+        **extra: Any,
     ) -> dict[str, Any]:
-        """Run ``prepare_file`` on an input."""
+        """Run ``prepare_file`` on an input; ``extra`` are further arguments, such as ``facts``."""
         ctx = self.ctx if max_chars is None else dataclasses.replace(self.ctx, max_chars=max_chars)
-        args = {"path": name, "pages": pages, "strips": strips, "have": list(have), "budget_s": budget_s}
+        args = {"path": name, "pages": pages, "strips": strips, "have": list(have), "budget_s": budget_s, **extra}
         return RUNNERS["prepare_file"](args, ctx)
 
     def written(self) -> list[str]:
@@ -1055,3 +1060,224 @@ def test_the_hint_on_a_deck_keeps_its_words_without_the_tool_name() -> None:
 
     assert hint == "slide 3 hold no text (pictures only?)."
     assert "OCR" not in (hint or "")
+
+
+# --- facts: the look at every page for text, which an on-demand render does not need --------
+
+
+def test_without_facts_the_pages_are_not_looked_at_for_text(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``facts=False`` lists no page without text and says nothing of the check, but draws the pages asked for."""
+    monkeypatch.setattr(runner, "PAGES_CHECKED_MAX", 2)  # with facts, the hint would say pages after 2 were not checked
+    make_fixtures.make_pdf(job.path("scans.pdf"), [None] * 6)
+
+    answer = job.prepare("scans.pdf", pages=[5, 6], facts=False)
+
+    assert (answer["kind"], answer["total"]) == ("pdf", 6)
+    assert (answer["pages_without_text"], answer["hint"], answer["frames"]) == ([], None, None)
+    assert _numbers(answer) == [5, 6]
+    assert job.written() == ["p0005.jpg", "p0006.jpg"]
+    for entry in answer["renders"]:
+        job.check(entry)
+    assert RenderAnswer.model_validate(answer).model_dump() == answer
+
+
+def test_the_text_check_runs_only_when_facts_are_wanted(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``facts=False`` ``pages_without_text`` is not called at all; by default, and with ``facts=True``, it is."""
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one", None, "three"])
+    calls: list[int] = []
+    real = pages.pages_without_text
+
+    def counted(pdf: Any, limit: int) -> tuple[list[int], bool]:
+        calls.append(limit)
+        return real(pdf, limit)
+
+    monkeypatch.setattr(pages, "pages_without_text", counted)
+
+    off = job.prepare("book.pdf", pages=[2], facts=False)
+    assert calls == []
+    default = job.prepare("book.pdf", pages=[2])
+    on = job.prepare("book.pdf", pages=[2], facts=True)
+
+    assert len(calls) == 2
+    assert (off["pages_without_text"], default["pages_without_text"], on["pages_without_text"]) == ([], [2], [2])
+
+
+def test_a_page_without_facts_still_fails_as_it_would_with_them(job: Job) -> None:
+    """The check is the only thing left out: a page past the end, an encrypted file and a damaged one are as before."""
+    make_fixtures.make_pdf(job.path("short.pdf"), ["one", "two"])
+    make_fixtures.make_pdf(job.path("locked.pdf"), ["one"], password="invented")
+    job.path("note.pdf").write_text("only words")
+
+    assert job.prepare("short.pdf", pages=[3], facts=False) == {"error": "no_such_part: this document has 2 pages"}
+    assert job.prepare("locked.pdf", facts=False) == {
+        "error": "unreadable_file: the PDF is password-protected (encrypted)"
+    }
+    assert job.prepare("note.pdf", facts=False) == {"error": f"unreadable_file: {DAMAGED}"}
+    assert job.written() == []
+
+
+def test_a_picture_without_facts_keeps_its_frames(job: Job) -> None:
+    """For a picture ``facts`` changes nothing: its frame count and the hint about it are still answered."""
+    make_images.make_gif(job.path("anim.gif"), frames=3)
+
+    answer = job.prepare("anim.gif", facts=False)
+
+    assert (answer["frames"], answer["hint"], answer["total"]) == (3, "only the first of 3 frames is shown", 1)
+    assert len(answer["renders"]) == 1
+
+
+@pytest.mark.parametrize("bad", ["no", "false", 1, 0, None, [], {}])
+def test_facts_must_be_a_bool(job: Job, bad: Any) -> None:
+    """Anything but ``True`` or ``False`` is the caller's mistake, refused before the file is opened."""
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one"])
+
+    with pytest.raises(ValueError, match="facts"):
+        job.prepare("book.pdf", facts=bad)
+    assert job.written() == []
+
+
+# --- what a render is encoded as ------------------------------------------------------------
+
+
+def _quantisation(quality: int) -> dict[int, Any]:
+    """The quantisation tables Pillow writes at ``quality``: they depend on nothing else, so they name the quality."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (16, 16), (120, 130, 140)).save(buffer, "JPEG", quality=quality)
+    return _tables(Image.open(buffer))
+
+
+def _tables(jpeg: Image.Image) -> dict[int, Any]:
+    """The quantisation tables of an opened JPEG."""
+    return dict(jpeg.quantization)  # type: ignore[attr-defined]
+
+
+def test_a_page_is_420_at_page_quality_and_a_photo_444_at_picture_quality(job: Job) -> None:
+    """Pages are 4:2:0 at ``PAGE_QUALITY``, pictures 4:4:4 at ``IMAGE_QUALITY``, whole or in strips."""
+    assert _quantisation(PAGE_QUALITY) != _quantisation(IMAGE_QUALITY)  # the two are told apart by their tables
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one", "two"])
+    make_images.make_photo(job.path("photo.jpg"), size=(96, 64), orientation=1)
+
+    page = job.check(job.prepare("book.pdf", pages=[1])["renders"][0])
+    strips = [job.check(entry) for entry in job.prepare("book.pdf", pages=[2], strips=2)["renders"]]
+    picture = job.check(job.prepare("photo.jpg")["renders"][0])
+    picture_strips = [job.check(entry) for entry in job.prepare("photo.jpg", strips=2)["renders"]]
+
+    assert {JpegImagePlugin.get_sampling(image) for image in [page, *strips]} == {2}
+    assert {JpegImagePlugin.get_sampling(image) for image in [picture, *picture_strips]} == {0}
+    for image in [page, *strips]:
+        assert _tables(image) == _quantisation(PAGE_QUALITY)
+    for image in [picture, *picture_strips]:
+        assert _tables(image) == _quantisation(IMAGE_QUALITY)
+
+
+# --- what a job loads -----------------------------------------------------------------------
+
+
+def test_a_pdf_job_does_not_load_the_text_library(job: Job) -> None:
+    """Drawing a page, or refusing an encrypted PDF, needs pdfium and Pillow, not pypdf, which only the readers use."""
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one", None])
+    make_fixtures.make_pdf(job.path("locked.pdf"), ["one"], password="invented")
+    code = textwrap.dedent(
+        """
+        import json, sys
+        from pathlib import Path
+
+        from workbench.executor.runners import RUNNERS, JobContext
+
+        work = Path(sys.argv[1])
+        ctx = JobContext(work_dir=work, out_dir=work / "out", chat_id="chat-1", max_chars=16384, file_mb=50)
+        answers = [
+            RUNNERS["prepare_file"]({"path": name, "pages": None, "strips": 1, "have": [], "budget_s": 60}, ctx)
+            for name in ("book.pdf", "locked.pdf")
+        ]
+        print(json.dumps({
+            "renders": len(answers[0]["renders"]),
+            "refused": answers[1],
+            "pdfium": "pypdfium2" in sys.modules,
+            "pypdf": "pypdf" in sys.modules,
+        }))
+        """
+    )
+
+    done = subprocess.run(
+        [sys.executable, "-c", code, str(job.ctx.work_dir)], capture_output=True, text=True, check=True, timeout=120
+    )
+
+    assert json.loads(done.stdout) == {
+        "renders": 2,
+        "refused": {"error": "unreadable_file: the PDF is password-protected (encrypted)"},
+        "pdfium": True,  # the probe did draw with pdfium
+        "pypdf": False,
+    }
+
+
+# --- what cannot be written, and what has no pages ------------------------------------------
+
+
+def test_a_render_that_cannot_be_written_is_a_fixed_error_that_leaves_nothing(
+    job: Job, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk at the second file ends in a text with no path; every file written, begun ones too, is removed."""
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one", "two", "three"])
+    real = Path.write_bytes
+    written: list[str] = []
+
+    def second_fails(self: Path, data: bytes) -> int:
+        written.append(self.name)
+        if len(written) == 2:
+            real(self, data[:10])  # a file that was begun
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", second_fails)
+
+    answer = job.prepare("book.pdf")
+
+    assert answer == {"error": "unreadable_file: the renders could not be written"}
+    assert str(job.ctx.work_dir) not in json.dumps(answer)
+    assert written == ["p0001.jpg", "p0002.jpg"]
+    assert job.written() == []
+
+
+def _bare_pdf(objects: list[bytes]) -> bytes:
+    """A PDF of the objects given, numbered from 1 with the first the catalogue, in the bytes of its own text."""
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    start = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    return out + f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n".encode()
+
+
+def test_a_pdf_with_an_empty_page_tree_is_unreadable(job: Job) -> None:
+    """A PDF whose page tree holds no page is refused, whether pdfium refuses it or finds a page it cannot load."""
+    job.path("none.pdf").write_bytes(_bare_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Count 0 >>"]))
+
+    answer = job.prepare("none.pdf")
+
+    assert set(answer) == {"error"}
+    assert answer["error"].startswith("unreadable_file: ")
+    assert job.written() == []
+
+
+def test_a_document_with_no_pages_is_closed_and_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If pdfium ever opens a document of no pages (it does not for any file tried), it is closed and called empty."""
+    closed: list[bool] = []
+
+    class Empty:
+        def __len__(self) -> int:
+            return 0
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(pages.pypdfium2, "PdfDocument", lambda path: Empty())
+
+    with pytest.raises(UnreadableFile) as refused:
+        pages.open_pdf(Path("empty.pdf"))
+
+    assert (str(refused.value), closed) == ("the PDF has no pages", [True])

@@ -16,13 +16,12 @@ from typing import Any, Final
 from pypdf import PdfReader
 from pypdf.errors import DependencyError
 
-from workbench.executor.readers import DocumentText, Part, UnreadableFile, check
+from workbench.executor.readers import PDF_ENCRYPTED, DocumentText, Part, UnreadableFile, check
 from workbench.executor.readers import paging as pg
 
 #: Most pages one read looks at, so a long run of scanned pages cannot keep the job busy.
 MAX_PAGES_LOOKED_AT: Final = 200
 
-_ENCRYPTED: Final = "the PDF is password-protected (encrypted)"
 _CANNOT_DECRYPT: Final = "the PDF is encrypted in a way that cannot be decrypted here"
 
 # pypdf reports damage it recovers from as warnings; the job's log is not where they belong.
@@ -48,9 +47,9 @@ def _open(path: Path) -> PdfReader:
         except DependencyError:
             raise UnreadableFile(_CANNOT_DECRYPT) from None
         except Exception:
-            raise UnreadableFile(_ENCRYPTED) from None
+            raise UnreadableFile(PDF_ENCRYPTED) from None
         if not opened:
-            raise UnreadableFile(_ENCRYPTED)
+            raise UnreadableFile(PDF_ENCRYPTED)
     return reader
 
 
