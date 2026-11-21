@@ -4,9 +4,10 @@ Any path outside the request's chat is ``404``. The calls state a purpose and a 
 which their events carry, and an upload, a prepare or a view that must state a purpose and does not is
 ``428``, recorded as denied. ``DELETE /files/chat`` deletes the request's chat.
 
-``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`). The
-view of a file answers the file itself; with ``rendition`` it answers one render of it instead, a page or a picture, or
-one strip of it, made first when it does not exist yet, on the user's own turn.
+``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`), and
+with ``strips`` of 2 or 3 also cuts a picture into that many strips. The view of a file answers the file itself; with
+``rendition`` it answers one render of it instead, a page or a picture, or one strip of it, made first when it does not
+exist yet, on the user's own turn.
 
 Every read or change of content is one audit event, by file id and never by name, and it is
 written *before* the content leaves, the file becomes visible or the chat goes: an action that
@@ -277,6 +278,7 @@ async def prepare_file(
     store: StoreDep,
     audit: CallAuditDep,
     jobs: JobsDep,
+    strips: Annotated[int, Query(ge=1, le=3)] = 1,
 ) -> dict[str, object]:
     """Render a picture or a PDF once, and answer its manifest.
 
@@ -284,7 +286,10 @@ async def prepare_file(
     one answers from the renders kept, with no job and no event. A file that is neither a picture nor a PDF is
     answered at once as ``kind: none``. The request has no body. It waits at most
     :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its turn, on the caller's prepare gate, and so never takes the
-    user's own turn from a chat in progress.
+    user's own turn from a chat in progress. With ``strips`` of 2 or 3, a picture is also cut into that many strips,
+    in a second job on the same gate (none once they exist), so that a model that sees it in strips pays no job on
+    its turn; a strip that cannot be made fails the prepare as a view of it would. A PDF's pages are cut when they are
+    viewed, whatever ``strips`` says.
 
     Args:
         path: The file's virtual path, in the request's chat.
@@ -294,21 +299,18 @@ async def prepare_file(
         store: The file store.
         audit: The audit log, bound to the call.
         jobs: The app's job queue.
+        strips: Into how many strips a picture is cut as well, 1 to 3; 1 for none.
 
     Returns:
-        The manifest, all its keys, the ones that hold nothing as ``null``.
+        The manifest, all its keys, the ones that hold nothing as ``null``: the same whatever ``strips`` is.
     """
     await run_in_threadpool(audit.check, "prepare", p)
     source = await run_in_threadpool(store.get, p, path)
     wall, budgeted = _wall_of(settings, caller)
-    manifest = await prepared(
-        p,
-        source,
-        settings=budgeted,
-        store=store,
-        audit=audit,
-        jobs=_render_jobs(jobs, wall, PREPARE_QUEUE_WAIT_S, caller, "prepare"),
-    )
+    gate = _render_jobs(jobs, wall, PREPARE_QUEUE_WAIT_S, caller, "prepare")
+    manifest = await prepared(p, source, settings=budgeted, store=store, audit=audit, jobs=gate)
+    if strips > 1 and manifest.kind == "image":
+        await renders_for(p, source, manifest, [1], strips, settings=budgeted, store=store, audit=audit, jobs=gate)
     return manifest.model_dump(mode="json")
 
 

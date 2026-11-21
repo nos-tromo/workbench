@@ -76,9 +76,10 @@ def pdf(store: Store, built: Path, name: str, pages: list[str | None], *, passwo
     return put(store, name, mk.make_pdf(built / name, pages, password=password).read_bytes(), p=PG)
 
 
-def prepare(client: TestClient, path: str, headers: Mapping[str, Any] = HEADERS) -> Any:
-    """Prepare ``path``, as Ghostwriter does unless other headers are given."""
-    return client.post("/files/prepare", params={"path": path}, headers=headers)
+def prepare(client: TestClient, path: str, headers: Mapping[str, Any] = HEADERS, strips: int | None = None) -> Any:
+    """Prepare ``path``, as Ghostwriter does unless other headers are given, with ``strips`` if given."""
+    params: dict[str, Any] = {"path": path} if strips is None else {"path": path, "strips": strips}
+    return client.post("/files/prepare", params=params, headers=headers)
 
 
 def rendition(
@@ -154,6 +155,52 @@ def test_prepare_again_answers_from_the_renders_without_a_job_or_event(
     assert second.json() == first.json()
     assert first.json()["kind"] == "image" and first.json()["total"] == 1
     assert (jobs, len(executor.requests), len(audit_lines())) == (1, 1, events)
+
+
+def test_prepare_with_strips_cuts_a_picture_into_them_at_once(
+    client: TestClient, photo: FileRecord, executor: Local, queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R16: ``strips=2`` makes the picture's two strips at prepare, on the prepare gate; a view of one runs no job.
+
+    The answer is the same manifest; a second such prepare runs no job either.
+    """
+    gates: list[str] = []
+    real = queue.submit_renders
+
+    async def watched(*args: Any, **more: Any) -> Any:
+        gates.append(more["gate"])
+        return await real(*args, **more)
+
+    monkeypatch.setattr(queue, "submit_renders", watched)
+    r = prepare(client, photo.virtual_path, strips=2)
+
+    assert r.status_code == 200
+    assert gates == ["prepare", "prepare"]
+    jobs = len(executor.requests)
+    assert (
+        prepare(client, photo.virtual_path, strips=2).json() == r.json() == prepare(client, photo.virtual_path).json()
+    )
+    assert rendition(client, photo.virtual_path, 1, strips=2, strip=1).status_code == 200
+    assert rendition(client, photo.virtual_path, 1, strips=2, strip=2).status_code == 200
+    assert len(executor.requests) == jobs
+
+
+def test_prepare_with_strips_leaves_the_pages_of_a_pdf_to_their_views(
+    client: TestClient, store: Store, built: Path, executor: Local
+) -> None:
+    """A PDF's strips stay on demand: its prepare is the one job of its first pages, whole."""
+    source = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026", None])
+
+    assert prepare(client, source.virtual_path, strips=3).status_code == 200
+    assert len(executor.requests) == 1
+    assert {rec.strips for rec in store.derived_of(source)} == {1}
+
+
+@pytest.mark.parametrize("strips", [0, 4])
+def test_prepare_strips_are_one_to_three(client: TestClient, photo: FileRecord, executor: Local, strips: int) -> None:
+    """Other counts are 422, with no job."""
+    assert prepare(client, photo.virtual_path, strips=strips).status_code == 422
+    assert executor.requests == []
 
 
 def test_prepare_of_a_word_file_is_kind_none_without_a_job(

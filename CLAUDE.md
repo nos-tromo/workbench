@@ -150,7 +150,8 @@ header selects what the model is told and shown, never what a caller may reach.
   so a refusal names its slide and block and costs no job.
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
   view, the chat delete). `POST /files/prepare` renders a picture or a PDF's
-  first 20 pages once (idempotent, answered from the rows after that) and
+  first 20 pages once (idempotent, answered from the rows after that; with
+  `strips` 2 or 3 it also cuts a picture into strips, on the prepare gate) and
   `GET /files/view?rendition=` serves one render, made first on the user's own
   turn when it does not exist yet.
 - `workbench/executor/runners/`: one runner per tool that needs file content
