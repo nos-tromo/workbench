@@ -190,24 +190,28 @@ things, the limits that matter to users:
   which loads it in code and writes `out/` as `.xlsx` or `.csv`; its rows are
   not copied into `write_table`. `read_document` shows a JSON file indented,
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
-- Pages and pictures come back as images for the model alone, after the
-  answer's text, and `shown` names each in order (image block `i` is
-  `shown[i]`). `read_document` lists the pages of a PDF that have no text
-  layer in `pages_without_text`, never as blank, and attaches their images in
-  the same answer: the pages of its window, whole, at most 4 images and
-  2.5 MiB, and the answer ends before the first page that does not fit, with
-  `next_part` naming it. A picture file is read as its image. `view_file`
-  shows any page or picture, at most 8 images. A read whose images cannot be
-  made (the executor has no room, the render is refused, the user's quota or
-  the file's cap of renders is spent) still answers the text, with `shown`
-  empty and a hint: for a cause that may pass (no room now, a job that ran
-  out of time) that `view_file` shows the pages, and for one that will not
-  (the file's cap of renders, the quota, a full volume, a file that cannot be
-  drawn) the cause, with no promise of `view_file`; a page that cannot be
-  read back is named in the hint. When the images end the answer early, the
-  hint says so and `pages_without_text` lists only the pages before
-  `next_part`. A picture file has no text to fall back on, so its read fails
-  with the render.
+- Pages and pictures come back as images for the model alone, on a call that
+  takes them (`X-Accept-Images: 1`, see [Callers and
+  doors](#callers-and-doors)), after the answer's text, and `shown` names each
+  in order (image block `i` is `shown[i]`). `read_document` lists the pages of
+  a PDF that have no text layer in `pages_without_text`, never as blank, and
+  attaches their images in the same answer: the pages of its window, whole, at
+  most 4 images and 2.5 MiB, and the answer ends before the first page that
+  does not fit, with `next_part` naming it. A picture file is read as its
+  image. `view_file` shows any page or picture, at most 8 images; with no
+  part, the first four pages of a PDF, and its hint names the pages after them
+  and the part that shows the next four. A picture of several frames is shown
+  as its first, and the hint says so; a page that could not be shown is named
+  in a sentence. A read whose images cannot be made (the executor has no room,
+  the render is refused, the user's quota or the file's cap of renders is
+  spent) still answers the text, with `shown` empty and a hint: for a cause
+  that may pass (no room now, a job or its reading that ran out of time) that
+  `view_file` shows the pages, and for one that will not (the file's cap of
+  renders, the quota, a full volume, a file that cannot be drawn) the cause,
+  with no promise of `view_file`; a page that cannot be read back is named in
+  the hint. When the images end the answer early, the hint says so and
+  `pages_without_text` lists only the pages before `next_part`. A picture file
+  has no text to fall back on, so its read fails with the render.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
 - A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place

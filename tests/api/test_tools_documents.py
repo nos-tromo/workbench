@@ -1220,7 +1220,8 @@ def test_a_quota_that_refuses_the_strips_still_answers_the_text(
         (StorageFull("storage is full"), FULL),
         (HTTPException(status_code=507, detail="storage_full: storage is full"), FULL),
         (HTTPException(status_code=422, detail="unreadable_file: the PDF cannot be opened"), UNDRAWABLE),
-        (HTTPException(status_code=422, detail="read_timeout: reading the file took longer than 90 s"), UNDRAWABLE),
+        # Final review M3: a runner that ran out of time may not next time, so view_file is promised.
+        (HTTPException(status_code=422, detail="read_timeout: reading the file took longer than 90 s"), UNSHOWN),
         (HTTPException(status_code=404, detail="file_not_found: the file is not in the workspace"), UNDRAWABLE),
     ],
     ids=[

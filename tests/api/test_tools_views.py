@@ -39,7 +39,6 @@ from workbench.models import DerivedRecord, FileRecord, Principal
 
 ANSWER_KEYS = {"path", "kind", "total", "shown", "truncated", "next_part", "hint", "outputs"}
 SHOWN_KEYS = {"label", "n", "width", "height", "mime"}
-LIMIT = "the renders of this file are at their limit"
 NAMES = [
     "fill_template",
     "inspect_template",
@@ -180,8 +179,11 @@ def test_view_file_shows_an_image_to_the_assistant(
 def test_view_file_shows_pages_1_to_4_by_default(
     client: TestClient, store: Store, built: Path, audit_lines: AuditLines
 ) -> None:
-    """Left out, ``part`` is the first four pages of a PDF, whatever more it has."""
-    source = pdf(store, built, "quay-list.pdf", quay_pages(6))
+    """Left out, ``part`` is the first four pages of a PDF, whatever more it has; the hint names the pages not shown.
+
+    Final review I3a: ``truncated`` stays "cut for room", so the sentence is what tells the model of the rest.
+    """
+    source = pdf(store, built, "quay-list.pdf", quay_pages(30))
     answer = seen(view(client, source.virtual_path))
 
     structured = answer["structuredContent"]
@@ -189,13 +191,60 @@ def test_view_file_shows_pages_1_to_4_by_default(
     assert [shown["n"] for shown in structured["shown"]] == [1, 2, 3, 4]
     assert (structured["kind"], structured["total"], structured["truncated"], structured["next_part"]) == (
         "pdf",
-        6,
+        30,
         False,
         None,
     )
+    assert structured["hint"] == 'Pages 5-30 are not shown; call view_file with part "pages 5-8".'
     assert len(images(answer)) == 4
     (event,) = events(audit_lines)
     assert event["criteria"] == {"caller": "ghostwriter", "images": 4, "strips": 1, "paged": False}
+
+
+@pytest.mark.parametrize(
+    ("total", "said"),
+    [
+        (4, None),
+        (5, 'Page 5 is not shown; call view_file with part "page 5".'),
+        (6, 'Pages 5-6 are not shown; call view_file with part "pages 5-6".'),
+    ],
+)
+def test_the_default_window_names_only_the_pages_it_leaves_out(
+    client: TestClient, store: Store, built: Path, total: int, said: str | None
+) -> None:
+    """A PDF of four pages is shown whole; one of five or six names its rest, and the window that shows it."""
+    source = pdf(store, built, "quay-list.pdf", quay_pages(total))
+
+    assert seen(view(client, source.virtual_path))["structuredContent"]["hint"] == said
+
+
+def test_a_window_cut_for_room_names_both_its_rest_and_the_pages_after_it(
+    client: TestClient, store: Store, built: Path
+) -> None:
+    """Three strips a page: the default window is cut after two pages, and pages 5 on are named as well."""
+    source = pdf(store, built, "quay-list.pdf", quay_pages(10))
+    structured = seen(view(client, source.virtual_path, strips=3))["structuredContent"]
+
+    assert (structured["truncated"], structured["next_part"]) == (True, "pages 3-4")
+    assert structured["hint"] == 'Pages 5-10 are not shown; call view_file with part "pages 5-8".'
+
+
+def test_a_named_part_says_nothing_of_the_pages_after_it(client: TestClient, store: Store, built: Path) -> None:
+    """The model chose the window: the pages it did not ask for are not named."""
+    source = pdf(store, built, "quay-list.pdf", quay_pages(30))
+
+    assert seen(view(client, source.virtual_path, "pages 1-4"))["structuredContent"]["hint"] is None
+
+
+def test_a_picture_with_several_frames_says_only_the_first_is_shown(
+    client: TestClient, store: Store, built: Path
+) -> None:
+    """Final review I3b: an animated GIF is shown as its first frame, and the model is told so."""
+    source = put(store, "harbour-cranes.gif", mi.make_gif(built / "harbour-cranes.gif", frames=3).read_bytes(), p=PG)
+    answer = seen(view(client, source.virtual_path))
+
+    assert len(images(answer)) == 1
+    assert answer["structuredContent"]["hint"] == "Only the first of 3 frames is shown."
 
 
 def test_a_part_shows_the_pages_it_names(client: TestClient, store: Store, built: Path) -> None:
@@ -446,7 +495,7 @@ def test_a_tampered_render_is_skipped_with_a_hint(
     answer = seen(view(client, source.virtual_path, "pages 1-4"))
     structured = answer["structuredContent"]
     assert [shown["n"] for shown in structured["shown"]] == [1, 3, 4]
-    assert structured["hint"] == "page 2 could not be shown"
+    assert structured["hint"] == "Page 2 could not be shown."
     assert (structured["truncated"], structured["next_part"]) == (False, None)
     for item, block in zip(structured["shown"], images(answer), strict=True):
         assert raw(block) == file_of(settings, renders[item["n"]]).read_bytes()
@@ -472,7 +521,7 @@ def test_a_page_past_the_render_cap_is_named_in_the_hint(
     assert len(answer["content"]) == 1
     structured = answer["structuredContent"]
     assert structured["shown"] == []
-    assert structured["hint"] == f"{LIMIT}; pages after 20 cannot be shown"
+    assert structured["hint"] == "The renders of this file are at their limit, so pages 21-30 cannot be shown."
     assert (structured["truncated"], structured["next_part"]) == (False, None)
     *_, event = events(audit_lines)
     assert event["target"]["ids"] == [source.id]
@@ -495,7 +544,7 @@ def test_the_pages_before_the_cap_are_still_shown(
     structured = answer["structuredContent"]
     assert [shown["n"] for shown in structured["shown"]] == [19, 20]
     assert len(images(answer)) == 2
-    assert structured["hint"] == "page 21 could not be shown page 22 could not be shown"
+    assert structured["hint"] == "Pages 21, 22 could not be shown."
 
 
 def test_a_page_the_quota_refuses_is_named_not_failed(
@@ -513,7 +562,7 @@ def test_a_page_the_quota_refuses_is_named_not_failed(
 
     structured = answer["structuredContent"]
     assert (len(answer["content"]), structured["shown"]) == (1, [])
-    assert structured["hint"] == "page 21 could not be shown"
+    assert structured["hint"] == "Page 21 could not be shown."
     assert (structured["truncated"], structured["next_part"]) == (False, None)
     *_, event = events(audit_lines)
     assert event["criteria"]["images"] == 0
@@ -532,25 +581,29 @@ def test_a_render_that_cannot_be_kept_for_any_other_reason_is_named_too(
     monkeypatch.setattr(store, "register_derived", refuse)
     answer = seen(view(client, source.virtual_path, "pages 21-22"))
 
-    assert answer["structuredContent"]["hint"] == "page 21 could not be shown page 22 could not be shown"
+    assert answer["structuredContent"]["hint"] == "Pages 21, 22 could not be shown."
 
 
 def test_a_rest_after_a_page_that_could_not_be_shown_is_still_named(
     client: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pages past what one answer takes are ``next_part`` whether or not the pages before them were shown."""
-    source = pdf(store, built, "quay-list.pdf", quay_pages(22))
+    """Pages past what one answer takes are ``next_part`` whether or not the pages before them were shown.
+
+    Three strips a page: one answer takes pages 21 and 22, which the quota refuses; 23 and 24 are the rest.
+    """
+    source = pdf(store, built, "quay-list.pdf", quay_pages(24))
     seen(view(client, source.virtual_path))
 
     def refuse(*_: Any, **__: Any) -> DerivedRecord:
         raise QuotaExceeded("workspace quota exceeded")
 
     monkeypatch.setattr(store, "register_derived", refuse)
-    answer = seen(view(client, source.virtual_path, "pages 21-22", 3))
+    answer = seen(view(client, source.virtual_path, "pages 21-24", 3))
 
     structured = answer["structuredContent"]
     assert structured["shown"] == []
-    assert structured["hint"] == "page 21 could not be shown page 22 could not be shown"
+    assert (structured["truncated"], structured["next_part"]) == (True, "pages 23-24")
+    assert structured["hint"] == "Pages 21, 22 could not be shown."
 
 
 # --- what is refused ---------------------------------------------------------------------------------------------

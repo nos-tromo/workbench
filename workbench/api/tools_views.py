@@ -9,7 +9,9 @@ after the answer's text. It never opens an image itself.
 pages: a page cut into ``k`` strips is ``k`` images, and the first page that does not fit ends the answer, whose
 ``next_part`` names the rest. A page that cannot be shown is left out and named in the hint, never an error: a render
 that is not what its row says, a page the store could not keep (the user's quota, a full volume, the source's cap of
-renders). The answer and its blocks go out together: image block ``i`` is ``shown[i]``, in order, always.
+renders). The hint also names, each in a whole sentence, the pages after the first four of a PDF when the call named
+no part, and the frames of a picture past its first: the model is told what it has not seen. The answer and its
+blocks go out together: image block ``i`` is ``shown[i]``, in order, always.
 
 ``read_document`` reads the text as ever, in the executor, and adds the pictures, so that a scan costs the model no
 second round, on a call that takes images (``X-Accept-Images: 1``). A call that takes none is read as workbench 0.6
@@ -93,6 +95,9 @@ AT_LIMIT: Final = "The pages without text cannot be shown: the renders of this f
 OVER_QUOTA: Final = "The pages without text cannot be shown: the workspace quota is exceeded."
 FULL: Final = "The pages without text cannot be shown: storage is full."
 UNDRAWABLE: Final = "The pages without text cannot be shown: the file cannot be drawn."
+
+#: The refusals of a runner that may pass on another try: they get ``UNSHOWN``, not ``UNDRAWABLE``.
+_TRANSIENT: Final = frozenset({"read_timeout"})
 
 #: A page as the PDF reader labels it.
 _PAGE: Final = re.compile(r"page (\d{1,9})")
@@ -235,6 +240,21 @@ def _part(first: int, last: int) -> str:
     return f"page {first}" if first == last else f"pages {first}-{last}"
 
 
+def _not_shown_after(last: int, total: int) -> str:
+    """Say which pages after the window a call named no part for are not shown, and how to see them.
+
+    Args:
+        last: The window's last page.
+        total: The file's pages, more than ``last``.
+
+    Returns:
+        A whole sentence: ``Pages 5-30 are not shown; call view_file with part "pages 5-8".``
+    """
+    rest = f"Page {last + 1} is" if last + 1 == total else f"Pages {last + 1}-{total} are"
+    window = _part(last + 1, min(total, last + DEFAULT_LAST))
+    return f'{rest} not shown; call view_file with part "{window}".'
+
+
 def _record(
     audit: AuditLog, p: Principal, source: FileRecord, shown: list[DerivedRecord], strips: int, *, paged: bool
 ) -> None:
@@ -268,7 +288,9 @@ async def view_file(
     The file is prepared on its first view; the pages asked for are made when they are not there yet. A window that
     gives more than eight images (``8 // strips`` pages) is shown in part, and ``next_part`` names where the rest
     begins. A page whose render could not be read back or kept is named in the hint, and a window wholly past the
-    source's cap of renders is answered with that said, not as an error.
+    source's cap of renders is answered with that said, not as an error. The hint says too, in whole sentences, which
+    pages a call that named no part does not show (those after the first four of a PDF), and that only the first frame
+    of a picture with several is shown.
 
     Args:
         body: The path, the pages, and into how many strips each is cut.
@@ -340,11 +362,15 @@ async def view_file(
     taken = await _take(store, pages, first, last, through)
     await run_in_threadpool(_record, audit, p, source, taken.renders, strips, paged=paged)
     notes = (
-        # No page asked for exists, so the last page that has a render is the one before the window.
-        [f"the renders of this file are at their limit; pages after {first - 1} cannot be shown"]
+        # No page asked for exists, and nothing more can be made.
+        [f"The renders of this file are at their limit, so {_part(first, last)} cannot be shown."]
         if at_limit
-        else [f"page {n} could not be shown" for n in taken.left_out]
+        else _notes([], taken.left_out, unshown=None)
     )
+    if not at_limit and not paged and last < manifest.total:
+        notes.append(_not_shown_after(last, manifest.total))
+    if kind == "image" and manifest.frames is not None and taken.renders:
+        notes.append(f"Only the first of {manifest.frames} frames is shown.")
     # Nothing more can be made at the source's limit, so a rest there is not offered.
     rest = None if at_limit or taken.cut_at is None else _part(taken.cut_at, last)
     answer = ViewedFile(
@@ -429,9 +455,10 @@ def _unshown_because(lost: Exception) -> str:
         lost: What stopped the renders: the executor having no room, a refusal of the render job, or a cap of the store.
 
     Returns:
-        A whole sentence. ``UNSHOWN`` for a cause that may pass (no room now, a job that ran out of time or memory, a
-        render the store could not keep); one that names the cause, and promises nothing, for a cause that will not
-        (the source's cap of renders, the user's quota, a full volume, a file the renderer refuses).
+        A whole sentence. ``UNSHOWN`` for a cause that may pass (no room now, a job or its runner that ran out of time,
+        a job that ran out of memory, a render the store could not keep); one that names the cause, and promises
+        nothing, for a cause that will not (the source's cap of renders, the user's quota, a full volume, a file the
+        renderer refuses).
     """
     if isinstance(lost, RendersFull):
         return AT_LIMIT
@@ -442,7 +469,8 @@ def _unshown_because(lost: Exception) -> str:
     if isinstance(lost, HTTPException):
         if lost.status_code == 507:
             return FULL
-        refused = lost.status_code in (404, 422) and str(lost.detail).partition(": ")[0] in _RUNNER_ERRORS
+        code = str(lost.detail).partition(": ")[0]
+        refused = lost.status_code in (404, 422) and code in _RUNNER_ERRORS and code not in _TRANSIENT
         return UNDRAWABLE if refused else UNSHOWN
     return UNSHOWN
 
