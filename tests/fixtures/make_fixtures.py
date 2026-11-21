@@ -238,6 +238,45 @@ def make_odt(path: Path) -> Path:
     return path
 
 
+#: What an encrypted ODF member's manifest entry carries: the checksum, the cipher and the key derivation, all invented.
+_ENCRYPTION_DATA = (
+    '<manifest:encryption-data manifest:checksum-type="SHA1/1K" manifest:checksum="AAAAAAAAAAAAAAAAAAAAAAAAAAA=">'
+    '<manifest:algorithm manifest:algorithm-name="Blowfish CFB" manifest:initialisation-vector="AAAAAAAAAAA="/>'
+    '<manifest:key-derivation manifest:key-derivation-name="PBKDF2" manifest:key-size="16" '
+    'manifest:iteration-count="1024" manifest:salt="AAAAAAAAAAAAAAAAAAAAAA=="/>'
+    "</manifest:encryption-data>"
+)
+
+
+def make_encrypted_odt(path: Path) -> Path:
+    """Write an OpenDocument text that has a password, as a reader of its zip sees it.
+
+    It is a good zip whose members are not flagged as encrypted, and whose manifest holds encryption data for
+    ``content.xml``; only the manifest says it is locked.
+
+    Args:
+        path: Where to write it.
+
+    Returns:
+        ``path``.
+    """
+    plain = make_odt(path.with_name(f"{path.name}.plain"))
+    entry = '<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>'
+    locked = entry.removesuffix("/>") + ">" + _ENCRYPTION_DATA + "</manifest:file-entry>"
+    try:
+        with zipfile.ZipFile(plain) as src, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as out:
+            for item in src.infolist():
+                data = src.read(item.filename)
+                if item.filename == "META-INF/manifest.xml":
+                    text = data.decode("utf-8")
+                    assert entry in text, "the manifest has no entry for content.xml"
+                    data = text.replace(entry, locked).encode("utf-8")
+                out.writestr(item, data)
+    finally:
+        plain.unlink()
+    return path
+
+
 def make_ods(path: Path) -> Path:
     """Write an OpenDocument spreadsheet: one sheet of numbers and words, then a long run of blank rows.
 

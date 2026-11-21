@@ -285,6 +285,7 @@ TOOLS: Final = frozenset(
         "write_document",
         "write_presentation",
         "prepare_file",
+        "convert_office",
     }
 )
 

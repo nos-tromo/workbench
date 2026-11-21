@@ -2640,6 +2640,48 @@ async def test_as_root_a_hung_child_is_stopped_at_its_deadline(
     assert time.monotonic() - began < scaled(10)
 
 
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_deck_is_converted_and_drawn_in_slots(root_volume: Path) -> None:
+    """``convert_office`` and then ``prepare_file``, the real entry point in a slot, draw a deck as its slides.
+
+    A five-slide deck whose second slide is a picture alone is converted to one staged output, ``converted.pdf``.
+    Put in a chat folder under that name, it is drawn with ``office`` naming the five slides: kind ``office``, five
+    slides and five renders, the second slide the one with no text.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    deck = make_fixtures.make_deck(scratch / "deck.pptx", 5, picture_only=[2])
+    chat = _chat(root_volume, {"deck.pptx": deck.read_bytes()})
+    sup = Supervisor(_settings(root_volume))
+
+    args: dict[str, Any] = {"path": "deck.pptx", "budget_s": 100}
+    converted = await sup.run_job(
+        _request(tool="convert_office", args=args, input_files=["deck.pptx"], limits=OFFICE_LIMITS)
+    )
+
+    assert converted.status == "ok", converted
+    assert converted.result == {"name": "converted.pdf", "pages": 5, "slides": 5}
+    (output,) = converted.outputs
+    assert output.name == "converted.pdf"
+    pdf = Path(output.staged_path).read_bytes()
+    assert pdf.startswith(b"%PDF-")
+
+    (chat / "converted.pdf").write_bytes(pdf)  # as the api keeps it, for the render job to read
+    office_args = {"unit": "slide", "slides": 5}
+    args = {"path": "converted.pdf", "pages": None, "strips": 1, "have": [], "budget_s": 100, "office": office_args}
+    drawn = await sup.run_job(
+        _request(tool="prepare_file", args=args, input_files=["converted.pdf"], limits=OFFICE_LIMITS)
+    )
+
+    assert drawn.status == "ok", drawn
+    result = RenderAnswer.model_validate(drawn.result)
+    assert (result.kind, result.unit, result.total) == ("office", "slide", 5)
+    assert result.pages_without_text == [2]
+    assert [entry.n for entry in result.renders] == [1, 2, 3, 4, 5]
+    assert all(entry.role == "page" for entry in result.renders)
+    assert sorted(output.name for output in drawn.outputs) == sorted(entry.name for entry in result.renders)
+
+
 @pytest.mark.skipif(not IN_THE_IMAGE, reason="the baked profile is the executor image's")
 def test_the_baked_profile_names_only_settings_libreoffice_knows() -> None:
     """Every setting of the image's profile is one LibreOffice's own schema names, so none is silently ignored."""

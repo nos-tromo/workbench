@@ -666,11 +666,17 @@ class Job:
         have: Sequence[int] = (),
         budget_s: float = 60,
         max_chars: int | None = None,
+        office: Any = None,
         **extra: Any,
     ) -> dict[str, Any]:
-        """Run ``prepare_file`` on an input; ``extra`` are further arguments, such as ``facts``."""
+        """Run ``prepare_file`` on an input; ``office`` is its argument of that name, left out when ``None``.
+
+        ``extra`` are further arguments, such as ``facts``.
+        """
         ctx = self.ctx if max_chars is None else dataclasses.replace(self.ctx, max_chars=max_chars)
         args = {"path": name, "pages": pages, "strips": strips, "have": list(have), "budget_s": budget_s, **extra}
+        if office is not None:
+            args["office"] = office
         return RUNNERS["prepare_file"](args, ctx)
 
     def written(self) -> list[str]:
@@ -990,14 +996,148 @@ def test_the_answer_names_no_path(job: Job) -> None:
         assert name not in text
 
 
-def test_a_word_file_is_unsupported(job: Job) -> None:
-    """A file that is neither a picture nor a PDF is not for this tool."""
-    make_fixtures.make_docx(job.path("memo.docx"))
+def test_a_file_of_no_kind_is_unsupported(job: Job) -> None:
+    """A file that is neither a picture, a PDF nor an Office file is not for this tool."""
+    make_fixtures.make_xlsx(job.path("sheet.xlsx"))
 
-    answer = job.prepare("memo.docx")
+    answer = job.prepare("sheet.xlsx")
 
     assert answer == {"error": "unsupported_format: only pictures and PDFs can be shown"}
-    assert "memo" not in json.dumps(answer)
+    assert "sheet" not in json.dumps(answer)
+
+
+def test_an_office_file_is_drawn_only_after_conversion(job: Job) -> None:
+    """A Word file or a deck is told to be converted first, in words of their own, and nothing is written."""
+    make_fixtures.make_docx(job.path("memo.docx"))
+    make_fixtures.make_pptx(job.path("deck.pptx"))
+
+    for name in ("memo.docx", "deck.pptx"):
+        answer = job.prepare(name)
+        assert answer == {"error": "unsupported_format: an Office file is converted first"}
+        assert name.split(".")[0] not in json.dumps(answer)
+    assert job.written() == []
+
+
+# --- a converted PDF, as the pages of an Office file ---------------------------------------
+
+
+def test_pages_of_a_converted_pdf_answer_as_office(job: Job) -> None:
+    """With ``office``, the pages of the PDF are those of the deck: kind, unit, the slides without text, role page."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["Invented slide 1", None, "Invented slide 3"])
+
+    answer = job.prepare("converted.pdf", office={"unit": "slide", "slides": 3})
+
+    assert (answer["kind"], answer["unit"], answer["total"]) == ("office", "slide", 3)
+    assert answer["pages_without_text"] == [2]
+    assert answer["frames"] is None
+    assert answer["hint"] is None
+    assert [(entry["role"], entry["n"]) for entry in answer["renders"]] == [("page", 1), ("page", 2), ("page", 3)]
+    for entry in answer["renders"]:
+        assert max(entry["width"], entry["height"]) == PAGE_LONG_SIDE
+        job.check(entry)
+    assert RenderAnswer.model_validate(answer).model_dump() == answer
+
+
+def test_a_document_in_pages_answers_as_office_in_pages(job: Job) -> None:
+    """A text document has no slide count and counts in pages."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["Invented page 1", "Invented page 2"])
+
+    answer = job.prepare("converted.pdf", office={"unit": "page"})
+
+    assert (answer["kind"], answer["unit"], answer["total"], answer["hint"]) == ("office", "page", 2, None)
+
+
+def test_a_pdf_has_the_unit_page(job: Job) -> None:
+    """A PDF with no ``office`` is a PDF, counted in pages, as before."""
+    make_fixtures.make_pdf(job.path("book.pdf"), ["one"])
+
+    answer = job.prepare("book.pdf")
+
+    assert (answer["kind"], answer["unit"]) == ("pdf", "page")
+
+
+def test_a_slide_count_that_differs_says_so(job: Job) -> None:
+    """A deck of four slides whose PDF has three pages says that a picture's number may not be its slide's."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["Invented slide 1", "Invented slide 2", "Invented slide 3"])
+
+    answer = job.prepare("converted.pdf", office={"unit": "slide", "slides": 4})
+
+    assert answer["hint"] == ("the deck has 4 slides and 3 were drawn, so a picture's number may not be its slide's")
+    assert answer["total"] == 3
+    RenderAnswer.model_validate(answer)
+
+
+def test_a_slide_count_that_matches_says_nothing(job: Job) -> None:
+    """The same count, or none, adds no sentence."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["one", "two"])
+
+    for office in ({"unit": "slide", "slides": 2}, {"unit": "slide"}, {"unit": "page"}):
+        assert job.prepare("converted.pdf", pages=[], office=office)["hint"] is None
+
+
+@pytest.mark.parametrize(
+    ("office", "noun"),
+    [({"unit": "slide", "slides": 45}, "slide"), ({"unit": "page"}, "page"), (None, "page")],
+    ids=["deck", "document", "pdf"],
+)
+def test_the_notes_of_an_office_file_name_its_unit(
+    job: Job, monkeypatch: pytest.MonkeyPatch, office: dict[str, Any] | None, noun: str
+) -> None:
+    """The two notes of a long file say slides for a deck and pages for a document; a PDF's words are unchanged."""
+    monkeypatch.setattr(runner, "PAGES_CHECKED_MAX", 40)
+    make_fixtures.make_pdf(job.path("converted.pdf"), [None] * 45)
+
+    answer = job.prepare("converted.pdf", pages=[1], max_chars=330, office=office)
+
+    assert answer["hint"].startswith(
+        f"{noun}s after 40 were not checked for text; {noun}s without text are listed up to {noun} "
+    )
+    RenderAnswer.model_validate(answer)
+
+
+def test_the_mismatch_comes_before_the_other_notes(job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the slide count off and a long deck, the hint joins the sentences, the count's first."""
+    monkeypatch.setattr(runner, "PAGES_CHECKED_MAX", 2)
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["one", None, None])
+
+    answer = job.prepare("converted.pdf", pages=[], office={"unit": "slide", "slides": 4})
+
+    assert answer["hint"] == (
+        "the deck has 4 slides and 3 were drawn, so a picture's number may not be its slide's; "
+        "slides after 2 were not checked for text"
+    )
+
+
+def test_office_needs_a_pdf_input(job: Job) -> None:
+    """``office`` is the caller's word about a converted PDF: given with a picture or a Word file, it is a mistake."""
+    make_images.make_photo(job.path("photo.jpg"))
+    make_fixtures.make_docx(job.path("memo.docx"))
+
+    for name in ("photo.jpg", "memo.docx"):
+        with pytest.raises(ValueError, match="PDF"):
+            job.prepare(name, office={"unit": "slide", "slides": 3})
+    assert job.written() == []
+
+
+def test_a_bad_office_argument_is_the_callers_mistake(job: Job) -> None:
+    """A unit that is none, a count of 0, a field it does not know and a non-object are refused, quoting nothing."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["one"])
+
+    for office in ({"unit": "sheet"}, {"unit": "slide", "slides": 0}, {"unit": "page", "extra": 1}, "slide", ["page"]):
+        with pytest.raises(ValueError) as raised:
+            job.prepare("converted.pdf", office=office)
+        assert "sheet" not in str(raised.value)
+    assert job.written() == []
+
+
+def test_an_office_pdf_can_be_drawn_in_strips_and_on_demand(job: Job) -> None:
+    """The pages are asked for as any PDF's are: a page, its strips, the ones the caller has."""
+    make_fixtures.make_pdf(job.path("converted.pdf"), ["one", "two", "three"])
+
+    answer = job.prepare("converted.pdf", pages=[2], strips=2, office={"unit": "slide", "slides": 3}, facts=False)
+
+    assert (answer["kind"], answer["unit"], answer["total"], answer["pages_without_text"]) == ("office", "slide", 3, [])
+    assert [(entry["n"], entry["strip"], entry["strips"]) for entry in answer["renders"]] == [(2, 1, 2), (2, 2, 2)]
 
 
 def test_a_missing_file_is_not_found(job: Job) -> None:
