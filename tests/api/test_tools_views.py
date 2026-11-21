@@ -814,6 +814,16 @@ def test_the_schema_stays_small(client: TestClient) -> None:
     assert 600 <= len(tool["description"]) <= 1000
 
 
+def test_a_shown_image_is_described_as_a_page_or_a_slide(client: TestClient) -> None:
+    """A deck's images are labelled ``slide 3``: the answer's schema says so, for both tools that show images."""
+    for name in ("view_file", "read_document"):
+        (tool,) = [t for t in tools_of(client, HG) if t["name"] == name]
+        shown = tool["outputSchema"]["$defs"]["ShownImage"]
+        assert "'slide 3'" in shown["properties"]["label"]["description"], name
+        assert shown["properties"]["n"]["description"].startswith("The page or slide"), name
+        assert "``slide 3``" in shown["description"], name
+
+
 def test_ghostwriter_is_offered_view_file(client: TestClient) -> None:
     """Ghostwriter's ten tools, sorted by name; docint's list is ``run_python`` alone."""
     assert [tool["name"] for tool in tools_of(client, HG)] == NAMES

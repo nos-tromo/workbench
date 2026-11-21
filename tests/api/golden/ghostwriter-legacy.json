@@ -1106,16 +1106,16 @@
             "type": "object"
           },
           "ShownImage": {
-            "description": "An image that comes with the answer for you to see: a picture, a page, or a strip of either.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``page 3, strip 1 of 2``.\n    n: The page, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
+            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, or a strip of one.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``page 3, strip 1 of 2``.\n    n: The page or slide, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
             "properties": {
               "label": {
-                "description": "What the image is: 'image', 'page 3' or 'page 3, strip 1 of 2'.",
+                "description": "What the image is: 'image', 'page 3', 'slide 3' or 'page 3, strip 1 of 2'.",
                 "maxLength": 100,
                 "title": "Label",
                 "type": "string"
               },
               "n": {
-                "description": "The page, counted from 1; 1 for a picture.",
+                "description": "The page or slide, counted from 1; 1 for a picture.",
                 "title": "N",
                 "type": "integer"
               },
@@ -1855,16 +1855,16 @@
             "type": "object"
           },
           "ShownImage": {
-            "description": "An image that comes with the answer for you to see: a picture, a page, or a strip of either.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``page 3, strip 1 of 2``.\n    n: The page, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
+            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, or a strip of one.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``page 3, strip 1 of 2``.\n    n: The page or slide, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
             "properties": {
               "label": {
-                "description": "What the image is: 'image', 'page 3' or 'page 3, strip 1 of 2'.",
+                "description": "What the image is: 'image', 'page 3', 'slide 3' or 'page 3, strip 1 of 2'.",
                 "maxLength": 100,
                 "title": "Label",
                 "type": "string"
               },
               "n": {
-                "description": "The page, counted from 1; 1 for a picture.",
+                "description": "The page or slide, counted from 1; 1 for a picture.",
                 "title": "N",
                 "type": "integer"
               },
