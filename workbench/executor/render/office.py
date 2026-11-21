@@ -210,30 +210,53 @@ def seed_profile(*, under: Path | None = None, prebuilt: Path = PROFILE) -> Path
     return folder
 
 
-def convert(source: Path, target: Path, *, deck: bool, deadline: float) -> None:
+def convert(
+    source: Path,
+    target: Path,
+    *,
+    deck: bool,
+    deadline: float,
+    test_only_load_options: bytes = LOAD_OPTIONS,
+    test_only_profile_settings: str | None = None,
+) -> None:
     """Convert an Office file to a PDF, in a forked child, by the deadline.
+
+    The child's exit code decides the answer. Only a child that could not start LibreOffice is the executor's error:
+    no library, no start, or an error of this module's own code in the child (:data:`EXIT_FAILED`). Everything else
+    that ends without a PDF is the file's: LibreOffice could not open it, could not save it, exited by itself or died
+    of a signal (a file that crashes it), or said it saved and left no regular file at ``target``.
 
     Args:
         source: The file, already checked (``readers.check_zip``, no encryption).
         target: Where the PDF is written.
         deck: The file is a presentation: Impress's filter data (hidden slides drawn, no notes pages).
         deadline: A :func:`time.monotonic` time after which the child is killed.
+        test_only_load_options: For tests only, never in a job: what the document is loaded with in place of
+            :data:`LOAD_OPTIONS` (the macro test's positive control asks LibreOfficeKit to run macros).
+        test_only_profile_settings: For tests only, never in a job: a ``registrymodifications.xcu`` written over the
+            seeded profile's; ``None``, the default, keeps the baked profile as it is.
 
     Raises:
-        UnreadableFile: LibreOffice could not open the file, or not convert it: a fixed text that names no path.
-        RuntimeError: LibreOffice could not start.
+        UnreadableFile: LibreOffice could not open the file (:data:`EXIT_NO_LOAD`), or not convert it
+            (:data:`EXIT_NO_SAVE`, any other nonzero code, a signal, or :data:`EXIT_OK` without a PDF): a fixed text
+            that names no path.
+        RuntimeError: LibreOffice could not start (:data:`EXIT_NO_LIBRARY`, :data:`EXIT_NO_START`,
+            :data:`EXIT_FAILED`).
         ReadTimeout: The conversion ran past the deadline; the child has been killed and reaped.
     """
     profile = seed_profile()
+    if test_only_profile_settings is not None:
+        _write_settings(profile, test_only_profile_settings)
     options = IMPRESS_OPTIONS if deck else WRITER_OPTIONS
-    code = run_in_child(partial(_convert_in_child, source, target, profile, options), deadline)
+    work = partial(_convert_in_child, source, target, profile, options, load_options=test_only_load_options)
+    code = run_in_child(work, deadline)
     if code == EXIT_OK and _is_regular(target):
         return
+    if code in (EXIT_NO_LIBRARY, EXIT_NO_START, EXIT_FAILED):
+        raise RuntimeError(_NO_START)
     if code == EXIT_NO_LOAD:
         raise UnreadableFile(_NOT_OPENED)
-    if code in (EXIT_OK, EXIT_NO_SAVE) or code < 0:
-        raise UnreadableFile(_NOT_CONVERTED)
-    raise RuntimeError(_NO_START)
+    raise UnreadableFile(_NOT_CONVERTED)
 
 
 def bake(profile: Path) -> None:
@@ -272,15 +295,16 @@ def main(argv: Sequence[str]) -> int:
     return 0
 
 
-def _write_settings(profile: Path) -> None:
-    """Write :data:`PROFILE_SETTINGS` as ``user/registrymodifications.xcu`` of ``profile``.
+def _write_settings(profile: Path, settings: str = PROFILE_SETTINGS) -> None:
+    """Write the settings as ``user/registrymodifications.xcu`` of ``profile``.
 
     Args:
         profile: The profile's folder.
+        settings: The file's text: :data:`PROFILE_SETTINGS`, but in a test.
     """
-    settings = profile / "user" / "registrymodifications.xcu"
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(PROFILE_SETTINGS, encoding="utf-8")
+    path = profile / "user" / "registrymodifications.xcu"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(settings, encoding="utf-8")
 
 
 def _is_regular(path: Path) -> bool:
@@ -349,7 +373,9 @@ def _start_in_child(profile: Path, scratch: Path) -> int:
     return _start(profile)[0]
 
 
-def _convert_in_child(source: Path, target: Path, profile: Path, options: bytes) -> int:
+def _convert_in_child(
+    source: Path, target: Path, profile: Path, options: bytes, *, load_options: bytes = LOAD_OPTIONS
+) -> int:
     """Open ``source`` and save it as a PDF at ``target``: the conversion's child, which never calls ``destroy``.
 
     Args:
@@ -357,6 +383,8 @@ def _convert_in_child(source: Path, target: Path, profile: Path, options: bytes)
         target: Where the PDF goes.
         profile: The profile's folder.
         options: The PDF filter's data.
+        load_options: What the document is loaded with: :data:`LOAD_OPTIONS`, but in a test
+            (``convert``'s ``test_only_load_options``).
 
     Returns:
         The child's exit code.
@@ -365,7 +393,7 @@ def _convert_in_child(source: Path, target: Path, profile: Path, options: bytes)
     if office is None:
         return code
     document = office.contents.pClass.contents.documentLoadWithOptions(
-        office, source.absolute().as_uri().encode(), LOAD_OPTIONS
+        office, source.absolute().as_uri().encode(), load_options
     )
     if not document:
         return EXIT_NO_LOAD

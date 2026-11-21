@@ -2415,22 +2415,28 @@ LIBREOFFICE_IN_A_SLOT = pytest.mark.skipif(
 #: A conversion's job: production's address space, and a wall for three conversions.
 OFFICE_LIMITS = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
 #: The start of each LibreOffice job: the real job's imports at fork time, and ``to_pdf``, which converts one input
-#: into the job's tmp and says how long it took.
+#: into the job's tmp (with ``convert``'s ``test_only_`` arguments, if any) and says how long it took.
 OFFICE_JOB = """
 import resource, time
-import pptx, pypdfium2
+import pptx, pypdfium2, pypdfium2.raw
 from workbench.executor import readers
 from workbench.executor.render import office
 tmp = pathlib.Path(os.environ["TMPDIR"])
 home = pathlib.Path(os.environ["HOME"])
-def to_pdf(name, *, deck):
+def to_pdf(name, *, deck, **test_only):
     target = tmp / (name + ".pdf")
     began = time.monotonic()
-    office.convert(pathlib.Path(name).absolute(), target, deck=deck, deadline=began + 60)
+    office.convert(pathlib.Path(name).absolute(), target, deck=deck, deadline=began + 60, **test_only)
     return target, time.monotonic() - began
 """
 #: The namespace of LibreOffice's registry.
 OOR = "http://openoffice.org/2001/registry"
+#: The macro test's positive control, never a job's: LibreOfficeKit asked to run macros, and a profile that lets it
+#: (macro security low, macros on).
+MACROS_ALLOWED_LOAD = "EnableMacrosExecution=true,MacroSecurityLevel=0"
+MACROS_ALLOWED_PROFILE = office.PROFILE_SETTINGS.replace(
+    '"MacroSecurityLevel" oor:op="fuse"><value>3<', '"MacroSecurityLevel" oor:op="fuse"><value>0<'
+).replace('"DisableMacrosExecution" oor:op="fuse"><value>true<', '"DisableMacrosExecution" oor:op="fuse"><value>false<')
 
 
 @LIBREOFFICE_IN_A_SLOT
@@ -2498,8 +2504,10 @@ async def test_as_root_a_hidden_slide_is_drawn_and_pictures_are_downsampled(
 ) -> None:
     """LibreOfficeKit takes the JSON filter data: a hidden slide is drawn, and photographs come down to 150 dpi.
 
-    A three-slide deck whose second slide is hidden is a PDF of three pages, so slide N stays page N; a five-slide
-    deck with a 3000 x 2000 photograph on every slide is a PDF of less than half the deck's size.
+    A three-slide deck whose second slide is hidden is a PDF of three pages, so slide N stays page N. A five-slide deck
+    with a 3000 x 2000 photograph, 4 in wide, on every slide is a PDF of less than half the deck's size, whose first
+    page holds the photograph at most 650 px wide: 4 in at 150 dpi, where LibreOffice's own default of 300 dpi, which
+    it keeps when the filter data is not taken, leaves about 1200.
     """
     scratch = root_volume.parent / "inputs"
     scratch.mkdir()
@@ -2517,6 +2525,11 @@ async def test_as_root_a_hidden_slide_is_drawn_and_pictures_are_downsampled(
                 target, _ = to_pdf(name, deck=True)
                 pdf = pypdfium2.PdfDocument(target)
                 result[name] = {"pages": len(pdf), "bytes": target.stat().st_size}
+                if name == "photos.pptx":
+                    page = pdf[0]
+                    pictures = page.get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE])
+                    result["photo_widths"] = [picture.get_px_size()[0] for picture in pictures]
+                    page.close()
                 pdf.close()
             """
         ),
@@ -2529,6 +2542,8 @@ async def test_as_root_a_hidden_slide_is_drawn_and_pictures_are_downsampled(
     assert answer.result["hidden.pptx"]["pages"] == 3
     assert answer.result["photos.pptx"]["pages"] == 5
     assert answer.result["photos.pptx"]["bytes"] < len(files["photos.pptx"]) / 2, answer.result
+    assert answer.result["photo_widths"], answer.result
+    assert max(answer.result["photo_widths"]) <= 650, answer.result
 
 
 @LIBREOFFICE_IN_A_SLOT
@@ -2555,6 +2570,45 @@ async def test_as_root_a_document_macro_never_runs(root_volume: Path, monkeypatc
 
     assert answer.status == "ok", answer
     assert answer.result == {"pdf": True, "ran": False}
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_the_macro_fixture_runs_when_macros_are_allowed(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The macro test's positive control: with macros allowed, the same document's macro does write its file.
+
+    So ``test_as_root_a_document_macro_never_runs`` holds because macros are kept off, not because the fixture's macro
+    could never run.
+    """
+    assert '"MacroSecurityLevel" oor:op="fuse"><value>0<' in MACROS_ALLOWED_PROFILE
+    assert '"DisableMacrosExecution" oor:op="fuse"><value>false<' in MACROS_ALLOWED_PROFILE
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {"macro.odt": make_fixtures.make_macro_odt(scratch / "macro.odt", "macro-ran").read_bytes()}
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            allowed = {
+                "test_only_load_options": spec["args"]["load"].encode(),
+                "test_only_profile_settings": spec["args"]["profile"],
+            }
+            target, _ = to_pdf("macro.odt", deck=False, **allowed)
+            result["pdf"] = target.is_file()
+            result["ran"] = (home / "macro-ran").exists()
+            """
+        ),
+    )
+    args = {"load": MACROS_ALLOWED_LOAD, "profile": MACROS_ALLOWED_PROFILE}
+    request = _request(args=args, input_files=sorted(files), limits=OFFICE_LIMITS)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result == {"pdf": True, "ran": True}
 
 
 @LIBREOFFICE_IN_A_SLOT

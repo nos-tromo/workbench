@@ -13,6 +13,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tests.conftest import scaled
 from workbench.executor.render import office
 
@@ -23,10 +25,10 @@ from workbench.executor.render import office
 """
 
 
-def _in_a_fresh_interpreter(body: str) -> Any:
-    """Run ``body`` after ``_HEAD`` in ``python -I`` and read the JSON it prints."""
+def _in_a_fresh_interpreter(body: str, *args: str) -> Any:
+    """Run ``body`` after ``_HEAD`` in ``python -I``, with ``args`` as its arguments, and read the JSON it prints."""
     done = subprocess.run(
-        [sys.executable, "-I", "-c", _HEAD + textwrap.dedent(body)],
+        [sys.executable, "-I", "-c", _HEAD + textwrap.dedent(body), *args],
         capture_output=True,
         text=True,
         timeout=20,
@@ -89,6 +91,48 @@ def test_a_child_ended_by_a_signal_reports_it() -> None:
         """
     )
     assert code == -9
+
+
+NOT_OPENED = "LibreOffice could not open the file: it is damaged, or not what its extension says"
+NOT_CONVERTED = "the file could not be converted to pages"
+NO_START = "LibreOffice could not start"
+
+#: ``convert`` with a stand-in for the conversion's child, which does ``{action}``; prints what ``convert`` did.
+_CONVERT_WITH_A_STAND_IN = """
+import sys, tempfile
+from pathlib import Path
+folder = Path(sys.argv[1])
+tempfile.tempdir = str(folder)
+target = folder / "out.pdf"
+def stand_in(*args, **kwargs):
+{action}
+office._convert_in_child = stand_in
+try:
+    office.convert(folder / "invented.docx", target, deck=False, deadline=time.monotonic() + 10)
+    print(json.dumps(["returned", ""]))
+except (RuntimeError, readers.UnreadableFile) as exc:
+    print(json.dumps([type(exc).__name__, str(exc)]))
+"""
+
+
+@pytest.mark.parametrize(
+    ("action", "answer"),
+    [
+        pytest.param("target.write_bytes(b'%PDF-1.7')\nreturn 0", ["returned", ""], id="a-pdf"),
+        pytest.param("return 0", ["UnreadableFile", NOT_CONVERTED], id="ok-without-a-pdf"),
+        pytest.param("return 3", ["RuntimeError", NO_START], id="no-library"),
+        pytest.param("return 4", ["RuntimeError", NO_START], id="no-start"),
+        pytest.param("return 70", ["RuntimeError", NO_START], id="our-own-error"),
+        pytest.param("return 5", ["UnreadableFile", NOT_OPENED], id="no-load"),
+        pytest.param("return 6", ["UnreadableFile", NOT_CONVERTED], id="no-save"),
+        pytest.param("return 255", ["UnreadableFile", NOT_CONVERTED], id="libreoffice-exits"),
+        pytest.param("os.kill(os.getpid(), signal.SIGKILL)", ["UnreadableFile", NOT_CONVERTED], id="a-signal"),
+    ],
+)
+def test_convert_answers_by_the_exit_code_of_its_child(tmp_path: Path, action: str, answer: list[str]) -> None:
+    """Only a failed start is the executor's error; a file LibreOffice cannot open, save or survive is unreadable."""
+    body = _CONVERT_WITH_A_STAND_IN.format(action=textwrap.indent(action, "    "))
+    assert _in_a_fresh_interpreter(body, str(tmp_path)) == answer
 
 
 def test_a_profile_is_seeded_into_tmp(tmp_path: Path) -> None:
