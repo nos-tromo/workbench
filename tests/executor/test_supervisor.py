@@ -2415,7 +2415,8 @@ LIBREOFFICE_IN_A_SLOT = pytest.mark.skipif(
 #: A conversion's job: production's address space, and a wall for three conversions.
 OFFICE_LIMITS = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
 #: The start of each LibreOffice job: the real job's imports at fork time, and ``to_pdf``, which converts one input
-#: into the job's tmp (with ``convert``'s ``test_only_`` arguments, if any) and says how long it took.
+#: whole into the job's tmp (with a headroom, none by default, and ``convert``'s ``test_only_`` arguments, if any) and
+#: says how long it took.
 OFFICE_JOB = """
 import resource, time
 import pptx, pypdfium2, pypdfium2.raw
@@ -2423,10 +2424,11 @@ from workbench.executor import readers
 from workbench.executor.render import office
 tmp = pathlib.Path(os.environ["TMPDIR"])
 home = pathlib.Path(os.environ["HOME"])
-def to_pdf(name, *, deck, **test_only):
+def to_pdf(name, *, deck, headroom=0, **test_only):
     target = tmp / (name + ".pdf")
     began = time.monotonic()
-    office.convert(pathlib.Path(name).absolute(), target, deck=deck, deadline=began + 60, **test_only)
+    source = pathlib.Path(name).absolute()
+    office.convert(source, target, deck=deck, deadline=began + 60, headroom=headroom, **test_only)
     return target, time.monotonic() - began
 """
 #: The namespace of LibreOffice's registry.
@@ -2680,6 +2682,115 @@ async def test_as_root_a_deck_is_converted_and_drawn_in_slots(root_volume: Path)
     assert [entry.n for entry in result.renders] == [1, 2, 3, 4, 5]
     assert all(entry.role == "page" for entry in result.renders)
     assert sorted(output.name for output in drawn.outputs) == sorted(entry.name for entry in result.renders)
+
+
+def _converted(answer: JobResult) -> tuple[list[int], list[str], str]:
+    """Read the PDF a ``convert_office`` job staged: the images on each page, each page's text, and its producer.
+
+    Args:
+        answer: The job's answer, which staged one output.
+
+    Returns:
+        The images of each page (inside form XObjects too), the text of each page, and the ``Producer`` it names.
+    """
+    import pypdfium2
+    import pypdfium2.raw
+
+    (output,) = answer.outputs
+    pdf = pypdfium2.PdfDocument(Path(output.staged_path))
+    images: list[int] = []
+    texts: list[str] = []
+    try:
+        for index in range(len(pdf)):
+            page = pdf[index]
+            images.append(len(list(page.get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE], max_depth=4))))
+            text = page.get_textpage()
+            texts.append(" ".join(text.get_text_range().split()))
+            text.close()
+            page.close()
+        producer = str(pdf.get_metadata_dict().get("Producer", ""))
+    finally:
+        pdf.close()
+    return images, texts, producer
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_deck_of_photos_past_the_ceiling_is_drawn_whole(root_volume: Path) -> None:
+    """A deck of 60 distinct 4000 x 3000 pictures and a logo on its slide master is drawn whole, or refused: never less.
+
+    Converted whole under production's address space, LibreOffice runs out of it after about 23 of the pictures, leaves
+    the rest out and says it succeeded. ``convert_office``, the real entry point in a slot with the default budget,
+    sees its child's peak come within the headroom and converts the deck again in parts, which pdfium joins: every
+    page shows the logo and its own picture. A page count per slide that the logo alone could fill would not tell.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    deck = make_fixtures.make_photo_deck(scratch / "photos.pptx", 60, master_logo=True)
+    _chat(root_volume, {"photos.pptx": deck.read_bytes()})
+    request = _request(
+        tool="convert_office", args={"path": "photos.pptx"}, input_files=["photos.pptx"], limits=OFFICE_LIMITS
+    )
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    seconds = time.monotonic() - began
+    assert answer.status == "ok", answer
+    assert answer.result == {"name": "converted.pdf", "pages": 60, "slides": 60}, (answer.result, seconds)
+    images, _, producer = _converted(answer)
+    assert images == [2] * 60, seconds
+    assert producer == "PDFium"  # joined from parts: the whole deck came to its ceiling
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_document_of_photos_past_the_ceiling_is_drawn_whole(root_volume: Path) -> None:
+    """A Word file of 40 pages, each a caption and a distinct 4000 x 3000 picture, is drawn whole, or refused.
+
+    Its whole conversion, alone in a job under production's address space, leaves pictures out and comes to the
+    ceiling. ``convert_office`` in a slot, with the default budget, draws every page's picture under its own caption.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {"figures.docx": make_fixtures.make_photo_docx(scratch / "figures.docx", 40).read_bytes()}
+    _chat(root_volume, files)
+    sup = Supervisor(_settings(root_volume))
+    with pytest.MonkeyPatch.context() as patch:
+        _runner(
+            patch,
+            OFFICE_JOB
+            + textwrap.dedent(
+                """
+                from workbench.executor.runners import convert as runner
+                pictures = runner._pictures(pathlib.Path("figures.docx"))
+                try:
+                    to_pdf("figures.docx", deck=False, headroom=runner._headroom(pictures))
+                    result["at_ceiling"] = False
+                except office.AtCeiling:
+                    result["at_ceiling"] = True
+                pdf = pypdfium2.PdfDocument(tmp / "figures.docx.pdf")
+                result["drawn"] = sum(
+                    len(list(pdf[n].get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE], max_depth=4)))
+                    for n in range(len(pdf))
+                )
+                pdf.close()
+                """
+            ),
+        )
+        whole = await sup.run_job(_request(input_files=sorted(files), limits=OFFICE_LIMITS))
+
+    answer = await sup.run_job(
+        _request(tool="convert_office", args={"path": "figures.docx"}, input_files=sorted(files), limits=OFFICE_LIMITS)
+    )
+
+    assert whole.status == "ok", whole
+    assert whole.result["at_ceiling"] is True
+    assert whole.result["drawn"] < 40
+    assert answer.status == "ok", answer
+    assert answer.result == {"name": "converted.pdf", "pages": 40, "slides": None}
+    images, texts, producer = _converted(answer)
+    assert images == [1] * 40
+    assert [text.split("Invented figure ")[1:] for text in texts] == [[str(n)] for n in range(1, 41)]
+    assert producer == "PDFium"
 
 
 @pytest.mark.skipif(not IN_THE_IMAGE, reason="the baked profile is the executor image's")

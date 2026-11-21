@@ -96,6 +96,7 @@ def test_a_child_ended_by_a_signal_reports_it() -> None:
 NOT_OPENED = "LibreOffice could not open the file: it is damaged, or not what its extension says"
 NOT_CONVERTED = "the file could not be converted to pages"
 NO_START = "LibreOffice could not start"
+TOO_MANY_PICTURES = "the file holds more or larger pictures than can be drawn within the memory limit"
 
 #: ``convert`` with a stand-in for the conversion's child, which does ``{action}``; prints what ``convert`` did.
 _CONVERT_WITH_A_STAND_IN = """
@@ -108,7 +109,7 @@ def stand_in(*args, **kwargs):
 {action}
 office._convert_in_child = stand_in
 try:
-    office.convert(folder / "invented.docx", target, deck=False, deadline=time.monotonic() + 10)
+    office.convert(folder / "invented.docx", target, deck=False, deadline=time.monotonic() + 10, headroom=0)
     print(json.dumps(["returned", ""]))
 except (RuntimeError, readers.UnreadableFile) as exc:
     print(json.dumps([type(exc).__name__, str(exc)]))
@@ -127,12 +128,93 @@ except (RuntimeError, readers.UnreadableFile) as exc:
         pytest.param("return 6", ["UnreadableFile", NOT_CONVERTED], id="no-save"),
         pytest.param("return 255", ["UnreadableFile", NOT_CONVERTED], id="libreoffice-exits"),
         pytest.param("os.kill(os.getpid(), signal.SIGKILL)", ["UnreadableFile", NOT_CONVERTED], id="a-signal"),
+        pytest.param("target.write_bytes(b'%PDF-1.7')\nreturn 7", ["AtCeiling", TOO_MANY_PICTURES], id="ceiling"),
+        pytest.param("return 7", ["AtCeiling", TOO_MANY_PICTURES], id="ceiling-without-a-pdf"),
     ],
 )
 def test_convert_answers_by_the_exit_code_of_its_child(tmp_path: Path, action: str, answer: list[str]) -> None:
-    """Only a failed start is the executor's error; a file LibreOffice cannot open, save or survive is unreadable."""
+    """Only a failed start is the executor's error; a file LibreOffice cannot open, save or survive is unreadable.
+
+    A child that came to the ceiling of its address space is :class:`office.AtCeiling`, an unreadable file whatever
+    it saved, so a caller that does not look for it keeps nothing.
+    """
     body = _CONVERT_WITH_A_STAND_IN.format(action=textwrap.indent(action, "    "))
     assert _in_a_fresh_interpreter(body, str(tmp_path)) == answer
+
+
+def test_convert_hands_its_child_the_headroom_and_the_range_and_removes_the_profile(tmp_path: Path) -> None:
+    """The child gets the headroom and the filter data with ``PageRange``; its copy of the profile goes after it."""
+    body = """
+    import sys, tempfile
+    from pathlib import Path
+    folder = Path(sys.argv[1])
+    tempfile.tempdir = str(folder)
+    report = folder / "seen.json"
+    def stand_in(source, target, profile, options, headroom, **kwargs):  # runs in the forked child
+        seen = dict(profile=str(profile), options=json.loads(options), headroom=headroom, there=profile.is_dir())
+        report.write_text(json.dumps(seen))
+        target.write_bytes(b"%PDF-1.7")
+        return 0
+    office._convert_in_child = stand_in
+    office.convert(folder / "deck.pptx", folder / "out.pdf", deck=True, deadline=time.monotonic() + 10,
+                   headroom=12345, pages=(3, 7))
+    seen = json.loads(report.read_text())
+    seen["left"] = Path(seen.pop("profile")).exists()
+    print(json.dumps(seen))
+    """
+
+    seen = _in_a_fresh_interpreter(body, str(tmp_path))
+
+    assert seen["headroom"] == 12345
+    assert seen["options"]["PageRange"] == {"type": "string", "value": "3-7"}
+    assert seen["options"]["ExportHiddenSlides"]["value"] == "true"
+    assert (seen["there"], seen["left"]) == (True, False)
+
+
+def test_the_filter_data_takes_a_page_range() -> None:
+    """``PageRange`` is added to either filter's data for a range, and only then; a range that is none is refused."""
+    assert office.filter_options(deck=True) == office.IMPRESS_OPTIONS
+    assert office.filter_options(deck=False) == office.WRITER_OPTIONS
+    writer = json.loads(office.filter_options(deck=False, pages=(5, 5)))
+    assert writer["PageRange"] == {"type": "string", "value": "5-5"}
+    assert writer["MaxImageResolution"] == {"type": "long", "value": "150"}
+    for pages in ((0, 3), (4, 3)):
+        with pytest.raises(ValueError, match="page range"):
+            office.filter_options(deck=False, pages=pages)
+
+
+@pytest.mark.parametrize(
+    ("peak", "limit", "headroom", "at"),
+    [
+        pytest.param(1500, None, 100, False, id="no-limit"),
+        pytest.param(1400, 1536, 100, False, id="further-than-the-headroom"),
+        pytest.param(1436, 1536, 100, True, id="exactly-the-headroom"),
+        pytest.param(1530, 1536, 100, True, id="closer"),
+        pytest.param(None, 1536, 100, True, id="peak-unknown-under-a-limit"),
+        pytest.param(None, None, 100, False, id="peak-unknown-without-a-limit"),
+    ],
+)
+def test_a_peak_within_the_headroom_of_the_limit_is_at_the_ceiling(
+    peak: int | None, limit: int | None, headroom: int, at: bool
+) -> None:
+    """A request that failed left the peak within its size of the limit; a peak that cannot be read counts as one."""
+    assert office.at_ceiling(peak, limit, headroom) is at
+
+
+@pytest.mark.skipif(not Path("/proc/self/status").exists(), reason="the peak is read from Linux's /proc")
+def test_a_process_reads_its_own_peak_and_limit() -> None:
+    """``VmPeak`` is read in bytes, never below what the process holds now; with no limit set, the limit is ``None``."""
+    seen = _in_a_fresh_interpreter(
+        """
+        import resource
+        before = office.address_space()
+        resource.setrlimit(resource.RLIMIT_AS, (8 << 30, 8 << 30))
+        print(json.dumps([office._status(b"VmPeak:"), *before, *office.address_space()]))
+        """
+    )
+    peak, held, limit, _, limited = seen
+    assert peak >= held > 1 << 20
+    assert (limit, limited) == (None, 8 << 30)
 
 
 def test_a_profile_is_seeded_into_tmp(tmp_path: Path) -> None:

@@ -15,11 +15,17 @@ The image bakes that profile once, warm, in :data:`PROFILE` (``python -m workben
 The file is untrusted, and LibreOffice's own error text may name its path: it is never read (``getError`` is in the
 vtable only for the order of the fields). A failure is an exit code of the child, which :func:`convert` turns into a
 short fixed text. Standard library only, besides the readers' errors.
+
+LibreOffice leaves out a picture it has no address space left to decode, saves the PDF all the same and says it
+succeeded. The PDF cannot tell, but the child's peak address space can: a picture is lost only when its request did
+not fit under ``RLIMIT_AS``, so the peak came within that request of the limit. The child reads its peak once the save
+is done and answers :data:`EXIT_AT_CEILING` when it came within the caller's ``headroom`` (:class:`AtCeiling`).
 """
 
 import ctypes
 import json
 import os
+import resource
 import shutil
 import signal
 import stat
@@ -49,6 +55,8 @@ EXIT_NO_LIBRARY: Final = 3
 EXIT_NO_START: Final = 4
 EXIT_NO_LOAD: Final = 5
 EXIT_NO_SAVE: Final = 6
+#: The child's peak address space came within its headroom of the limit, saved or not (:class:`AtCeiling`).
+EXIT_AT_CEILING: Final = 7
 EXIT_FAILED: Final = 70
 
 #: How long the image's bake may take to start LibreOfficeKit once.
@@ -57,6 +65,26 @@ _BAKE_S: Final = 120.0
 _NOT_OPENED: Final = "LibreOffice could not open the file: it is damaged, or not what its extension says"
 _NOT_CONVERTED: Final = "the file could not be converted to pages"
 _NO_START: Final = "LibreOffice could not start"
+#: What a file is told whose pictures cannot all be drawn within a job's address space.
+TOO_MANY_PICTURES: Final = "the file holds more or larger pictures than can be drawn within the memory limit"
+
+_STATUS: Final = Path("/proc/self/status")
+_PEAK_FIELD: Final = b"VmPeak:"
+_SIZE_FIELD: Final = b"VmSize:"
+
+
+class AtCeiling(UnreadableFile):
+    """The child's peak address space came within ``headroom`` of the limit: pictures may be lost from its PDF.
+
+    Writer and Impress leave such a picture out and save; Impress may fail the save instead. A PDF that was saved stays
+    at the target. Its pages are all there, since the layout never waits for a picture to be decoded, so its page count
+    holds; its pictures may not, and it is never kept as it is.
+    """
+
+    def __init__(self) -> None:
+        """Say so in the fixed text, :data:`TOO_MANY_PICTURES`."""
+        super().__init__(TOO_MANY_PICTURES)
+
 
 #: The profile's settings, as officecfg names them: macro security very high (3) and macros off, no link updated
 #: (Writer's ``Link`` 2 and Calc's ``Link`` 1 are "never"), no autosave or recovery, no first-run, no lock files.
@@ -101,6 +129,47 @@ _IMPRESS: Final = {
 WRITER_OPTIONS: Final = json.dumps(_WRITER, separators=(",", ":")).encode()
 #: The PDF filter's data for a deck.
 IMPRESS_OPTIONS: Final = json.dumps(_IMPRESS, separators=(",", ":")).encode()
+
+
+def filter_options(*, deck: bool, pages: tuple[int, int] | None = None) -> bytes:
+    """The PDF filter's data: Impress's or Writer's, and ``PageRange`` when only some pages are drawn.
+
+    A range counts the pages of the PDF the whole file gives: hidden slides included, and the empty pages Writer
+    inserts (and leaves out of the PDF) not. A range past the last page gives fewer pages, which the caller checks.
+
+    Args:
+        deck: The file is a presentation.
+        pages: The first and last page to draw, counted from 1; ``None`` for all.
+
+    Returns:
+        The JSON, as bytes.
+
+    Raises:
+        ValueError: ``pages`` is not a range of pages.
+    """
+    if pages is None:
+        return IMPRESS_OPTIONS if deck else WRITER_OPTIONS
+    first, last = pages
+    if not 1 <= first <= last:
+        raise ValueError("a page range runs from page 1 or later to a page no earlier")
+    data = {**(_IMPRESS if deck else _WRITER), "PageRange": {"type": "string", "value": f"{first}-{last}"}}
+    return json.dumps(data, separators=(",", ":")).encode()
+
+
+def at_ceiling(peak: int | None, limit: int | None, headroom: int) -> bool:
+    """Tell whether a peak address space came within ``headroom`` of its limit, so that a request may have failed.
+
+    Args:
+        peak: The process's peak address space in bytes (``VmPeak``); ``None`` when it could not be read.
+        limit: ``RLIMIT_AS`` in bytes; ``None`` when there is none.
+        headroom: The bytes that must have stayed free: the largest request that may fail without a crash.
+
+    Returns:
+        ``True`` when the peak came that close, or when there is a limit and the peak could not be read.
+    """
+    if limit is None:
+        return False
+    return peak is None or peak + headroom >= limit
 
 
 # LibreOfficeKit's ABI (LibreOfficeKit.h): each object is a pointer to its class, a table of functions that starts
@@ -216,6 +285,8 @@ def convert(
     *,
     deck: bool,
     deadline: float,
+    headroom: int,
+    pages: tuple[int, int] | None = None,
     test_only_load_options: bytes = LOAD_OPTIONS,
     test_only_profile_settings: str | None = None,
 ) -> None:
@@ -224,32 +295,46 @@ def convert(
     The child's exit code decides the answer. Only a child that could not start LibreOffice is the executor's error:
     no library, no start, or an error of this module's own code in the child (:data:`EXIT_FAILED`). Everything else
     that ends without a PDF is the file's: LibreOffice could not open it, could not save it, exited by itself or died
-    of a signal (a file that crashes it), or said it saved and left no regular file at ``target``.
+    of a signal (a file that crashes it), or said it saved and left no regular file at ``target``. A child whose peak
+    came within ``headroom`` of the address-space limit is :class:`AtCeiling`. The profile's copy is removed once the
+    child is gone.
 
     Args:
         source: The file, already checked (``readers.check_zip``, no encryption).
         target: Where the PDF is written.
         deck: The file is a presentation: Impress's filter data (hidden slides drawn, no notes pages).
         deadline: A :func:`time.monotonic` time after which the child is killed.
+        headroom: The bytes of ``RLIMIT_AS`` that must stay free at the child's peak: at least the largest request
+            LibreOffice may make and survive the failure of, which is the largest picture it decodes.
+        pages: The first and last page to draw (:func:`filter_options`); ``None`` for all.
         test_only_load_options: For tests only, never in a job: what the document is loaded with in place of
             :data:`LOAD_OPTIONS` (the macro test's positive control asks LibreOfficeKit to run macros).
         test_only_profile_settings: For tests only, never in a job: a ``registrymodifications.xcu`` written over the
             seeded profile's; ``None``, the default, keeps the baked profile as it is.
 
     Raises:
+        AtCeiling: The PDF's pictures may be incomplete, or the save failed for want of address space
+            (:data:`EXIT_AT_CEILING`).
         UnreadableFile: LibreOffice could not open the file (:data:`EXIT_NO_LOAD`), or not convert it
-            (:data:`EXIT_NO_SAVE`, any other nonzero code, a signal, or :data:`EXIT_OK` without a PDF): a fixed text
-            that names no path.
+            (:data:`EXIT_NO_SAVE`, any other nonzero code, a signal, or a PDF said to be saved that is not there): a
+            fixed text that names no path.
         RuntimeError: LibreOffice could not start (:data:`EXIT_NO_LIBRARY`, :data:`EXIT_NO_START`,
             :data:`EXIT_FAILED`).
         ReadTimeout: The conversion ran past the deadline; the child has been killed and reaped.
     """
+    options = filter_options(deck=deck, pages=pages)
     profile = seed_profile()
-    if test_only_profile_settings is not None:
-        _write_settings(profile, test_only_profile_settings)
-    options = IMPRESS_OPTIONS if deck else WRITER_OPTIONS
-    work = partial(_convert_in_child, source, target, profile, options, load_options=test_only_load_options)
-    code = run_in_child(work, deadline)
+    try:
+        if test_only_profile_settings is not None:
+            _write_settings(profile, test_only_profile_settings)
+        work = partial(
+            _convert_in_child, source, target, profile, options, headroom, load_options=test_only_load_options
+        )
+        code = run_in_child(work, deadline)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+    if code == EXIT_AT_CEILING:
+        raise AtCeiling
     if code == EXIT_OK and _is_regular(target):
         return
     if code in (EXIT_NO_LIBRARY, EXIT_NO_START, EXIT_FAILED):
@@ -373,8 +458,42 @@ def _start_in_child(profile: Path, scratch: Path) -> int:
     return _start(profile)[0]
 
 
+def _status(field: bytes) -> int | None:
+    """Read one of this process's sizes in ``/proc/self/status``, such as ``VmPeak:``.
+
+    Args:
+        field: The field's name with its colon.
+
+    Returns:
+        The size in bytes, or ``None`` when it cannot be read (no ``/proc``).
+    """
+    try:
+        lines = _STATUS.read_bytes().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith(field):
+            try:
+                return int(line.split()[1]) * 1024
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def address_space() -> tuple[int | None, int | None]:
+    """Read this process's address space: what it holds now (``VmSize``) and its limit (``RLIMIT_AS``).
+
+    A child forked now starts with what the process holds.
+
+    Returns:
+        Both in bytes; the first ``None`` when it cannot be read, the second ``None`` when there is no limit.
+    """
+    soft, _ = resource.getrlimit(resource.RLIMIT_AS)
+    return _status(_SIZE_FIELD), None if soft == resource.RLIM_INFINITY else soft
+
+
 def _convert_in_child(
-    source: Path, target: Path, profile: Path, options: bytes, *, load_options: bytes = LOAD_OPTIONS
+    source: Path, target: Path, profile: Path, options: bytes, headroom: int, *, load_options: bytes = LOAD_OPTIONS
 ) -> int:
     """Open ``source`` and save it as a PDF at ``target``: the conversion's child, which never calls ``destroy``.
 
@@ -383,11 +502,13 @@ def _convert_in_child(
         target: Where the PDF goes.
         profile: The profile's folder.
         options: The PDF filter's data.
+        headroom: The bytes of the address-space limit that must have stayed free at the child's peak.
         load_options: What the document is loaded with: :data:`LOAD_OPTIONS`, but in a test
             (``convert``'s ``test_only_load_options``).
 
     Returns:
-        The child's exit code.
+        The child's exit code: :data:`EXIT_AT_CEILING` when its peak came within ``headroom`` of the limit, whether
+        the PDF was saved or not (Impress fails the save of a deck of pictures with alpha at the ceiling).
     """
     code, office = _start(profile)
     if office is None:
@@ -398,6 +519,8 @@ def _convert_in_child(
     if not document:
         return EXIT_NO_LOAD
     saved = document.contents.pClass.contents.saveAs(document, target.absolute().as_uri().encode(), b"pdf", options)
+    if at_ceiling(_status(_PEAK_FIELD), address_space()[1], headroom):
+        return EXIT_AT_CEILING
     return EXIT_OK if saved else EXIT_NO_SAVE
 
 

@@ -1015,6 +1015,84 @@ def make_long_docx(path: Path, pages: int = 24, *, picture_on: int | None = None
     return path
 
 
+def _distinct_photo(number: int, size: tuple[int, int]) -> bytes:
+    """A JPEG of ``size`` that no other number gives: one colour and a block of another, quick to write and small.
+
+    LibreOffice decodes every distinct picture to its full size whatever it shows, so a plain one costs it as much
+    address space as a photograph.
+
+    Args:
+        number: Which picture, from 1.
+        size: Width and height.
+
+    Returns:
+        The JPEG's bytes.
+    """
+    from PIL import Image, ImageDraw
+
+    ground = ((number * 37) % 256, (number * 91) % 256, (number * 53) % 256)
+    picture = Image.new("RGB", size, ground)
+    ImageDraw.Draw(picture).rectangle(
+        (number * 16, number * 8, size[0] // 2, size[1] // 2), fill=(255 - ground[0], 64, 255 - ground[2])
+    )
+    out = io.BytesIO()
+    picture.save(out, "JPEG", quality=80)
+    return out.getvalue()
+
+
+def make_photo_deck(
+    path: Path, slides: int, size: tuple[int, int] = (4000, 3000), *, master_logo: bool = False
+) -> Path:
+    """Write a deck of ``slides`` slides, each a distinct picture of ``size`` across it and no text.
+
+    Args:
+        path: Where to write it.
+        slides: How many slides.
+        size: Each picture's width and height.
+        master_logo: Also put a small picture (a PNG) on the slide master, which every slide shows.
+
+    Returns:
+        ``path``.
+    """
+    from PIL import Image
+    from pptx.oxml.shapes.picture import CT_Picture
+
+    deck: Any = Presentation()
+    if master_logo:
+        master = deck.slide_master
+        logo = io.BytesIO()
+        Image.new("RGB", (300, 100), (20, 60, 120)).save(logo, "PNG")
+        _, rel = master.part.get_or_add_image_part(logo)
+        place = (Inches(8), Inches(6.8), Inches(1.8), Inches(0.6))
+        master.shapes._spTree.append(CT_Picture.new_pic(900, "Invented logo", "", rel, *place))
+    for number in range(1, slides + 1):
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        slide.shapes.add_picture(io.BytesIO(_distinct_photo(number, size)), Inches(0), Inches(0), Inches(10))
+    deck.save(str(path))
+    return path
+
+
+def make_photo_docx(path: Path, pages: int, size: tuple[int, int] = (4000, 3000)) -> Path:
+    """Write a Word file of ``pages`` pages, each a caption ``Invented figure N`` and a distinct picture of ``size``.
+
+    Args:
+        path: Where to write it.
+        pages: How many pages.
+        size: Each picture's width and height.
+
+    Returns:
+        ``path``.
+    """
+    doc = Document()
+    for number in range(1, pages + 1):
+        doc.add_paragraph(f"Invented figure {number}")
+        doc.add_picture(io.BytesIO(_distinct_photo(number, size)), width=docx_shared.Inches(6))
+        if number < pages:
+            doc.add_page_break()
+    doc.save(str(path))
+    return path
+
+
 _ODF_OFFICE = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
 _ODF_MANIFEST = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"
 _OOO_LIBRARY = "http://openoffice.org/2000/library"
