@@ -175,8 +175,11 @@ header selects what the model is told and shown, never what a caller may reach.
   `prepare_file`'s, which the render routes and tools run, and `convert.py` is
   `convert_office`'s: it runs the checks LibreOffice must not be the first to meet
   (the zip guard, an OpenDocument manifest that says it is encrypted; a deck
-  with no slides, a macro-enabled one or a slide show is `unsupported_format`), has `render/office.py` convert the file to one PDF in a folder
-  of the job's tmp, checks that PDF (a regular file, at most 32 MiB, the `%PDF-`
+  with no slides, a macro-enabled one or a slide show is `unsupported_format`;
+  the size of every picture, from its header), has `render/office.py` convert
+  the file to one PDF in a folder of the job's tmp (whole, or in page ranges
+  joined by pdfium when the whole came to the address-space ceiling: see
+  Gotchas), checks that PDF (a regular file, at most 32 MiB, the `%PDF-`
   signature, pdfium counts its pages) and only then moves it to
   `out/converted.pdf`. `prepare_file` then draws the pages from that PDF, which
   the api hands it at its derived path, never one a caller names.
@@ -405,6 +408,18 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   deadline, then kills and reaps it. The image has no Java and no Python script
   provider (`--no-install-recommends`), and the executor image is about 515 MB
   larger for LibreOffice and its fonts.
+- **LibreOffice drops pictures at the address-space ceiling and says it
+  succeeded.** Under the job's `RLIMIT_AS` (1536 MB, never raised for it) it
+  holds every distinct picture it has decoded until the PDF is saved; one that no
+  longer fits is left out, the PDF saved, success reported. Nothing in the PDF
+  tells, so the child reads its own `VmPeak` after the save and exits
+  `office.EXIT_AT_CEILING` when it came within a headroom of the limit: the
+  largest picture at 4 bytes a pixel (Pillow reads every member's header in the
+  job, whatever its name) and 128 MiB. A conversion at the ceiling is never
+  kept: `runners/convert.py` converts the file again in page ranges, a fresh
+  child each, halving a range that comes to the ceiling again, joins the parts
+  with pdfium, and refuses with `office.TOO_MANY_PICTURES` when a single page
+  still does or the budget runs out. `docs/sandbox.md` § Limits has the numbers.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in

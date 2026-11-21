@@ -67,7 +67,8 @@ record of processing and the impact assessment.
   and its pages or slides are drawn from that PDF as a PDF's are. They are
   made from the file's own content, which can be anything a picture or a page
   shows, text and faces included. The converted PDF holds the whole of the
-  file's content, text and pictures, as the source does; it is read by the
+  file's content, text and pictures, as the source does (a conversion that may
+  have left a picture out is refused, never kept); it is read by the
   render jobs alone, and no route and no tool sends it anywhere. **Every render is stripped of image metadata**:
   the source's EXIF (the GPS block among it), XMP and comments are not carried
   into it, and its colour profile is applied to the pixels, which come out in

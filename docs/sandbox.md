@@ -314,25 +314,53 @@ names and shared strings are counted before it is loaded. An Office file that
 is to be converted passes two more before LibreOffice sees it: an old binary or
 password-protected container (an OLE file) is refused, and so is an OpenDocument
 text whose manifest says its content is encrypted (both `unreadable_file`, with
-no conversion). A deck with no slides, a macro-enabled deck and a slide show are
-refused too, as `unsupported_format` with the reader's own text, and no child is
-forked.
+no conversion). A deck with no slides is refused as `unsupported_format` with the
+runner's own text (`runners/convert.py:_NO_SLIDES`), a macro-enabled deck and a
+slide show with the reader's; then Pillow reads the size of every picture in the
+file from its header, decoding none, and a picture of more than 120 megapixels
+is `unreadable_file`. No child is forked for any of these.
 
 A conversion (`convert_office`) is a child of the job, forked for one
 LibreOfficeKit start (`office.run_in_child`): the library starts once per
 process, and a C call that hangs inside it can only be stopped by killing the
 process that made it. The child has its own `RLIMIT_AS`, 1536 MB, as every
 process of the job has (the limit is per process, and a fork starts with the
-parent's), and its peak was 208 MB in the root tests. It is of the slot's uid, so
+parent's). It is of the slot's uid, so
 it counts against `RLIMIT_NPROC` and in the watchdog's sum of the job's resident
 memory, and the wall time, `RLIMIT_CPU` and the disk limits hold it as they hold
 any process of the job. The job's own deadline is 3/4 of the wall time: the
 parent polls for the child until then, then kills it with `SIGKILL`, reaps it,
 and answers `read_timeout`; the wall time's kill of the process group is the
-backstop. LibreOffice's own files (its profile, a copy of the image's) go to the
-job's private tmp and home, and `out/` holds only the checked PDF. A
-conversion took 0.2 to 0.3 s in the root tests, and a cold 30-slide deck 2.8 s
-in the spike that chose this design.
+backstop. LibreOffice's own files (its profile, a copy of the image's, removed
+when the child is gone) go to the job's private tmp and home, and `out/` holds
+only the checked PDF. A conversion took 0.2 to 0.3 s in the root tests, and a
+cold 30-slide deck 2.8 s in the spike that chose this design.
+
+**At the address-space ceiling.** Starting LibreOffice and loading a file take
+610 to 740 MB of the child's 1536 MB (measured in the image). LibreOffice then
+decodes every distinct picture of the pages it draws at full size, about 3 bytes
+a pixel, and holds them until the PDF is saved. When a picture no longer fits it
+does not fail: it leaves that picture out, saves the PDF and reports success
+(Impress, with pictures that have alpha, may fail the save instead). A deck of 60
+distinct 12-megapixel photos lost 37 of them that way, a 40-page Word file with
+one such photo a page 14. So the child reads its peak address space (`VmPeak`)
+once the PDF is saved, and answers `office.EXIT_AT_CEILING` when the peak came
+within a headroom of the limit. A picture is lost only when the request to decode
+it did not fit, so the peak was then within that request of the limit; the
+headroom is the largest such request, 4 bytes a pixel of the largest picture
+Pillow sized, and 128 MiB for the rest (`runners/convert.py:_headroom`). A
+conversion at the ceiling is never kept. The runner converts the file again in
+parts: page ranges (`PageRange`), each in a fresh child that decodes only the
+pictures of its pages, as many pages as the room left under the limit holds,
+halved while one comes to the ceiling again; pdfium joins them into the one PDF.
+A page that comes to the ceiling alone, a Word or OpenDocument file whose whole
+conversion saved no PDF there (its pages are then unknown), and a budget spent
+on the parts are `unreadable_file: the file holds more or larger pictures than
+can be drawn within the memory limit`, with nothing kept. Measured in the image
+with the default budget of 90 s: that deck converts in 22 s (whole once, then
+five parts), with a logo on its slide master in 23 s, that Word file in 14 s.
+A lone picture of about 95 megapixels or more is refused, since its headroom and
+its decoding no longer fit together under the limit.
 
 ### What the supervisor checks before it starts
 
@@ -578,7 +606,17 @@ Each of these is accepted. Each says what it would take.
     is never read;
   - the PDF it makes is accepted only as a regular file of at most 32 MiB that
     starts with `%PDF-` and that pdfium opens, and the api keeps it as that and
-    nothing more.
+    nothing more;
+  - a conversion whose peak address space came within its headroom of the limit
+    is never kept, since LibreOffice may have left pictures out of it
+    ([Limits](#limits)). The headroom covers the largest picture Pillow sizes
+    from its header (JPEG, PNG, GIF, BMP, TIFF, WebP and a few older formats)
+    and 128 MiB besides. A bitmap LibreOffice decodes from inside a metafile or
+    an SVG, or from a format Pillow cannot size, is covered by those 128 MiB
+    alone: one larger than that, in a file at the ceiling, could still be left
+    out unnoticed. None of the sweeps across the ceiling (decks and Word files
+    of 6- to 80-megapixel JPEGs, PNGs with and without alpha, a logo on the
+    master) found a loss the peak did not show.
 
   What does not narrow it: `run_python` can load the same library through ctypes,
   in the same sandbox, so the conversion adds no reach a job did not have, only a
