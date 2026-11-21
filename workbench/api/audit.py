@@ -45,6 +45,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "view": ("disclose", "file.view"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
+    "view_file": ("query", "tool.view_file"),
     "run_python": ("combine", "tool.run_python"),
     "run_python_inline": ("combine", "tool.run_python.inline"),
     "inspect_template": ("query", "tool.inspect_template"),

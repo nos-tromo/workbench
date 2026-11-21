@@ -13,7 +13,7 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and five file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the nine) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and five file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
@@ -46,6 +46,7 @@ Every tool that runs in the executor also leaves a job record (see
 | `list_files` | names, sizes, dates and kinds of the chat's files, from the database | nothing | not recorded: the user's own metadata | nothing |
 | `read_document` | one file, as a copy in a job | nothing | `query` / `tool.read_document` | a job record |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
+| `view_file` | one picture or PDF of the chat, as a copy in a job when a page is not rendered yet; its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
 | `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
 | `inspect_template` | one template or slide master, as a copy in a job; no file without a path (the plain slide master) | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
@@ -54,14 +55,15 @@ Every tool that runs in the executor also leaves a job record (see
 | `write_presentation` | the slide master (`.pptx` or `.potx`), if one is given, every picture of the chat a slide shows (PNG, JPEG or GIF) and every file a slide's source names, as copies in a job | one new `.pptx` in the master's chat, or without a master in the request's chat (a `.potx` master gives a `.pptx`); the master, the pictures and the sources are not changed | `modify` / `tool.write_presentation` | the new file and a job record |
 | `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
 
-The nine tools answer Ghostwriter with `outputs` besides their own answer: the
+The ten tools answer Ghostwriter with `outputs` besides their own answer: the
 id of each file the call wrote and, for a csv or xlsx file, a preview of it.
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
 `read_document`, `search_files`, `run_python`),
 `workbench/api/tools_templates.py` (`inspect_template`, `fill_template`),
 `workbench/api/tools_output.py` (`write_table`, `write_document`),
-`workbench/api/tools_presentations.py` (`write_presentation`).
+`workbench/api/tools_presentations.py` (`write_presentation`),
+`workbench/api/tools_views.py` (`view_file`).
 
 ### File routes
 

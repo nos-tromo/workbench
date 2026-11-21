@@ -30,6 +30,7 @@ EXPECTED_OPERATIONS = {
     "view": ("disclose", "file.view"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
+    "view_file": ("query", "tool.view_file"),
     "run_python": ("combine", "tool.run_python"),
     "run_python_inline": ("combine", "tool.run_python.inline"),
     "inspect_template": ("query", "tool.inspect_template"),
@@ -368,6 +369,7 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         source = store.get(PG, scan_path)
         assert client.post("/files/prepare", params={"path": scan_path}, headers=HG).status_code == 200
         assert len(store.derived_of(source)) == 1
+        assert answered(acall(client, "view_file", {"path": scan_path}))["shown"][0]["label"] == "image"
         executor.files = {}
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200

@@ -37,7 +37,7 @@ def test_every_env_variable_is_documented() -> None:
 def test_every_tool_is_in_the_permission_matrix() -> None:
     """Each workspace tool, a row of the table, has its row in the matrix of ``docs/permissions.md``."""
     tools = [tool.name for tool in WORKSPACE_TABLE]
-    assert len(tools) == 9
+    assert len(tools) == 10
     rows = {line.split("|")[1].strip() for line in doc("permissions.md").splitlines() if line.startswith("| `")}
     assert [tool for tool in tools if f"`{tool}`" not in rows] == []
 

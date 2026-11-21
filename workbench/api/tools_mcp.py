@@ -29,6 +29,7 @@ from workbench.api.auth import Caller
 from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper
 from workbench.api.mcp_wire import _compact_json
 from workbench.api.registry import ToolEnv, ToolOutcome, ToolSpec
+from workbench.api.renders import WithBlocks
 from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.protocol import JobResult, OutputFile, TablePreview
@@ -270,6 +271,9 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         }
         given = {name: offered[name] for name in takes}
         answer = await endpoint(**given) if asynchronous else await run_in_threadpool(endpoint, **given)
+        blocks: list[dict[str, Any]] = []
+        if isinstance(answer, WithBlocks):
+            answer, blocks = answer.answer, answer.blocks
         outputs: list[OutputRef] = [] if jobs is None else jobs.outputs()
         structured = {
             **answer.model_dump(mode="json"),
@@ -278,7 +282,7 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         told = [
             {name: value for name, value in output.items() if name != "preview"} for output in structured["outputs"]
         ]
-        return ToolOutcome(structured, [], _compact_json({**structured, "outputs": told}))
+        return ToolOutcome(structured, blocks, _compact_json({**structured, "outputs": told}))
 
     return run
 

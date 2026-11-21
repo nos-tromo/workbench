@@ -45,8 +45,8 @@ CALLER_DEFAULTS = {
 
 #: Ghostwriter's variables in the api's environment: the key, its tools and its two limits.
 TOOLS_LIST = (
-    "list_files,read_document,search_files,run_python,inspect_template,fill_template,write_table,write_document,"
-    "write_presentation"
+    "list_files,read_document,search_files,view_file,run_python,inspect_template,fill_template,write_table,"
+    "write_document,write_presentation"
 )
 GHOSTWRITER_DEFAULTS = {
     "GHOSTWRITER_WORKBENCH_KEY": "",

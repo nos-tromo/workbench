@@ -1,6 +1,6 @@
 """The MCP door's ``tools/list``, frozen: what each of its callers is told it can call.
 
-Ghostwriter's nine workspace tools and docint's ``run_python`` are written once into ``tests/api/golden/``, on both
+Ghostwriter's ten workspace tools and docint's ``run_python`` are written once into ``tests/api/golden/``, on both
 revisions the door speaks. A change to a tool's name, description or schema, or to what a caller is offered, fails here
 and is made on purpose, by editing the file, never by regenerating it.
 """

@@ -13,7 +13,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
-from workbench.api import tools, tools_output, tools_presentations, tools_templates
+from workbench.api import tools, tools_output, tools_presentations, tools_templates, tools_views
 from workbench.tables import MAX_WORD_COLUMNS
 
 
@@ -148,6 +148,23 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools.SearchFilesRequest,
         output_model=tools.SearchResult,
         function=tools.search_files,
+    ),
+    WorkspaceTool(
+        name="view_file",
+        title="Look at a picture or the pages of a PDF",
+        description=(
+            "Show a picture or pages of a file of this conversation as images for you to see, with their metadata "
+            "removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC) and the pages of a PDF. part chooses "
+            "pages: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out, a picture is shown, or pages 1-4 of a "
+            "PDF. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to "
+            "look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at "
+            "once: when truncated is true, call again with part set to next_part. Pages that could not be shown are "
+            "named in hint. Word, PowerPoint and spreadsheets are not shown yet: read them with read_document. "
+            "Never describe an image you have not looked at."
+        ),
+        input_model=tools_views.ViewFileRequest,
+        output_model=tools_views.ViewedFile,
+        function=tools_views.view_file,
     ),
     WorkspaceTool(
         name="write_document",

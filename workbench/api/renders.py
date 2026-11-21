@@ -62,6 +62,9 @@ MAX_SHOWN_BYTES: Final = 2_621_440
 #: The hint of a file that is neither a picture nor a PDF.
 NOT_SHOWN: Final = "This kind of file is not shown as pictures; read it with read_document."
 
+#: The text of the 500 for a render the store lost for a reason it cannot name (:func:`_lost`).
+NOT_KEPT: Final = "the renders of this file could not be kept"
+
 #: The roles of the derived files that are renders.
 _RENDER_ROLES: Final = frozenset({"image", "page"})
 
@@ -333,7 +336,7 @@ def _lost(message: str) -> Exception:
         return RendersFull("the renders of this file are at their limit")
     if reason == "storage full":
         return StorageFull("storage is full")
-    return HTTPException(status_code=500, detail="the renders of this file could not be kept")
+    return HTTPException(status_code=500, detail=NOT_KEPT)
 
 
 async def prepared(

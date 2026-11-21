@@ -6,6 +6,7 @@ GHOSTWRITER_TOOLS = frozenset(
         "list_files",
         "read_document",
         "search_files",
+        "view_file",
         "run_python",
         "inspect_template",
         "fill_template",

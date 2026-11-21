@@ -571,7 +571,7 @@ def test_ghostwriter_is_offered_write_presentation(client: TestClient) -> None:
     """Nine tools, in name order; the description says to agree the outline first and how a slide is filled."""
     tools = result(rpc(client, "tools/list", headers=HG))["tools"]
     assert [tool["name"] for tool in tools] == sorted(GHOSTWRITER_TOOLS)
-    assert len(tools) == 9
+    assert len(tools) == 10
     (tool,) = [tool for tool in tools if tool["name"] == "write_presentation"]
     description = tool["description"]
     for phrase in (

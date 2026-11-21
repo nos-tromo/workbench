@@ -30,6 +30,7 @@ from tests.api.test_tools_python import ran
 from tests.api.test_tools_templates import Local
 from tests.callers import GHOSTWRITER_TOOLS
 from tests.conftest import scaled
+from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import OPERATIONS, AuditLog
 from workbench.api.auth import Caller
@@ -70,6 +71,7 @@ PURPOSE: Final = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request
 GUARDED: Final[dict[str, tuple[str, dict[str, Any]]]] = {
     "read_document": ("query", {"path": f"{CHAT}/q.csv"}),
     "search_files": ("query", {"query": "user-a"}),
+    "view_file": ("query", {"path": f"{CHAT}/q.csv"}),
     "run_python": ("combine", {"code": "print(1)"}),
     "inspect_template": ("query", {"path": f"{CHAT}/form.docx"}),
     "fill_template": (
@@ -190,11 +192,13 @@ def test_every_answer_holds_to_the_output_schema_it_lists(
     form = keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
     master = keep(store, PG, "master.pptx", mt.make_master(tmp_path / "master.pptx").read_bytes())
     keep(store, PG, "q.csv")
+    photo = keep(store, PG, "quay-photo.jpg", mi.make_photo(tmp_path / "quay-photo.jpg").read_bytes())
     assistant = {"kind": "assistant"}
     calls: list[tuple[str, dict[str, Any]]] = [
         ("list_files", {}),
         ("read_document", {"path": f"{CHAT}/q.csv"}),
         ("search_files", {"query": "user-a"}),
+        ("view_file", {"path": photo.virtual_path}),
         ("inspect_template", {"path": form.virtual_path}),
         ("fill_template", {"path": form.virtual_path, "values": {"customer": {"value": "x", "source": assistant}}}),
         ("write_table", TABLE),
@@ -502,7 +506,7 @@ def strict_client(settings: Settings, store: Store, audit: AuditLog, executor: L
 
 
 def test_the_guard_covers_every_recorded_workspace_tool() -> None:
-    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other eight, each under its recorded action."""
+    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other nine, each under its recorded action."""
     assert set(GHOSTWRITER_TOOLS) - set(OPERATIONS) == {"list_files"}
     assert {tool: action for tool, (action, _) in GUARDED.items()} == {
         tool: OPERATIONS[tool][0] for tool in GHOSTWRITER_TOOLS - {"list_files"}
