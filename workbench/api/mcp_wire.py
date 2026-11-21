@@ -58,7 +58,7 @@ INSTRUCTIONS: Final = (
 WORKSPACE_INSTRUCTIONS: Final = (
     "workbench works on the files of this chat: it lists, reads and searches them, runs Python over them in a sandbox "
     "with no network, fills report templates and writes tables and documents. Every file a tool writes comes back as "
-    "a reference with its path and id, never as bytes."
+    "a reference with its path and id, never as bytes; pages and pictures come back as images for you to see."
 )
 
 #: How long a client may keep ``server/discover``'s and ``tools/list``'s answers, in milliseconds.

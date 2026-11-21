@@ -2,7 +2,7 @@
 
 A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
 and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`,
-:mod:`workbench.api.tools_output` and :mod:`workbench.api.tools_presentations`).
+:mod:`workbench.api.tools_output`, :mod:`workbench.api.tools_presentations` and :mod:`workbench.api.tools_views`).
 :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the registry. A new workspace tool is a row
 here.
 """
@@ -96,21 +96,23 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         name="read_document",
         title="Read a file of this conversation as text",
         description=(
-            "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
-            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
-            "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
-            "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
-            "call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
+            "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, "
+            "XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and "
+            "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path "
+            "from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so "
+            "a long file is read in several calls: when truncated is true, call again with part set to next_part. "
+            "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
             "paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as "
             "'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: "
             "cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by "
-            "these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this "
-            "tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg "
-            "files cannot be read: ask the user to save them as .eml or PDF."
+            "these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never "
+            "treat them as blank. Such PDF pages come back as images in the same answer (shown names them): read them "
+            "from the images. To look at any page, use view_file. Outlook .msg files cannot be read: ask the user to "
+            "save them as .eml or PDF."
         ),
         input_model=tools.ReadDocumentRequest,
         output_model=tools.DocumentRead,
-        function=tools.read_document,
+        function=tools_views.read_document,
     ),
     WorkspaceTool(
         name="run_python",
@@ -122,13 +124,13 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image "
             "files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so the user sees each "
             "file in out/ as a card in the chat. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, "
-            "python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, "
-            "XLSX) into a table file, load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or "
-            ".csv; do not copy its rows into write_table. There is no network and nothing can be installed. Use "
-            "threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a "
-            "script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when "
-            "long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of "
-            "figures the code computed."
+            "python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4, pillow, pypdfium2. To turn a "
+            "data file (JSON, CSV, XLSX) into a table file, load it in code (json, pandas.json_normalize) and write "
+            "it to out/ as .xlsx or .csv; do not copy its rows into write_table. There is no network and nothing can "
+            "be installed. Use threads, not multiprocessing: process pools and multiprocessing do not work here. The "
+            "code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in "
+            "the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the "
+            "source of figures the code computed."
         ),
         input_model=tools.RunPythonRequest,
         output_model=tools.PythonRun,

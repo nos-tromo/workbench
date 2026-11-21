@@ -44,7 +44,7 @@ Every tool that runs in the executor also leaves a job record (see
 | Tool | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | `list_files` | names, sizes, dates and kinds of the chat's files, from the database | nothing | not recorded: the user's own metadata | nothing |
-| `read_document` | one file, as a copy in a job | nothing | `query` / `tool.read_document` | a job record |
+| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer also has the renders of those pages, which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer | for a picture or a PDF with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
 | `view_file` | one picture or PDF of the chat, as a copy in a job when a page is not rendered yet; its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
 | `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
@@ -59,11 +59,11 @@ The ten tools answer Ghostwriter with `outputs` besides their own answer: the
 id of each file the call wrote and, for a csv or xlsx file, a preview of it.
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
-`read_document`, `search_files`, `run_python`),
+`search_files`, `run_python`),
 `workbench/api/tools_templates.py` (`inspect_template`, `fill_template`),
 `workbench/api/tools_output.py` (`write_table`, `write_document`),
 `workbench/api/tools_presentations.py` (`write_presentation`),
-`workbench/api/tools_views.py` (`view_file`).
+`workbench/api/tools_views.py` (`read_document`, `view_file`).
 
 ### File routes
 
@@ -178,6 +178,19 @@ things, the limits that matter to users:
   which loads it in code and writes `out/` as `.xlsx` or `.csv`; its rows are
   not copied into `write_table`. `read_document` shows a JSON file indented,
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
+- Pages and pictures come back as images for the model alone, after the
+  answer's text, and `shown` names each in order (image block `i` is
+  `shown[i]`). `read_document` lists the pages of a PDF that have no text
+  layer in `pages_without_text`, never as blank, and attaches their images in
+  the same answer: the pages of its window, whole, at most 4 images and
+  2.5 MiB, and the answer ends before the first page that does not fit, with
+  `next_part` naming it. A picture file is read as its image. `view_file`
+  shows any page or picture, at most 8 images. A read whose images cannot be
+  made (the executor has no room, the render is refused, the user's quota or
+  the file's cap of renders is spent) still answers the text, with `shown`
+  empty and a hint that `view_file` shows the pages; a page that cannot be
+  read back is named in the hint. A picture file has no text to fall back on,
+  so its read fails with the render.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
 - A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place
@@ -209,5 +222,4 @@ things, the limits that matter to users:
   layouts.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
   newest 1000 files of the chat; answers are cut at `WORKBENCH_RESULT_MAX_KB`
-  and say how to go on; `read_document` does no OCR and lists pages without a
-  text layer; Outlook `.msg` files cannot be read.
+  and say how to go on; Outlook `.msg` files cannot be read.

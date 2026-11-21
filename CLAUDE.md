@@ -103,8 +103,12 @@ in `tests/api/golden/`). The nine: `list_files`, `read_document`,
 `search_files`, `run_python`, `inspect_template`, `fill_template`,
 `write_table`, `write_document`, `write_presentation`.
 
-- `workbench/api/tools.py`: `list_files`, `read_document`, `search_files`,
-  `run_python`, and the helpers the other tool modules share.
+- `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
+  models of `read_document`, and the helpers the other tool modules share.
+- `workbench/api/tools_views.py`: `read_document` and `view_file`, the tools that
+  show pictures and pages as images. `workbench/api/renders.py` prepares and
+  reads the renders back and imports `tools.py`, so `tools.py` never imports it,
+  and `read_document`'s function lives here.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
   template and output tools. A new tool gets a module of its own, as
   `workbench/api/tools_presentations.py` (`write_presentation`) has: it checks the

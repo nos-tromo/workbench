@@ -23,9 +23,10 @@ from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import NotFound, Store
-from workbench.api.tools import ReadDocumentRequest, read_document
+from workbench.api.tools import ReadDocumentRequest
 from workbench.api.tools_mcp import CallJobs
 from workbench.api.tools_templates import InspectTemplateRequest, inspect_template
+from workbench.api.tools_views import read_document
 from workbench.config import Settings
 from workbench.layout import WORKSPACES
 from workbench.models import FileRecord, Principal

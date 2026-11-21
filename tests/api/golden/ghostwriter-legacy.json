@@ -982,9 +982,9 @@
     {
       "name": "read_document",
       "title": "Read a file of this conversation as text",
-      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
+      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never treat them as blank. Such PDF pages come back as images in the same answer (shown names them): read them from the images. To look at any page, use view_file. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
       "inputSchema": {
-        "description": "Body of ``read_document``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Where to start reading, or ``None`` for the start.",
+        "description": "Body of ``read_document``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Where to start reading, or ``None`` for the start.\n    strips: Into how many strips each image of the answer is cut.",
         "properties": {
           "path": {
             "description": "The file's absolute path, for example /workspace/<chat>/report.pdf, as list_files gives it.",
@@ -1006,6 +1006,22 @@
             "description": "Where to start reading; leave it out for the start. Use the next_part of an earlier answer to go on. A page: 'page 3' or 'pages 3-9'. A slide: 'slide 2'. A paragraph: 'paragraph 40'. A table or some of its rows: 'table 2', 'table 2, row 350' or 'table 2, rows 30-60'. A sheet: its name, or a range of rows: 'Sheet1!A201:F400'. Lines of a text: 'lines 100-200'.",
             "title": "Part",
             "type": "string"
+          },
+          "strips": {
+            "anyOf": [
+              {
+                "maximum": 3,
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Leave it out.",
+            "title": "Strips",
+            "type": "integer"
           }
         },
         "required": [
@@ -1089,6 +1105,50 @@
             "title": "OutputRef",
             "type": "object"
           },
+          "ShownImage": {
+            "description": "An image that comes with the answer for you to see: a picture, a page, or a strip of either.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``page 3, strip 1 of 2``.\n    n: The page, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
+            "properties": {
+              "label": {
+                "description": "What the image is: 'image', 'page 3' or 'page 3, strip 1 of 2'.",
+                "maxLength": 100,
+                "title": "Label",
+                "type": "string"
+              },
+              "n": {
+                "description": "The page, counted from 1; 1 for a picture.",
+                "title": "N",
+                "type": "integer"
+              },
+              "width": {
+                "description": "Its width in pixels.",
+                "title": "Width",
+                "type": "integer"
+              },
+              "height": {
+                "description": "Its height in pixels.",
+                "title": "Height",
+                "type": "integer"
+              },
+              "mime": {
+                "description": "Its media type.",
+                "enum": [
+                  "image/jpeg",
+                  "image/png"
+                ],
+                "title": "Mime",
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "n",
+              "width",
+              "height",
+              "mime"
+            ],
+            "title": "ShownImage",
+            "type": "object"
+          },
           "TablePreview": {
             "additionalProperties": false,
             "description": "The start of a table a job wrote: its header and first rows, cut short, read inside the job.\n\nThe job's own code could have written it, so only its shape and its caps are trusted.\n\nAttributes:\n    columns: The header: the first record of a csv, or the first row with content of an xlsx's first sheet.\n    rows: The rows below the header, at most ``PREVIEW_ROWS``.\n    row_count: How many rows lie below the header, at most ``PREVIEW_COUNT_MAX``, or ``None`` when they were not\n        counted to the end.\n    truncated: Whether a row, a column or a cell was left out or cut.",
@@ -1169,11 +1229,19 @@
             "type": "integer"
           },
           "pages_without_text": {
-            "description": "Pages or slides looked at that hold no text (scans or pictures): this tool does no OCR.",
+            "description": "Pages or slides looked at that hold no text (scans or pictures); never treat them as blank.",
             "items": {
               "type": "integer"
             },
             "title": "Pages Without Text",
+            "type": "array"
+          },
+          "shown": {
+            "description": "Pages without text shown as images with this answer.",
+            "items": {
+              "$ref": "#/$defs/ShownImage"
+            },
+            "title": "Shown",
             "type": "array"
           },
           "truncated": {
@@ -1232,7 +1300,7 @@
     {
       "name": "run_python",
       "title": "Run Python on the files of this conversation",
-      "description": "Run Python code on this conversation's files and get back what it printed. The files are in the current folder, under their names as list_files gives them (also at their /workspace/<chat>/<name> paths), read-only. Write every result file directly into the out/ folder, not into a subfolder: each becomes a new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so the user sees each file in out/ as a card in the chat. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, XLSX) into a table file, load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or .csv; do not copy its rows into write_table. There is no network and nothing can be installed. Use threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures the code computed.",
+      "description": "Run Python code on this conversation's files and get back what it printed. The files are in the current folder, under their names as list_files gives them (also at their /workspace/<chat>/<name> paths), read-only. Write every result file directly into the out/ folder, not into a subfolder: each becomes a new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so the user sees each file in out/ as a card in the chat. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4, pillow, pypdfium2. To turn a data file (JSON, CSV, XLSX) into a table file, load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or .csv; do not copy its rows into write_table. There is no network and nothing can be installed. Use threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of figures the code computed.",
       "inputSchema": {
         "description": "Body of ``run_python``.\n\nAttributes:\n    code: The Python to run, as a script.",
         "properties": {

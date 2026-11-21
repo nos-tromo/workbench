@@ -1,11 +1,13 @@
 """The workspace tools the model calls, one function each, and the helpers the other tool modules share.
 
 :mod:`workbench.api.tool_table` names each tool, describes it for the model and binds it to its function here.
-``read_document``, ``search_files`` and ``run_python`` hand the chat's files to a job in the executor
+``search_files`` and ``run_python`` hand the chat's files to a job in the executor
 (:mod:`workbench.executor.runners.documents`, :mod:`workbench.executor.runners.python`) and are built here from what
 the store knows and what the job answers. Each later tool has a module of its own, sharing this module's helpers:
 ``inspect_template`` and ``fill_template`` are in :mod:`workbench.api.tools_templates`, ``write_table`` and
-``write_document`` in :mod:`workbench.api.tools_output`.
+``write_document`` in :mod:`workbench.api.tools_output`. ``read_document``'s models are here, but the tool is in
+:mod:`workbench.api.tools_views` with ``view_file``: it shows pages and pictures as images, which needs
+:mod:`workbench.api.renders`, and that imports this module, so this one never imports it.
 
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
@@ -187,6 +189,7 @@ _CUT_MARK: Final = " [cut]"
 #: The longest hint an answer carries.
 MAX_HINT: Final = 2000
 _STRING: Final[JsonDict] = {"type": "string"}
+_INTEGER: Final[JsonDict] = {"type": "integer"}
 
 
 class ReadDocumentRequest(BaseModel):
@@ -195,6 +198,7 @@ class ReadDocumentRequest(BaseModel):
     Attributes:
         path: The file's absolute path.
         part: Where to start reading, or ``None`` for the start.
+        strips: Into how many strips each image of the answer is cut.
     """
 
     path: str = Field(
@@ -212,6 +216,7 @@ class ReadDocumentRequest(BaseModel):
         ),
         json_schema_extra=_STRING,
     )
+    strips: int | None = Field(default=None, ge=1, le=3, description="Leave it out.", json_schema_extra=_INTEGER)
 
 
 class DocumentPart(BaseModel):
@@ -249,11 +254,12 @@ class DocumentRead(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``, ``html``, ``json`` or
-            ``text``.
+        kind: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``, ``html``, ``json``,
+            ``text`` or ``image``.
         parts: The text, in order, each piece with its reference.
         total_parts: How many pages, sheets, slides, paragraphs and tables or lines the file has.
         pages_without_text: Pages or slides looked at that have no text.
+        shown: The images that come with this answer, in order: the first is the first image block after the text.
         truncated: Whether text was left out of this answer.
         next_part: Where to continue, when the answer was cut.
         hint: What to tell the user, or how to go on.
@@ -264,7 +270,10 @@ class DocumentRead(BaseModel):
     parts: list[DocumentPart] = Field(description="The text in order, each piece with its reference.")
     total_parts: int = Field(description="How many pages, sheets, slides, paragraphs and tables or lines there are.")
     pages_without_text: list[int] = Field(
-        description="Pages or slides looked at that hold no text (scans or pictures): this tool does no OCR."
+        description="Pages or slides looked at that hold no text (scans or pictures); never treat them as blank."
+    )
+    shown: list[ShownImage] = Field(
+        default_factory=list, description="Pages without text shown as images with this answer."
     )
     truncated: bool = Field(description="True if text was left out; then call again with part set to next_part.")
     next_part: str | None = Field(default=None, max_length=300, description="Where to continue when truncated.")
@@ -673,41 +682,6 @@ def _fit_search(answer: SearchResult, limit_kb: int, notes: list[str]) -> Search
     while skipped and _json_size(final.model_copy(update={"skipped": skipped})) > limit:
         skipped.pop()
     return _within(final.model_copy(update={"skipped": skipped or None}), limit)
-
-
-async def read_document(
-    body: ReadDocumentRequest,
-    p: Principal,
-    settings: Settings,
-    store: Store,
-    audit: AuditLog,
-    jobs: "CallJobs",
-) -> DocumentRead:
-    """Read one of the user's files in the executor and answer with its text, cut to the result limit.
-
-    The job runs in the request's chat folder, where the file lives, with that one file as its input. The job
-    is recorded by the file's id once it has answered and before anything of the answer goes out, a refusal as
-    ``error`` with its code; neither the name, the part nor the text is recorded.
-
-    Args:
-        body: The path and where to start.
-        p: The caller, user and chat.
-        settings: The api's settings; ``result_max_kb`` caps the answer.
-        store: The file store.
-        audit: The audit log.
-        jobs: The queue, within the call's limits.
-
-    Returns:
-        The parts read, the pages without text and how to go on.
-    """
-    rec = await run_in_threadpool(store.get, p, body.path)
-    args = {"path": rec.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
-    _, result, _ = await jobs.submit(p, "read_document", args, [rec.name])
-    shown = {**result.result, "path": rec.virtual_path} if isinstance(result.result, dict) else None
-    criteria = {"paged": body.part is not None}
-    await run_in_threadpool(record_answer, audit, "read_document", p, [rec.id], criteria, result, DocumentRead, shown)
-    _payload(result, "file")
-    return _fit_read(_parse(DocumentRead, shown), settings.result_max_kb)
 
 
 async def search_files(

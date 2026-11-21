@@ -1,7 +1,7 @@
 """PDF files, by page, from the text layer only.
 
 There is no OCR. A page whose text layer is empty (a scan, a picture) is never returned as an empty
-page: it is listed in ``pages_without_text``, so the model can tell the user the file needs OCR elsewhere.
+page: it is listed in ``pages_without_text``, and the api sends the model that page as an image to read.
 A PDF that asks for a password to open is :class:`~workbench.executor.readers.UnreadableFile`; one that only has
 an owner password (it restricts printing or copying, and opens for anyone) is read, whatever its algorithm: the
 AES ones need the ``cryptography`` library, which the executor image carries.
