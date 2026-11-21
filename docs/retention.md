@@ -30,8 +30,11 @@ It also removes what interrupted work left behind, and forgets old job records.
 
 ### Renders
 
-A render, the picture or page image workbench makes of a file, is a derived
-file: as old as its source, in the user's quota, reachable through no path.
+A render, the picture, page or slide image workbench makes of a file, is a
+derived file: as old as its source, in the user's quota, reachable through no
+path. So is the PDF an Office file is converted to (role `pdf`, kept beside its
+renders): it goes with them, in the same batches, and is counted as a render in
+`derived`.
 
 - **Renders go with their source, in its record.** A batch's event names the
   batch's file ids and then the ids of their renders (`Store.derived_for`);
