@@ -345,6 +345,35 @@ def test_a_broken_profile_falls_back_to_the_plain_conversion(tmp_path: Path) -> 
     assert _close(image.getpixel((8, 8)), RED)
 
 
+@pytest.mark.parametrize(("fmt", "mode"), [("PNG", "RGB"), ("JPEG", "RGB"), ("PNG", "P")])
+def test_a_wide_gamut_picture_is_brought_to_srgb(tmp_path: Path, fmt: str, mode: str) -> None:
+    """Final review I2: a picture's numbers mean the colours of its profile, so a Display P3 one is turned to sRGB."""
+    path = make_images.make_wide_gamut(tmp_path / f"dusk.{fmt.lower()}", fmt, mode=mode)
+
+    image = images.normalise(path).image
+
+    assert image.mode == "RGB"
+    assert _close(image.getpixel((8, 8)), make_images.WIDE_IN_SRGB, within=3)
+
+
+def test_a_transparent_wide_gamut_picture_keeps_its_transparency(tmp_path: Path) -> None:
+    """The opaque half is turned to sRGB; the transparent half is still laid on white."""
+    path = make_images.make_wide_gamut(tmp_path / "dusk.png", "PNG", mode="RGBA")
+
+    image = images.normalise(path).image
+
+    assert _close(image.getpixel((2, 8)), make_images.WIDE_IN_SRGB, within=3)
+    assert image.getpixel((13, 8)) == WHITE
+
+
+def test_an_rgb_picture_with_a_broken_profile_keeps_its_numbers(tmp_path: Path) -> None:
+    """A profile the library cannot use costs the picture nothing: its numbers are taken as they are."""
+    path = tmp_path / "dusk.png"
+    Image.new("RGB", (16, 16), make_images.WIDE_STORED).save(path, icc_profile=b"not a profile at all")
+
+    assert images.normalise(path).image.getpixel((8, 8)) == make_images.WIDE_STORED
+
+
 def test_the_source_limit_is_checked_before_the_pixels_are_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

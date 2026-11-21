@@ -158,6 +158,88 @@ def make_cmyk_jpeg(path: Path) -> Path:
     return path
 
 
+#: The colour a wide-gamut picture stores, and what it is in sRGB under :func:`wide_gamut_profile`.
+WIDE_STORED = (200, 120, 60)
+WIDE_IN_SRGB = (213, 115, 42)
+
+
+def _s15(value: float) -> bytes:
+    """An ICC ``s15Fixed16Number``: a signed fixed-point number, 16 bits of fraction, big-endian."""
+    return struct.pack(">i", round(value * 65536))
+
+
+def _xyz(x: float, y: float, z: float) -> bytes:
+    """An ICC ``XYZType`` tag of one colour."""
+    return b"XYZ \0\0\0\0" + _s15(x) + _s15(y) + _s15(z)
+
+
+def wide_gamut_profile() -> bytes:
+    """Build an ICC v4 RGB display profile of a wide gamut, as phones and screenshots carry one, from its numbers.
+
+    A matrix/TRC profile: the colorants are those of Display P3 adapted to D50 (published values), and each channel
+    has the sRGB tone curve as a parametric curve. It is built here, byte by byte, so that no binary fixture and no
+    profile of the system is needed. Under it, :data:`WIDE_STORED` is :data:`WIDE_IN_SRGB` in sRGB.
+
+    Returns:
+        The profile's bytes.
+    """
+    d50 = (0.9642, 1.0, 0.8249)
+    curve = b"para\0\0\0\0" + struct.pack(">HH", 3, 0)
+    curve += b"".join(_s15(v) for v in (2.4, 1 / 1.055, 0.055 / 1.055, 1 / 12.92, 0.04045))
+    name = "Invented wide gamut".encode("utf-16-be")
+    description = b"mluc\0\0\0\0" + struct.pack(">II", 1, 12) + b"enUS" + struct.pack(">II", len(name), 28) + name
+    tags = [
+        (b"desc", description),
+        (b"wtpt", _xyz(*d50)),
+        (b"rXYZ", _xyz(0.515121, 0.241196, -0.001053)),
+        (b"gXYZ", _xyz(0.291977, 0.692245, 0.041885)),
+        (b"bXYZ", _xyz(0.157104, 0.066574, 0.784073)),
+        (b"rTRC", curve),
+        (b"gTRC", curve),
+        (b"bTRC", curve),
+    ]
+    offset = 128 + 4 + 12 * len(tags)
+    table, body = struct.pack(">I", len(tags)), b""
+    for signature, data in tags:
+        data += b"\0" * (-len(data) % 4)
+        table += signature + struct.pack(">II", offset + len(body), len(data))
+        body += data
+    header = (
+        struct.pack(">I", 128 + len(table) + len(body))
+        + b"\0\0\0\0"
+        + struct.pack(">I", 0x04300000)
+        + b"mntrRGB XYZ "
+        + struct.pack(">6H", 2026, 1, 1, 0, 0, 0)
+        + b"acsp"
+        + b"\0" * 28
+        + b"".join(_s15(v) for v in d50)
+        + b"\0" * 48
+    )
+    return header + table + body
+
+
+def make_wide_gamut(path: Path, fmt: str, *, mode: str = "RGB") -> Path:
+    """Write a picture of :data:`WIDE_STORED` tagged with :func:`wide_gamut_profile`.
+
+    Args:
+        path: Where to write it.
+        fmt: ``PNG`` or ``JPEG``.
+        mode: ``RGB``; ``RGBA``, its right half fully transparent; or ``P``, a palette of that one colour.
+
+    Returns:
+        ``path``.
+    """
+    image = Image.new("RGB", (16, 16), WIDE_STORED)
+    if mode == "RGBA":
+        image = image.convert("RGBA")
+        image.paste(Image.new("RGBA", (8, 16), (0, 0, 0, 0)), (8, 0))
+    elif mode == "P":
+        image = image.convert("P", palette=Image.Palette.ADAPTIVE, colors=2)
+    extra = {"quality": 95, "subsampling": 0} if fmt == "JPEG" else {}
+    image.save(path, fmt, icc_profile=wide_gamut_profile(), **extra)
+    return path
+
+
 def make_png16(path: Path) -> Path:
     """Write a 16-bit grey PNG (mode ``I;16``) of one value, 32768: mid grey.
 

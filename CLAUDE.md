@@ -152,7 +152,8 @@ in `tests/api/golden/`). The ten: `list_files`, `read_document`,
   and in the tools run on the user's own turn.
 - `workbench/executor/render/`: what `prepare_file` uses. `images.py` decodes a
   picture (its content decides the format, not its name; at most 120 MP; one HEIF
-  decoder thread), turns it upright and brings it to the bounds of a render;
+  decoder thread), brings it to the bounds of a render, to sRGB through its
+  colour profile, and upright;
   `encode.py` writes JPEG or PNG under 768 KiB with none of the source's
   metadata, and cuts strips; `pages.py` opens a PDF with pdfium, finds the pages
   with no text and draws one at 1600 px. Imported by the executor only.

@@ -64,7 +64,9 @@ record of processing and the impact assessment.
   made from the file's own content, which can be anything a picture or a page
   shows, text and faces included. **Every render is stripped of image metadata**:
   the source's EXIF (the GPS block among it), XMP and comments are not carried
-  into it, and its colour profile is applied to the pixels and then dropped. A
+  into it, and its colour profile is applied to the pixels, which come out in
+  sRGB, and then dropped (a grey picture keeps its grey values, and a profile
+  that cannot be read is dropped unapplied). A
   render is a derived file of its source, not a file of the chat: see
   [Where it is stored](#where-it-is-stored).
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to

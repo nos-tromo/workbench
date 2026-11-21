@@ -1,9 +1,10 @@
 """Decode a source picture, bring it to the bounds of a render and turn it upright.
 
 The order keeps memory small: the picture is opened without reading its pixels, a JPEG is decoded at a reduced size,
-and the orientation is applied last, on the small picture, so nothing large is copied for it. The source's metadata is
-read for the orientation only; none of it is carried into the result (:mod:`~workbench.executor.render.encode` also
-writes none).
+and the colour profile and the orientation are applied last, on the small picture, so nothing large is copied for them.
+The source's metadata is read for the orientation and the colour profile only; none of it is carried into the result
+(:mod:`~workbench.executor.render.encode` also writes none), so the result is in sRGB, which is how a picture with no
+profile is read.
 """
 
 import io
@@ -28,6 +29,11 @@ LOSSLESS_FORMATS: Final = frozenset({"PNG", "GIF", "BMP"})
 
 _TOO_MANY_PIXELS: Final = "the picture is larger than 120 megapixels"
 
+#: The modes whose colour profile describes RGB numbers, which :func:`_convert` keeps as they are: the profile is
+#: applied once the picture is small (:func:`_to_srgb`). Any other mode with a profile is converted through it on the
+#: way to RGB (:func:`_to_rgb`), and a grey one keeps its numbers.
+_RGB_MODES: Final = frozenset({"RGB", "RGBA", "RGBa", "P", "PA"})
+
 #: What each EXIF orientation takes to be upright, as a Pillow transpose; 1 (and anything else) turns nothing.
 _UPRIGHT: Final = {
     2: Image.Transpose.FLIP_LEFT_RIGHT,
@@ -48,7 +54,7 @@ class Normalised:
     """A picture ready to encode.
 
     Attributes:
-        image: The picture, ``RGB``, upright, within the bounds asked for, with no metadata.
+        image: The picture, ``RGB`` in sRGB, upright, within the bounds asked for, with no metadata.
         lossless: Whether the source was a PNG, GIF or BMP, which is kept as PNG when it fits.
         frames: How many frames the source has; only the first is in ``image``.
     """
@@ -185,7 +191,33 @@ def _convert(image: Image.Image) -> Image.Image:
         return image.convert("RGBA")
     if mode in ("L", "RGB"):
         return image
+    if mode == "P":
+        return image.convert("RGB")  # the palette's numbers: its profile, if any, is applied once it is small
     return _to_rgb(image)
+
+
+def _to_srgb(image: Image.Image, profile: bytes | None) -> Image.Image:
+    """Bring a small RGB or RGBA picture from the colour profile of its source to sRGB.
+
+    The numbers of a wide-gamut picture (Display P3 from a phone or a screenshot, Adobe RGB) mean other colours than
+    the same numbers in sRGB, which is how a render is read once its profile is gone.
+
+    Args:
+        image: The picture, ``RGB`` or ``RGBA``, already small.
+        profile: The ICC profile of its source, or ``None``.
+
+    Returns:
+        The picture in sRGB, in its own mode, its alpha kept; as it is with no profile, or with one that is broken or
+        that the library cannot use, as :func:`_to_rgb` falls back.
+    """
+    if not profile or image.mode not in ("RGB", "RGBA"):
+        return image
+    try:
+        source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+        converted = ImageCms.profileToProfile(image, source, ImageCms.createProfile("sRGB"), outputMode=image.mode)
+    except Exception:  # a broken profile, or none the library can use: the numbers as they are
+        return image
+    return image if converted is None else converted
 
 
 def _upright(image: Image.Image, orientation: int) -> Image.Image:
@@ -229,7 +261,8 @@ def normalise(path: Path, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int =
         max_pixels: Most pixels in the result.
 
     Returns:
-        The picture upright and ``RGB`` with no metadata, whether its source is kept lossless, and its frame count.
+        The picture upright and ``RGB`` in sRGB with no metadata, whether its source is kept lossless, and its frame
+        count.
 
     Raises:
         UnreadableFile: Not a picture of a known kind, damaged, over 120 megapixels, or too large for the memory limit.
@@ -248,10 +281,11 @@ def normalise(path: Path, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int =
                 source.load()
                 # After the load, since a PNG's EXIF block may follow its pixels; the block is not read for more.
                 orientation = _orientation(source)
+                profile = source.info.get("icc_profile") if source.mode in _RGB_MODES else None
                 image = _convert(source)
                 if image.size != size:
                     image = image.resize(size, Image.Resampling.LANCZOS, reducing_gap=3.0)
-                image = on_white(_upright(image, orientation))
+                image = on_white(_upright(_to_srgb(image, profile), orientation))
                 if image is source:
                     image = (
                         source.copy()
