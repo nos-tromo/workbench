@@ -1051,6 +1051,7 @@ def test_a_pptx_attaches_nothing_yet(
 
     structured = answer["structuredContent"]
     assert (structured["kind"], structured["pages_without_text"], structured["shown"]) == ("pptx", [1], [])
+    assert structured["hint"] == "slide 1 holds no text (pictures only?) and cannot be shown yet; tell the user."
     assert len(answer["content"]) == 1
     assert local.tools() == ["read_document"]
     (event,) = read_events(audit_lines)

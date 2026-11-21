@@ -1081,13 +1081,20 @@ def test_the_hint_on_a_scanned_pdf_says_what_to_do_without_the_tool_name() -> No
     )
 
 
-def test_the_hint_on_a_deck_keeps_its_words_without_the_tool_name() -> None:
-    """The slide sentence is as it was, less the clause about OCR."""
-    doc = DocumentText(kind="pptx", parts=[], pages_without_text=[3], total_parts=4)
+@pytest.mark.parametrize(
+    ("slides", "said"),
+    [
+        ([3], "slide 3 holds no text (pictures only?) and cannot be shown yet; tell the user."),
+        ([3, 7], "slides 3, 7 hold no text (pictures only?) and cannot be shown yet; tell the user."),
+    ],
+)
+def test_the_hint_on_a_deck_says_its_slides_cannot_be_shown_yet(slides: list[int], said: str) -> None:
+    """Final review M6: only PDF pages are rendered, so a slide without text is not promised as an image."""
+    doc = DocumentText(kind="pptx", parts=[], pages_without_text=slides, total_parts=8)
 
     hint = _hint(doc, images=True)
 
-    assert hint == "slide 3 hold no text (pictures only?)."
+    assert hint == said
     assert "OCR" not in (hint or "")
 
 

@@ -94,9 +94,12 @@ def _hint(doc: readers.DocumentText, *, images: bool) -> str | None:
     notes: list[str] = []
     if doc.pages_without_text:
         if doc.kind == "pptx":
-            noun, what = "slide", "hold no text (pictures only?)"
-            ending = "." if images else "; read_document does no OCR."
-            notes.append(f"{_numbers(noun, doc.pages_without_text)} {what}{ending}")
+            slides = _numbers("slide", doc.pages_without_text)
+            if images:  # only the pages of a PDF are shown as images: a slide is not, yet
+                verb = "holds" if len(doc.pages_without_text) == 1 else "hold"
+                notes.append(f"{slides} {verb} no text (pictures only?) and cannot be shown yet; tell the user.")
+            else:
+                notes.append(f"{slides} hold no text (pictures only?); read_document does no OCR.")
         else:
             noun = "page"
             what = (
