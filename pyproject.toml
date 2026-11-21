@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 dependencies = [
-    "fastapi>=0.162.4",
+    "fastapi>=0.162.7",
     "prometheus-client>=0.26.0",
     "pydantic>=2.14.3",
     "python-multipart>=0.0.33",
@@ -31,7 +31,7 @@ executor = [
     "pandas>=3.1.1",
     "pi-heif>=1.4.0",
     "pillow>=13.0.0",
-    "pypdf>=7.0.1",
+    "pypdf>=7.1.0",
     "pypdfium2>=5.15.2",
     "python-docx>=1.2.0",
     "python-pptx>=1.0.2",
