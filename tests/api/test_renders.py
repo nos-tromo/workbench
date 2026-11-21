@@ -16,7 +16,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any, override
 
@@ -25,13 +25,14 @@ from fastapi import HTTPException
 
 from tests.api.conftest import CALL, PG, AuditLines, put, unrecorded
 from tests.api.test_tools_templates import Local
-from tests.conftest import scaled
+from tests.conftest import FakeOffice, scaled
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_templates as mt
 from workbench.api import renders as api_renders
 from workbench.api.audit import AuditLog, PurposeRequired
 from workbench.api.errors import describe
-from workbench.api.jobs import Busy, Gate, JobQueue
+from workbench.api.jobs import Busy, Gate, JobQueue, Turn
 from workbench.api.metrics import Metrics
 from workbench.api.renders import (
     MAX_READ_IMAGES,
@@ -41,9 +42,11 @@ from workbench.api.renders import (
     RenderJobs,
     RouteJobs,
     WithBlocks,
+    converted_of,
     image_block,
     label,
     manifest_of,
+    noun_of,
     page_window,
     prepared,
     read_render,
@@ -63,7 +66,7 @@ from workbench.api.store import (
 from workbench.api.tools import ShownImage
 from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
-from workbench.models import DerivedRecord, DerivedSpec, FileRecord
+from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
 from workbench.renders import PAGE_LONG_SIDE, RENDER_MAX_BYTES, RENDERS_PER_JOB
 from workbench.utils.audit_event import AuditWriteError, verify_chain
@@ -71,7 +74,7 @@ from workbench.utils.audit_event import AuditWriteError, verify_chain
 pytestmark = pytest.mark.anyio
 
 #: The hint of a file that is neither a picture nor a PDF.
-NOT_SHOWN = "This kind of file is not shown as pictures; read it with read_document."
+NOT_SHOWN = "This kind of file, such as a spreadsheet, is not shown as pictures; read it with read_document."
 
 
 @pytest.fixture
@@ -179,6 +182,16 @@ class World:
         """A small photo, uploaded to Ghostwriter's chat."""
         return put(self.store, name, mi.make_photo(self.built / name).read_bytes(), p=PG)
 
+    def deck(self, slides: int, name: str = "harbour-deck.pptx", **more: Any) -> FileRecord:
+        """A deck of ``slides`` invented slides (``make_deck``'s other arguments in ``more``), uploaded to the chat."""
+        return put(self.store, name, mk.make_deck(self.built / name, slides, **more).read_bytes(), p=PG)
+
+    def converted(self, source: FileRecord) -> DerivedRecord:
+        """The PDF an Office file was converted to, which must be there."""
+        pdf = converted_of(self.store.derived_of(source))
+        assert pdf is not None
+        return pdf
+
     def file_of(self, rec: DerivedRecord) -> Path:
         """Where a render lies on the volume."""
         return self.settings.data_dir / "workspaces" / rec.caller / rec.user_id / rec.chat_id / rec.relative_path
@@ -239,6 +252,7 @@ async def test_a_manifest_names_pages_without_text_and_renditions(world: World) 
     assert manifest.model_dump(exclude={"renditions"}) == {
         "path": source.virtual_path,
         "kind": "pdf",
+        "unit": "page",
         "total": 3,
         "pages_without_text": [2],
         "frames": None,
@@ -255,16 +269,17 @@ async def test_a_manifest_names_pages_without_text_and_renditions(world: World) 
     assert world.store.files_in_chat(PG) == [source]  # renders are never files of the chat
 
 
-async def test_a_word_file_is_kind_none_without_a_job(world: World) -> None:
-    """Neither a picture nor a PDF: kind ``none``, nothing to show, no job and no event."""
-    built = mk.make_docx(world.built / "harbour-notes.docx")
-    source = put(world.store, "harbour-notes.docx", built.read_bytes(), p=PG)
+async def test_a_spreadsheet_is_kind_none_without_a_job(world: World) -> None:
+    """Neither a picture, a PDF nor a document or deck: kind ``none``, nothing to show, no job and no event."""
+    built = mk.make_xlsx(world.built / "quarterly-figures.xlsx")
+    source = put(world.store, "quarterly-figures.xlsx", built.read_bytes(), p=PG)
     events = len(world.lines())
     manifest = await world.prepare(source)
 
     assert manifest.model_dump(mode="json") == {
         "path": source.virtual_path,
         "kind": "none",
+        "unit": "page",
         "total": 0,
         "pages_without_text": [],
         "renditions": [],
@@ -676,6 +691,328 @@ async def test_a_busy_queue_propagates(world: World) -> None:
         await world.renders(source, manifest, [21])
 
 
+# --- Office files ------------------------------------------------------------------------------------------------
+
+
+def turns_of(world: World, monkeypatch: pytest.MonkeyPatch) -> tuple[list[Turn], list[tuple[str, Turn | None]]]:
+    """Watch the turns the queue hands out, and the turn each conversion and render job is sent with, in order."""
+    taken: list[Turn] = []
+    sent: list[tuple[str, Turn | None]] = []
+    turn, renders, conversion = world.queue.turn, world.queue.submit_renders, world.queue.submit_conversion
+
+    @contextlib.asynccontextmanager
+    async def counted(*args: Any, **more: Any) -> AsyncIterator[Turn]:
+        async with turn(*args, **more) as held:
+            taken.append(held)
+            yield held
+
+    async def render(*args: Any, **more: Any) -> Any:
+        sent.append(("prepare_file", more.get("turn")))
+        return await renders(*args, **more)
+
+    async def convert(*args: Any, **more: Any) -> Any:
+        sent.append(("convert_office", more.get("turn")))
+        return await conversion(*args, **more)
+
+    monkeypatch.setattr(world.queue, "turn", counted)
+    monkeypatch.setattr(world.queue, "submit_renders", render)
+    monkeypatch.setattr(world.queue, "submit_conversion", convert)
+    return taken, sent
+
+
+async def test_a_deck_is_converted_once_and_drawn(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deck is converted to one PDF, kept beside it, and its slides drawn from that PDF in the same turn.
+
+    Each job is recorded before what it made is visible: the conversion by the deck and its PDF, with ``converted``;
+    the drawing by the deck and each slide, as a PDF's prepare is.
+    """
+    taken, sent = turns_of(world, monkeypatch)
+    source = world.deck(3, picture_only=[2])
+    manifest = await world.prepare(source)
+    rows = world.store.derived_of(source)
+    pdf = world.converted(source)
+    pages = [row for row in rows if row.role == "page"]
+
+    assert (manifest.kind, manifest.unit, manifest.total, manifest.pages_without_text) == ("office", "slide", 3, [2])
+    assert (manifest.frames, manifest.hint) == (None, None)
+    assert [r.n for r in manifest.renditions] == [row.ordinal for row in pages] == [1, 2, 3]
+    assert sorted(row.role for row in rows) == ["page", "page", "page", "pdf"]
+    assert (pdf.mime, pdf.width, pdf.height, pdf.meta["slides"]) == ("application/pdf", None, None, 3)
+    convert, render = world.executor.requests
+    assert (convert.tool, convert.input_files) == ("convert_office", [source.name])
+    assert convert.args == {"budget_s": max(1, world.settings.job_wall_s * 3 // 4), "path": source.name}
+    assert (render.tool, render.input_files, render.args["path"]) == (
+        "prepare_file",
+        [pdf.relative_path],
+        pdf.relative_path,
+    )
+    assert render.args["office"] == {"unit": "slide", "slides": 3}
+    (turn,) = taken
+    assert [(tool, held is turn) for tool, held in sent] == [("convert_office", True), ("prepare_file", True)]
+    assert turn.gate == "prepare"
+    assert fake_office.calls == 1
+    converted, drawn = world.events()
+    assert (converted["action"], converted["outcome"]) == ("modify", "ok")
+    assert converted["target"]["ids"] == [source.id, pdf.id]
+    assert converted["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 0,
+        "strips": 1,
+        "on_demand": False,
+        "converted": True,
+        "outputs": 1,
+    }
+    assert (drawn["action"], drawn["outcome"]) == ("modify", "ok")
+    assert drawn["target"]["ids"] == [source.id, *(row.id for row in pages)]
+    assert drawn["criteria"] == {"caller": "ghostwriter", "renders": 3, "strips": 1, "on_demand": False, "outputs": 3}
+    assert world.store.files_in_chat(PG) == [source]  # neither the PDF nor a slide is a file of the chat
+
+
+async def test_a_word_file_is_drawn_as_pages(world: World, fake_office: FakeOffice) -> None:
+    """A Word file is converted and drawn as a deck is, and counted by page."""
+    source = put(world.store, "harbour-notes.docx", mk.make_docx(world.built / "harbour-notes.docx").read_bytes(), p=PG)
+    manifest = await world.prepare(source)
+
+    assert (manifest.kind, manifest.unit, manifest.total, manifest.pages_without_text) == ("office", "page", 3, [])
+    assert [r.n for r in manifest.renditions] == [1, 2, 3]
+    _, render = world.executor.requests
+    assert render.args["office"] == {"unit": "page", "slides": None}
+    assert fake_office.decks == [False]
+
+
+async def test_a_prepared_deck_answers_from_the_rows(world: World, fake_office: FakeOffice) -> None:
+    """A deck prepared once is answered from its rows: no request, no event, no conversion."""
+    source = world.deck(3)
+    first = await world.prepare(source)
+    requests, events = len(world.executor.requests), len(world.lines())
+
+    assert await world.prepare(source) == first
+    assert (len(world.executor.requests), len(world.lines()), fake_office.calls) == (requests, events, 1)
+
+
+async def test_a_deck_converted_before_is_not_converted_again(world: World, fake_office: FakeOffice) -> None:
+    """A deck with its PDF and no head (its slides' renders went): the prepare only draws, from that PDF."""
+    source = world.deck(3)
+    staged = mk.make_pdf(world.built / "converted.pdf", ["Invented slide 1", "Invented slide 2", "Invented slide 3"])
+    spec = DerivedSpec("pdf", 0, "application/pdf", None, None, {"pages": 3, "slides": 3})
+    pdf = world.store.register_derived(source, staged, spec, file_id=new_file_id(), quota_bytes=10**9)
+    manifest = await world.prepare(source)
+
+    (req,) = world.executor.requests
+    assert (req.tool, req.input_files, req.args["office"]) == (
+        "prepare_file",
+        [pdf.relative_path],
+        {"unit": "slide", "slides": 3},
+    )
+    assert fake_office.calls == 0
+    assert (manifest.kind, manifest.unit, manifest.total) == ("office", "slide", 3)
+    (event,) = world.events()
+    assert event["target"]["ids"][0] == source.id
+    assert "converted" not in event["criteria"]
+
+
+@pytest.mark.parametrize(
+    ("meta", "slides"),
+    [({"pages": 3, "slides": 3}, 3), ({"pages": 3, "slides": "3"}, None), ({"slides": True}, None), ({}, None)],
+    ids=["counted", "text", "bool", "missing"],
+)
+async def test_a_slide_count_the_pdf_row_does_not_keep_is_left_out(
+    world: World, fake_office: FakeOffice, meta: dict[str, object], slides: int | None
+) -> None:
+    """The slide count goes to the job only as the whole number a conversion kept; any other is left out, not failed."""
+    source = world.deck(3)
+    staged = mk.make_pdf(world.built / "converted.pdf", ["Invented slide 1", "Invented slide 2", "Invented slide 3"])
+    spec = DerivedSpec("pdf", 0, "application/pdf", None, None, meta)
+    world.store.register_derived(source, staged, spec, file_id=new_file_id(), quota_bytes=10**9)
+    manifest = await world.prepare(source)
+
+    (req,) = world.executor.requests
+    assert req.args["office"] == {"unit": "slide", "slides": slides}
+    assert (manifest.kind, manifest.total) == ("office", 3)
+
+
+async def test_later_slides_reuse_the_pdf(world: World, fake_office: FakeOffice) -> None:
+    """Slide 21 of 22 is one job over the PDF kept at the prepare: no conversion again."""
+    source = world.deck(22, chart_on=None)
+    manifest = await world.prepare(source)
+    pdf = world.converted(source)
+    made = await world.renders(source, manifest, [21])
+
+    assert [r.ordinal for r in made] == [21]
+    (req,) = world.executor.requests[2:]
+    assert (req.tool, req.input_files) == ("prepare_file", [pdf.relative_path])
+    assert req.args == {
+        "pages": [21],
+        "strips": 1,
+        "budget_s": max(1, world.settings.job_wall_s * 3 // 4),
+        "facts": False,
+        "office": {"unit": "slide", "slides": 22},
+        "path": pdf.relative_path,
+    }
+    assert fake_office.calls == 1
+    assert world.events()[-1]["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 1,
+        "strips": 1,
+        "on_demand": True,
+        "outputs": 1,
+    }
+
+
+async def test_a_lost_pdf_is_converted_again(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deck whose PDF went is converted again for a later slide, then drawn, both in one turn under its lock."""
+    source = world.deck(22, chart_on=None)
+    manifest = await world.prepare(source)
+    lost = world.converted(source)
+    world.store.remove_derived(lost)
+    taken, sent = turns_of(world, monkeypatch)
+    made = await world.renders(source, manifest, [21])
+
+    again = world.converted(source)
+    assert again.id != lost.id
+    assert [r.ordinal for r in made] == [21]
+    convert, render = world.executor.requests[2:]
+    assert (convert.tool, render.tool, render.input_files) == ("convert_office", "prepare_file", [again.relative_path])
+    (turn,) = taken
+    assert [(tool, held is turn) for tool, held in sent] == [("convert_office", True), ("prepare_file", True)]
+    assert turn.gate == "user"
+    assert fake_office.calls == 2
+    converted, drawn = world.events()[-2:]
+    assert converted["target"]["ids"] == [source.id, again.id]
+    assert converted["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 0,
+        "strips": 1,
+        "on_demand": True,
+        "converted": True,
+        "outputs": 1,
+    }
+    assert drawn["criteria"]["on_demand"] is True and "converted" not in drawn["criteria"]
+
+
+async def test_two_prepares_of_a_deck_convert_once(world: World, fake_office: FakeOffice) -> None:
+    """Two prepares of one deck at once: one conversion, one render job, one set of rows, no error."""
+    slow = world.over(Slow(world.settings.data_dir, world.built.parent / "slow-jobs"))
+    source = slow.deck(3)
+    first, second = await asyncio.gather(slow.prepare(source), slow.prepare(source))
+
+    assert first == second
+    assert [req.tool for req in slow.executor.requests] == ["convert_office", "prepare_file"]
+    assert fake_office.calls == 1
+    assert sorted(row.role for row in slow.store.derived_of(source)) == ["page", "page", "page", "pdf"]
+    assert [event["outcome"] for event in slow.events()] == ["ok", "ok"]
+
+
+async def test_the_source_lock_is_taken_before_the_turn(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every path takes the source's lock first and a turn of its gate second: the reverse order can deadlock.
+
+    When the prepare of a deck and the on-demand render of its 21st slide each take their turn, the source's lock is
+    already held (one source tracked), and both are let go afterwards.
+    """
+    held_at_turn: list[int] = []
+    real_turn = world.queue.turn
+
+    def turn(p: Principal, **limits: Any) -> contextlib.AbstractAsyncContextManager[Turn]:
+        held_at_turn.append(world.queue.tracked_sources)
+        return real_turn(p, **limits)
+
+    monkeypatch.setattr(world.queue, "turn", turn)
+    source = world.deck(22)
+
+    manifest = await world.prepare(source)
+    drawn = await world.renders(source, manifest, [21])
+
+    assert [rec.ordinal for rec in drawn] == [21]
+    assert held_at_turn == [1, 1]
+    assert world.queue.tracked_sources == 0
+
+
+async def test_a_turn_is_let_go_after_a_refused_conversion(world: World, fake_office: FakeOffice) -> None:
+    """A prepare whose conversion is refused lets its turn and its lock go: the next prepare of a deck runs at once.
+
+    One deck is refused for its pictures (every page came to the ceiling), a slide master for having no slides; a
+    turn that stayed held would keep the caller's prepare gate, and the third prepare would wait for it.
+    """
+    fake_office.ceiling = 0
+    crowded = world.deck(2, name="harbour-crowded.pptx")
+    master = mt.as_potx(mt.make_master(world.built / "harbour-master.pptx", examples=0), world.built / "master.potx")
+    empty = put(world.store, "harbour-master.potx", master.read_bytes(), p=PG)
+
+    refusals: list[str] = []
+    for source in (crowded, empty):
+        with pytest.raises(HTTPException) as refused:
+            await world.prepare(source)
+        assert refused.value.status_code == 422
+        refusals.append(str(refused.value.detail))
+    fake_office.ceiling = None
+
+    assert (
+        refusals[0]
+        == "unreadable_file: the file holds more or larger pictures than can be drawn within the memory limit"
+    )
+    assert refusals[1].startswith("unsupported_format: the deck has no slides")
+    assert world.queue.tracked_sources == 0
+    manifest = await asyncio.wait_for(world.prepare(world.deck(3)), scaled(5))
+    assert (manifest.kind, manifest.total) == ("office", 3)
+
+
+async def test_an_encrypted_deck_is_422_with_nothing_kept(world: World, fake_office: FakeOffice) -> None:
+    """Review Focus 1: a password-protected deck (an OLE container) is refused before it is converted; nothing is kept.
+
+    The one job, the conversion, is recorded as an ``error`` by its code; no slide is drawn.
+    """
+    source = put(world.store, "harbour-deck.pptx", mk.make_ole(world.built / "harbour-deck.pptx").read_bytes(), p=PG)
+    with pytest.raises(HTTPException) as refused:
+        await world.prepare(source)
+
+    assert refused.value.status_code == 422
+    assert str(refused.value.detail).startswith("unreadable_file:")
+    assert "password-protected" in str(refused.value.detail)
+    assert world.store.derived_of(source) == []
+    assert [req.tool for req in world.executor.requests] == ["convert_office"]
+    assert fake_office.calls == 0
+    (event,) = world.events()
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("modify", "error", [source.id])
+    assert event["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 0,
+        "strips": 1,
+        "on_demand": False,
+        "converted": True,
+        "outputs": 0,
+        "refused": "unreadable_file",
+    }
+    # The turn taken inside the lock is let go with it: the prepare gate, one job at a time, serves the next at once.
+    assert world.queue.tracked_sources == 0
+    assert (await asyncio.wait_for(world.prepare(world.photo()), scaled(5))).kind == "image"
+
+
+async def test_a_pdf_past_the_quota_is_507(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The PDF counts in the user's quota: one the store's quota refuses is 507, and no slide is drawn or kept."""
+    source = world.deck(3)
+    real = functools.partial(Store.register_derived, world.store)
+
+    def register(source: FileRecord, staged: Path, spec: DerivedSpec, **more: Any) -> DerivedRecord:
+        return real(source, staged, spec, **({**more, "quota_bytes": 1} if spec.role == "pdf" else more))
+
+    monkeypatch.setattr(world.store, "register_derived", register)
+    with pytest.raises(QuotaExceeded) as refused:
+        await world.prepare(source)
+
+    assert describe(refused.value) == (507, "workspace quota exceeded")
+    assert world.store.derived_of(source) == []
+    assert [req.tool for req in world.executor.requests] == ["convert_office"]
+    assert [event["outcome"] for event in world.events()] == ["ok", "error"]  # the PDF, named again
+
+
 # --- reading back ------------------------------------------------------------------------------------------------
 
 
@@ -710,7 +1047,7 @@ async def test_shown_images_are_labelled_by_picture_page_and_strip(world: World)
         label="image", n=1, width=whole.width or 0, height=whole.height or 0, mime="image/jpeg"
     )
     assert shown_image("image", first).label == "image, strip 1 of 2"
-    assert [label("image", 1, 1, 1), label("image", 1, 1, 2), label("pdf", 3, 1, 1), label("pdf", 3, 2, 3)] == [
+    assert [label("image", 1, 1, 1), label("image", 1, 1, 2), label("page", 3, 1, 1), label("page", 3, 2, 3)] == [
         "image",
         "image, strip 1 of 2",
         "page 3",
@@ -764,6 +1101,40 @@ def test_a_manifest_needs_a_head_with_its_facts() -> None:
     assert later is not None and (later.kind, later.total) == ("pdf", 2)
 
 
+def test_a_v07_head_reads_as_unit_page() -> None:
+    """Ruling R7: a head kept by v0.7 has no ``unit`` and reads as ``page``; an Office head is a manifest of its own."""
+    owner = {"caller": "ghostwriter", "user_id": "user-a", "chat_id": "chat-1"}
+
+    def source(name: str) -> FileRecord:
+        return FileRecord(
+            id="f" * 32, name=name, size=9, mime="application/pdf", kind="upload", created_at=1.0, job_id=None, **owner
+        )
+
+    def head(facts: dict[str, object]) -> DerivedRecord:
+        return DerivedRecord(
+            id="1" * 32,
+            source_id="f" * 32,
+            role="page",
+            ordinal=1,
+            name=f"{'1' * 32}.jpg",
+            size=5,
+            mime="image/jpeg",
+            width=9,
+            height=9,
+            meta={"facts": facts},
+            created_at=1.0,
+            **owner,
+        )
+
+    v07: dict[str, object] = {"kind": "pdf", "total": 1, "pages_without_text": [], "frames": None, "hint": None}
+    old = manifest_of(source("quay-list.pdf"), [head(v07)])
+    assert old is not None
+    assert (old.kind, old.unit, old.model_dump(mode="json")["unit"]) == ("pdf", "page", "page")
+    deck = manifest_of(source("harbour-deck.pptx"), [head({**v07, "kind": "office", "unit": "slide"})])
+    assert deck is not None
+    assert (deck.kind, deck.unit, deck.total) == ("office", "slide", 1)
+
+
 # --- the shared rules --------------------------------------------------------------------------------------------
 
 
@@ -792,6 +1163,74 @@ def test_page_window_grammar() -> None:
     with pytest.raises(HTTPException) as one:
         page_window("page 2", 1, default_last=4)
     assert one.value.detail == "no_such_part: this document has 1 page"
+
+
+def test_slide_window_grammar() -> None:
+    """A deck's slides are ``slide N``, ``N``, ``slides N-M`` or ``N-M``, either word alike; a page is refused there.
+
+    A PDF's and a document's pages keep their grammar, which does not take slides.
+    """
+    assert page_window("slide 3", 10, default_last=4, unit="slide") == (3, 3)
+    assert page_window("slides 2-5", 10, default_last=4, unit="slide") == (2, 5)
+    assert page_window("Slide 2-5", 10, default_last=4, unit="slide") == (2, 5)
+    assert page_window("slides 3", 10, default_last=4, unit="slide") == (3, 3)
+    assert page_window("3", 10, default_last=4, unit="slide") == (3, 3)
+    assert page_window("2-5", 10, default_last=4, unit="slide") == (2, 5)
+    assert page_window("slides 8-20", 10, default_last=4, unit="slide") == (8, 10)
+    assert page_window(None, 10, default_last=4, unit="slide") == (1, 4)
+    slides = "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'"
+    for part, detail in [
+        ("page 3", slides),
+        ("pages 2-5", slides),
+        ("slides 5-2", slides),
+        ("slide 11", "no_such_part: this document has 10 slides"),
+        ("slide 0", "no_such_part: this document has 10 slides"),
+    ]:
+        with pytest.raises(HTTPException) as refused:
+            page_window(part, 10, default_last=4, unit="slide")
+        assert (refused.value.status_code, refused.value.detail) == (422, detail)
+    with pytest.raises(HTTPException) as one:
+        page_window("slide 2", 1, default_last=4, unit="slide")
+    assert one.value.detail == "no_such_part: this document has 1 slide"
+
+    assert page_window("page 3", 10, default_last=4, unit="page") == (3, 3)
+    with pytest.raises(HTTPException) as paged:
+        page_window("slide 3", 10, default_last=4, unit="page")
+    assert paged.value.detail == "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'"
+
+
+def test_labels_name_slides() -> None:
+    """A slide's render says so; a picture's and a page's say what they said in v0.7."""
+    assert label("slide", 3, 1, 1) == "slide 3"
+    assert label("slide", 3, 2, 3) == "slide 3, strip 2 of 3"
+    assert [label("image", 1, 1, 1), label("image", 1, 2, 2), label("page", 3, 1, 1), label("page", 3, 2, 3)] == [
+        "image",
+        "image, strip 2 of 2",
+        "page 3",
+        "page 3, strip 2 of 3",
+    ]
+
+
+def test_the_noun_of_a_manifest() -> None:
+    """A picture is an image, a PDF's renders are pages, and an Office file's are its unit's."""
+    base: dict[str, object] = {
+        "path": "/workspace/chat-1/x",
+        "total": 1,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "hint": None,
+    }
+    nouns = [
+        noun_of(Manifest.model_validate({**base, **more}))
+        for more in (
+            {"kind": "image"},
+            {"kind": "pdf"},
+            {"kind": "office", "unit": "page"},
+            {"kind": "office", "unit": "slide"},
+        )
+    ]
+    assert nouns == ["image", "page", "page", "slide"]
 
 
 def test_the_image_block_is_for_the_assistant() -> None:

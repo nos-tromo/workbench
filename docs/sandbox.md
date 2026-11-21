@@ -1,8 +1,9 @@
 # Sandbox
 
 Every file a user uploads is opened in the `executor`, never in the api: the
-document readers, the search, the template work, the writers and the model's
-free Python. This page says how the executor is confined, why it holds each
+document readers, the search, the renders of pictures and pages, the conversion
+of Office files to pages, the template work, the writers and the model's free
+Python. This page says how the executor is confined, why it holds each
 capability it has, what it checks before it starts, and the risks that remain.
 
 ## The executor container
@@ -185,7 +186,13 @@ asyncio and ctypes callbacks work under it
 Nothing needs a socket or shared anonymous memory in a job: the executor has no
 network, and multiprocessing, the only Python code in the image that maps
 shared anonymous memory (`multiprocessing.heap`, `shared_memory`), does not work
-there anyway.
+there anyway. The conversion of an Office file is no exception:
+LibreOfficeKit, loaded in-process through ctypes in a child of the job
+(`workbench/executor/render/office.py`), needs no socket. The `soffice` program's
+pipe to a running instance would, which the filter refuses, so `soffice` is
+never run: the image holds it, as the package ships it, and nothing starts it
+(`tests/executor/test_supervisor.py::test_as_root_libreofficekit_converts_a_deck_and_a_document_in_a_slot`
+converts a deck and a document as a slot under the filter).
 The files of the user's other chats are never copied in. A file below a folder
 named `out` is never copied in either: `out/` is where a job writes.
 
@@ -303,7 +310,57 @@ For the container (`docker/compose.yaml`, see
 Documents get guards of their own before a library parses them: an Office file
 may unpack to at most 20 times the upload limit, with at most 10 000 members
 (`workbench/executor/readers/__init__.py:check_zip`), and a workbook's sheets,
-names and shared strings are counted before it is loaded.
+names and shared strings are counted before it is loaded. An Office file that
+is to be converted passes two more before LibreOffice sees it: an old binary or
+password-protected container (an OLE file) is refused, and so is an OpenDocument
+text whose manifest says its content is encrypted (both `unreadable_file`, with
+no conversion). A deck with no slides is refused as `unsupported_format` with the
+runner's own text (`runners/convert.py:_NO_SLIDES`), a macro-enabled deck and a
+slide show with the reader's; then Pillow reads the size of every picture in the
+file from its header, decoding none, and a picture of more than 120 megapixels
+is `unreadable_file`. No child is forked for any of these.
+
+A conversion (`convert_office`) is a child of the job, forked for one
+LibreOfficeKit start (`office.run_in_child`): the library starts once per
+process, and a C call that hangs inside it can only be stopped by killing the
+process that made it. The child has its own `RLIMIT_AS`, 1536 MB, as every
+process of the job has (the limit is per process, and a fork starts with the
+parent's). It is of the slot's uid, so
+it counts against `RLIMIT_NPROC` and in the watchdog's sum of the job's resident
+memory, and the wall time, `RLIMIT_CPU` and the disk limits hold it as they hold
+any process of the job. The job's own deadline is 3/4 of the wall time: the
+parent polls for the child until then, then kills it with `SIGKILL`, reaps it,
+and answers `read_timeout`; the wall time's kill of the process group is the
+backstop. LibreOffice's own files (its profile, a copy of the image's, removed
+when the child is gone) go to the job's private tmp and home, and `out/` holds
+only the checked PDF. A conversion took 0.2 to 0.3 s in the root tests, and a
+cold 30-slide deck 2.8 s in the spike that chose this design.
+
+**At the address-space ceiling.** Starting LibreOffice and loading a file take
+610 to 740 MB of the child's 1536 MB (measured in the image). LibreOffice then
+decodes every distinct picture of the pages it draws at full size, about 3 bytes
+a pixel, and holds them until the PDF is saved. When a picture no longer fits it
+does not fail: it leaves that picture out, saves the PDF and reports success
+(Impress, with pictures that have alpha, may fail the save instead). A deck of 60
+distinct 12-megapixel photos lost 37 of them that way, a 40-page Word file with
+one such photo a page 14. So the child reads its peak address space (`VmPeak`)
+once the PDF is saved, and answers `office.EXIT_AT_CEILING` when the peak came
+within a headroom of the limit. A picture is lost only when the request to decode
+it did not fit, so the peak was then within that request of the limit; the
+headroom is the largest such request, 4 bytes a pixel of the largest picture
+Pillow sized, and 128 MiB for the rest (`runners/convert.py:_headroom`). A
+conversion at the ceiling is never kept. The runner converts the file again in
+parts: page ranges (`PageRange`), each in a fresh child that decodes only the
+pictures of its pages, as many pages as the room left under the limit holds,
+halved while one comes to the ceiling again; pdfium joins them into the one PDF.
+A page that comes to the ceiling alone, a Word or OpenDocument file whose whole
+conversion saved no PDF there (its pages are then unknown), and a budget spent
+on the parts are `unreadable_file: the file holds more or larger pictures than
+can be drawn within the memory limit`, with nothing kept. Measured in the image
+with the default budget of 90 s: that deck converts in 22 s (whole once, then
+five parts), with a logo on its slide master in 23 s, that Word file in 14 s.
+A lone picture of about 95 megapixels or more is refused, since its headroom and
+its decoding no longer fit together under the limit.
 
 ### What the supervisor checks before it starts
 
@@ -526,6 +583,47 @@ Each of these is accepted. Each says what it would take.
   only, and a width and a height only within the bounds of a render, so a wrong
   value the executor states costs the model tokens and never access. A
   decoder's time and memory are the job's own limits.
+- **LibreOffice's import filters and PDF export, in the executor only.** Since
+  0.8.0 a Word, PowerPoint or OpenDocument text file the user dropped is opened
+  by LibreOffice (Debian's `libreoffice-*-nogui` packages) to be drawn as pages.
+  Its OOXML and ODF import filters and its PDF export are one more native parser
+  of hostile input, and as large as an office suite. A flaw in one is a flaw in a
+  job's process, with the same reach as the decoders above: a slot uid, no
+  network, the limits and the filters of this page, and a copy of its own chat's
+  files. What narrows it:
+  - it runs only in a child forked for that one conversion, under the job's
+    limits and a deadline that kills it, and shares nothing with another job;
+  - it sees a file only after the zip guard (bombs, an OLE container) and the
+    encryption checks;
+  - no macro runs. The document is loaded with `Batch=true`, the baked profile
+    sets the macro security to very high, turns macros off and never updates a
+    link, and the image has no Java and no Python script provider. A root test
+    shows that a document whose Basic macro is bound to its load never writes its
+    file, and that the same document does when macros are allowed
+    (`tests/executor/test_supervisor.py::test_as_root_a_document_macro_never_runs`
+    and `::test_as_root_the_macro_fixture_runs_when_macros_are_allowed`);
+  - it has no network and no socket, and its error text, which may name a path,
+    is never read;
+  - the PDF it makes is accepted only as a regular file of at most 32 MiB that
+    starts with `%PDF-` and that pdfium opens, and the api keeps it as that and
+    nothing more;
+  - a conversion whose peak address space came within its headroom of the limit
+    is never kept, since LibreOffice may have left pictures out of it
+    ([Limits](#limits)). The headroom covers the largest picture Pillow sizes
+    from its header (JPEG, PNG, GIF, BMP, TIFF, WebP and a few older formats)
+    and 128 MiB besides. A bitmap LibreOffice decodes from inside a metafile or
+    an SVG, or from a format Pillow cannot size, is covered by those 128 MiB
+    alone: one larger than that, in a file at the ceiling, could still be left
+    out unnoticed. None of the sweeps across the ceiling (decks and Word files
+    of 6- to 80-megapixel JPEGs, PNGs with and without alpha, a logo on the
+    master) found a loss the peak did not show.
+
+  What does not narrow it: `run_python` can load the same library through ctypes,
+  in the same sandbox, so the conversion adds no reach a job did not have, only a
+  parser a job's code could already call. The image grows by about 515 MB
+  unpacked (191 MB compressed) for LibreOffice and its fonts. The version is
+  whatever Debian's trixie archive holds when the image is built (25.2.3 at
+  0.8.0); nothing is fetched at run time.
 
 ## gVisor
 
@@ -552,6 +650,11 @@ Neither a caller nor a job brings packages of its own:
   together with what those packages depend on, Jinja2 among them. The same
   venv also carries the project's own dependencies (FastAPI, pydantic, uvicorn
   and the rest), which a job has no use for.
+- **LibreOffice, as a library and not a package.** The image holds LibreOffice
+  25.2 for the conversion of Office files (`/usr/lib/libreoffice/program`), and
+  a job's code could load it through ctypes, as `convert_office` does; there is
+  no Python module for it (no script provider, no `uno` for the venv's
+  interpreter), and no Java runtime. See [Residual risks](#residual-risks).
 - **The exact versions are in `uv.lock`.** Dependabot moves them, so this page
   names none.
 

@@ -30,7 +30,9 @@ and these documents differ, these documents describe the code.
 ## Third-party licences
 
 workbench is Apache-2.0. Its images ship third-party Python packages, each
-under its own licence; four need a note, and a fifth that no image ships:
+under its own licence; four need a note, and a fifth that no image ships. The
+executor image also ships LibreOffice and its fonts, all Debian packages, noted
+below:
 
 - **docxtpl** is LGPL-2.1. workbench uses it unmodified, as a separate Python
   package, and its source is in the executor image as installed, so it can be
@@ -46,6 +48,43 @@ under its own licence; four need a note, and a fifth that no image ships:
 - **pillow-heif** (the writer the tests make a HEIC picture with) bundles the
   GPL-2.0 x265 encoder. It is in the `dev` dependency group and the `test` stage
   of the executor's Dockerfile only, never in an image that is shipped.
+- **LibreOffice** converts Word, PowerPoint and OpenDocument text files to PDF
+  in the executor, through LibreOfficeKit. It comes from Debian's
+  `libreoffice-core-nogui`, `-writer-nogui`, `-impress-nogui` and `-calc-nogui`
+  packages and the packages they pull in (25.2.3 at 0.8.0). workbench uses it
+  unmodified, as Debian packages, so it is replaceable in the executor image: it
+  is one `apt-get install` layer of `docker/Dockerfile.executor`, and its source
+  is Debian's. The `/usr/share/doc/<package>/copyright` file of each
+  `libreoffice-*` package is the same file. It says the suite is MPL-2.0, with
+  some files that incorporate Apache-2.0 material, and names other licences for
+  parts of the source tree and for what Debian adds: Apache-2.0, MIT and Expat,
+  BSD-2-clause and BSD-3-clause, MPL-1.1, LGPL-2, LGPL-3+, GPL-2, GPL-2+ and
+  GPL-3+, CC0-1.0 and CC-BY-SA-3.0. The image carries no Java runtime and no
+  Python script provider.
+- **The fonts** LibreOffice draws with. The Dockerfile installs five font
+  packages, `fonts-crosextra-carlito`, `fonts-crosextra-caladea`,
+  `fonts-liberation2`, `fonts-dejavu-core` and `fonts-noto-core`, and with what
+  they and LibreOffice pull in, eight packages carry fonts in the executor
+  image. All are Debian's and unmodified:
+  - Carlito (`fonts-crosextra-carlito`) and Caladea (`fonts-crosextra-caladea`)
+    stand in for Calibri and Cambria;
+  - Liberation is held by `fonts-liberation`; `fonts-liberation2`, which the
+    Dockerfile names, is a transitional package with no font in it that depends
+    on `fonts-liberation`;
+  - DejaVu is in `fonts-dejavu-core` and `fonts-dejavu-mono`, which it pulls in;
+  - Noto is in `fonts-noto-core` and `fonts-noto-mono`, which it pulls in;
+  - OpenSymbol is `fonts-opensymbol`, which `libreoffice-core-nogui` pulls in.
+
+  Their copyright files say Carlito, Caladea, Noto (core and mono) and
+  Liberation are under the SIL Open Font License 1.1 (`OFL-1.1`; the Liberation
+  file writes `SIL-OFL-1.1`), DejaVu (core and mono) under the Bitstream Vera
+  licence, with DejaVu's own changes in the public domain, and OpenSymbol under
+  MPL-2.0, in the LibreOffice copyright file (some of its files incorporate
+  Apache-2.0 material) that `fonts-opensymbol` carries as well. They name the
+  Debian packaging of Carlito, Liberation and DejaVu as GPL-2+, of Noto as
+  GPL-3+ and of Caladea as Apache-2.0. A font only draws the pages: the
+  converted PDF, which embeds subsets of the fonts, never leaves workbench, and a
+  render is a picture.
 
 No Python package the images could use only under the GPL or the AGPL is
 installed: of the shipped packages, only docxtpl, odfpy and pi-heif (through the
@@ -55,4 +94,5 @@ read: the Python parser for them, `extract-msg`, is GPL. `read_document` asks
 the user to save such a file as `.eml` or PDF.
 
 The images' Debian base, `python:3.12-slim-trixie`, carries the operating
-system's own packages under their own licences, GPL ones among them.
+system's own packages under their own licences, GPL ones among them; the
+executor image adds LibreOffice and the fonts above to it.

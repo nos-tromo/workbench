@@ -22,9 +22,11 @@ root (e.g. `docker/compose.yaml`).
 
 `workbench` is the nos-tromo federation's shared tool tier: the place where
 tools run on users' files, so that no app runs a code sandbox or office tooling
-of its own ("tool execution is shared, never embedded"). Ghostwriter connects
+of its own ("tool execution is shared, never embedded"; Office files are
+converted to pages in the executor too). Ghostwriter connects
 through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
-reads and searches them, looks at pictures and the pages of PDFs as images, runs
+reads and searches them, looks at pictures, the pages of PDFs and the pages and
+slides of Word, PowerPoint and OpenDocument text files as images, runs
 Python over them, inspects and fills report templates, builds presentations in a
 slide master (or a plain one), and writes tables and documents, through ten typed
 tools. Every file is recorded in the audit trail by id and deleted
@@ -46,7 +48,9 @@ deploy's spec `docs/superpowers/specs/2026-11-17-open-webui-retirement-design.md
 v0.6.0's are `docs/superpowers/specs/2026-11-18-write-presentation-design.md` and
 `docs/superpowers/plans/2026-11-18-write-presentation.md`; v0.7.0's are deploy's
 spec `docs/superpowers/specs/2026-11-20-ghostwriter-vision-design.md` and its plan
-`docs/superpowers/plans/2026-11-20-ghostwriter-vision-workbench-v0.7.md`.
+`docs/superpowers/plans/2026-11-20-ghostwriter-vision-workbench-v0.7.md`; v0.8.0's
+(Office files drawn as pages and slides) is the same spec and deploy's plan
+`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.8.md`.
 Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
@@ -75,8 +79,9 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   capabilities, that runs every job touching file content as a fresh process
   under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
   default 4, run at once), copy-in and copy-out, with limits. The
-  readers, the search, the templates, the writers, `run_python` and the renders
-  of pictures and PDF pages all run there.
+  readers, the search, the templates, the writers, `run_python`, the renders
+  of pictures and PDF pages and the conversion of Office files to a PDF all run
+  there.
 - **`volume-permissions`**: a one-shot that lays out `workbench-data`
   (`workbench/executor/prepare_volume.py`) before the other two start.
 - **Networks**: the external `workbench-net`, the federation's fourth seam.
@@ -87,11 +92,14 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   (`workbench/layout.py`): `workspaces/<caller>/<user-id>/<chat-id>/`,
   `staging/<job-id>/`, `jobs/<job-id>/` and `workbench.db` (SQLite, WAL). Only
   `make nuke` removes it. `workbench-run` holds only the executor's socket.
-  The renders of a file (a picture, the pages of a PDF) are its **derived
-  files**: `<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`), each a row of
-  the `derived` table bound to its source. They are as old as it, count in the
-  user's quota, go with it, and no path reaches `.derived` (`layout.DERIVED`,
-  a reserved name that no upload, output or folder takes).
+  The renders of a file (a picture, the pages of a PDF, the pages or slides of
+  an Office file) and the PDF an Office file was converted to are its **derived
+  files**: `<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`; `.pdf`, role
+  `pdf`, for the conversion), each a row of the `derived` table bound to its
+  source. They are as old as it, count in the user's quota, go with it, and no
+  path reaches `.derived` (`layout.DERIVED`, a reserved name that no upload,
+  output or folder takes). Only renders ever leave: the converted PDF is read by
+  the render jobs alone.
 - **Bring-up order**: inference → data → obs → workbench → apps → edge.
 
 Shared modules: `workbench/config.py` (settings for both roles),
@@ -100,9 +108,11 @@ Shared modules: `workbench/config.py` (settings for both roles),
 on the volume), `workbench/tables.py` (table rules both sides apply),
 `workbench/decks.py` (the bounds of a deck, which the api checks before a job and
 the runner checks again, as with `tables.py`), `workbench/renders.py` (the bounds
-of a render, `RenderAnswer` and its checks, `kind_of`, the strip rule and
-`render_name`, which the api checks the executor's answer against; it imports no
-imaging library). The executor imports nothing of the api, and the api never
+of a render, `RenderAnswer` and its checks, `kind_of` (which names an Office file,
+`OFFICE_SUFFIXES`, and `unit_of` whether its pages count as pages or slides), the
+converted PDF's name, type and cap, the strip rule and `render_name`, which the
+api checks the executor's answer against; it imports no imaging library and
+nothing of LibreOffice). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
 a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
 the row of its page 1 render and read back leniently, an unknown one ignored, so
@@ -132,14 +142,19 @@ header selects what the model is told and shown, never what a caller may reach.
 - `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
   models of `read_document`, and the helpers the other tool modules share.
 - `workbench/api/tools_views.py`: `read_document` and `view_file`, the tools that
-  show pictures and pages as images: MCP image blocks for the assistant alone,
+  show pictures, pages and slides as images (an Office file's too; a deck's are
+  `slide N`, `ViewedFile.unit` says which): MCP image blocks for the assistant
+  alone,
   after the answer's text, at most 8 (`read_document`: 4) and 2.5 MiB raw, image
   block `i` being `shown[i]`, always. `workbench/api/renders.py` prepares and
   reads the renders back and imports `tools.py`, so `tools.py` never imports it,
   and `read_document`'s function lives here. It decides which render jobs run
   (`prepared`, `renders_for`: a file or a page whose renders exist is answered
   from the rows without the source's lock, and no job runs when the source's
-  renders leave no room for one more) and reads each render back by its row,
+  renders leave no room for one more; an Office file with no `pdf` row is
+  converted first, under the source's lock, in the same turn as its drawing,
+  and one whose PDF has gone is converted again) and reads each render back by
+  its row,
   never one that is not what the row says. A render becomes visible only after its `modify` /
   `file.prepare` event, and leaves only after its `disclose` / `file.view`,
   `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
@@ -149,14 +164,25 @@ header selects what the model is told and shown, never what a caller may reach.
   master, the name, every deck bound, each picture and each source before a job,
   so a refusal names its slide and block and costs no job.
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
-  view, the chat delete). `POST /files/prepare` renders a picture or a PDF's
-  first 20 pages once (idempotent, answered from the rows after that; with
-  `strips` 2 or 3 it also cuts a picture into strips, on the prepare gate) and
-  `GET /files/view?rendition=` serves one render, made first on the user's own
-  turn when it does not exist yet.
+  view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
+  pages of a PDF or an Office file, once (idempotent, answered from the rows after
+  that; an Office file is converted first and then drawn, two jobs in one turn of
+  the prepare gate; with `strips` 2 or 3 it also cuts a picture into strips, on
+  the prepare gate) and `GET /files/view?rendition=` serves one render, made first
+  on the user's own turn when it does not exist yet.
 - `workbench/executor/runners/`: one runner per tool that needs file content
-  (`RUNNERS`); `presentations.py` is `write_presentation`'s and `render.py` is
-  `prepare_file`'s, which the render routes and tools run.
+  (`RUNNERS`); `presentations.py` is `write_presentation`'s, `render.py` is
+  `prepare_file`'s, which the render routes and tools run, and `convert.py` is
+  `convert_office`'s: it runs the checks LibreOffice must not be the first to meet
+  (the zip guard, an OpenDocument manifest that says it is encrypted; a deck
+  with no slides, a macro-enabled one or a slide show is `unsupported_format`;
+  the size of every picture, from its header), has `render/office.py` convert
+  the file to one PDF in a folder of the job's tmp (whole, or in page ranges
+  joined by pdfium when the whole came to the address-space ceiling: see
+  Gotchas), checks that PDF (a regular file, at most 32 MiB, the `%PDF-`
+  signature, pdfium counts its pages) and only then moves it to
+  `out/converted.pdf`. `prepare_file` then draws the pages from that PDF, which
+  the api hands it at its derived path, never one a caller names.
   `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
   its record. A render job (`submit_renders`) keeps its outputs as derived files
   of its source (`Store.register_derived`), never as files of the chat. **The
@@ -173,6 +199,14 @@ header selects what the model is told and shown, never what a caller may reach.
   `encode.py` writes JPEG or PNG under 768 KiB with none of the source's
   metadata, and cuts strips; `pages.py` opens a PDF with pdfium, finds the pages
   with no text and draws one at 1600 px. Imported by the executor only.
+  `office.py` is `convert_office`'s: LibreOfficeKit loaded through
+  ctypes in a **forked child** (it starts once per process and a hung C call can
+  only be stopped by killing the process), with a profile of its own, filter data
+  that draws hidden slides, leaves out notes pages and keeps pictures to 150 dpi,
+  and the image's bake (`python -m workbench.executor.render.office bake <dir>`).
+  It imports only the standard library and the readers' errors; LibreOffice is
+  loaded in that child alone, never in the job's process, and `soffice` is never
+  run.
 - `workbench/executor/presentations/`: what the runners of a slide master use.
   `master.py` reads the layouts and their places (`inspect_template`) and opens a
   `.pptx` or `.potx`, or makes the plain master (`plain_master`: python-pptx's
@@ -247,8 +281,14 @@ starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
   source's metadata (no EXIF, GPS, ICC or XMP). The api trusts a render's stated
   width and height only within the bounds, so a wrong value costs tokens, never
   access.
+- **Every conversion runs in the executor too.** A Word, PowerPoint or
+  OpenDocument text file reaches LibreOffice only there, after the zip guard and
+  the encryption checks, in a forked child under the job's limits, with macros
+  off and no network (`docs/sandbox.md` § Residual risks). The api never converts:
+  it keeps the one PDF a conversion made, checking its signature and size alone.
 - **No network** in the executor, and no socket in a job (a seccomp filter of
-  workbench's own). A job sees copies of its own chat's files, read-only (an
+  workbench's own; LibreOfficeKit in-process needs none). A job sees copies of
+  its own chat's files, read-only (an
   inline job, docint's, sees only the data its call brought), and writes only
   its `out/` and its private `home/` (with its `tmp/`), both removed with the
   job, inside a job folder no other slot can pass. A watchdog holds each running
@@ -356,6 +396,30 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   each job copies that cache into a config folder in its private tmp
   (`workbench/executor/runners/python.py`). A change of the base image or of
   matplotlib rebuilds it with the image.
+- **LibreOffice's profile is baked, and each conversion copies it.** The image
+  starts LibreOfficeKit once at build time and keeps the profile
+  (`/opt/lo-profile`, root's, read-only: the macro and link settings of
+  `office.PROFILE_SETTINGS`, warm), and each conversion copies it into a folder
+  of the job's private tmp (`office.seed_profile`), as the font cache is copied,
+  since LibreOffice writes to its profile. LibreOfficeKit starts once per process
+  and cannot start again, so each conversion forks a child of the job
+  (`office.run_in_child`), which ends in `os._exit` without `destroy`. A hung
+  LibreOffice call is stopped only by killing that child: the parent polls to its
+  deadline, then kills and reaps it. The image has no Java and no Python script
+  provider (`--no-install-recommends`), and the executor image is about 515 MB
+  larger for LibreOffice and its fonts.
+- **LibreOffice drops pictures at the address-space ceiling and says it
+  succeeded.** Under the job's `RLIMIT_AS` (1536 MB, never raised for it) it
+  holds every distinct picture it has decoded until the PDF is saved; one that no
+  longer fits is left out, the PDF saved, success reported. Nothing in the PDF
+  tells, so the child reads its own `VmPeak` after the save and exits
+  `office.EXIT_AT_CEILING` when it came within a headroom of the limit: the
+  largest picture at 4 bytes a pixel (Pillow reads every member's header in the
+  job, whatever its name) and 128 MiB. A conversion at the ceiling is never
+  kept: `runners/convert.py` converts the file again in page ranges, a fresh
+  child each, halving a range that comes to the ceiling again, joins the parts
+  with pdfium, and refuses with `office.TOO_MANY_PICTURES` when a single page
+  still does or the budget runs out. `docs/sandbox.md` § Limits has the numbers.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in

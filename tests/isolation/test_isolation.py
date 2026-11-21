@@ -929,6 +929,9 @@ def test_a_chat_delete_leaves_nothing(api_info: dict[str, Any], executor: str) -
 
 VISION_USER, VISION_CHAT = "user-vision", "chat-vision"
 
+#: The eight keys of every manifest `POST /files/prepare` answers.
+MANIFEST_KEYS = {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
+
 #: Run in the api: the renders of one Ghostwriter chat in the database and the chat's folder on the volume, read-only.
 RENDERS_OF_THE_CHAT = r"""
 import json, os, sqlite3, sys
@@ -970,11 +973,12 @@ def test_a_picture_and_a_scan_are_prepared_and_viewed_in_the_sandbox(api_info: d
         answer = ghostwriter(api_info, "POST", "/files/prepare", chat=chat, user=user, params={"path": path})
         assert answer.status_code == 200, answer.text
         body: dict[str, Any] = answer.json()
-        assert set(body) == {"path", "kind", "total", "pages_without_text", "renditions", "frames", "hint"}
+        assert set(body) == MANIFEST_KEYS
         return body
 
     prepared_photo = prepare(photo_path)
-    assert (prepared_photo["kind"], prepared_photo["total"], prepared_photo["pages_without_text"]) == ("image", 1, [])
+    assert (prepared_photo["kind"], prepared_photo["unit"]) == ("image", "page")
+    assert (prepared_photo["total"], prepared_photo["pages_without_text"]) == (1, [])
     (item,) = prepared_photo["renditions"]
     assert (item["n"], item["mime"], item["width"], item["height"]) == (1, "image/jpeg", 48, 64)  # turned upright
     prepared_scan = prepare(scan_path)
@@ -1020,3 +1024,109 @@ def test_a_picture_and_a_scan_are_prepared_and_viewed_in_the_sandbox(api_info: d
     )
     assert (gone.status_code, gone.json()) == NOT_FOUND
     assert left() == {"rows": 0, "folder": False}
+
+
+# --- Office files, converted and shown ----------------------------------------------------------------------------
+
+OFFICE_USER, OFFICE_CHAT = "user-office", "chat-office"
+
+#: Run in the api: the derived rows of one Ghostwriter chat, how many of them are converted PDFs, and what the chat's
+#: folder on the volume still holds of `.derived`, anywhere below it: its folders, and the folders of sources in them.
+DERIVED_OF_THE_CHAT = r"""
+import json, os, sqlite3, sys
+user, chat = sys.argv[1], sys.argv[2]
+db = sqlite3.connect("file:/data/workbench.db?mode=ro", uri=True)
+rows, pdfs = db.execute(
+    "SELECT COUNT(*), COALESCE(SUM(role = 'pdf'), 0) FROM derived"
+    " WHERE caller = 'ghostwriter' AND user_id = ? AND chat_id = ?",
+    (user, chat),
+).fetchone()
+folder = f"/data/workspaces/ghostwriter/{user}/{chat}"
+derived = [(root, names) for root, names, _ in os.walk(folder) if os.path.basename(root) == ".derived"]
+print(json.dumps({
+    "rows": rows, "pdfs": pdfs, "derived": len(derived), "sources": sum(len(n) for _, n in derived),
+    "folder": os.path.exists(folder),
+}))
+"""
+
+
+def test_a_deck_and_a_document_are_converted_and_shown_in_the_sandbox(api_info: dict[str, Any], tmp_path: Path) -> None:
+    """A deck with a picture-only slide and a Word document are converted by LibreOfficeKit and drawn, then deleted.
+
+    The conversion runs in the shipped image as a slot uid: a read-only root, no network, no socket, the baked
+    profile copied into the job's tmp, and LibreOfficeKit in a forked child, so this also proves LibreOffice and its
+    fonts are there and work as a job runs them. Each file is converted once to a PDF that is a derived file of its
+    source and draws its pages; ``view_file`` shows slide 2 alone, ``read_document`` attaches the slide with no text
+    and the document's page is served as a JPEG. Deleting the chat takes the renders and the PDFs, and the
+    ``.derived`` folder with the chat's own.
+    """
+    user, chat = OFFICE_USER, OFFICE_CHAT
+    deck = mk.make_deck(tmp_path / "harbour-deck.pptx", 4, picture_only=[2])
+    document = mk.make_long_docx(tmp_path / "quay-report.docx", 3)
+    deck_path = f"/workspace/{chat}/{_upload(api_info, 'harbour-deck.pptx', deck.read_bytes(), user=user, chat=chat)}"
+    document_path = (
+        f"/workspace/{chat}/{_upload(api_info, 'quay-report.docx', document.read_bytes(), user=user, chat=chat)}"
+    )
+
+    def prepare(path: str) -> dict[str, Any]:
+        answer = ghostwriter(api_info, "POST", "/files/prepare", chat=chat, user=user, params={"path": path})
+        assert answer.status_code == 200, answer.text
+        body: dict[str, Any] = answer.json()
+        assert set(body) == MANIFEST_KEYS
+        return body
+
+    prepared_deck = prepare(deck_path)
+    assert (prepared_deck["kind"], prepared_deck["unit"], prepared_deck["total"]) == ("office", "slide", 4)
+    assert prepared_deck["pages_without_text"] == [2]
+    assert [item["n"] for item in prepared_deck["renditions"]] == [1, 2, 3, 4]
+    prepared_document = prepare(document_path)
+    assert (prepared_document["kind"], prepared_document["unit"], prepared_document["total"]) == ("office", "page", 3)
+    assert prepared_document["pages_without_text"] == []
+    assert [item["n"] for item in prepared_document["renditions"]] == [1, 2, 3]
+
+    viewed = mcp_result(
+        ghostwriter_mcp(api_info, "view_file", {"path": deck_path, "part": "slide 2"}, chat=chat, user=user)
+    )
+    assert viewed["isError"] is False, viewed
+    structured = viewed["structuredContent"]
+    assert (structured["kind"], structured["unit"], structured["total"], structured["truncated"]) == (
+        "office",
+        "slide",
+        4,
+        False,
+    )
+    (slide_two,) = structured["shown"]
+    assert (slide_two["label"], slide_two["n"]) == ("slide 2", 2)
+    (slide,) = _image_blocks(viewed)  # one block, and it is shown[0]
+    assert Image.open(io.BytesIO(slide)).size == (slide_two["width"], slide_two["height"])
+
+    read = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": deck_path}, chat=chat, user=user))
+    assert read["isError"] is False, read
+    body = read["structuredContent"]
+    assert (body["kind"], body["total_parts"], body["pages_without_text"]) == ("pptx", 4, [2])
+    assert "Invented slide 1" in read["content"][0]["text"]
+    (shown,) = body["shown"]
+    assert (shown["label"], shown["n"]) == ("slide 2", 2)
+    (attached,) = _image_blocks(read)
+    assert attached == slide  # the very render view_file showed for slide 2
+
+    page = ghostwriter(
+        api_info, "GET", "/files/view", chat=chat, user=user, params={"path": document_path, "rendition": 1}
+    )
+    assert page.status_code == 200, page.text
+    assert page.headers["content-type"] == "image/jpeg"
+    assert page.content.startswith(b"\xff\xd8\xff")
+    assert "quay-report-page-1.jpg" in page.headers["content-disposition"]
+
+    def left() -> dict[str, Any]:
+        return json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", DERIVED_OF_THE_CHAT, user, chat))
+
+    # each file's PDF and its pages: 1 + 4 for the deck, 1 + 3 for the document
+    assert left() == {"rows": 9, "pdfs": 2, "derived": 1, "sources": 2, "folder": True}
+    deleted = ghostwriter(api_info, "DELETE", "/files/chat", chat=chat, user=user)
+    assert (deleted.status_code, deleted.json()) == (200, {"deleted": 2})
+    gone = ghostwriter(
+        api_info, "GET", "/files/view", chat=chat, user=user, params={"path": document_path, "rendition": 1}
+    )
+    assert (gone.status_code, gone.json()) == NOT_FOUND
+    assert left() == {"rows": 0, "pdfs": 0, "derived": 0, "sources": 0, "folder": False}

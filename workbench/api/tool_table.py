@@ -112,9 +112,9 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: "
             "cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by "
             "these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never "
-            "treat them as blank. Such PDF pages come back as images in the same answer (shown names them): read them "
-            "from the images. To look at any page, use view_file. Outlook .msg files cannot be read: ask the user to "
-            "save them as .eml or PDF."
+            "treat them as blank. Such PDF pages and PowerPoint slides come back as images in the same answer (shown "
+            "names them): read them from the images. To look at any page or slide, use view_file. Outlook .msg files "
+            "cannot be read: ask the user to save them as .eml or PDF."
         ),
         input_model=tools.ReadDocumentRequest,
         output_model=tools.DocumentRead,
@@ -173,16 +173,18 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
     ),
     WorkspaceTool(
         name="view_file",
-        title="Look at a picture or the pages of a PDF",
+        title="Look at a picture, or the pages or slides of a file",
         description=(
-            "Show a picture or pages of a file of this conversation as images for you to see, with their metadata "
-            "removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC) and the pages of a PDF. part chooses "
-            "pages: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out, a picture is shown, or pages 1-4 of a "
-            "PDF. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to "
-            "look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at "
-            "once: when truncated is true, call again with part set to next_part. Pages that could not be shown are "
-            "named in hint. Word, PowerPoint and spreadsheets are not shown yet: read them with read_document. "
-            "Never describe an image you have not looked at."
+            "Show a picture, or the pages or slides of a file of this conversation, as images for you to see, with "
+            "their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, "
+            "Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, "
+            "drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or "
+            "'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Use it for what text "
+            "cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture "
+            "a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, "
+            "call again with part set to next_part. Pages or slides that could not be shown are named in hint. "
+            "Spreadsheets are not shown: read them with read_document. Never describe an image you have not looked "
+            "at."
         ),
         input_model=tools_views.ViewFileRequest,
         output_model=tools_views.ViewedFile,

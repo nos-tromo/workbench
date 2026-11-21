@@ -56,18 +56,25 @@ record of processing and the impact assessment.
   built. The master, the pictures and the files a source names are only read.
   The plain master is python-pptx's own, read from the executor image: no file
   of a chat is in it (`workbench/executor/presentations/master.py:plain_master`).
-- **Renders of pictures and PDFs** (`workbench/api/renders.py`,
-  `workbench/executor/runners/render.py`). A file the model or Ghostwriter asks
-  to see (`POST /files/prepare`, `GET /files/view?rendition=`, `view_file`,
-  `read_document`) is drawn in the executor into JPEG or PNG renders: a picture
-  scaled to at most 2048 px, a PDF page at 1600 px, each under 768 KiB. They are
+- **Renders of pictures, PDFs and Office files** (`workbench/api/renders.py`,
+  `workbench/executor/runners/render.py`, `workbench/executor/runners/convert.py`).
+  A file the model or Ghostwriter asks to see (`POST /files/prepare`,
+  `GET /files/view?rendition=`, `view_file`, `read_document`) is drawn in the
+  executor into JPEG or PNG renders: a picture scaled to at most 2048 px, a PDF
+  page at 1600 px, each under 768 KiB. A Word, PowerPoint or OpenDocument text
+  file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`) is first converted once, in
+  the executor, to a PDF of at most 32 MiB (`converted.pdf` in the job's `out/`),
+  and its pages or slides are drawn from that PDF as a PDF's are. They are
   made from the file's own content, which can be anything a picture or a page
-  shows, text and faces included. **Every render is stripped of image metadata**:
+  shows, text and faces included. The converted PDF holds the whole of the
+  file's content, text and pictures, as the source does (a conversion that may
+  have left a picture out is refused, never kept); it is read by the
+  render jobs alone, and no route and no tool sends it anywhere. **Every render is stripped of image metadata**:
   the source's EXIF (the GPS block among it), XMP and comments are not carried
   into it, and its colour profile is applied to the pixels, which come out in
   sRGB, and then dropped (a grey picture keeps its grey values, and a profile
-  that cannot be read is dropped unapplied). A
-  render is a derived file of its source, not a file of the chat: see
+  that cannot be read is dropped unapplied). A render, like the converted PDF,
+  is a derived file of its source, not a file of the chat: see
   [Where it is stored](#where-it-is-stored).
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
@@ -89,7 +96,7 @@ Everything lives on the external volume `workbench-data`, mounted at `/data`.
 |---|---|---|
 | `/data/` | root, group of the api, `1771` | the parts below; the api may add the database's journal files here |
 | `workspaces/<caller>/<user-id>/<chat-id>/…` | api, `0700` | the users' files: uploads under the names users chose, tool outputs under the names the model chose, as plain bytes |
-| `workspaces/<caller>/<user-id>/<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`) | api, `0700` | the renders of a picture or a PDF, named by an id and nothing of the source's name; the folder is reserved, no path of any caller reaches it and no listing shows it |
+| `workspaces/<caller>/<user-id>/<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`, or `.pdf`) | api, `0700` | the renders of a picture, a PDF or an Office file, and the PDF an Office file was converted to, each named by an id and nothing of the source's name; the folder is reserved, no path of any caller reaches it and no listing shows it |
 | `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder (a render, into its source's `.derived/` folder) within the same request (an inline job's are read back and removed) |
 | `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder root's, `0710`, its group the slot's; its `home/` and `out/` the slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `home/` with its `tmp/` and its answer (`result.json`), and the request (`spec.json`); removed when the job ends |
 | `workbench.db` | api, `0600` | the SQLite database, in WAL mode with `secure_delete` on |
@@ -100,12 +107,13 @@ The database has three tables (`workbench/api/store.py`):
   chat folder), size, media type, kind (`upload` or `output`), creation time
   and, for an output, the job that made it;
 - `derived`: per render its id, its source's id, caller, user id, chat id, role
-  (`image` or `page`), place (page number), name (`<id>.jpg` or `<id>.png`),
-  size, media type, width and height, a few facts (the strip, and on a file's
-  first render what the executor found: kind, page count, the pages without a
-  text layer) and the creation time **of its source**. It is bound to its
-  source: counted in the user's quota, deleted with it, and reachable by no
-  path;
+  (`image` or `page`; `pdf` for the PDF an Office file was converted to),
+  place (page number), name (`<id>.jpg`, `<id>.png` or `<id>.pdf`), size, media
+  type, width and height (none for the PDF), a few facts (the strip, and on a
+  file's first render what the executor found: kind, unit, page count, the pages
+  without a text layer; on the PDF its pages and, for a deck, its slides) and the
+  creation time **of its source**. It is bound to its source: counted in the
+  user's quota, deleted with it, and reachable by no path;
 - `jobs`: per tool run its id, caller, user id, chat id, tool, start time and
   status. No argument, code or result.
 
@@ -129,7 +137,7 @@ operator's.
 | What | Kept for | Enforced by |
 |---|---|---|
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
-| Renders | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
+| Renders, and an Office file's converted PDF | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render or PDF with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |

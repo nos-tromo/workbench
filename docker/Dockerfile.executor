@@ -58,6 +58,16 @@ RUN set -eu; \
 # is the job's own copy of x, whichever job asks.
 RUN ln -s /proc/self/cwd/.. /workspace
 
+# LibreOffice for convert_office: LibreOfficeKit in-process, never soffice; no
+# Java and no Python script provider. Carlito and Caladea stand in for Calibri
+# and Cambria at the same metrics.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libreoffice-core-nogui libreoffice-writer-nogui libreoffice-impress-nogui libreoffice-calc-nogui \
+      fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation2 fonts-dejavu-core fonts-noto-core \
+ && rm -rf /var/lib/apt/lists/* \
+ && fc-cache -f
+
 # No setuid or setgid program: no-new-privileges, which the supervisor requires,
 # already keeps them inert for a job; the image carries none at all.
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
@@ -78,6 +88,13 @@ RUN python -m compileall -q -j 0 /usr/local/lib/python3.12 /app
 # again whenever its config folder is not writable.
 RUN MPLCONFIGDIR=/opt/mpl-cache python -c "import matplotlib.font_manager" \
     && chmod -R a+rX,go-w /opt/mpl-cache
+
+# LibreOffice's profile, baked once here: the settings that keep macros and links
+# off (workbench/executor/render/office.py), then one start of LibreOfficeKit, so
+# it is warm. Root's and read-only like the font cache: each conversion copies it
+# into its private tmp (office.seed_profile), since LibreOffice writes to it.
+RUN python -m workbench.executor.render.office bake /opt/lo-profile \
+    && chmod -R a+rX,go-w /opt/lo-profile
 
 # The supervisor is root with six capabilities (docs/sandbox.md); every job
 # drops to its slot's uid before it runs.

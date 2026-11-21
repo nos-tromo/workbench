@@ -1,23 +1,29 @@
-"""The api's view of the renders of a picture or a PDF: prepared once, made on demand, read back checked.
+"""The api's view of the renders of a picture, a PDF or an Office file: prepared once, made on demand, read back.
 
 A render is a derived file of its source (:meth:`~workbench.api.store.Store.register_derived`), made by the executor's
-``prepare_file`` job through the queue (:meth:`~workbench.api.jobs.JobQueue.submit_renders`). This module decides which
-jobs run and reads their renders back. It decodes nothing and imports no imaging library: a render is checked by its
-signature and its size alone (:mod:`workbench.renders`).
+``prepare_file`` job through the queue (:meth:`~workbench.api.jobs.JobQueue.submit_renders`). An Office file (a text
+document or a deck) is converted once to a PDF by a ``convert_office`` job
+(:meth:`~workbench.api.jobs.JobQueue.submit_conversion`), kept as its derived file of role ``pdf``, and its pages or
+slides are drawn from that PDF as a PDF's are; a later page reuses it, and one that went is converted again. This module
+decides which jobs run and reads their renders back. It decodes and converts nothing, and imports no imaging library and
+nothing of LibreOffice: a render, like the PDF, is checked by its signature and its size alone
+(:mod:`workbench.renders`).
 
 - :func:`prepared` answers a file's :class:`Manifest`. The first time, one job draws the first pages and finds the
-  facts (kind, page count, pages without text), which the whole render of page 1 keeps; every later call answers from
-  the rows, with no job, no event and no wait for the source's lock.
+  facts (kind, unit, page count, pages without text), which the whole render of page 1 keeps; an Office file is
+  converted first, in the same turn. Every later call answers from the rows, with no job, no event and no wait for the
+  source's lock.
 - :func:`renders_for` answers the renders of some pages at a strip count, and makes those that are missing, unless
   the source's renders leave no room for one more.
 - :func:`read_render` reads one back, or nothing when it is not what its row says.
-- :func:`image_block`, :func:`label`, :func:`shown_image` and :func:`page_window` are what the tools that show images
-  share, with the caps of what one answer shows.
+- :func:`image_block`, :func:`noun_of`, :func:`label`, :func:`shown_image` and :func:`page_window` are what the tools
+  that show images share, with the caps of what one answer shows.
 
-Every job is recorded before any render it made is visible (``modify`` / ``file.prepare``, by the source's id and
-then each render's), and one call at a time makes the renders of a source (:meth:`RenderJobs.source_lock`), so two
-prepares of one file run one job and keep one set of renders. The rows are read again after every job: a render whose
-row is not there is never answered, whatever the job said it made.
+Every job is recorded before any file it made is visible (``modify`` / ``file.prepare``, by the source's id and then
+each render's, or the PDF's), and one call at a time makes the renders of a source (:meth:`RenderJobs.source_lock`), so
+two prepares of one file run one job (an Office file's two) and keep one set of renders. The jobs of one call run in
+one turn of its gate (:meth:`RenderJobs.turn`), taken inside the source's lock, never the other way round. The rows are
+read again after every job: a render whose row is not there is never answered, whatever the job said it made.
 """
 
 import base64
@@ -33,7 +39,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ValidationError
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import CallLimits, Gate, JobQueue, Keeper
+from workbench.api.jobs import CallLimits, Gate, JobQueue, Keeper, Turn
 from workbench.api.store import NotFound, QuotaExceeded, RendersFull, StorageFull, Store, StoreError
 from workbench.api.tools import OutputKeeper, ShownImage, _parse, _payload, _readable, judged
 from workbench.config import Settings
@@ -46,10 +52,13 @@ from workbench.renders import (
     RENDER_MAX_BYTES,
     RENDERS_PER_JOB,
     SIGNATURES,
+    ConvertAnswer,
     RenderAnswer,
     RenderFacts,
+    Unit,
     kind_of,
     signature_ok,
+    unit_of,
 )
 
 _log = logging.getLogger(__name__)
@@ -61,8 +70,8 @@ MAX_READ_IMAGES: Final = 4
 #: Most raw bytes of the images of one answer (2.5 MiB): as base64 they stay under Ghostwriter's 4 MiB answer cap.
 MAX_SHOWN_BYTES: Final = 2_621_440
 
-#: The hint of a file that is neither a picture nor a PDF.
-NOT_SHOWN: Final = "This kind of file is not shown as pictures; read it with read_document."
+#: The hint of a file that is neither a picture, a PDF nor an Office file that is drawn.
+NOT_SHOWN: Final = "This kind of file, such as a spreadsheet, is not shown as pictures; read it with read_document."
 
 #: The text of the 500 for a render the store lost for a reason it cannot name (:func:`_lost`).
 NOT_KEPT: Final = "the renders of this file could not be kept"
@@ -70,22 +79,35 @@ NOT_KEPT: Final = "the renders of this file could not be kept"
 #: The roles of the derived files that are renders.
 _RENDER_ROLES: Final = frozenset({"image", "page"})
 
+#: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
+_CONVERTED_ROLE: Final = "pdf"
+
+#: What a render shows: a picture, a page of a PDF or document, or a slide of a deck.
+Noun = Literal["image", "page", "slide"]
+
 #: The note the queue adds to a job's message for the outputs it could not keep, their reasons in the order they first
 #: came (:meth:`~workbench.api.jobs.JobQueue._keep`). A prepare draws whole pages only, so the whole render of page 1
 #: is the first of its outputs, which are in name order: when it was lost, its reason is the first.
 _LOST: Final = re.compile(r"\d+ outputs? could not be kept \(([a-z ,]+)\)\Z")
 
-#: What a page or a window of pages may be written as: ``page 3``, ``3``, ``pages 2-5`` or ``2-5``, in any case, with
-#: ``page`` and ``pages`` taken alike. Nine digits at most, so no number is too long to read.
-_PART: Final = re.compile(r"(?:pages?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE)
-_GRAMMAR: Final = "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'"
+#: What a page or a window of pages may be written as, by the unit of the file: ``page 3``, ``3``, ``pages 2-5`` or
+#: ``2-5`` (for a deck ``slide 3``, ``3``, ``slides 2-5`` or ``2-5``), in any case, with the singular and the plural
+#: taken alike. Nine digits at most, so no number is too long to read.
+_PART: Final[Mapping[Unit, re.Pattern[str]]] = {
+    "page": re.compile(r"(?:pages?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
+    "slide": re.compile(r"(?:slides?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
+}
+_GRAMMAR: Final[Mapping[Unit, str]] = {
+    "page": "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'",
+    "slide": "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'",
+}
 
 
 class Rendition(BaseModel):
-    """One whole render of a file that exists now: the picture, or a page.
+    """One whole render of a file that exists now: the picture, or a page or slide.
 
     Attributes:
-        n: The page, counted from 1; 1 for a picture.
+        n: The page or slide, counted from 1; 1 for a picture.
         width: Its width in pixels.
         height: Its height in pixels.
         mime: Its type.
@@ -104,16 +126,19 @@ class Manifest(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``image``, ``pdf``, or ``none`` for a file that is not shown as pictures.
-        total: Pages of a PDF; 1 for a picture, 0 for ``none``.
-        pages_without_text: The pages of a PDF with no text of their own (scans, pictures).
-        renditions: The whole renders that exist now, by page.
+        kind: ``image``, ``pdf``, ``office`` for a text document or a deck drawn from the PDF it was converted to, or
+            ``none`` for a file that is not shown as pictures.
+        unit: What ``total`` and the pages count: ``slide`` for a deck, ``page`` for every other file, ``none`` too.
+        total: Pages of a PDF or a document, slides of a deck; 1 for a picture, 0 for ``none``.
+        pages_without_text: The pages or slides with no text of their own (scans, pictures).
+        renditions: The whole renders that exist now, by page or slide.
         frames: The frame count of a picture with several, of which only the first is shown; else ``None``.
         hint: A short note, such as which pages were not checked for text; ``None`` for none.
     """
 
     path: str
-    kind: Literal["image", "pdf", "none"]
+    kind: Literal["image", "pdf", "office", "none"]
+    unit: Unit = "page"
     total: int
     pages_without_text: list[int]
     renditions: list[Rendition]
@@ -138,11 +163,18 @@ class RenderJobs(Protocol):
     """The queue as a call that renders sees it, within that call's limits and on its gate.
 
     The MCP door's :class:`~workbench.api.tools_mcp.CallJobs` is one, on the user's own turn; :class:`RouteJobs` is the
-    file routes'.
+    file routes'. The turn and both submits are on the same gate.
     """
 
     async def submit_renders(
-        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper
+        self,
+        p: Principal,
+        source: FileRecord,
+        args: dict[str, Any],
+        keeper: Keeper,
+        *,
+        turn: Turn | None = None,
+        converted: DerivedRecord | None = None,
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render a picture or pages of a PDF, as :meth:`~workbench.api.jobs.JobQueue.submit_renders` does.
 
@@ -151,9 +183,39 @@ class RenderJobs(Protocol):
             source: The file to render.
             args: The runner's other arguments.
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
+            turn: The turn of the gate the caller holds (:meth:`turn`), in which the job runs; ``None`` waits for one.
+            converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
 
         Returns:
             The job record, the executor's answer and the renders kept.
+        """
+        ...
+
+    async def submit_conversion(
+        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper, *, turn: Turn | None = None
+    ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+        """Convert an Office file to a PDF, as :meth:`~workbench.api.jobs.JobQueue.submit_conversion` does.
+
+        Args:
+            p: The caller, user and chat the job runs for: the source's own.
+            source: The Office file.
+            args: The runner's other arguments.
+            keeper: Records the job before the PDF becomes visible, and picks the outputs to keep.
+            turn: The turn of the gate the caller holds (:meth:`turn`), in which the job runs; ``None`` waits for one.
+
+        Returns:
+            The job record, the executor's answer and the PDF kept, if it was.
+        """
+        ...
+
+    def turn(self, p: Principal) -> AbstractAsyncContextManager[Turn]:
+        """Hold one turn of the gate for the jobs of one call, as :meth:`~workbench.api.jobs.JobQueue.turn` does.
+
+        Args:
+            p: The caller and user.
+
+        Returns:
+            The turn, held while the context runs; entering it raises ``Busy`` as a job's turn does.
         """
         ...
 
@@ -184,7 +246,14 @@ class RouteJobs:
     gate: Gate
 
     async def submit_renders(
-        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper
+        self,
+        p: Principal,
+        source: FileRecord,
+        args: dict[str, Any],
+        keeper: Keeper,
+        *,
+        turn: Turn | None = None,
+        converted: DerivedRecord | None = None,
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render within the call's limits, on the route's gate.
 
@@ -193,11 +262,43 @@ class RouteJobs:
             source: The file to render.
             args: The runner's other arguments.
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
+            turn: The turn of the route's gate the call holds (:meth:`turn`), or ``None`` to wait for one.
+            converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
 
         Returns:
             What :meth:`~workbench.api.jobs.JobQueue.submit_renders` returns.
         """
-        return await self.queue.submit_renders(p, source, args, keeper, call=self.call, gate=self.gate)
+        return await self.queue.submit_renders(
+            p, source, args, keeper, call=self.call, gate=self.gate, turn=turn, converted=converted
+        )
+
+    async def submit_conversion(
+        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper, *, turn: Turn | None = None
+    ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+        """Convert an Office file to a PDF within the call's limits, on the route's gate.
+
+        Args:
+            p: The caller, user and chat the job runs for: the source's own.
+            source: The Office file.
+            args: The runner's other arguments.
+            keeper: Records the job before the PDF becomes visible, and picks the outputs to keep.
+            turn: The turn of the route's gate the call holds (:meth:`turn`), or ``None`` to wait for one.
+
+        Returns:
+            What :meth:`~workbench.api.jobs.JobQueue.submit_conversion` returns.
+        """
+        return await self.queue.submit_conversion(p, source, args, keeper, call=self.call, gate=self.gate, turn=turn)
+
+    def turn(self, p: Principal) -> AbstractAsyncContextManager[Turn]:
+        """Hold one turn of the route's gate, within the call's limits.
+
+        Args:
+            p: The caller and user.
+
+        Returns:
+            The turn, held while the context runs.
+        """
+        return self.queue.turn(p, call=self.call, gate=self.gate)
 
     def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the lock of one source's renders, waiting at most the call's wait.
@@ -253,7 +354,8 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
 
     Returns:
         The manifest: the facts of the whole render of page 1 and every whole render of its role, by page. ``None``
-        when there is no whole render of page 1 that carries its facts: the file is not prepared yet.
+        when there is no whole render of page 1 that carries its facts: the file is not prepared yet. The unit is the
+        facts'; a head kept before there were units has none, and reads as ``page``.
     """
     whole = [rec for rec in rows if _is_render(rec) and rec.strips == 1]
     head = next((rec for rec in whole if rec.ordinal == 1), None)
@@ -270,12 +372,42 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
     return Manifest(
         path=source.virtual_path,
         kind=facts.kind,
+        unit=facts.unit,
         total=facts.total,
         pages_without_text=facts.pages_without_text,
         renditions=renditions,
         frames=facts.frames,
         hint=facts.hint,
     )
+
+
+def converted_of(rows: Sequence[DerivedRecord]) -> DerivedRecord | None:
+    """Find the PDF an Office file was converted to among its derived files.
+
+    Args:
+        rows: The file's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The row of role ``pdf`` (a source has one at most), or ``None`` when it was not converted, or its PDF went.
+    """
+    return next((rec for rec in rows if rec.role == _CONVERTED_ROLE), None)
+
+
+def _office(source: FileRecord, pdf: DerivedRecord) -> dict[str, object]:
+    """The ``office`` argument of a render job over an Office file's PDF: what the PDF stands for.
+
+    Args:
+        source: The Office file; its suffix gives the unit.
+        pdf: The PDF it was converted to; its row keeps the slides the reader counted in a deck.
+
+    Returns:
+        An :class:`~workbench.renders.OfficeRequest` as JSON. A slide count the row does not keep as a whole number of
+        at least 1 is left out (``None``), so a row of another version never fails the job: the executor then only
+        cannot say that the deck's slides are not its pages.
+    """
+    slides = pdf.meta.get("slides")
+    counted = slides if isinstance(slides, int) and not isinstance(slides, bool) and slides >= 1 else None
+    return {"unit": unit_of(source.name), "slides": counted}
 
 
 def _budget(settings: Settings) -> int:
@@ -323,7 +455,7 @@ def _keeper(audit: AuditLog, p: Principal, source: FileRecord, *, strips: int, o
 
 
 def _lost(message: str) -> Exception:
-    """Name why the whole render of page 1 was not kept, from the note the queue adds to the job's message.
+    """Name why the whole render of page 1, or a converted PDF, was not kept, from the note the queue adds to a message.
 
     Args:
         message: The job's message.
@@ -350,16 +482,104 @@ def _lost(message: str) -> Exception:
     return HTTPException(status_code=500, detail=NOT_KEPT)
 
 
+async def _convert(
+    p: Principal,
+    source: FileRecord,
+    *,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: RenderJobs,
+    turn: Turn,
+    on_demand: bool,
+) -> DerivedRecord:
+    """Convert an Office file to a PDF in a turn the caller holds, and answer the PDF's row.
+
+    The caller holds the source's lock and has checked the call's purpose. The job is recorded before the PDF is
+    visible (``modify`` / ``file.prepare``, by the source's id and then the PDF's), with ``converted`` among its
+    criteria and no render.
+
+    Args:
+        p: The caller, user and chat of the source.
+        source: The Office file.
+        settings: The api's settings; ``job_wall_s`` gives the runner's time.
+        store: The store.
+        audit: The audit log, bound to the call.
+        jobs: The queue, within the call's limits and on its gate.
+        turn: The turn of that gate the caller holds; the job runs in it.
+        on_demand: Whether the conversion is for pages a call asked for after the prepare (its PDF went).
+
+    Returns:
+        The PDF's row, read again after the job.
+
+    Raises:
+        AuditWriteError: The job's event could not be written; no PDF is kept.
+        Busy: The executor is busy.
+        HTTPException: The runner refused the file (its code's status: 422 ``unreadable_file`` for a damaged,
+            password-protected or old binary file, one that could not be converted or whose PDF would pass 32 MB;
+            422 ``unsupported_format`` for a deck with no slides), the job ran out of time (422), or failed or answered
+            what cannot be read (500); or the PDF was not kept for a reason that is not one of the three below (500).
+        QuotaExceeded: The PDF would take the user over their quota (507).
+        RendersFull: It would take the source over its cap of derived files (507).
+        StorageFull: The volume is full (507).
+        NotFound: The file went while the job ran, with its chat (404).
+    """
+
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        usable = result.status == "ok" and _readable(ConvertAnswer, result.result)
+        keep: list[str] = list(planned) if usable else []
+        outcome, more = judged(result, usable)
+        criteria: dict[str, object] = {
+            "renders": 0,
+            "strips": 1,
+            "on_demand": on_demand,
+            "converted": True,
+            "outputs": len(keep),
+        }
+        return keep, outcome, {**criteria, **more}
+
+    keeper = OutputKeeper(audit, p, "prepare", [source.id], decide)
+    _, result, _ = await jobs.submit_conversion(p, source, {"budget_s": _budget(settings)}, keeper, turn=turn)
+    _parse(ConvertAnswer, _payload(result, "file"))
+    pdf = converted_of(await run_in_threadpool(store.derived_of, source))
+    if pdf is None:
+        raise _lost(result.message)
+    return pdf
+
+
+def not_shown(source: FileRecord) -> Manifest:
+    """The manifest of a file that is not shown as pictures: ``kind: none``, nothing drawn, and the hint to read it.
+
+    Args:
+        source: The file.
+
+    Returns:
+        The manifest, counted by page.
+    """
+    return Manifest(
+        path=source.virtual_path,
+        kind="none",
+        unit="page",
+        total=0,
+        pages_without_text=[],
+        renditions=[],
+        frames=None,
+        hint=NOT_SHOWN,
+    )
+
+
 async def prepared(
     p: Principal, source: FileRecord, *, settings: Settings, store: Store, audit: AuditLog, jobs: RenderJobs
 ) -> Manifest:
     """Answer a file's manifest, rendering its first pages the first time.
 
-    A file that is neither a picture nor a PDF is answered at once, ``kind: none``, with no job. A file whose rows hold
-    the manifest is answered from them, with no job, no event and no wait for the source's lock, which a job of later
-    pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job, which draws the
-    first pages (but those whole pages it has already), finds the facts and is recorded before any render is visible.
-    A second call for the same file waits for the lock and then finds the rows.
+    A file that is neither a picture, a PDF nor an Office file is answered at once, ``kind: none``, with no job. A file
+    whose rows hold the manifest is answered from them, with no job, no event and no wait for the source's lock, which a
+    job of later pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job,
+    which draws the first pages (but those whole pages it has already), finds the facts and is recorded before any
+    render is visible. An Office file takes one turn of the gate inside the lock and has two jobs in it: the conversion
+    to a PDF, unless its PDF is kept already (:func:`_convert`), then the drawing of that PDF. A second call for the
+    same file waits for the lock and then finds the rows.
 
     Args:
         p: The caller, user and chat of the source.
@@ -378,22 +598,16 @@ async def prepared(
         Busy: The lock or the queue did not come free in time, or the executor is busy.
         HTTPException: The runner refused the file (its code's status, such as 422 ``unreadable_file``), the job ran
             out of time (422), or failed or answered what cannot be read (500); or the whole render of page 1, which
-            holds the facts, was not kept for a reason that is not one of the three below (500).
-        QuotaExceeded: That render would take the user over their quota (507).
+            holds the facts, or an Office file's PDF, was not kept for a reason that is not one of the three below
+            (500).
+        QuotaExceeded: That render, or the PDF, would take the user over their quota (507).
         RendersFull: It would take the source over its cap of renders (507).
         StorageFull: The volume is full (507).
         NotFound: The file went while the job ran, with its chat (404).
     """
-    if kind_of(source.name) == "none":
-        return Manifest(
-            path=source.virtual_path,
-            kind="none",
-            total=0,
-            pages_without_text=[],
-            renditions=[],
-            frames=None,
-            hint=NOT_SHOWN,
-        )
+    kind = kind_of(source.name)
+    if kind == "none":
+        return not_shown(source)
     manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
     if manifest is not None:
         return manifest
@@ -404,9 +618,17 @@ async def prepared(
             return manifest
         await run_in_threadpool(audit.check, "prepare", p)
         have = sorted({rec.ordinal for rec in rows if _is_render(rec) and rec.strips == 1})
-        args = {"pages": None, "strips": 1, "have": have, "budget_s": _budget(settings), "facts": True}
+        args: dict[str, Any] = {"pages": None, "strips": 1, "have": have, "budget_s": _budget(settings), "facts": True}
         keeper = _keeper(audit, p, source, strips=1, on_demand=False)
-        _, result, _ = await jobs.submit_renders(p, source, args, keeper)
+        if kind == "office":
+            async with jobs.turn(p) as turn:
+                pdf = converted_of(rows) or await _convert(
+                    p, source, settings=settings, store=store, audit=audit, jobs=jobs, turn=turn, on_demand=False
+                )
+                args["office"] = _office(source, pdf)
+                _, result, _ = await jobs.submit_renders(p, source, args, keeper, turn=turn, converted=pdf)
+        else:
+            _, result, _ = await jobs.submit_renders(p, source, args, keeper)
         _parse(RenderAnswer, _payload(result, "file"))
         manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
         if manifest is None:
@@ -467,8 +689,10 @@ async def renders_for(
     """Answer the renders of some pages at a strip count, making those that are missing.
 
     The rows are read first; when a page lacks a render, the missing pages are made under the source's lock, the rows
-    read again inside it, by one job per at most ``RENDERS_PER_JOB // strips`` pages. Each job is recorded before any
-    render it made is visible, and does not look for the facts again: the manifest holds them (ruling R4). No job runs
+    read again inside it, by one job per at most ``RENDERS_PER_JOB // strips`` pages, all in one turn of the gate taken
+    inside the lock. The pages of an Office file are drawn from its PDF; when the PDF went, it is converted again first,
+    in the same turn (:func:`_convert`). Each job is recorded before any render it made is visible, and does not look
+    for the facts again: the manifest holds them (ruling R4). No job runs
     when the source's renders leave no room for one more (:func:`_no_room`): the missing pages are left out as the cap
     would leave them. A page the job did not make, or whose renders the store could not keep (the user's quota, the
     source's cap, a full volume), is left out: the answer is only rows that exist. When none of the pages asked for
@@ -496,7 +720,8 @@ async def renders_for(
         AuditWriteError: A job's event could not be written; none of its renders is kept.
         Busy: The lock or the queue did not come free in time, or the executor is busy.
         HTTPException: The runner refused the file (its code's status), the job ran out of time (422), or failed or
-            answered what cannot be read (500); or no page asked for exists and the loss a job reported is not one of
+            answered what cannot be read (500); an Office file's PDF, converted again, was not kept for a reason that is
+            not one of the three below (500); or no page asked for exists and the loss a job reported is not one of
             the three below (500).
         QuotaExceeded: No page asked for exists, and the first loss was the user's quota (507).
         RendersFull: No page asked for exists, and the first loss was the source's cap of renders, or the renders left
@@ -522,18 +747,26 @@ async def renders_for(
             if missing and not full:
                 await run_in_threadpool(audit.check, "prepare", p)
                 per_job = RENDERS_PER_JOB // strips
-                for start in range(0, len(missing), per_job):
-                    args = {
-                        "pages": missing[start : start + per_job],
-                        "strips": strips,
-                        "budget_s": _budget(settings),
-                        "facts": False,
-                    }
-                    keeper = _keeper(audit, p, source, strips=strips, on_demand=True)
-                    _, result, _ = await jobs.submit_renders(p, source, args, keeper)
-                    _parse(RenderAnswer, _payload(result, "file"))
-                    if _LOST.search(result.message) is not None:
-                        losses.append(result.message)
+                async with jobs.turn(p) as turn:
+                    pdf = None
+                    if manifest.kind == "office":
+                        pdf = converted_of(rows) or await _convert(
+                            p, source, settings=settings, store=store, audit=audit, jobs=jobs, turn=turn, on_demand=True
+                        )
+                    for start in range(0, len(missing), per_job):
+                        args: dict[str, Any] = {
+                            "pages": missing[start : start + per_job],
+                            "strips": strips,
+                            "budget_s": _budget(settings),
+                            "facts": False,
+                        }
+                        if pdf is not None:
+                            args["office"] = _office(source, pdf)
+                        keeper = _keeper(audit, p, source, strips=strips, on_demand=True)
+                        _, result, _ = await jobs.submit_renders(p, source, args, keeper, turn=turn, converted=pdf)
+                        _parse(RenderAnswer, _payload(result, "file"))
+                        if _LOST.search(result.message) is not None:
+                            losses.append(result.message)
                 complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
     found = [rec for n in wanted if n in complete for rec in complete[n]]
     if wanted and not found and full:
@@ -588,35 +821,53 @@ def image_block(mime: str, data: bytes) -> dict[str, Any]:
     }
 
 
-def label(kind: Literal["image", "pdf"], n: int, strip: int, strips: int) -> str:
+def noun_of(manifest: Manifest) -> Noun:
+    """Say what a file's renders show, by its manifest.
+
+    Args:
+        manifest: The file's manifest.
+
+    Returns:
+        ``image`` for a picture, ``page`` for a PDF, the unit of an Office file (``page`` or ``slide``); ``page`` for a
+        file that is not shown, which has no renders.
+    """
+    if manifest.kind == "image":
+        return "image"
+    if manifest.kind == "office":
+        return manifest.unit
+    return "page"
+
+
+def label(noun: Noun, n: int, strip: int, strips: int) -> str:
     """Say what a render shows.
 
     Args:
-        kind: ``image`` or ``pdf``.
-        n: The page, counted from 1.
+        noun: ``image``, ``page`` or ``slide`` (:func:`noun_of`).
+        n: The page or slide, counted from 1.
         strip: Which strip, counted from 1.
         strips: Into how many strips the page is cut.
 
     Returns:
-        ``image``, ``image, strip 1 of 2``, ``page 3`` or ``page 3, strip 2 of 3``.
+        ``image``, ``image, strip 1 of 2``, ``page 3``, ``page 3, strip 2 of 3``, ``slide 3`` or
+        ``slide 3, strip 2 of 3``.
     """
-    whole = "image" if kind == "image" else f"page {n}"
+    whole = "image" if noun == "image" else f"{noun} {n}"
     return whole if strips == 1 else f"{whole}, strip {strip} of {strips}"
 
 
-def shown_image(kind: Literal["image", "pdf"], rec: DerivedRecord) -> ShownImage:
+def shown_image(noun: Noun, rec: DerivedRecord) -> ShownImage:
     """Describe a render that comes with an answer.
 
     Args:
-        kind: ``image`` or ``pdf``, the file's.
+        noun: ``image``, ``page`` or ``slide``, what the file's renders show (:func:`noun_of`).
         rec: The render.
 
     Returns:
-        Its label, page, size and type.
+        Its label, page or slide, size and type.
     """
     return ShownImage.model_validate(
         {
-            "label": label(kind, rec.ordinal, rec.strip, rec.strips),
+            "label": label(noun, rec.ordinal, rec.strip, rec.strips),
             "n": rec.ordinal,
             "width": rec.width,
             "height": rec.height,
@@ -625,32 +876,34 @@ def shown_image(kind: Literal["image", "pdf"], rec: DerivedRecord) -> ShownImage
     )
 
 
-def page_window(part: str | None, total: int, *, default_last: int) -> tuple[int, int]:
-    """Read which pages a call asks to see.
+def page_window(part: str | None, total: int, *, default_last: int, unit: Unit = "page") -> tuple[int, int]:
+    """Read which pages, or slides of a deck, a call asks to see.
 
     Args:
         part: ``page N`` or ``N`` for one page; ``pages N-M`` or ``N-M`` for N to M; ``None`` for the first pages.
-        total: How many pages the file has.
+            For ``unit`` ``slide``, ``slide`` and ``slides`` (alike) in place of ``page`` and ``pages``.
+        total: How many pages or slides the file has.
         default_last: The last page of the window when ``part`` is ``None``.
+        unit: What the file counts, ``page`` or ``slide``; only its own word is taken.
 
     Returns:
         The first and the last page: ``(1, min(default_last, total))`` for ``None``; otherwise ``(N, N)``, or
         ``(N, min(M, total))``.
 
     Raises:
-        HTTPException: 422 ``no_such_part: …``: ``part`` is not of that grammar, its end comes before its start, or N
-            is not a page of the file.
+        HTTPException: 422 ``no_such_part: …``: ``part`` is not of that unit's grammar, its end comes before its
+            start, or N is not a page (or slide) of the file.
     """
     if part is None:
         return 1, min(default_last, total)
-    found = _PART.fullmatch(part.strip())
+    found = _PART[unit].fullmatch(part.strip())
     if found is None:
-        raise HTTPException(status_code=422, detail=_GRAMMAR)
+        raise HTTPException(status_code=422, detail=_GRAMMAR[unit])
     first = int(found.group(1))
     last = first if found.group(2) is None else int(found.group(2))
     if last < first:
-        raise HTTPException(status_code=422, detail=_GRAMMAR)
+        raise HTTPException(status_code=422, detail=_GRAMMAR[unit])
     if not 1 <= first <= total:
-        noun = "page" if total == 1 else "pages"
+        noun = unit if total == 1 else f"{unit}s"
         raise HTTPException(status_code=422, detail=f"no_such_part: this document has {total} {noun}")
     return first, min(last, total)

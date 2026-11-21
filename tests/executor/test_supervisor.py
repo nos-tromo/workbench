@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -28,10 +29,11 @@ from PIL import Image
 
 from tests.conftest import scaled
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
-from tests.fixtures import make_fixtures, make_images
+from tests.fixtures import make_fixtures, make_images, make_templates
 from workbench.config import Settings, load_settings
 from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
+from workbench.executor.render import office
 from workbench.executor.sandbox import Slot, SlotUse
 from workbench.executor.supervisor import (
     MAX_OUTPUTS,
@@ -2403,6 +2405,406 @@ async def test_as_root_a_photo_and_a_scan_are_prepared_in_a_slot(root_volume: Pa
             data = staged[entry.name].read_bytes()
             assert signature_ok(data, entry.mime)
             assert Image.open(io.BytesIO(data)).size == (entry.width, entry.height)
+
+
+#: The cases that run LibreOfficeKit: root on Linux, to switch to a slot uid, in the image that has LibreOffice.
+LIBREOFFICE_IN_A_SLOT = pytest.mark.skipif(
+    not (ROOT_ON_LINUX and office.PROGRAM.is_dir()),
+    reason="LibreOfficeKit runs in the executor image, as root on Linux to switch to a slot uid",
+)
+#: A conversion's job: production's address space, and a wall for three conversions.
+OFFICE_LIMITS = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
+#: The start of each LibreOffice job: the real job's imports at fork time, and ``to_pdf``, which converts one input
+#: whole into the job's tmp (with a headroom, none by default, and ``convert``'s ``test_only_`` arguments, if any) and
+#: says how long it took.
+OFFICE_JOB = """
+import resource, time
+import pptx, pypdfium2, pypdfium2.raw
+from workbench.executor import readers
+from workbench.executor.render import office
+tmp = pathlib.Path(os.environ["TMPDIR"])
+home = pathlib.Path(os.environ["HOME"])
+def to_pdf(name, *, deck, headroom=0, **test_only):
+    target = tmp / (name + ".pdf")
+    began = time.monotonic()
+    source = pathlib.Path(name).absolute()
+    office.convert(source, target, deck=deck, deadline=began + 60, headroom=headroom, **test_only)
+    return target, time.monotonic() - began
+"""
+#: The namespace of LibreOffice's registry.
+OOR = "http://openoffice.org/2001/registry"
+#: The macro test's positive control, never a job's: LibreOfficeKit asked to run macros, and a profile that lets it
+#: (macro security low, macros on).
+MACROS_ALLOWED_LOAD = "EnableMacrosExecution=true,MacroSecurityLevel=0"
+MACROS_ALLOWED_PROFILE = office.PROFILE_SETTINGS.replace(
+    '"MacroSecurityLevel" oor:op="fuse"><value>3<', '"MacroSecurityLevel" oor:op="fuse"><value>0<'
+).replace('"DisableMacrosExecution" oor:op="fuse"><value>true<', '"DisableMacrosExecution" oor:op="fuse"><value>false<')
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_libreofficekit_converts_a_deck_and_a_document_in_a_slot(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LibreOfficeKit starts and converts in a forked child of a job, as a slot, under production's limits and filter.
+
+    A 30-slide deck, as a ``.pptx`` and as a ``.potx``, and a 24-page document each become a PDF of as many pages, each
+    well within its time, the children within the address space of 1536 MB at a fraction of it, and the job's home
+    small afterwards; the deck's picture-only slide is a page with no text.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    deck = make_fixtures.make_deck(scratch / "deck.pptx", 30, chart_on=1, picture_only=[2])
+    files = {
+        "deck.pptx": deck.read_bytes(),
+        "deck.potx": make_templates.as_potx(deck, scratch / "deck.potx").read_bytes(),
+        "report.docx": make_fixtures.make_long_docx(scratch / "report.docx", 24).read_bytes(),
+    }
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            result["address_space_mb"] = resource.getrlimit(resource.RLIMIT_AS)[0] // (1024 * 1024)
+            result["pages"], result["seconds"] = {}, {}
+            for name in ("deck.pptx", "deck.potx", "report.docx"):
+                target, seconds = to_pdf(name, deck=name.startswith("deck"))
+                pdf = pypdfium2.PdfDocument(target)
+                result["pages"][name], result["seconds"][name] = len(pdf), seconds
+                if name == "deck.pptx":
+                    page = pdf[1]
+                    text = page.get_textpage()
+                    result["slide_2_text"] = text.get_text_range()
+                    text.close()
+                    page.close()
+                pdf.close()
+            result["peak_mb"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
+            made = [path for path in home.rglob("*") if path.is_file()]
+            result["home_files"] = len(made)
+            result["home_mb"] = sum(path.stat().st_size for path in made) / (1024 * 1024)
+            """
+        ),
+    )
+    request = _request(input_files=sorted(files), limits=OFFICE_LIMITS)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    seen = answer.result
+    assert seen["address_space_mb"] == 1536
+    assert seen["pages"] == {"deck.pptx": 30, "deck.potx": 30, "report.docx": 24}
+    assert all(seconds < 30 for seconds in seen["seconds"].values()), seen["seconds"]
+    assert seen["peak_mb"] < 1024, seen["peak_mb"]
+    assert seen["home_files"] < 2000, seen["home_files"]
+    assert seen["home_mb"] < 200, seen["home_mb"]
+    assert seen["slide_2_text"].strip() == ""
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_hidden_slide_is_drawn_and_pictures_are_downsampled(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LibreOfficeKit takes the JSON filter data: a hidden slide is drawn, and photographs come down to 150 dpi.
+
+    A three-slide deck whose second slide is hidden is a PDF of three pages, so slide N stays page N. A five-slide deck
+    with a 3000 x 2000 photograph, 4 in wide, on every slide is a PDF of less than half the deck's size, whose first
+    page holds the photograph at most 650 px wide: 4 in at 150 dpi, where LibreOffice's own default of 300 dpi, which
+    it keeps when the filter data is not taken, leaves about 1200.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {
+        "hidden.pptx": make_fixtures.make_deck(scratch / "hidden.pptx", 3, hidden=[2]).read_bytes(),
+        "photos.pptx": make_fixtures.make_deck(scratch / "photos.pptx", 5, photo=(3000, 2000)).read_bytes(),
+    }
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            for name in ("hidden.pptx", "photos.pptx"):
+                target, _ = to_pdf(name, deck=True)
+                pdf = pypdfium2.PdfDocument(target)
+                result[name] = {"pages": len(pdf), "bytes": target.stat().st_size}
+                if name == "photos.pptx":
+                    page = pdf[0]
+                    pictures = page.get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE])
+                    result["photo_widths"] = [picture.get_px_size()[0] for picture in pictures]
+                    page.close()
+                pdf.close()
+            """
+        ),
+    )
+    request = _request(input_files=sorted(files), limits=OFFICE_LIMITS)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result["hidden.pptx"]["pages"] == 3
+    assert answer.result["photos.pptx"]["pages"] == 5
+    assert answer.result["photos.pptx"]["bytes"] < len(files["photos.pptx"]) / 2, answer.result
+    assert answer.result["photo_widths"], answer.result
+    assert max(answer.result["photo_widths"]) <= 650, answer.result
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_document_macro_never_runs(root_volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A document whose Basic macro runs when it loads converts, and the file the macro would write is never made."""
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {"macro.odt": make_fixtures.make_macro_odt(scratch / "macro.odt", "macro-ran").read_bytes()}
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            target, _ = to_pdf("macro.odt", deck=False)
+            result["pdf"] = target.is_file()
+            result["ran"] = (home / "macro-ran").exists()
+            """
+        ),
+    )
+    request = _request(input_files=sorted(files), limits=OFFICE_LIMITS)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result == {"pdf": True, "ran": False}
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_the_macro_fixture_runs_when_macros_are_allowed(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The macro test's positive control: with macros allowed, the same document's macro does write its file.
+
+    So ``test_as_root_a_document_macro_never_runs`` holds because macros are kept off, not because the fixture's macro
+    could never run.
+    """
+    assert '"MacroSecurityLevel" oor:op="fuse"><value>0<' in MACROS_ALLOWED_PROFILE
+    assert '"DisableMacrosExecution" oor:op="fuse"><value>false<' in MACROS_ALLOWED_PROFILE
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {"macro.odt": make_fixtures.make_macro_odt(scratch / "macro.odt", "macro-ran").read_bytes()}
+    _chat(root_volume, files)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            allowed = {
+                "test_only_load_options": spec["args"]["load"].encode(),
+                "test_only_profile_settings": spec["args"]["profile"],
+            }
+            target, _ = to_pdf("macro.odt", deck=False, **allowed)
+            result["pdf"] = target.is_file()
+            result["ran"] = (home / "macro-ran").exists()
+            """
+        ),
+    )
+    args = {"load": MACROS_ALLOWED_LOAD, "profile": MACROS_ALLOWED_PROFILE}
+    request = _request(args=args, input_files=sorted(files), limits=OFFICE_LIMITS)
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result == {"pdf": True, "ran": True}
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_hung_child_is_stopped_at_its_deadline(
+    root_volume: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that never ends, under the seccomp filter, is killed at its deadline, and the job goes on to answer."""
+    _chat(root_volume)
+    _runner(
+        monkeypatch,
+        OFFICE_JOB
+        + textwrap.dedent(
+            """
+            try:
+                office.run_in_child(lambda: time.sleep(60) or 0, time.monotonic() + 2)
+                result["timed_out"] = False
+            except readers.ReadTimeout:
+                result["timed_out"] = True
+            """
+        ),
+    )
+    request = _request(limits=OFFICE_LIMITS)
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    assert answer.result == {"timed_out": True}
+    assert time.monotonic() - began < scaled(10)
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_deck_is_converted_and_drawn_in_slots(root_volume: Path) -> None:
+    """``convert_office`` and then ``prepare_file``, the real entry point in a slot, draw a deck as its slides.
+
+    A five-slide deck whose second slide is a picture alone is converted to one staged output, ``converted.pdf``.
+    Put in a chat folder under that name, it is drawn with ``office`` naming the five slides: kind ``office``, five
+    slides and five renders, the second slide the one with no text.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    deck = make_fixtures.make_deck(scratch / "deck.pptx", 5, picture_only=[2])
+    chat = _chat(root_volume, {"deck.pptx": deck.read_bytes()})
+    sup = Supervisor(_settings(root_volume))
+
+    args: dict[str, Any] = {"path": "deck.pptx", "budget_s": 100}
+    converted = await sup.run_job(
+        _request(tool="convert_office", args=args, input_files=["deck.pptx"], limits=OFFICE_LIMITS)
+    )
+
+    assert converted.status == "ok", converted
+    assert converted.result == {"name": "converted.pdf", "pages": 5, "slides": 5}
+    (output,) = converted.outputs
+    assert output.name == "converted.pdf"
+    pdf = Path(output.staged_path).read_bytes()
+    assert pdf.startswith(b"%PDF-")
+
+    (chat / "converted.pdf").write_bytes(pdf)  # as the api keeps it, for the render job to read
+    office_args = {"unit": "slide", "slides": 5}
+    args = {"path": "converted.pdf", "pages": None, "strips": 1, "have": [], "budget_s": 100, "office": office_args}
+    drawn = await sup.run_job(
+        _request(tool="prepare_file", args=args, input_files=["converted.pdf"], limits=OFFICE_LIMITS)
+    )
+
+    assert drawn.status == "ok", drawn
+    result = RenderAnswer.model_validate(drawn.result)
+    assert (result.kind, result.unit, result.total) == ("office", "slide", 5)
+    assert result.pages_without_text == [2]
+    assert [entry.n for entry in result.renders] == [1, 2, 3, 4, 5]
+    assert all(entry.role == "page" for entry in result.renders)
+    assert sorted(output.name for output in drawn.outputs) == sorted(entry.name for entry in result.renders)
+
+
+def _converted(answer: JobResult) -> tuple[list[int], list[str], str]:
+    """Read the PDF a ``convert_office`` job staged: the images on each page, each page's text, and its producer.
+
+    Args:
+        answer: The job's answer, which staged one output.
+
+    Returns:
+        The images of each page (inside form XObjects too), the text of each page, and the ``Producer`` it names.
+    """
+    import pypdfium2
+    import pypdfium2.raw
+
+    (output,) = answer.outputs
+    pdf = pypdfium2.PdfDocument(Path(output.staged_path))
+    images: list[int] = []
+    texts: list[str] = []
+    try:
+        for index in range(len(pdf)):
+            page = pdf[index]
+            images.append(len(list(page.get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE], max_depth=4))))
+            text = page.get_textpage()
+            texts.append(" ".join(text.get_text_range().split()))
+            text.close()
+            page.close()
+        producer = str(pdf.get_metadata_dict().get("Producer", ""))
+    finally:
+        pdf.close()
+    return images, texts, producer
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_deck_of_photos_past_the_ceiling_is_drawn_whole(root_volume: Path) -> None:
+    """A deck of 60 distinct 4000 x 3000 pictures and a logo on its slide master is drawn whole, or refused: never less.
+
+    Converted whole under production's address space, LibreOffice runs out of it after about 23 of the pictures, leaves
+    the rest out and says it succeeded. ``convert_office``, the real entry point in a slot with the default budget,
+    sees its child's peak come within the headroom and converts the deck again in parts, which pdfium joins: every
+    page shows the logo and its own picture. A page count per slide that the logo alone could fill would not tell.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    deck = make_fixtures.make_photo_deck(scratch / "photos.pptx", 60, master_logo=True)
+    _chat(root_volume, {"photos.pptx": deck.read_bytes()})
+    request = _request(
+        tool="convert_office", args={"path": "photos.pptx"}, input_files=["photos.pptx"], limits=OFFICE_LIMITS
+    )
+    began = time.monotonic()
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    seconds = time.monotonic() - began
+    assert answer.status == "ok", answer
+    assert answer.result == {"name": "converted.pdf", "pages": 60, "slides": 60}, (answer.result, seconds)
+    images, _, producer = _converted(answer)
+    assert images == [2] * 60, seconds
+    assert producer == "PDFium"  # joined from parts: the whole deck came to its ceiling
+
+
+@LIBREOFFICE_IN_A_SLOT
+async def test_as_root_a_document_of_photos_past_the_ceiling_is_drawn_whole(root_volume: Path) -> None:
+    """A Word file of 40 pages, each a caption and a distinct 4000 x 3000 picture, is drawn whole, or refused.
+
+    Its whole conversion, alone in a job under production's address space, leaves pictures out and comes to the
+    ceiling. ``convert_office`` in a slot, with the default budget, draws every page's picture under its own caption.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {"figures.docx": make_fixtures.make_photo_docx(scratch / "figures.docx", 40).read_bytes()}
+    _chat(root_volume, files)
+    sup = Supervisor(_settings(root_volume))
+    with pytest.MonkeyPatch.context() as patch:
+        _runner(
+            patch,
+            OFFICE_JOB
+            + textwrap.dedent(
+                """
+                from workbench.executor.runners import convert as runner
+                pictures = runner._pictures(pathlib.Path("figures.docx"))
+                try:
+                    to_pdf("figures.docx", deck=False, headroom=runner._headroom(pictures))
+                    result["at_ceiling"] = False
+                except office.AtCeiling:
+                    result["at_ceiling"] = True
+                pdf = pypdfium2.PdfDocument(tmp / "figures.docx.pdf")
+                result["drawn"] = sum(
+                    len(list(pdf[n].get_objects(filter=[pypdfium2.raw.FPDF_PAGEOBJ_IMAGE], max_depth=4)))
+                    for n in range(len(pdf))
+                )
+                pdf.close()
+                """
+            ),
+        )
+        whole = await sup.run_job(_request(input_files=sorted(files), limits=OFFICE_LIMITS))
+
+    answer = await sup.run_job(
+        _request(tool="convert_office", args={"path": "figures.docx"}, input_files=sorted(files), limits=OFFICE_LIMITS)
+    )
+
+    assert whole.status == "ok", whole
+    assert whole.result["at_ceiling"] is True
+    assert whole.result["drawn"] < 40
+    assert answer.status == "ok", answer
+    assert answer.result == {"name": "converted.pdf", "pages": 40, "slides": None}
+    images, texts, producer = _converted(answer)
+    assert images == [1] * 40
+    assert [text.split("Invented figure ")[1:] for text in texts] == [[str(n)] for n in range(1, 41)]
+    assert producer == "PDFium"
+
+
+@pytest.mark.skipif(not IN_THE_IMAGE, reason="the baked profile is the executor image's")
+def test_the_baked_profile_names_only_settings_libreoffice_knows() -> None:
+    """Every setting of the image's profile is one LibreOffice's own schema names, so none is silently ignored."""
+    settings = ET.parse(office.PROFILE / "user" / "registrymodifications.xcu").getroot()
+    names = {prop.get(f"{{{OOR}}}name") for prop in settings.iter("prop")}
+    schema = "".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in Path("/usr/lib/libreoffice/share/registry").rglob("*.xcd")
+    )
+
+    assert names
+    assert sorted(str(name) for name in names if f'oor:name="{name}"' not in schema) == []
 
 
 #: The job's half of a barrier the test holds, for two jobs that must look at each other while both run.

@@ -32,10 +32,12 @@ from workbench.api.jobs import (
     CallLimits,
     ExecutorClient,
     ExecutorUnavailable,
+    Gate,
     JobQueue,
     Keeper,
     RequestTooLarge,
     TakenOutputs,
+    Turn,
 )
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, Store
@@ -56,7 +58,15 @@ from workbench.protocol import (
     decode_request,
     encode,
 )
-from workbench.renders import RENDER_MAX_BYTES, SIGNATURES, render_name
+from workbench.renders import (
+    CONVERTED_MAX_BYTES,
+    CONVERTED_MIME,
+    CONVERTED_NAME,
+    CONVERTED_SIGNATURE,
+    RENDER_MAX_BYTES,
+    SIGNATURES,
+    render_name,
+)
 from workbench.utils.audit_event import AuditWriteError
 
 pytestmark = pytest.mark.anyio
@@ -108,6 +118,8 @@ class FakeClient(ExecutorClient):
         previews: A preview, as the arguments of ``TablePreview``, by the name of the output that has it; a job that
             asked for previews (``req.previews``) gets each staged output's.
         answer: The runner's answer it gives, such as a render answer; ``None`` for ``{"answer": 42}``.
+        scripts: The answer and the files to stage of a job of one tool, by the tool's name, in place of ``answer``
+            and ``files``: a conversion and a render job of one turn each get their own.
     """
 
     def __init__(self, data_dir: Path, *, delay: float = 0.0) -> None:
@@ -127,6 +139,7 @@ class FakeClient(ExecutorClient):
         self.message = ""
         self.error: Exception | None = None
         self.answer: dict[str, Any] | None = None
+        self.scripts: dict[str, tuple[dict[str, Any], dict[str, bytes]]] = {}
 
     def staged(self, job_id: str, name: str) -> Path:
         """Where the executor would stage ``name`` for ``job_id``."""
@@ -146,14 +159,15 @@ class FakeClient(ExecutorClient):
                 await asyncio.sleep(self.delay)
             if self.error is not None:
                 raise self.error
+            answer, files = self.scripts.get(req.tool, (self.answer, self.files))
             outputs = []
-            for name, data in self.files.items():
+            for name, data in files.items():
                 path = self.staged(req.job_id, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 preview = TablePreview(**self.previews[name]) if req.previews and name in self.previews else None
                 outputs.append(OutputFile(name=name, staged_path=str(path), size=len(data), preview=preview))
-            return sample_result(req.job_id, outputs, status=self.status, message=self.message, result=self.answer)
+            return sample_result(req.job_id, outputs, status=self.status, message=self.message, result=answer)
         finally:
             self.running -= 1
 
@@ -2381,7 +2395,7 @@ async def test_renders_are_recorded_before_they_are_kept(
     assert [(r.role, r.ordinal, r.mime, r.width, r.height, r.size) for r in rows] == [
         ("page", n, "image/jpeg", 120, 160, len(JPEG)) for n in (1, 2, 3)
     ]
-    assert rows[0].meta["facts"] == FACTS
+    assert rows[0].meta["facts"] == {**FACTS, "unit": "page"}  # an answer without a unit reads as pages, and keeps it
     assert [dict(rec.meta) for rec in rows[1:]] == [{}, {}]
     assert [rec.id for rec in store.files_in_chat(me)] == [source.id]
     assert (job.status, result.message, result.outputs, keeper.again_ids) == ("ok", "", [], [])
@@ -2602,3 +2616,357 @@ async def test_a_calls_jobs_render_on_the_users_turn_and_name_no_output(
     assert locked.value.reason == "wait_timeout"
     executor.gate.set()
     await interactive
+
+
+# --- version 0.8: an Office file's PDF, and one turn for its conversion and its renders -----------------------------
+
+#: The first bytes of a PDF, then invented ones: the api checks the converted PDF's signature and size alone.
+CONVERTED = CONVERTED_SIGNATURE + b"1.7 synthetic converted deck"
+
+
+def deck(store: Store, p: Principal = PG_SETUP, name: str = "harbour-deck.pptx") -> FileRecord:
+    """An invented deck of ``p``'s chat: the source of a conversion."""
+    return put(store, name, b"PK synthetic deck", p=p)
+
+
+def converts(executor: FakeClient, data: bytes = CONVERTED, *, name: str = CONVERTED_NAME) -> None:
+    """Script a conversion: the answer of a 3-slide deck converted to 3 pages, and ``data`` staged as ``name``."""
+    executor.scripts["convert_office"] = ({"name": CONVERTED_NAME, "pages": 3, "slides": 3}, {name: data})
+
+
+async def convert(
+    queue: JobQueue, p: Principal, source: FileRecord, keeper: Keeper | None = None, **more: Any
+) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+    """Convert ``source`` on the user's own turn, unless ``more`` names a gate or a turn."""
+    return await queue.submit_conversion(p, source, {}, keeper or KeepAll(), call=CALL, **more)
+
+
+class SeesDerived(KeepAll):
+    """A keeper that also notes, when it records, the derived files its source has at that moment.
+
+    Attributes:
+        derived_seen: What :meth:`Store.derived_of` gave as it recorded; ``None`` before it records.
+    """
+
+    def __init__(self, store: Store, p: Principal, source: FileRecord) -> None:
+        """Look into ``p``'s chat and at ``source``'s derived files when recording."""
+        super().__init__(store, p)
+        self.source = source
+        self.derived_seen: list[DerivedRecord] | None = None
+
+    @override
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Note the source's derived files, then keep every output."""
+        assert self.store is not None
+        self.derived_seen = self.store.derived_of(self.source)
+        return super().record(result, planned)
+
+
+async def test_a_conversion_keeps_one_pdf_after_its_record(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The job is ``convert_office`` over the source; the keeper sees the planned id while no row exists.
+
+    Then the source has one ``pdf`` row, with the answer's pages and slides, and the chat holds the source alone.
+    """
+    me = user("user-a")
+    source = deck(store)
+    converts(executor)
+    keeper = SeesDerived(store, me, source)
+    queue = queue_for(settings, executor, store, metrics)
+    job, result, kept = await queue.submit_conversion(
+        me, source, {"budget_s": 90, "path": "other.pptx"}, keeper, call=CALL
+    )
+    (req,) = executor.requests
+    assert (job.tool, req.tool, req.input_files) == ("convert_office", "convert_office", ["harbour-deck.pptx"])
+    assert req.args == {"budget_s": 90, "path": "harbour-deck.pptx"}
+    ((status, planned, seen),) = keeper.recorded
+    assert (status, seen, keeper.derived_seen) == ("ok", ["harbour-deck.pptx"], [])
+    (pdf,) = store.derived_of(source)
+    assert [rec.id for rec in kept] == [pdf.id] == planned
+    assert (pdf.role, pdf.ordinal, pdf.mime, pdf.width, pdf.height, pdf.size) == (
+        "pdf",
+        0,
+        CONVERTED_MIME,
+        None,
+        None,
+        len(CONVERTED),
+    )
+    assert (pdf.meta["pages"], pdf.meta["slides"]) == (3, 3)
+    assert pdf.relative_path == f".derived/{source.id}/{pdf.id}.pdf"
+    assert [rec.id for rec in store.files_in_chat(me)] == [source.id]
+    assert (job.status, result.message, result.outputs, keeper.again_ids) == ("ok", "", [], [])
+    assert not (settings.data_dir / "staging" / job.id).exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        ("other.pdf", CONVERTED),
+        (CONVERTED_NAME, JPEG),
+        (CONVERTED_NAME, CONVERTED.ljust(CONVERTED_MAX_BYTES + 1, b"\x00")),
+    ],
+    ids=["another-name", "a-jpeg", "past-32-mib"],
+)
+async def test_a_conversion_output_that_is_no_pdf_is_not_kept(
+    name: str, data: bytes, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Another name, another signature or one byte past the cap: no row, and the keeper names the output again."""
+    me = user("user-a")
+    source = deck(store)
+    converts(executor, data, name=name)
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await convert(queue, me, source, keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [planned])
+    assert result.message == "1 output could not be kept (invalid)"
+    assert not (_chat_folder(settings, me) / ".derived").exists()
+
+
+async def test_a_converted_pdf_of_exactly_the_cap_is_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The cap is the most a converted PDF may have: one of exactly 32 MiB is kept."""
+    me = user("user-a")
+    source = deck(store)
+    converts(executor, CONVERTED.ljust(CONVERTED_MAX_BYTES, b"\x00"))
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, kept = await convert(queue, me, source)
+    assert [(rec.role, rec.size) for rec in kept] == [("pdf", CONVERTED_MAX_BYTES)]
+
+
+@pytest.mark.parametrize(
+    ("status", "answer"),
+    [
+        ("error", {"error": "read_timeout: the work ran past its time limit"}),
+        ("timeout", {"error": "read_timeout: the work ran past its time limit"}),
+        ("killed", {"error": "hidden"}),
+    ],
+)
+async def test_a_failed_conversion_keeps_nothing_it_staged(
+    status: str, answer: dict[str, Any], settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A conversion that answers no success keeps no row, even with ``converted.pdf`` staged by a deadline race.
+
+    No output is planned, so the keeper records none and names none again; the staging goes.
+    """
+    me = user("user-a")
+    source = deck(store)
+    converts(executor)
+    executor.scripts["convert_office"] = (answer, {CONVERTED_NAME: CONVERTED})
+    executor.status = status
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    job, result, kept = await convert(queue, me, source, keeper)
+    assert keeper.recorded == [(status, [], [])]
+    assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [])
+    assert (job.status, result.outputs) == (status, [])
+    assert not (settings.data_dir / "staging" / job.id).exists()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"answer": 42},
+        {"name": "other.pdf", "pages": 3},
+        {"name": CONVERTED_NAME, "pages": 0},
+        {"name": CONVERTED_NAME, "pages": 3, "renders": []},
+    ],
+    ids=["no-conversion-answer", "another-name", "no-pages", "an-unknown-field"],
+)
+async def test_an_answer_that_is_no_conversion_keeps_nothing(
+    answer: dict[str, Any], settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """An ``ok`` answer that does not read as a ``ConvertAnswer`` keeps no PDF it staged; the keeper names it again."""
+    me = user("user-a")
+    source = deck(store)
+    executor.scripts["convert_office"] = (answer, {CONVERTED_NAME: CONVERTED})
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await convert(queue, me, source, keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [planned])
+    assert result.message == "1 output could not be kept (invalid)"
+
+
+async def test_a_conversion_runs_only_for_its_sources_chat(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A source of another user, chat or caller is a programming error: no turn, no job row, nothing sent."""
+    source = deck(store)
+    queue = queue_for(settings, executor, store, metrics)
+    for other in (user("user-b"), user("user-a", "chat-2"), Principal("docint", "user-a", "chat-1")):
+        with pytest.raises(ValueError, match="source"):
+            await convert(queue, other, source, gate="prepare")
+    assert (executor.requests, jobs_recorded(settings), queue.tracked_users) == ([], 0, 0)
+
+
+async def test_renders_of_a_converted_pdf_read_it_as_their_input(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The render job's one input and its ``path`` are the PDF's derived path, whatever path the args name.
+
+    The renders are of the Office file itself, beside its PDF.
+    """
+    me = user("user-a")
+    source = deck(store)
+    converts(executor)
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, (pdf,) = await convert(queue, me, source)
+    rendered(executor, page(1), page(2))
+    office = {"unit": "slide", "slides": 3}
+    _, _, kept = await queue.submit_renders(
+        me, source, {"pages": [1, 2], "path": "other.pdf", "office": office}, KeepAll(), call=CALL, converted=pdf
+    )
+    req = executor.requests[-1]
+    assert (req.tool, req.input_files) == ("prepare_file", [pdf.relative_path])
+    assert req.args == {"pages": [1, 2], "path": pdf.relative_path, "office": office}
+    assert {rec.source_id for rec in kept} == {source.id}
+    assert [(rec.role, rec.ordinal) for rec in store.derived_of(source)] == [("page", 1), ("page", 2), ("pdf", 0)]
+
+
+async def test_a_render_input_must_be_the_sources_pdf(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Another source's PDF, a page render, or a record changed from the PDF's row is a programming error.
+
+    Nothing is sent and no job row is made for any of them.
+    """
+    me = user("user-a")
+    source = deck(store)
+    other = deck(store, name="other-deck.pptx")
+    converts(executor)
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, (pdf,) = await convert(queue, me, source)
+    _, _, (other_pdf,) = await convert(queue, me, other)
+    rendered(executor, page(1))
+    _, _, (a_page,) = await queue.submit_renders(me, source, {"pages": [1]}, KeepAll(), call=CALL)
+    before = (len(executor.requests), jobs_recorded(settings))
+    for wrong in (
+        other_pdf,
+        a_page,
+        dataclasses.replace(pdf, name="harbour-deck.pptx"),
+        dataclasses.replace(pdf, mime="image/jpeg"),
+        dataclasses.replace(pdf, chat_id="chat-2"),
+    ):
+        with pytest.raises(ValueError, match="PDF"):
+            await queue.submit_renders(me, source, {"pages": [2]}, KeepAll(), call=CALL, converted=wrong)
+    assert (len(executor.requests), jobs_recorded(settings), queue.tracked_users) == (*before, 0)
+
+
+async def test_one_turn_holds_a_conversion_and_its_renders(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Under the prepare gate, user B's prepare waits while user A's conversion runs, and after A's renders too.
+
+    A's two jobs run in one turn of the gate, so B never slips in between them.
+    """
+    a = user("user-a")
+    b = Principal("ghostwriter", "user-b", "chat-1")
+    source = deck(store, a)
+    other = scan(store, b)
+    converts(executor)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a"}
+    queue = queue_for(settings, executor, store, metrics)
+
+    async def prepare_office() -> list[DerivedRecord]:
+        async with queue.turn(a, call=CALL, gate="prepare") as held:
+            assert held == Turn("ghostwriter", "user-a", "prepare")
+            _, _, (pdf,) = await convert(queue, a, source, gate="prepare", turn=held)
+            _, _, renders = await queue.submit_renders(
+                a, source, {"pages": None}, KeepAll(), call=CALL, gate="prepare", turn=held, converted=pdf
+            )
+        return [pdf, *renders]
+
+    first = asyncio.create_task(prepare_office())
+    await until(lambda: executor.running == 1)
+    second = asyncio.create_task(prepare(queue, b, other))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    await asyncio.sleep(0.05)
+    assert len(executor.requests) == 1
+    executor.gate.set()
+    kept, _ = await asyncio.gather(first, second)
+    assert [(req.user_id, req.tool) for req in executor.requests] == [
+        ("user-a", "convert_office"),
+        ("user-a", "prepare_file"),
+        ("user-b", "prepare_file"),
+    ]
+    assert [rec.role for rec in kept] == ["pdf", "page"]
+    assert executor.peak == 1
+    assert (queue.tracked_users, sample(metrics, "workbench_queue_length")) == (0, 0)
+
+
+async def test_a_turn_serves_only_its_own_user(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A turn serves its own caller, user and gate while it is held: any other, a copy or a turn let go is refused.
+
+    Each refusal comes before a job row, and nothing is sent.
+    """
+    a = user("user-a")
+    b = user("user-b")
+    docint = Principal("docint", "user-a", "chat-1")
+    sources = {a: deck(store, a), b: deck(store, b), docint: deck(store, docint)}
+    queue = queue_for(settings, executor, store, metrics)
+
+    async def refused(p: Principal, held: Turn, gate: Gate = "user") -> None:
+        with pytest.raises(ValueError, match="turn"):
+            await convert(queue, p, sources[p], gate=gate, turn=held)
+        with pytest.raises(ValueError, match="turn"):
+            await queue.submit_renders(p, sources[p], {}, KeepAll(), call=CALL, gate=gate, turn=held)
+
+    async with queue.turn(a, call=CALL) as held:
+        assert held == Turn("ghostwriter", "user-a", "user")
+        await refused(b, held)
+        await refused(docint, held)
+        await refused(a, held, "prepare")
+        await refused(a, Turn("ghostwriter", "user-a", "user"))
+    await refused(a, held)
+    assert (executor.requests, jobs_recorded(settings), queue.tracked_users) == ([], 0, 0)
+
+
+async def test_a_turn_runs_one_job_at_a_time(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A turn holds one slot: a second job sent in it while one of it runs is refused, and the first runs on."""
+    me = user("user-a")
+    source = deck(store)
+    converts(executor)
+    executor.hold = {"ghostwriter/user-a"}
+    queue = queue_for(settings, executor, store, metrics)
+    async with queue.turn(me, call=CALL) as held:
+        running = asyncio.create_task(convert(queue, me, source, turn=held))
+        await until(lambda: executor.running == 1)
+        with pytest.raises(ValueError, match="one job"):
+            await convert(queue, me, source, turn=held)
+        executor.gate.set()
+        _, _, kept = await running
+        assert [rec.role for rec in kept] == ["pdf"]
+    assert (len(executor.requests), jobs_recorded(settings), queue.tracked_users) == (1, 1, 0)
+
+
+async def test_a_calls_jobs_convert_and_render_in_one_turn_of_the_user(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """``CallJobs`` holds the user's own turn with its call's limits; both jobs run in it, and neither is an output.
+
+    One job per user and no wait: a job that took the user's turn again inside the one held would be refused.
+    """
+    me = user("user-a")
+    source = deck(store)
+    converts(executor)
+    rendered(executor, page(1))
+    queue = queue_for(settings, executor, store, metrics, jobs_per_user=1)
+    jobs = CallJobs(queue, dataclasses.replace(GHOSTWRITER, wall_s=30, wait_s=0))
+    async with jobs.turn(me) as held:
+        assert held == Turn("ghostwriter", "user-a", "user")
+        _, _, (pdf,) = await jobs.submit_conversion(me, source, {}, KeepAll(), turn=held)
+        _, _, kept = await jobs.submit_renders(me, source, {"pages": [1]}, KeepAll(), turn=held, converted=pdf)
+    assert [req.tool for req in executor.requests] == ["convert_office", "prepare_file"]
+    assert [req.limits.wall_s for req in executor.requests] == [30, 30]
+    assert executor.requests[1].input_files == [pdf.relative_path]
+    assert [rec.ordinal for rec in kept] == [1]
+    assert jobs.outputs() == []
+    assert queue.tracked_users == 0

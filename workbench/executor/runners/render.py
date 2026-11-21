@@ -1,5 +1,9 @@
 """The runner of ``prepare_file``: a picture or the pages of a PDF, drawn into the files the api serves.
 
+A PDF that an Office file was converted to (``convert_office``) is drawn as any PDF is; its ``office`` argument says it
+stands for a deck or a document, so the answer is of kind ``office`` and its words count slides or pages. An Office file
+itself is never drawn here: it is converted first.
+
 The job's working folder is the chat folder, as for ``read_document``. A picture is brought to the bounds of a render
 (:mod:`workbench.executor.render.images`) and a PDF page is drawn at ``PAGE_LONG_SIDE``
 (:mod:`workbench.executor.render.pages`); either is encoded without metadata and, when strips are asked for, cut
@@ -19,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
+from pydantic import ValidationError
+
 from workbench import protocol
 from workbench.executor import readers
 from workbench.executor.context import JobContext
@@ -31,8 +37,10 @@ from workbench.renders import (
     PAGE_QUALITY,
     PAGES_CHECKED_MAX,
     RENDERS_PER_JOB,
+    OfficeRequest,
     RenderAnswer,
     RenderEntry,
+    Unit,
     kind_of,
     render_name,
 )
@@ -53,26 +61,28 @@ class _Request:
         strips: How many strips each is cut into, 1 to ``MAX_STRIPS``.
         have: The whole pages the caller already has.
         facts: Whether to look for the pages of a PDF with no text; ``False`` skips the check and its cost.
+        office: What the PDF stands for when an Office file was converted to it, else ``None``.
     """
 
     pages: list[int] | None
     strips: int
     have: frozenset[int]
     facts: bool
+    office: OfficeRequest | None
 
     @classmethod
     def of(cls, args: dict[str, Any]) -> "_Request":
         """Read the arguments of a job.
 
         Args:
-            args: ``pages``, ``strips``, ``have`` and ``facts`` of the job; each may be missing.
+            args: ``pages``, ``strips``, ``have``, ``facts`` and ``office`` of the job; each may be missing.
 
         Returns:
             The request.
 
         Raises:
-            ValueError: ``strips`` is not 1 to ``MAX_STRIPS``, or ``facts`` is not a bool; that is the caller's
-                mistake, never the file's.
+            ValueError: ``strips`` is not 1 to ``MAX_STRIPS``, ``facts`` is not a bool, or ``office`` is not an
+                :class:`workbench.renders.OfficeRequest`; that is the caller's mistake, never the file's.
         """
         pages = args.get("pages")
         strips = int(args.get("strips", 1))
@@ -81,11 +91,17 @@ class _Request:
         facts = args.get("facts", True)
         if not isinstance(facts, bool):
             raise ValueError("facts is true or false")
+        office = args.get("office")
+        try:
+            stands_for = None if office is None else OfficeRequest.model_validate(office)
+        except ValidationError:  # its text would quote the argument
+            raise ValueError("office is a unit, page or slide, and for a deck its slide count") from None
         return cls(
             pages=None if pages is None else [int(n) for n in pages],
             strips=strips,
             have=frozenset(int(n) for n in args.get("have") or []),
             facts=facts,
+            office=stands_for,
         )
 
     def wanted(self, total: int) -> list[int]:
@@ -143,12 +159,13 @@ class _Facts:
     """What a file turned out to be, besides its renders.
 
     Attributes:
-        kind: ``image`` or ``pdf``.
+        kind: ``image``, ``pdf`` or ``office``.
         total: Pictures are 1; for a PDF, its pages.
         blank: The pages of a PDF with no text.
         unchecked: Whether pages of a PDF past ``PAGES_CHECKED_MAX`` were left unchecked.
         frames: The frame count of a picture with several, else ``None``.
         made: The renders.
+        unit: What ``total`` and the pages count: ``slide`` for a deck, else ``page``.
     """
 
     kind: str
@@ -157,6 +174,7 @@ class _Facts:
     unchecked: bool
     frames: int | None
     made: list[_Made]
+    unit: Unit = "page"
 
 
 def _encoded(n: int, strip: int, strips: int, data: bytes, mime: str) -> _Made:
@@ -220,7 +238,7 @@ def _pdf(path: Path, request: _Request) -> _Facts:
         request: What was asked for.
 
     Returns:
-        The facts and the renders.
+        The facts and the renders; of kind ``office`` and its unit when the PDF is a converted Office file.
 
     Raises:
         readers.NoSuchPart: A page asked for is not in the document.
@@ -248,7 +266,16 @@ def _pdf(path: Path, request: _Request) -> _Facts:
                 made.append(_encoded(n, strip, request.strips, data, mime))
     finally:
         pdf.close()
-    return _Facts(kind="pdf", total=total, blank=blank, unchecked=unchecked, frames=None, made=made)
+    office = request.office
+    return _Facts(
+        kind="pdf" if office is None else "office",
+        total=total,
+        blank=blank,
+        unchecked=unchecked,
+        frames=None,
+        made=made,
+        unit="page" if office is None else office.unit,
+    )
 
 
 def _hint(notes: list[str]) -> str | None:
@@ -263,7 +290,7 @@ def _hint(notes: list[str]) -> str | None:
     return "; ".join(notes) or None
 
 
-def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: int) -> dict[str, Any]:
+def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: int, unit: Unit) -> dict[str, Any]:
     """Cut the list of pages without text so that the answer, as the job writes it, stays within ``max_chars``.
 
     The renders and the other facts are kept whole; only the list gives way, and the hint says where it stops.
@@ -273,6 +300,7 @@ def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: 
         blank: The whole list.
         notes: The hint's sentences, which a cut adds to.
         max_chars: The most characters the answer may take.
+        unit: What the numbers count, ``page`` or ``slide``, for the hint's words.
 
     Returns:
         ``answer`` when it fits; otherwise it with the longest list that fits, which may be empty.
@@ -280,7 +308,7 @@ def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: 
 
     def with_first(count: int) -> dict[str, Any]:
         last = blank[count - 1] if count else 0
-        cut = [*notes, f"pages without text are listed up to page {last}"]
+        cut = [*notes, f"{unit}s without text are listed up to {unit} {last}"]
         return {**answer, "pages_without_text": blank[:count], "hint": _hint(cut)}
 
     if not blank or len(json.dumps(answer)) <= max_chars:
@@ -298,31 +326,40 @@ def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: 
 def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Draw a picture or the pages of a PDF into ``out/``, for a model to look at.
 
+    A PDF that ``convert_office`` made of an Office file is drawn with ``office`` naming what it stands for.
+
     Args:
         args: ``path``, relative to the chat folder; ``pages``, the pages to draw or ``None`` for the first
             ``FIRST_PAGES`` (a picture accepts only ``None`` or ``[1]``); ``strips``, 1 to ``MAX_STRIPS``, how many
             strips along the long side each is cut into; ``have``, the whole pages already rendered, which are not
             drawn again when ``strips`` is 1; ``facts``, a bool, default true: ``False`` leaves out the look at every
             page of a PDF for text (the caller has that already), so ``pages_without_text`` is ``[]`` with no hint
-            about it; and ``budget_s``, the seconds after which the job stops.
+            about it; ``office``, an :class:`workbench.renders.OfficeRequest` as JSON, given only with the PDF an Office
+            file was converted to, which then answers as kind ``office`` by its unit (and says so when a deck's slides
+            are not the PDF's pages); and ``budget_s``, the seconds after which the job stops.
         ctx: The job's surroundings.
 
     Returns:
         A :class:`workbench.renders.RenderAnswer` as a dict; every render in it is a file in ``ctx.out_dir`` under
         its ``name``. Or an ``error`` result: ``file_not_found``, ``unsupported_format`` (neither a picture nor a
-        PDF), ``unreadable_file``, ``no_such_part`` or ``read_timeout``, none of which names a path.
+        PDF; or an Office file, which is converted first), ``unreadable_file``, ``no_such_part`` or ``read_timeout``,
+        none of which names a path.
 
     Raises:
-        ValueError: ``strips`` is out of range, ``facts`` is not a bool, or more renders are asked for than one job may
-            make.
+        ValueError: ``strips`` is out of range, ``facts`` is not a bool, ``office`` is not an ``OfficeRequest`` or is
+            given with an input that is not a PDF, or more renders are asked for than one job may make.
     """
     name = protocol.check_input_path(str(args["path"]))
     real = ctx.work_dir / name
     if name.split("/")[0] == "out" or not real.is_file():
         return error("file_not_found", "there is no such file in this conversation's workspace")
     kind = kind_of(name)
+    if args.get("office") is not None and kind != "pdf":
+        raise ValueError("office names what a converted PDF stands for, and the input is not a PDF")
     if kind == "none":
         return error("unsupported_format", "only pictures and PDFs can be shown")
+    if kind == "office":
+        return error("unsupported_format", "an Office file is converted first")
     request = _Request.of(args)
     budget = float(args.get("budget_s", _BUDGET_S))
     deadline = time.monotonic() + budget
@@ -357,11 +394,17 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     notes: list[str] = []
     if facts.frames is not None:
         notes.append(f"only the first of {facts.frames} frames is shown")
+    if request.office is not None and request.office.slides not in (None, facts.total):
+        notes.append(
+            f"the deck has {request.office.slides} slides and {facts.total} were drawn, "
+            "so a picture's number may not be its slide's"
+        )
     if facts.unchecked:
-        notes.append(f"pages after {PAGES_CHECKED_MAX} were not checked for text")
+        notes.append(f"{facts.unit}s after {PAGES_CHECKED_MAX} were not checked for text")
     whole = RenderAnswer.model_validate(
         {
             "kind": facts.kind,
+            "unit": facts.unit,
             "total": facts.total,
             "pages_without_text": facts.blank,
             "frames": facts.frames,
@@ -369,7 +412,7 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             "renders": [entry.model_dump() for entry in entries],
         }
     ).model_dump()
-    answer = RenderAnswer.model_validate(_fit(whole, facts.blank, notes, ctx.max_chars)).model_dump()
+    answer = RenderAnswer.model_validate(_fit(whole, facts.blank, notes, ctx.max_chars, facts.unit)).model_dump()
     written: list[Path] = []
     try:
         for made, entry in zip(facts.made, entries, strict=True):
