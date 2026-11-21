@@ -2,7 +2,8 @@
 
 Every builder writes one file and returns its path. All text is invented. The libraries that
 write the files are the ones the executor image carries (python-docx, openpyxl, python-pptx,
-odfpy) plus reportlab, a dev dependency, for PDFs.
+odfpy, and Pillow for the pictures of noise, through ``make_images``) plus reportlab, a dev
+dependency, for PDFs.
 """
 
 import io
@@ -14,18 +15,24 @@ from collections.abc import Callable, Sequence
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 from docx import Document
+from docx import shared as docx_shared
 from docx.table import _Cell
 from odf.opendocument import OpenDocumentSpreadsheet, OpenDocumentText
 from odf.table import Table, TableCell, TableRow
 from odf.text import H, P
 from openpyxl import Workbook
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE
 from pptx.util import Inches
 from pypdf import PdfWriter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
+
+from tests.fixtures import make_images
 
 OLE_MAGIC = bytes.fromhex("d0cf11e0a1b11ae1")
 _MIB = 1024 * 1024
@@ -866,4 +873,185 @@ def make_junk_strings_xlsx(path: Path, elements: int) -> Path:
             for _ in range(elements // 100_000):
                 member.write(block)
             member.write(b"</sst>")
+    return path
+
+
+def _noise_beside(path: Path, suffix: str, size: tuple[int, int], fmt: str) -> Path:
+    """Write a picture of noise next to ``path``, for a builder to put into it and remove afterwards.
+
+    Args:
+        path: The file being built.
+        suffix: What the picture's name adds to the file's.
+        size: Width and height.
+        fmt: The Pillow format name.
+
+    Returns:
+        The picture's path.
+    """
+    return make_images.make_noise(path.with_name(f"{path.name}.{suffix}"), size, fmt)
+
+
+def make_deck(
+    path: Path,
+    slides: int = 30,
+    *,
+    chart_on: int | None = 1,
+    picture_only: Sequence[int] = (),
+    hidden: Sequence[int] = (),
+    photo: tuple[int, int] | None = None,
+) -> Path:
+    """Write a deck of ``slides`` slides, each titled ``Invented slide N`` with one bullet, for LibreOffice to draw.
+
+    Args:
+        path: Where to write it.
+        slides: How many slides.
+        chart_on: The slide that also holds a clustered column chart of invented figures, or ``None``.
+        picture_only: Slides that hold one picture of noise (a PNG) and no text frame instead.
+        hidden: Slides hidden in the slide show (``show="0"`` on the slide).
+        photo: The size of a noise JPEG put on every slide, or ``None``.
+
+    Returns:
+        ``path``.
+    """
+    deck: Any = Presentation()
+    noise = _noise_beside(path, "noise.png", (320, 240), "PNG") if picture_only else None
+    picture = _noise_beside(path, "photo.jpg", photo, "JPEG") if photo else None
+    try:
+        for number in range(1, slides + 1):
+            if noise is not None and number in picture_only:
+                slide = deck.slides.add_slide(deck.slide_layouts[6])
+                slide.shapes.add_picture(str(noise), Inches(2), Inches(1.5), Inches(6))
+            else:
+                slide = deck.slides.add_slide(deck.slide_layouts[1])
+                slide.shapes.title.text = f"Invented slide {number}"
+                slide.placeholders[1].text = f"Invented point {number}"
+            if number == chart_on:
+                data = CategoryChartData()
+                data.categories = ["North pier", "South pier", "East pier"]
+                data.add_series("Invented tonnes", (12, 7, 9))
+                slide.shapes.add_chart(
+                    XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(1), Inches(3.5), Inches(8), Inches(3.5), data
+                )
+            if picture is not None:
+                slide.shapes.add_picture(str(picture), Inches(5.5), Inches(4.5), Inches(4))
+            if number in hidden:
+                slide._element.set("show", "0")
+        deck.save(str(path))
+    finally:
+        for made in (noise, picture):
+            if made is not None:
+                made.unlink()
+    return path
+
+
+def make_long_docx(path: Path, pages: int = 24, *, picture_on: int | None = None) -> Path:
+    """Write a Word document of ``pages`` pages: a heading ``Invented section N`` and two paragraphs on each.
+
+    A page break ends every page but the last, which would otherwise leave an empty page after it.
+
+    Args:
+        path: Where to write it.
+        pages: How many pages.
+        picture_on: The page that holds a picture of noise (a PNG) alone instead, or ``None``.
+
+    Returns:
+        ``path``.
+    """
+    doc = Document()
+    noise = _noise_beside(path, "noise.png", (320, 240), "PNG") if picture_on else None
+    try:
+        for number in range(1, pages + 1):
+            if noise is not None and number == picture_on:
+                doc.add_picture(str(noise), width=docx_shared.Inches(4))
+            else:
+                doc.add_heading(f"Invented section {number}", level=1)
+                doc.add_paragraph(f"The invented survey of section {number} counts the synthetic cranes of a harbour.")
+                doc.add_paragraph("A second invented paragraph closes the section.")
+            if number < pages:
+                doc.add_page_break()
+        doc.save(str(path))
+    finally:
+        if noise is not None:
+            noise.unlink()
+    return path
+
+
+_ODF_OFFICE = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+_ODF_MANIFEST = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"
+_OOO_LIBRARY = "http://openoffice.org/2000/library"
+_ODT_BASIC = ("Basic/script-lc.xml", "Basic/Standard/script-lb.xml", "Basic/Standard/Module1.xml")
+_QUOT = {'"': "&quot;"}
+
+
+def make_macro_odt(path: Path, marker: str) -> Path:
+    """Write an OpenDocument text whose Basic macro, run when the document loads, writes ``$HOME/<marker>``.
+
+    The macro is ``Standard.Module1.Main`` in the document's own Basic library (``Basic/``, every part listed in the
+    manifest), bound to the document's ``dom:load`` event in ``content.xml``'s ``office:event-listeners``, as an
+    office suite saves a document macro on "open document".
+
+    Args:
+        path: Where to write it.
+        marker: The name of the file the macro would write in ``HOME``.
+
+    Returns:
+        ``path``.
+    """
+    target = marker.replace('"', '""')
+    code = (
+        "Sub Main\n"
+        "    Dim n As Integer\n"
+        "    n = FreeFile()\n"
+        f'    Open Environ("HOME") & "/" & "{target}" For Output As #n\n'
+        '    Print #n, "an invented line"\n'
+        "    Close #n\n"
+        "End Sub\n"
+    )
+    module = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<script:module xmlns:script="http://openoffice.org/2000/script" script:name="Module1" '
+        f'script:language="StarBasic" script:moduleType="normal">{escape(code, _QUOT)}</script:module>\n'
+    )
+    library = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<library:library xmlns:library="{_OOO_LIBRARY}" library:name="Standard" library:readonly="false" '
+        'library:passwordprotected="false"><library:element library:name="Module1"/></library:library>\n'
+    )
+    libraries = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<library:libraries xmlns:library="{_OOO_LIBRARY}" xmlns:xlink="http://www.w3.org/1999/xlink">'
+        '<library:library library:name="Standard" library:link="false"/></library:libraries>\n'
+    )
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<office:document-content xmlns:office="{_ODF_OFFICE}" '
+        'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+        'xmlns:script="urn:oasis:names:tc:opendocument:xmlns:script:1.0" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:dom="http://www.w3.org/2001/xml-events" '
+        'xmlns:ooo="http://openoffice.org/2004/office" office:version="1.3">'
+        "<office:scripts><office:event-listeners>"
+        '<script:event-listener script:language="ooo:script" script:event-name="dom:load" '
+        'xlink:href="vnd.sun.star.script:Standard.Module1.Main?language=Basic&amp;location=document" '
+        'xlink:type="simple"/>'
+        "</office:event-listeners></office:scripts>"
+        "<office:body><office:text><text:p>An invented paragraph of a document with a macro.</text:p>"
+        "</office:text></office:body></office:document-content>\n"
+    )
+    entries = "".join(
+        f'<manifest:file-entry manifest:full-path="{name}" manifest:media-type="text/xml"/>'
+        for name in ("content.xml", *_ODT_BASIC)
+    )
+    manifest = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<manifest:manifest xmlns:manifest="{_ODF_MANIFEST}" manifest:version="1.3">'
+        '<manifest:file-entry manifest:full-path="/" manifest:version="1.3" '
+        'manifest:media-type="application/vnd.oasis.opendocument.text"/>'
+        f"{entries}</manifest:manifest>\n"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("mimetype", "application/vnd.oasis.opendocument.text", compress_type=zipfile.ZIP_STORED)
+        archive.writestr("META-INF/manifest.xml", manifest)
+        archive.writestr("content.xml", content)
+        for name, part in zip(_ODT_BASIC, (libraries, library, module), strict=True):
+            archive.writestr(name, part)
     return path
