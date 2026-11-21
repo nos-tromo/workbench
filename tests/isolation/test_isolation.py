@@ -19,11 +19,13 @@ import httpx
 import openpyxl
 import pytest
 from docx import Document
+from PIL import Image
 from pptx import Presentation
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from tests.fixtures import make_fixtures as mk
+from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
 from tests.isolation.conftest import (
     docker,
@@ -921,3 +923,100 @@ def test_a_chat_delete_leaves_nothing(api_info: dict[str, Any], executor: str) -
     assert (event["action"], event["outcome"], event["actor"]) == ("delete", "ok", {"user": user, "via": "service"})
     assert sorted(event["target"].pop("ids")) == sorted([uploaded["id"], *made])
     assert event["target"] == {"kind": "file", "count": 4, "container": f"chat:{CHAT_A}"}
+
+
+# --- pictures and scans, end to end -------------------------------------------------------------------------------
+
+VISION_USER, VISION_CHAT = "user-vision", "chat-vision"
+
+#: Run in the api: the renders of one Ghostwriter chat in the database and the chat's folder on the volume, read-only.
+RENDERS_OF_THE_CHAT = r"""
+import json, os, sqlite3, sys
+user, chat = sys.argv[1], sys.argv[2]
+db = sqlite3.connect("file:/data/workbench.db?mode=ro", uri=True)
+rows = db.execute(
+    "SELECT COUNT(*) FROM derived WHERE caller = 'ghostwriter' AND user_id = ? AND chat_id = ?", (user, chat)
+).fetchone()[0]
+print(json.dumps({"rows": rows, "folder": os.path.exists(f"/data/workspaces/ghostwriter/{user}/{chat}")}))
+"""
+
+
+def _image_blocks(result: dict[str, Any]) -> list[bytes]:
+    """The bytes of the image blocks of a result, after its text block, each block checked on the way."""
+    text, *blocks = result["content"]
+    assert text["type"] == "text"
+    assert [(block["type"], block["mimeType"], block["annotations"]) for block in blocks] == [
+        ("image", "image/jpeg", {"audience": ["assistant"]})
+    ] * len(blocks)
+    return [base64.b64decode(block["data"], validate=True) for block in blocks]
+
+
+def test_a_picture_and_a_scan_are_prepared_and_viewed_in_the_sandbox(api_info: dict[str, Any], tmp_path: Path) -> None:
+    """A photo with EXIF and GPS and a PDF with a page of no text are rendered by real jobs and shown, then deleted.
+
+    The decoders (Pillow, pi-heif) and pdfium run as slot uids with a read-only root and no network, in the shipped
+    image, so this also proves they are there and work as the job runs them. The photo's render is upright and
+    carries none of its metadata; ``view_file`` and ``read_document`` show the pages as image blocks that match
+    ``shown``; deleting the chat takes the renders and leaves nothing to view.
+    """
+    user, chat = VISION_USER, VISION_CHAT
+    photo = mi.make_photo(tmp_path / "quay-photo.jpg", size=(64, 48), orientation=6, gps=True).read_bytes()
+    scan = mk.make_pdf(tmp_path / "harbour-report.pdf", ["Invented harbour figures", None, "Invented quay list"])
+    assert b"Exif" in photo  # the source does carry its metadata
+    photo_path = f"/workspace/{chat}/{_upload(api_info, 'quay-photo.jpg', photo, user=user, chat=chat)}"
+    scan_path = f"/workspace/{chat}/{_upload(api_info, 'harbour-report.pdf', scan.read_bytes(), user=user, chat=chat)}"
+
+    def prepare(path: str) -> dict[str, Any]:
+        answer = ghostwriter(api_info, "POST", "/files/prepare", chat=chat, user=user, params={"path": path})
+        assert answer.status_code == 200, answer.text
+        body: dict[str, Any] = answer.json()
+        assert set(body) == {"path", "kind", "total", "pages_without_text", "renditions", "frames", "hint"}
+        return body
+
+    prepared_photo = prepare(photo_path)
+    assert (prepared_photo["kind"], prepared_photo["total"], prepared_photo["pages_without_text"]) == ("image", 1, [])
+    (item,) = prepared_photo["renditions"]
+    assert (item["n"], item["mime"], item["width"], item["height"]) == (1, "image/jpeg", 48, 64)  # turned upright
+    prepared_scan = prepare(scan_path)
+    assert (prepared_scan["kind"], prepared_scan["total"], prepared_scan["pages_without_text"]) == ("pdf", 3, [2])
+    assert [item["n"] for item in prepared_scan["renditions"]] == [1, 2, 3]
+
+    rendition = ghostwriter(
+        api_info, "GET", "/files/view", chat=chat, user=user, params={"path": photo_path, "rendition": 1}
+    )
+    assert rendition.status_code == 200, rendition.text
+    assert rendition.headers["content-type"] == "image/jpeg"
+    assert rendition.content.startswith(b"\xff\xd8\xff")
+    assert b"Exif" not in rendition.content and b"GPS" not in rendition.content
+    assert Image.open(io.BytesIO(rendition.content)).size == (48, 64)
+
+    viewed = mcp_result(ghostwriter_mcp(api_info, "view_file", {"path": scan_path}, chat=chat, user=user))
+    assert viewed["isError"] is False, viewed
+    structured = viewed["structuredContent"]
+    assert (structured["kind"], structured["total"], structured["truncated"]) == ("pdf", 3, False)
+    assert [item["label"] for item in structured["shown"]] == ["page 1", "page 2", "page 3"]
+    pages = _image_blocks(viewed)
+    for item, data in zip(structured["shown"], pages, strict=True):  # image block i is shown[i]
+        assert Image.open(io.BytesIO(data)).size == (item["width"], item["height"])
+
+    read = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": scan_path}, chat=chat, user=user))
+    assert read["isError"] is False, read
+    body = read["structuredContent"]
+    assert (body["kind"], body["total_parts"], body["pages_without_text"]) == ("pdf", 3, [2])
+    assert "Invented harbour figures" in read["content"][0]["text"]
+    (page_two,) = body["shown"]
+    assert (page_two["label"], page_two["n"]) == ("page 2", 2)
+    (data,) = _image_blocks(read)
+    assert data == pages[1]  # the very render view_file showed for page 2
+
+    def left() -> dict[str, Any]:
+        return json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", RENDERS_OF_THE_CHAT, user, chat))
+
+    assert left() == {"rows": 4, "folder": True}  # the photo's one render and the PDF's three pages
+    deleted = ghostwriter(api_info, "DELETE", "/files/chat", chat=chat, user=user)
+    assert (deleted.status_code, deleted.json()) == (200, {"deleted": 2})
+    gone = ghostwriter(
+        api_info, "GET", "/files/view", chat=chat, user=user, params={"path": photo_path, "rendition": 1}
+    )
+    assert (gone.status_code, gone.json()) == NOT_FOUND
+    assert left() == {"rows": 0, "folder": False}

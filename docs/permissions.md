@@ -75,7 +75,7 @@ chat.
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
 | prepare, `POST /files/prepare` | a picture or PDF, as a copy in a job of the executor; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF, or the picture | `modify` / `file.prepare`, before any render is visible | the renders, until the source goes; the answer is their manifest |
 | view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
-| `DELETE /files/chat` | nothing | the chat's files and rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
+| `DELETE /files/chat` | nothing | the chat's files and renders and their rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
 
 The service routes (`/healthz`, `/metrics`) read no file content and are not

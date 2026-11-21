@@ -56,6 +56,17 @@ record of processing and the impact assessment.
   built. The master, the pictures and the files a source names are only read.
   The plain master is python-pptx's own, read from the executor image: no file
   of a chat is in it (`workbench/executor/presentations/master.py:plain_master`).
+- **Renders of pictures and PDFs** (`workbench/api/renders.py`,
+  `workbench/executor/runners/render.py`). A file the model or Ghostwriter asks
+  to see (`POST /files/prepare`, `GET /files/view?rendition=`, `view_file`,
+  `read_document`) is drawn in the executor into JPEG or PNG renders: a picture
+  scaled to at most 2048 px, a PDF page at 1600 px, each under 768 KiB. They are
+  made from the file's own content, which can be anything a picture or a page
+  shows, text and faces included. **Every render is stripped of image metadata**:
+  the source's EXIF (the GPS block among it), XMP and comments are not carried
+  into it, and its colour profile is applied to the pixels and then dropped. A
+  render is a derived file of its source, not a file of the chat: see
+  [Where it is stored](#where-it-is-stored).
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
   checks, topic listings), which can hold special categories of data, with the
@@ -76,15 +87,23 @@ Everything lives on the external volume `workbench-data`, mounted at `/data`.
 |---|---|---|
 | `/data/` | root, group of the api, `1771` | the parts below; the api may add the database's journal files here |
 | `workspaces/<caller>/<user-id>/<chat-id>/…` | api, `0700` | the users' files: uploads under the names users chose, tool outputs under the names the model chose, as plain bytes |
-| `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder within the same request (an inline job's are read back and removed) |
+| `workspaces/<caller>/<user-id>/<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`) | api, `0700` | the renders of a picture or a PDF, named by an id and nothing of the source's name; the folder is reserved, no path of any caller reaches it and no listing shows it |
+| `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder (a render, into its source's `.derived/` folder) within the same request (an inline job's are read back and removed) |
 | `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder root's, `0710`, its group the slot's; its `home/` and `out/` the slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `home/` with its `tmp/` and its answer (`result.json`), and the request (`spec.json`); removed when the job ends |
 | `workbench.db` | api, `0600` | the SQLite database, in WAL mode with `secure_delete` on |
 
-The database has two tables (`workbench/api/store.py`):
+The database has three tables (`workbench/api/store.py`):
 
 - `files`: per file its id, caller, user id, chat id, name (its path below the
   chat folder), size, media type, kind (`upload` or `output`), creation time
   and, for an output, the job that made it;
+- `derived`: per render its id, its source's id, caller, user id, chat id, role
+  (`image` or `page`), place (page number), name (`<id>.jpg` or `<id>.png`),
+  size, media type, width and height, a few facts (the strip, and on a file's
+  first render what the executor found: kind, page count, the pages without a
+  text layer) and the creation time **of its source**. It is bound to its
+  source: counted in the user's quota, deleted with it, and reachable by no
+  path;
 - `jobs`: per tool run its id, caller, user id, chat id, tool, start time and
   status. No argument, code or result.
 
@@ -108,6 +127,7 @@ operator's.
 | What | Kept for | Enforced by |
 |---|---|---|
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
+| Renders | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
@@ -141,6 +161,14 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
   run by an outside provider (a hosted API, or an Ollama `*-cloud` model), the
   results leave the host and the federation to that provider. They stay in the
   caller's chat history for its own retention (see the box at the top).
+- **Image bytes go to the caller too**, as renders: in the MCP image blocks of
+  `view_file` and `read_document` (for the assistant alone, at most 8 and 4
+  images and 2.5 MiB an answer), and as the bytes of a rendition view
+  (`GET /files/view?rendition=`) for the user's browser. Each is recorded by the
+  ids of the source and the render before it leaves ([audit.md](audit.md)).
+  Besides the image, the caller gets the manifest's metadata: the kind, the page
+  count, the pages without a text layer, and each render's size, type, width and
+  height. A render has none of the source's own image metadata.
 - **Files go to Ghostwriter**, and from it to the user's browser, when the user
   views or downloads them (`GET /files/view`). What a user downloads is outside
   workbench from then on.
@@ -182,9 +210,10 @@ operator (deploy ADR 0003, "Consequences").
 **Categories of data.** Whatever users upload (Ghostwriter's, by chat), or docint
 sends with a call (passages of its documents), which workbench cannot know in
 advance: documents, spreadsheets, e-mails, presentations, and what is in them.
-That can include special categories of personal data. Also what the model
-writes into new files (table values, Markdown, template values, slide content)
-and their names. Besides: file names, chat ids, the user and session pseudonyms
+That can include special categories of personal data. Pictures and scans are
+among them (a photograph can show a person), and a render holds all of what its
+source shows. Also what the model writes into new files (table values,
+Markdown, template values, slide content) and their names. Besides: file names, chat ids, the user and session pseudonyms
 of docint and Ghostwriter with the purpose and request id they send, and the
 time and tool of each run.
 
@@ -195,9 +224,9 @@ the values the model writes.
 **Where data flows.** These are the flows, as facts:
 
 - to the caller that asked, for the same user: results to docint (workbench
-  keeps neither its data nor its outputs); results and viewed files to
-  Ghostwriter, with `outputs` and a preview of each csv or xlsx file, which
-  Ghostwriter keeps for `WORKBENCH_RETENTION_DAYS`;
+  keeps neither its data nor its outputs); results, viewed files and the images
+  of pictures and pages to Ghostwriter, with `outputs` and a preview of each
+  csv or xlsx file, which Ghostwriter keeps for `WORKBENCH_RETENTION_DAYS`;
 - through docint and Ghostwriter, to their models and their own databases: what
   a run returns enters their model context and is kept with the turn; their own
   processing, recorded there;
@@ -210,10 +239,11 @@ model the operator configured behind the inference router; if that is an
 outside provider, they leave the host and the federation. Whether any of these
 is a recipient in the legal sense is for the operator to decide.
 
-**Storage periods.** Files and job records: `WORKBENCH_RETENTION_DAYS`, 7 days by
-default, from creation. Ghostwriter's chat delete (`DELETE /files/chat`) removes
-the chat's files at once and leaves an event by file id, nothing else.
-Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
+**Storage periods.** Files, their renders and job records:
+`WORKBENCH_RETENTION_DAYS`, 7 days by default, from creation (a render counts
+from its source's). Ghostwriter's chat delete (`DELETE /files/chat`) removes
+the chat's files and their renders at once and leaves an event by file id
+(the renders' among them), nothing else. Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
 retention (`AUDIT_RETENTION`, one year by default). Copies in Ghostwriter's
 chat database and docint's session database, kept with the chat turn: their own
 retention; workbench keeps neither the data nor the outputs of a docint call.
@@ -233,6 +263,7 @@ little traffic it can outlive obs-plane's retention.
 | Hardened containers: read-only roots, no capabilities but those listed, no privilege escalation | [sandbox.md](sandbox.md#capabilities) |
 | Every file read, change, disclosure and deletion recorded by file id, fail closed | [audit.md](audit.md) |
 | Files deleted after the period, each deletion recorded first | [retention.md](retention.md) |
+| Every picture and page is decoded only in the sandbox, and every render is stripped of image metadata | [sandbox.md](sandbox.md#residual-risks) |
 | No content, name or user id in workbench's own log lines or in metrics | [What leaves](#what-leaves) |
 | No tool deletes or overwrites a file | [permissions.md](permissions.md#the-agent-deletes-nothing) |
 

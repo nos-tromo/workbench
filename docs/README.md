@@ -30,19 +30,29 @@ and these documents differ, these documents describe the code.
 ## Third-party licences
 
 workbench is Apache-2.0. Its images ship third-party Python packages, each
-under its own licence; two need a note:
+under its own licence; four need a note, and a fifth that no image ships:
 
 - **docxtpl** is LGPL-2.1. workbench uses it unmodified, as a separate Python
   package, and its source is in the executor image as installed, so it can be
   replaced there.
 - **odfpy** is offered under several licences; workbench uses it under its
   Apache-2.0 option.
+- **pi-heif**'s wheel bundles libheif and libde265, both LGPL-3.0. workbench
+  uses them unmodified, as the shared libraries the wheel ships, so they are
+  replaceable in the executor image. They decode HEIC pictures there and
+  nowhere else.
+- **pypdfium2** is Apache-2.0 or BSD-3-Clause, and its wheel carries pdfium and
+  the licences of pdfium's own bundled libraries, which ship with it.
+- **pillow-heif** (the writer the tests make a HEIC picture with) bundles the
+  GPL-2.0 x265 encoder. It is in the `dev` dependency group and the `test` stage
+  of the executor's Dockerfile only, never in an image that is shipped.
 
 No Python package the images could use only under the GPL or the AGPL is
-installed: of the shipped packages, only these two name a GNU licence. That is
-why Outlook `.msg` files are not read: the Python parser for them,
-`extract-msg`, is GPL. `read_document` asks the user to save such a file as
-`.eml` or PDF.
+installed: of the shipped packages, only docxtpl, odfpy and pi-heif (through the
+libraries its wheel bundles) name a GNU licence, the first and the last the LGPL
+and odfpy one option among several. That is why Outlook `.msg` files are not
+read: the Python parser for them, `extract-msg`, is GPL. `read_document` asks
+the user to save such a file as `.eml` or PDF.
 
 The images' Debian base, `python:3.12-slim-trixie`, carries the operating
 system's own packages under their own licences, GPL ones among them.

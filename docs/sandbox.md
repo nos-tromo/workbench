@@ -508,6 +508,24 @@ Each of these is accepted. Each says what it would take.
   `run_python` can write its own `previews.json`. A preview describes only the
   caller's own output; the supervisor and the api check its shape and caps
   (`TablePreview`) and parse no file.
+- **Decoders of hostile pictures and PDFs, in the executor only.** Since 0.7.0
+  a picture or a PDF the user dropped is decoded to be shown to the model
+  (`workbench/executor/render/`), which puts three native parsers in front of
+  hostile input: Pillow's decoders (PNG, JPEG, WebP, GIF, BMP and TIFF), libheif
+  and libde265 through pi-heif (HEIC), and pdfium through pypdfium2. A flaw in
+  one is a flaw in a job's process: it runs as a slot uid with no network, the
+  limits and the filters above, and nothing but a copy of its own chat's files,
+  so what it could reach is what any `run_python` job reaches. What narrows it:
+  the open is restricted to the formats of `images.FORMATS`, and the picture's
+  content decides which, whatever its name says; HEIF is decoded with one
+  decoder thread, no thumbnail, depth or auxiliary image; a source over 120
+  megapixels is refused before a pixel is read (`SOURCE_MAX_PIXELS`); a
+  password-protected PDF is refused; and each render is bounded by 2048 px and
+  768 KiB. The api decodes none of them (it imports neither `PIL`, `pypdfium2`
+  nor `pi_heif`, and its image has none): it takes a render's signature and size
+  only, and a width and a height only within the bounds of a render, so a wrong
+  value the executor states costs the model tokens and never access. A
+  decoder's time and memory are the job's own limits.
 
 ## gVisor
 
@@ -529,11 +547,11 @@ Neither a caller nor a job brings packages of its own:
 - **The standard library and the venv.** The image builds the venv with
   `uv sync --locked --no-dev --extra executor`. It holds the `executor` extra of
   `pyproject.toml` (beautifulsoup4, charset-normalizer, cryptography, docxtpl,
-  lxml, markdown-it-py, matplotlib, numpy, odfpy, openpyxl, pandas, pypdf,
-  python-docx, python-pptx, scipy, xlsxwriter) together with what those
-  packages depend on, Pillow and Jinja2 among them. The same venv also carries
-  the project's own dependencies (FastAPI, pydantic, uvicorn and the rest),
-  which a job has no use for.
+  lxml, markdown-it-py, matplotlib, numpy, odfpy, openpyxl, pandas, pi-heif,
+  pillow, pypdf, pypdfium2, python-docx, python-pptx, scipy, xlsxwriter)
+  together with what those packages depend on, Jinja2 among them. The same
+  venv also carries the project's own dependencies (FastAPI, pydantic, uvicorn
+  and the rest), which a job has no use for.
 - **The exact versions are in `uv.lock`.** Dependabot moves them, so this page
   names none.
 
@@ -543,7 +561,8 @@ the venv included, is read-only. Every job starts with `MPLBACKEND=Agg` and
 (`workbench/executor/sandbox.py:CLEAN_ENV`).
 
 The tool descriptions name only part of this list. Ghostwriter's `run_python`
-names thirteen packages (`workbench/api/tool_table.py`) and docint's names four
+names fifteen packages, since 0.7.0 pillow and pypdfium2 among them
+(`workbench/api/tool_table.py`), and docint's names four
 (`workbench/api/tools_inline.py`). A job can import the rest just the same.
 
 ## Limits of `run_python`
