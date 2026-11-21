@@ -2494,7 +2494,7 @@ async def test_a_render_that_exists_or_passes_the_cap_is_lost_as_duplicate_or_fu
 async def test_a_render_of_a_deleted_chat_is_not_kept(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """The chat is deleted while the job runs: no derived row, no folder, and the render is named again."""
+    """The chat is deleted while the job runs: no derived row, no folder, and the render is named again, as gone."""
     me = user("user-a")
     source = scan(store)
     rendered(executor, page(1))
@@ -2508,7 +2508,7 @@ async def test_a_render_of_a_deleted_chat_is_not_kept(
     _, result, kept = await running
     ((_, planned, _),) = keeper.recorded
     assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [planned])
-    assert result.message == "1 output could not be kept (failed)"
+    assert result.message == "1 output could not be kept (gone)"
     assert not _chat_folder(settings, me).exists()
 
 

@@ -8,6 +8,7 @@ the cap of a source's renders, and the checks a render passes before its bytes g
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import functools
 import io
@@ -22,11 +23,14 @@ from typing import Any, override
 import pytest
 from fastapi import HTTPException
 
-from tests.api.conftest import CALL, PG, AuditLines, put
+from tests.api.conftest import CALL, PG, AuditLines, put, unrecorded
 from tests.api.test_tools_templates import Local
+from tests.conftest import scaled
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from workbench.api import renders as api_renders
 from workbench.api.audit import AuditLog, PurposeRequired
+from workbench.api.errors import describe
 from workbench.api.jobs import Busy, Gate, JobQueue
 from workbench.api.metrics import Metrics
 from workbench.api.renders import (
@@ -84,6 +88,24 @@ class Slow(Local):
         """Wait, then run the runner."""
         await asyncio.sleep(0.2)
         return await super().run(req, timeout_s)
+
+
+class Held(Local):
+    """The in-process executor, each job of which, its runner through, waits for the test to let it answer."""
+
+    def __init__(self, data_dir: Path, jobs: Path) -> None:
+        """Run the real runners; answer when :attr:`release` is set."""
+        super().__init__(data_dir, jobs)
+        self.through = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @override
+    async def run(self, req: JobRequest, timeout_s: float) -> JobResult:
+        """Run the runner, say so, then wait to answer."""
+        result = await super().run(req, timeout_s)
+        self.through.set()
+        await self.release.wait()
+        return result
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,6 +314,51 @@ async def test_two_prepares_at_once_run_one_job(world: World) -> None:
     assert [event["outcome"] for event in slow.lines() if event["operation"].startswith("file.")] == ["ok"]
 
 
+async def test_a_prepared_file_is_answered_while_its_lock_is_held(world: World) -> None:
+    """Final review M1: the rows answer a prepared file, and the pages it has, without waiting for the source's lock.
+
+    A job of later pages may hold the lock for seconds; a view of what is there does not wait behind it.
+    """
+    source = world.pdf("quay-list.pdf", quay_pages(3))
+    manifest = await world.prepare(source)
+    requests = len(world.executor.requests)
+    held, release = asyncio.Event(), asyncio.Event()
+
+    async def hold() -> None:
+        async with world.queue.source_lock(source.id, 60):
+            held.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    await held.wait()
+    try:
+        again = await asyncio.wait_for(world.prepare(source), scaled(2))
+        pages = await asyncio.wait_for(world.renders(source, manifest, [1, 2]), scaled(2))
+    finally:
+        release.set()
+        await holder
+    assert again == manifest
+    assert [r.ordinal for r in pages] == [1, 2]
+    assert len(world.executor.requests) == requests
+
+
+async def test_a_chat_deleted_while_its_prepare_runs_is_not_found(world: World) -> None:
+    """Final review M4: the file went with its chat, so the prepare is a 404, not a render that could not be kept."""
+    executor = Held(world.settings.data_dir, world.built.parent / "held-jobs")
+    held = world.over(executor)
+    source = held.pdf("harbour-report.pdf", ["Harbour figures 2026", None])
+    preparing = asyncio.create_task(held.prepare(source))
+    await executor.through.wait()
+    held.store.delete_chat(PG, unrecorded)
+    executor.release.set()
+
+    with pytest.raises(NotFound) as gone:
+        await preparing
+    assert describe(gone.value) == (404, "not found")
+    assert held.store.derived_of(source) == []
+    assert [event["outcome"] for event in held.events()] == ["ok", "error"]
+
+
 async def test_a_refusal_answers_its_code_and_keeps_nothing(world: World) -> None:
     """A text file named ``.png`` is refused as unreadable (422); the refusal is recorded by its code alone."""
     source = put(world.store, "quay-photo.png", b"Quay list, not a picture", p=PG)
@@ -481,6 +548,34 @@ async def test_a_source_at_its_render_cap_says_so(world: World, monkeypatch: pyt
     assert world.store.derived_of(fresh) == []
 
 
+async def test_a_page_past_the_cap_runs_no_job_when_no_render_has_room(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review M7: when the room left is less than the smallest page held, a page past the cap makes no job.
+
+    The limit is raised at once: no request reaches the executor and no event is written. With room for a page like
+    the smallest, the job runs, and the store decides.
+    """
+    source = world.pdf("quay-list.pdf", quay_pages(22))
+    manifest = await world.prepare(source)
+    rows = world.store.derived_of(source)
+    held, smallest = sum(row.size for row in rows), min(row.size for row in rows)
+    monkeypatch.setattr(api_renders, "DERIVED_MAX_BYTES", held + smallest - 1)
+    capped(world.store, monkeypatch, held + smallest - 1)
+    requests, events = len(world.executor.requests), len(world.events())
+
+    with pytest.raises(RendersFull):
+        await world.renders(source, manifest, [21])
+    assert [r.ordinal for r in await world.renders(source, manifest, [1, 21])] == [1]
+    assert (len(world.executor.requests), len(world.events())) == (requests, events)
+
+    monkeypatch.setattr(api_renders, "DERIVED_MAX_BYTES", held + smallest)
+    capped(world.store, monkeypatch, held + smallest)
+    with contextlib.suppress(RendersFull):  # the job ran; page 21 may still be larger than the smallest page
+        await world.renders(source, manifest, [21])
+    assert len(world.executor.requests) == requests + 1
+
+
 async def test_two_views_of_one_later_page_at_once_run_one_job(world: World) -> None:
     """The rows are read again under the lock: the second call finds the page the first made, and makes none."""
     source = world.pdf("quay-list.pdf", quay_pages(21))
@@ -624,7 +719,10 @@ async def test_shown_images_are_labelled_by_picture_page_and_strip(world: World)
 
 
 def test_a_manifest_needs_a_head_with_its_facts() -> None:
-    """Without a whole render of page 1 that carries the facts, there is no manifest yet."""
+    """Without a whole render of page 1 that carries the facts, there is no manifest yet.
+
+    Final review M2: a fact the head carries that this version does not know (a later version's) is ignored.
+    """
     owner = {"caller": "ghostwriter", "user_id": "user-a", "chat_id": "chat-1"}
     source = FileRecord(
         id="f" * 32,
@@ -662,6 +760,8 @@ def test_a_manifest_needs_a_head_with_its_facts() -> None:
     manifest = manifest_of(source, [row(1, {"facts": facts}), row(2, {}), row(2, {"strip": 1, "strips": 2})])
     assert manifest is not None
     assert [(r.n, r.bytes) for r in manifest.renditions] == [(1, 5), (2, 5)]
+    later = manifest_of(source, [row(1, {"facts": {**facts, "duration": 12.5}}), row(2, {})])
+    assert later is not None and (later.kind, later.total) == ("pdf", 2)
 
 
 # --- the shared rules --------------------------------------------------------------------------------------------

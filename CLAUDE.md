@@ -104,7 +104,10 @@ of a render, `RenderAnswer` and its checks, `kind_of`, the strip rule and
 `render_name`, which the api checks the executor's answer against; it imports no
 imaging library). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
-a render's signature and size alone.
+a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
+the row of its page 1 render and read back leniently, an unknown one ignored, so
+**a field added to `RenderFacts` needs a default**: each version then reads the
+heads the other prepared, and a rollback never leaves a file that always 500s.
 
 ## The tool core and the doors
 
@@ -134,8 +137,10 @@ header selects what the model is told and shown, never what a caller may reach.
   block `i` being `shown[i]`, always. `workbench/api/renders.py` prepares and
   reads the renders back and imports `tools.py`, so `tools.py` never imports it,
   and `read_document`'s function lives here. It decides which render jobs run
-  (`prepared`, `renders_for`) and reads each render back by its row, never one that
-  is not what the row says. A render becomes visible only after its `modify` /
+  (`prepared`, `renders_for`: a file or a page whose renders exist is answered
+  from the rows without the source's lock, and no job runs when the source's
+  renders leave no room for one more) and reads each render back by its row,
+  never one that is not what the row says. A render becomes visible only after its `modify` /
   `file.prepare` event, and leaves only after its `disclose` / `file.view`,
   `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the

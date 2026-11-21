@@ -61,6 +61,7 @@ from pydantic import ValidationError
 from workbench.api.metrics import Metrics
 from workbench.api.store import (
     Conflict,
+    Gone,
     QuotaExceeded,
     RendersFull,
     StorageFull,
@@ -1370,8 +1371,9 @@ class JobQueue:
         Each staged output gets its file id before anything is recorded, so the keeper's event names every file that
         may become visible. The store trusts the path it is given, so only a file the executor staged for this job,
         under ``staging/<job-id>/``, is handed to ``place``. An output that cannot be kept, for whatever reason (the
-        user's quota, a full volume, the source's cap of renders, a render that exists, an invalid name or render, or
-        an error the store does not foresee, which is logged by its type), does not stop the others; those are
+        user's quota, a full volume, the source's cap of renders, a render that exists, an invalid name or render, a
+        source or job that went while it ran, ``gone``, or an error the store does not foresee, which is logged by its
+        type), does not stop the others; those are
         recorded again as errors once all are through. An error record that cannot be written removes the outputs kept
         before it (``_discard``), then goes on up.
 
@@ -1409,6 +1411,8 @@ class JobQueue:
                     why = "duplicate"
                 except (PathError, _Invalid):
                     why = "invalid"
+                except Gone:  # the source, its chat or the job went while the job ran
+                    why = "gone"
                 except (StoreError, OSError):
                     why = "failed"
                 except Exception as exc:  # the event named the output, so it is named again whatever the error

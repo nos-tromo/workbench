@@ -197,6 +197,10 @@ class NotFound(StoreError):
     """No such file, folder or job for this user."""
 
 
+class Gone(NotFound):
+    """The file, job or chat a new file was for went while it was made: its chat was deleted, or retention took it."""
+
+
 class TooLarge(StoreError):
     """An upload is bigger than the per-file limit."""
 
@@ -670,11 +674,11 @@ class Store:
             chat_id: The chat's id.
 
         Raises:
-            NotFound: If the chat is held.
+            Gone: If the chat is held.
         """
         deadline = self._deleted.get((caller, user_id, chat_id))
         if deadline is not None and deadline > self._monotonic():
-            raise NotFound("chat deleted")
+            raise Gone("chat deleted")
 
     def _require_folder(self, real: Path, segments: list[str]) -> None:
         """Make sure a folder exists; a chat folder is made on first use, a deeper one must exist.
@@ -1007,7 +1011,8 @@ class Store:
 
         Raises:
             PathError: If the name is invalid, or ``staged`` is not a regular file.
-            NotFound: If ``staged`` does not exist, or the job's row is gone; ``staged`` stays.
+            NotFound: If ``staged`` does not exist; ``staged`` stays.
+            Gone: If the job's row is gone, with its chat; ``staged`` stays.
             QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
@@ -1017,7 +1022,7 @@ class Store:
             raise ValueError("a file id is 32 lowercase hex digits")
         with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
             if self.find_job(job_id) is None:
-                raise NotFound("job gone")
+                raise Gone("job gone")
             if self.usage(p) + st.st_size > quota_bytes:
                 raise QuotaExceeded("workspace quota exceeded")
             folder = self._ws.chat_dir(p)
@@ -1609,8 +1614,9 @@ class Store:
         Raises:
             PathError: If ``spec.mime`` is no type of render, or ``staged`` is not a regular file.
             ValueError: If ``file_id`` is not 32 lowercase hex digits.
-            NotFound: If ``staged`` does not exist, the source's row is gone, or its chat was deleted within
-                :data:`DELETED_CHAT_HOLD_S`; ``staged`` stays.
+            NotFound: If ``staged`` does not exist; ``staged`` stays.
+            Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`; ``staged``
+                stays.
             Conflict: If the source has a render of this role, ordinal, strip and strips, or ``file_id`` is taken;
                 ``staged`` stays.
             QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
@@ -1627,7 +1633,7 @@ class Store:
         p = Principal(source.caller, source.user_id, source.chat_id)
         with self._lock:  # the source, the room and the folder are settled before retention or a delete may look
             if not self._has_file(source.id, source.caller, source.user_id, source.chat_id):
-                raise NotFound("file not found")
+                raise Gone("file not found")
             self._refuse_deleted(p.caller, p.user_id, p.chat_id)
             rec = DerivedRecord(
                 id=file_id,

@@ -7,8 +7,9 @@ signature and its size alone (:mod:`workbench.renders`).
 
 - :func:`prepared` answers a file's :class:`Manifest`. The first time, one job draws the first pages and finds the
   facts (kind, page count, pages without text), which the whole render of page 1 keeps; every later call answers from
-  the rows, with no job and no event.
-- :func:`renders_for` answers the renders of some pages at a strip count, and makes those that are missing.
+  the rows, with no job, no event and no wait for the source's lock.
+- :func:`renders_for` answers the renders of some pages at a strip count, and makes those that are missing, unless
+  the source's renders leave no room for one more.
 - :func:`read_render` reads one back, or nothing when it is not what its row says.
 - :func:`image_block`, :func:`label`, :func:`shown_image` and :func:`page_window` are what the tools that show images
   share, with the caps of what one answer shows.
@@ -23,7 +24,7 @@ import base64
 import dataclasses
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Final, Literal, Protocol
 
@@ -33,13 +34,14 @@ from pydantic import BaseModel, ValidationError
 
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import CallLimits, Gate, JobQueue, Keeper
-from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store, StoreError
+from workbench.api.store import NotFound, QuotaExceeded, RendersFull, StorageFull, Store, StoreError
 from workbench.api.tools import OutputKeeper, ShownImage, _parse, _payload, _readable, judged
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.paths import PathError
 from workbench.protocol import JobResult
 from workbench.renders import (
+    DERIVED_MAX_BYTES,
     MAX_STRIPS,
     RENDER_MAX_BYTES,
     RENDERS_PER_JOB,
@@ -222,7 +224,10 @@ def _is_render(rec: DerivedRecord) -> bool:
 
 
 def _facts(head: DerivedRecord) -> RenderFacts | None:
-    """Read the facts the whole render of page 1 keeps.
+    """Read the facts the whole render of page 1 keeps, leniently: a fact this version does not know is left out.
+
+    A later version may keep more facts (and gives each it adds a default, so that it reads this version's); a head
+    it prepared is still read here, after a rollback, rather than taken for one with no facts, which no job could mend.
 
     Args:
         head: The whole render of page 1.
@@ -230,8 +235,11 @@ def _facts(head: DerivedRecord) -> RenderFacts | None:
     Returns:
         The facts, or ``None`` when it keeps none that can be read: a render made by a job that did not look for them.
     """
+    stored = head.meta.get("facts")
+    if isinstance(stored, Mapping):
+        stored = {name: value for name, value in stored.items() if name in RenderFacts.model_fields}
     try:
-        return RenderFacts.model_validate(head.meta.get("facts"))
+        return RenderFacts.model_validate(stored)
     except ValidationError:
         return None
 
@@ -321,15 +329,18 @@ def _lost(message: str) -> Exception:
         message: The job's message.
 
     Returns:
-        The store's error of that loss, each a 507: the user's quota, the source's cap of renders or a full volume.
-        Any other loss, such as a render that exists already (or a reserved folder that is not one) or one the store
-        did not foresee, or none, is a 500. The first reason names the loss, except a ``duplicate`` that comes before
-        another: a job of strips draws again the strips of a page that exist, which the store refuses as duplicates
-        before it refuses the one that was lost.
+        The store's error of that loss: a 507 for the user's quota, the source's cap of renders or a full volume, and
+        ``NotFound`` (404) for a source that went while the job ran, with its chat or by retention. Any other loss,
+        such as a render that exists already (or a reserved folder that is not one) or one the store did not foresee,
+        or none, is a 500. The first reason names the loss, except a ``duplicate`` that comes before another: a job of
+        strips draws again the strips of a page that exist, which the store refuses as duplicates before it refuses
+        the one that was lost.
     """
     found = _LOST.search(message)
     reasons: list[str] = found.group(1).split(", ") if found is not None else []
     reason = next((why for why in reasons if why != "duplicate"), reasons[0] if reasons else None)
+    if reason == "gone":
+        return NotFound("file not found")
     if reason == "quota":
         return QuotaExceeded("workspace quota exceeded")
     if reason == "full":
@@ -344,11 +355,11 @@ async def prepared(
 ) -> Manifest:
     """Answer a file's manifest, rendering its first pages the first time.
 
-    A file that is neither a picture nor a PDF is answered at once, ``kind: none``, with no job. Otherwise everything
-    happens under the source's lock: a file whose rows hold the manifest is answered from them, with no job and no
-    event; one that does not has one job, which draws the first pages (but those whole pages it has already), finds the
-    facts and is recorded before any render is visible. A second call for the same file waits for the lock and then
-    finds the rows.
+    A file that is neither a picture nor a PDF is answered at once, ``kind: none``, with no job. A file whose rows hold
+    the manifest is answered from them, with no job, no event and no wait for the source's lock, which a job of later
+    pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job, which draws the
+    first pages (but those whole pages it has already), finds the facts and is recorded before any render is visible.
+    A second call for the same file waits for the lock and then finds the rows.
 
     Args:
         p: The caller, user and chat of the source.
@@ -371,6 +382,7 @@ async def prepared(
         QuotaExceeded: That render would take the user over their quota (507).
         RendersFull: It would take the source over its cap of renders (507).
         StorageFull: The volume is full (507).
+        NotFound: The file went while the job ran, with its chat (404).
     """
     if kind_of(source.name) == "none":
         return Manifest(
@@ -382,6 +394,9 @@ async def prepared(
             frames=None,
             hint=NOT_SHOWN,
         )
+    manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
+    if manifest is not None:
+        return manifest
     async with jobs.source_lock(source.id):
         rows = await run_in_threadpool(store.derived_of, source)
         manifest = manifest_of(source, rows)
@@ -397,6 +412,25 @@ async def prepared(
         if manifest is None:
             raise _lost(result.message)
     return manifest
+
+
+def _no_room(rows: Sequence[DerivedRecord], strips: int) -> bool:
+    """Tell whether a source's renders leave no room for one more at a strip count, so that a job would keep none.
+
+    The store refuses a render that would take its source past ``DERIVED_MAX_BYTES``. The renders of one file at one
+    strip count are of like size, so when the room left is less than the smallest of them the source holds, the job is
+    not run: it would be thrown away, with its event, on every view of a page past the cap. With none held at that
+    strip count, the job runs and the store decides.
+
+    Args:
+        rows: The source's derived files, every one counted.
+        strips: Into how many strips each page would be cut.
+
+    Returns:
+        Whether there is no room.
+    """
+    alike = [rec.size for rec in rows if _is_render(rec) and rec.strips == strips]
+    return bool(alike) and DERIVED_MAX_BYTES - sum(rec.size for rec in rows) < min(alike)
 
 
 def _complete(rows: Sequence[DerivedRecord], role: str, strips: int) -> dict[int, list[DerivedRecord]]:
@@ -434,11 +468,13 @@ async def renders_for(
 
     The rows are read first; when a page lacks a render, the missing pages are made under the source's lock, the rows
     read again inside it, by one job per at most ``RENDERS_PER_JOB // strips`` pages. Each job is recorded before any
-    render it made is visible, and does not look for the facts again: the manifest holds them (ruling R4). A page the
-    job did not make, or whose renders the store could not keep (the user's quota, the source's cap, a full volume), is
-    left out: the answer is only rows that exist. When none of the pages asked for exists once the jobs are through, and
-    a job reported that renders could not be kept, the first such loss is raised, as :func:`prepared` raises the loss of
-    the head (:func:`_lost`); a page left out beside others that exist is not an error.
+    render it made is visible, and does not look for the facts again: the manifest holds them (ruling R4). No job runs
+    when the source's renders leave no room for one more (:func:`_no_room`): the missing pages are left out as the cap
+    would leave them. A page the job did not make, or whose renders the store could not keep (the user's quota, the
+    source's cap, a full volume), is left out: the answer is only rows that exist. When none of the pages asked for
+    exists once the jobs are through, and a job reported that renders could not be kept, the first such loss is raised,
+    as :func:`prepared` raises the loss of the head (:func:`_lost`), or the cap when no job ran for want of room; a page
+    left out beside others that exist is not an error.
 
     Args:
         p: The caller, user and chat of the source.
@@ -463,8 +499,10 @@ async def renders_for(
             answered what cannot be read (500); or no page asked for exists and the loss a job reported is not one of
             the three below (500).
         QuotaExceeded: No page asked for exists, and the first loss was the user's quota (507).
-        RendersFull: No page asked for exists, and the first loss was the source's cap of renders (507).
+        RendersFull: No page asked for exists, and the first loss was the source's cap of renders, or the renders left
+            no room for one more (507).
         StorageFull: No page asked for exists, and the first loss was a full volume (507).
+        NotFound: No page asked for exists, and the file went while a job ran, with its chat (404).
     """
     if not 1 <= strips <= MAX_STRIPS:
         raise ValueError(f"strips is 1 to {MAX_STRIPS}")
@@ -474,11 +512,14 @@ async def renders_for(
     wanted = sorted({n for n in pages if 1 <= n <= manifest.total})
     complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
     losses: list[str] = []
+    full = False
     if any(n not in complete for n in wanted):
         async with jobs.source_lock(source.id):
-            complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
+            rows = await run_in_threadpool(store.derived_of, source)
+            complete = _complete(rows, role, strips)
             missing = [n for n in wanted if n not in complete]
-            if missing:
+            full = bool(missing) and _no_room(rows, strips)
+            if missing and not full:
                 await run_in_threadpool(audit.check, "prepare", p)
                 per_job = RENDERS_PER_JOB // strips
                 for start in range(0, len(missing), per_job):
@@ -495,6 +536,8 @@ async def renders_for(
                         losses.append(result.message)
                 complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
     found = [rec for n in wanted if n in complete for rec in complete[n]]
+    if wanted and not found and full:
+        raise RendersFull("the renders of this file are at their limit")
     if wanted and not found and losses:
         raise _lost(losses[0])
     return found
