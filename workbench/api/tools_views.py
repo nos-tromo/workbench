@@ -1,31 +1,35 @@
-"""The tools that show pictures and pages to the model as images: ``view_file`` and ``read_document``.
+"""The tools that show pictures, pages and slides to the model as images: ``view_file`` and ``read_document``.
 
-A picture or a PDF of the chat is prepared once (:func:`~workbench.api.renders.prepared`): its renders are derived
-files of it, made in the executor, with the metadata removed. This module chooses which of them one answer shows, reads
-them back checked (:func:`~workbench.api.renders.read_render`) and sends them as MCP image blocks for the model alone,
-after the answer's text. It never opens an image itself.
+A picture, a PDF or an Office file of the chat is prepared once (:func:`~workbench.api.renders.prepared`): its renders
+are derived files of it, made in the executor, with the metadata removed; an Office file is converted to a PDF first,
+and its pages (a deck's slides) are drawn from that. This module chooses which of them one answer shows, reads them
+back checked (:func:`~workbench.api.renders.read_render`) and sends them as MCP image blocks for the model alone, after
+the answer's text. It never opens an image itself.
 
 ``view_file`` shows at most ``MAX_VIEW_IMAGES`` images and ``MAX_SHOWN_BYTES`` raw bytes in one answer, and always whole
 pages: a page cut into ``k`` strips is ``k`` images, and the first page that does not fit ends the answer, whose
 ``next_part`` names the rest. A page that cannot be shown is left out and named in the hint, never an error: a render
 that is not what its row says, a page the store could not keep (the user's quota, a full volume, the source's cap of
 renders). The hint also names, each in a whole sentence, the pages after the first four of a PDF when the call named
-no part, and the frames of a picture past its first: the model is told what it has not seen. The answer and its
-blocks go out together: image block ``i`` is ``shown[i]``, in order, always.
+no part, and the frames of a picture past its first: the model is told what it has not seen. A deck is counted, named
+and paged by slide (``slide 3``, ``slides 5-8``), every other file by page; an Office file's own note (such as a deck
+whose pictures are fewer than its slides) is told too. The answer and its blocks go out together: image block ``i`` is
+``shown[i]``, in order, always.
 
 ``read_document`` reads the text as ever, in the executor, and adds the pictures, so that a scan costs the model no
 second round, on a call that takes images (``X-Accept-Images: 1``). A call that takes none is read as workbench 0.6
 read it: no image, no render, no note of one, the reader's own hint as 0.6 wrote it, and a picture file refused by
-the reader. A PDF read that finds pages without a text layer attaches the renders of those pages inside its window,
-under the same rules but with ``MAX_READ_IMAGES`` images; a picture file is read as its image, with no read job. The
-pictures never fail a PDF read, whose text was read already: when they cannot be made (the executor has no room, the
-render job is refused, the user's quota, a full volume or the source's cap of renders stops them) the text is answered
-with ``shown`` empty and a hint. A picture file has no text to fall back on, and fails with them as ``view_file``
-does. Pages of a Word or PowerPoint file are not rendered yet, and a read of one attaches nothing.
+the reader. A PDF read that finds pages without a text layer, or a deck's read that finds slides without text, attaches
+the renders of those pages or slides inside its window, under the same rules but with ``MAX_READ_IMAGES`` images; a
+deck whose pictures are not as many as its slides attaches none, since their numbers may not match. A picture file is
+read as its image, with no read job. The pictures never fail a read, whose text was read already: when they cannot be
+made (the executor has no room, the conversion or the render job is refused, the user's quota, a full volume or the
+source's cap of renders stops them) the text is answered with ``shown`` empty and a hint. A picture file has no text to
+fall back on, and fails with them as ``view_file`` does. A Word or OpenDocument text file is read as text alone, and
+its first read says that ``view_file`` shows its pages.
 
 Every call is recorded as a ``query`` of the source and of each render shown, before any block is returned; a file that
-is not a picture or a PDF is recorded too, with no image. If the event cannot be written the call fails and no image
-leaves.
+shows no image is recorded too, with none. If the event cannot be written the call fails and no image leaves.
 """
 
 import dataclasses
@@ -47,7 +51,6 @@ from workbench.api.renders import (
     NOT_KEPT,
     WithBlocks,
     image_block,
-    not_shown,
     noun_of,
     page_window,
     prepared,
@@ -74,7 +77,7 @@ from workbench.api.tools import (
 )
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
-from workbench.renders import kind_of
+from workbench.renders import Unit, kind_of, unit_of
 from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
@@ -90,19 +93,30 @@ _INTEGER: Final[JsonDict] = {"type": "integer"}
 PICTURE: Final = "This is a picture: it comes with this answer for you to see."
 #: What it says when the picture could not be read back.
 NO_PICTURE: Final = "This picture could not be shown."
-#: What a read of a PDF says when the pictures of its pages without text could not be made now, and may be later.
-UNSHOWN: Final = "The pages without text could not be shown now; view_file shows them."
+#: What a read of a PDF (``pages``) or a deck (``slides``) says when the pictures of its pages or slides without text
+#: could not be made now, and may be later; ``{units}`` is the plural.
+UNSHOWN: Final = "The {units} without text could not be shown now; view_file shows them."
 #: What it says when they cannot be made at all: the cause is named, and view_file is not promised.
-AT_LIMIT: Final = "The pages without text cannot be shown: the renders of this file are at their limit."
-OVER_QUOTA: Final = "The pages without text cannot be shown: the workspace quota is exceeded."
-FULL: Final = "The pages without text cannot be shown: storage is full."
-UNDRAWABLE: Final = "The pages without text cannot be shown: the file cannot be drawn."
+AT_LIMIT: Final = "The {units} without text cannot be shown: the renders of this file are at their limit."
+OVER_QUOTA: Final = "The {units} without text cannot be shown: the workspace quota is exceeded."
+FULL: Final = "The {units} without text cannot be shown: storage is full."
+UNDRAWABLE: Final = "The {units} without text cannot be shown: the file cannot be drawn."
+#: What a read of a deck says when its PDF has another number of pages than the deck has slides, so that a picture's
+#: number may not be its slide's: no picture is attached.
+MISMATCH: Final = (
+    "The slides without text cannot be matched to their pictures here; view_file shows the slides as drawn."
+)
+#: What the first read of a Word or OpenDocument text file adds on a call that takes images: its pages are not attached.
+PAGES_VIEWABLE: Final = "view_file shows its pages as images, as they would print."
 
 #: The refusals of a runner that may pass on another try: they get ``UNSHOWN``, not ``UNDRAWABLE``.
 _TRANSIENT: Final = frozenset({"read_timeout"})
 
-#: A page as the PDF reader labels it.
-_PAGE: Final = re.compile(r"page (\d{1,9})")
+#: A page as the PDF reader labels it, and a slide as the deck's reader does.
+_NUMBERED: Final[Mapping[Unit, re.Pattern[str]]] = {
+    "page": re.compile(r"page (\d{1,9})"),
+    "slide": re.compile(r"slide (\d{1,9})"),
+}
 
 
 class ViewFileRequest(BaseModel):
@@ -110,7 +124,7 @@ class ViewFileRequest(BaseModel):
 
     Attributes:
         path: The file's absolute path.
-        part: Which pages to show; left out, the picture or pages 1-4.
+        part: Which pages or slides to show; left out, the picture or the first four.
         strips: Into how many strips each page is cut.
     """
 
@@ -122,7 +136,8 @@ class ViewFileRequest(BaseModel):
     part: str | None = Field(
         default=None,
         description=(
-            "Which pages to show: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out: the picture, or pages 1-4."
+            "Which pages or slides to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5'; "
+            "left out: the picture, or the first four."
         ),
         json_schema_extra=_STRING,
     )
@@ -134,8 +149,11 @@ class ViewedFile(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``image``, ``pdf``, or ``none`` for a file that is not shown as pictures.
-        total: How many pages the file has; 1 for a picture, 0 for ``none``.
+        kind: ``image``, ``pdf``, ``office`` (a Word, OpenDocument text or PowerPoint file), or ``none`` for a file
+            that is not shown as pictures.
+        unit: What ``total`` and the parts count: ``slide`` for a deck, ``page`` for a PDF or a document; ``None`` for
+            a picture or a file not shown.
+        total: How many pages or slides the file has; 1 for a picture, 0 for ``none``.
         shown: The images that come with this answer, in order: the first is the first image block after the text.
         truncated: Whether pages were left out of this answer for want of room.
         next_part: Where to continue when it was cut.
@@ -143,10 +161,16 @@ class ViewedFile(BaseModel):
     """
 
     path: str = Field(description="The file's path.")
-    kind: Literal["image", "pdf", "none"] = Field(
-        description="image, pdf, or none for a file that is not shown as pictures."
+    kind: Literal["image", "pdf", "office", "none"] = Field(
+        description=(
+            "image, pdf, office (Word, OpenDocument text, PowerPoint), or none for a file not shown as pictures."
+        )
     )
-    total: int = Field(description="How many pages the file has; 1 for a picture, 0 for none.")
+    unit: Literal["page", "slide"] | None = Field(
+        default=None,
+        description="slide for a deck, page for a PDF or a document; null for a picture or a file not shown.",
+    )
+    total: int = Field(description="How many pages or slides the file has; 1 for a picture, 0 for none.")
     shown: list[ShownImage] = Field(
         description="The images that come with this answer, in order: the first is the first image after the text."
     )
@@ -229,32 +253,48 @@ async def _take(store: Store, pages: Mapping[int, list[DerivedRecord]], first: i
     return taken
 
 
-def _part(first: int, last: int) -> str:
-    """Write the pages ``first`` to ``last`` as a ``part`` the tool takes.
+def _part(first: int, last: int, noun: Unit) -> str:
+    """Write the pages (or slides) ``first`` to ``last`` as a ``part`` the tool takes.
 
     Args:
         first: The first page.
         last: The last page.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
-        ``page 9`` or ``pages 9-12``.
+        ``page 9`` or ``pages 9-12``; ``slide 9`` or ``slides 9-12``.
     """
-    return f"page {first}" if first == last else f"pages {first}-{last}"
+    return f"{noun} {first}" if first == last else f"{noun}s {first}-{last}"
 
 
-def _not_shown_after(last: int, total: int) -> str:
-    """Say which pages after the window a call named no part for are not shown, and how to see them.
+def _not_shown_after(last: int, total: int, noun: Unit) -> str:
+    """Say which pages (or slides) after the window a call named no part for are not shown, and how to see them.
 
     Args:
         last: The window's last page.
         total: The file's pages, more than ``last``.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
-        A whole sentence: ``Pages 5-30 are not shown; call view_file with part "pages 5-8".``
+        A whole sentence: ``Pages 5-30 are not shown; call view_file with part "pages 5-8".``, or of slides.
     """
-    rest = f"Page {last + 1} is" if last + 1 == total else f"Pages {last + 1}-{total} are"
-    window = _part(last + 1, min(total, last + DEFAULT_LAST))
+    word = noun.capitalize()
+    rest = f"{word} {last + 1} is" if last + 1 == total else f"{word}s {last + 1}-{total} are"
+    window = _part(last + 1, min(total, last + DEFAULT_LAST), noun)
     return f'{rest} not shown; call view_file with part "{window}".'
+
+
+def _sentence(note: str) -> str:
+    """Write a note of a file's facts, which the executor writes in lower case and with no full stop, as a sentence.
+
+    Args:
+        note: The note, not empty.
+
+    Returns:
+        It with a capital first letter and a full stop at its end.
+    """
+    text = note[0].upper() + note[1:]
+    return text if text.endswith(".") else f"{text}."
 
 
 def _record(
@@ -285,14 +325,16 @@ async def view_file(
     audit: AuditLog,
     jobs: "CallJobs",
 ) -> ViewedFile | WithBlocks:
-    """Show a picture, or pages of a PDF, of the chat as images.
+    """Show a picture, or pages of a PDF or an Office file (a deck's slides), of the chat as images.
 
-    The file is prepared on its first view; the pages asked for are made when they are not there yet. A window that
-    gives more than eight images (``8 // strips`` pages) is shown in part, and ``next_part`` names where the rest
-    begins. A page whose render could not be read back or kept is named in the hint, and a window wholly past the
-    source's cap of renders is answered with that said, not as an error. The hint says too, in whole sentences, which
-    pages a call that named no part does not show (those after the first four of a PDF), and that only the first frame
-    of a picture with several is shown.
+    The file is prepared on its first view (an Office file is converted, then drawn); the pages asked for are made when
+    they are not there yet. A deck is counted by slide: ``part``, the labels, ``next_part`` and the hint say slides. A
+    window that gives more than eight images (``8 // strips`` pages) is shown in part, and ``next_part`` names where the
+    rest begins. A page whose render could not be read back or kept is named in the hint, and a window wholly past the
+    source's cap of renders is answered with that said, not as an error. The hint says too, in whole sentences, an
+    Office file's own note (such as a deck whose pictures are fewer than its slides), which pages a call that named no
+    part does not show (those after the first four of a PDF or an Office file), and that only the first frame of a
+    picture with several is shown.
 
     Args:
         body: The path, the pages, and into how many strips each is cut.
@@ -307,8 +349,8 @@ async def view_file(
         blocks that follow its ``shown``.
 
     Raises:
-        HTTPException: The file cannot be rendered (the runner's refusal), or ``part`` is not a page of it
-            (``no_such_part``).
+        HTTPException: The file cannot be converted or rendered (the runner's refusal), or ``part`` is not a page (a
+            slide, of a deck) of it (``no_such_part``).
         PathError: The path is outside the chat.
         StoreError: The file does not exist, or is not the chat's.
         PurposeRequired: The call had to state a purpose for ``modify`` and did not.
@@ -316,19 +358,17 @@ async def view_file(
         Busy: The lock or the queue did not come free in time, or the executor is busy.
     """
     source = await run_in_threadpool(store.get, p, body.path)
-    if kind_of(source.name) == "office":  # not shown by view_file yet: answered as a file that is not shown, no job
-        manifest = not_shown(source)
-    else:
-        manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+    manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
     strips = body.strips or 1
     paged = body.part is not None
     kind = manifest.kind
     limit = settings.result_max_kb * 1024
-    if kind == "none" or kind == "office":
+    if kind == "none":
         await run_in_threadpool(_record, audit, p, source, [], strips, paged=paged)
         nothing = ViewedFile(
             path=source.virtual_path,
             kind="none",
+            unit=None,
             total=0,
             shown=[],
             truncated=False,
@@ -337,7 +377,8 @@ async def view_file(
         )
         return _within(nothing, limit, keep_none=True)
 
-    first, last = page_window(body.part, manifest.total, default_last=DEFAULT_LAST)
+    noun = manifest.unit  # what the parts and the sentences count: a picture and a PDF count by page
+    first, last = page_window(body.part, manifest.total, default_last=DEFAULT_LAST, unit=noun)
     through = min(last, first + MAX_VIEW_IMAGES // strips - 1)  # the pages one answer may take
     at_limit = False
     rows: list[DerivedRecord] = []
@@ -366,21 +407,22 @@ async def view_file(
         pages.setdefault(rec.ordinal, []).append(rec)
     taken = await _take(store, pages, first, last, through)
     await run_in_threadpool(_record, audit, p, source, taken.renders, strips, paged=paged)
-    notes = (
-        # No page asked for exists, and nothing more can be made.
-        [f"The renders of this file are at their limit, so {_part(first, last)} cannot be shown."]
-        if at_limit
-        else _notes([], taken.left_out, unshown=None)
-    )
+    # An Office file's own note comes first: a deck whose pictures are fewer than its slides is told so on every view.
+    notes = [_sentence(manifest.hint)] if kind == "office" and manifest.hint else []
+    if at_limit:  # no page asked for exists, and nothing more can be made
+        notes.append(f"The renders of this file are at their limit, so {_part(first, last, noun)} cannot be shown.")
+    else:
+        notes += _notes([], taken.left_out, unshown=None, noun=noun)
     if not at_limit and not paged and last < manifest.total:
-        notes.append(_not_shown_after(last, manifest.total))
+        notes.append(_not_shown_after(last, manifest.total, noun))
     if kind == "image" and manifest.frames is not None and taken.renders:
         notes.append(f"Only the first of {manifest.frames} frames is shown.")
     # Nothing more can be made at the source's limit, so a rest there is not offered.
-    rest = None if at_limit or taken.cut_at is None else _part(taken.cut_at, last)
+    rest = None if at_limit or taken.cut_at is None else _part(taken.cut_at, last, noun)
     answer = ViewedFile(
         path=source.virtual_path,
         kind=kind,
+        unit=None if kind == "image" else noun,
         total=manifest.total,
         shown=[shown_image(noun_of(manifest), rec) for rec in taken.renders],
         truncated=rest is not None,
@@ -396,7 +438,7 @@ async def view_file(
 
 @dataclasses.dataclass(frozen=True)
 class _Attached:
-    """The images one read of a PDF attaches, and what became of the pages it asked for.
+    """The images one read of a PDF or a deck attaches, and what became of the pages (or slides) it asked for.
 
     Attributes:
         shown: The renders that go with the answer and their bytes, in the order of the image blocks.
@@ -413,80 +455,87 @@ class _Attached:
     unshown: str | None = None
 
 
-def _page_of(label: str | None) -> int | None:
-    """Read the page a part or a ``next_part`` of a PDF names.
+def _page_of(label: str | None, noun: Unit) -> int | None:
+    """Read the page a part or a ``next_part`` of a PDF names, or the slide one of a deck names.
 
     Args:
-        label: ``page 3``, or ``None``.
+        label: ``page 3`` (``slide 3``), or ``None``.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
-        The page, or ``None`` when the label is none or is not that of a page.
+        The page, or ``None`` when the label is none or is not that of a page (a slide).
     """
-    found = None if label is None else _PAGE.fullmatch(label)
+    found = None if label is None else _NUMBERED[noun].fullmatch(label)
     return None if found is None else int(found.group(1))
 
 
-def _pages(numbers: Sequence[int]) -> str:
-    """Name pages in a sentence.
+def _pages(numbers: Sequence[int], noun: Unit) -> str:
+    """Name pages, or slides, in a sentence.
 
     Args:
         numbers: The pages, in order; at least one.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
-        ``Page 2`` or ``Pages 2, 5``.
+        ``Page 2`` or ``Pages 2, 5``; ``Slide 2`` or ``Slides 2, 5``.
     """
-    return f"Page {numbers[0]}" if len(numbers) == 1 else f"Pages {', '.join(str(n) for n in numbers)}"
+    word = noun.capitalize()
+    return f"{word} {numbers[0]}" if len(numbers) == 1 else f"{word}s {', '.join(str(n) for n in numbers)}"
 
 
-def _cut_note(cut: int) -> str:
+def _cut_note(cut: int, noun: Unit) -> str:
     """Say that the images, not the text, ended the answer, and where to go on.
 
     Args:
-        cut: The first page that did not come with this answer.
+        cut: The first page (slide) that did not come with this answer.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
         A whole sentence, which the text's own cut at the result limit does not use.
     """
     return (
-        f"The answer is cut before page {cut} to keep its images within the limit. "
-        f'Call read_document again with part="page {cut}" to continue.'
+        f"The answer is cut before {noun} {cut} to keep its images within the limit. "
+        f'Call read_document again with part="{noun} {cut}" to continue.'
     )
 
 
-def _unshown_because(lost: Exception) -> str:
+def _unshown_because(lost: Exception, noun: Unit) -> str:
     """Tell the model why the pictures of a read could not be made, and whether view_file can show them later.
 
     Args:
-        lost: What stopped the renders: the executor having no room, a refusal of the render job, or a cap of the store.
+        lost: What stopped the renders: the executor having no room, a refusal of the conversion or the render job, or
+            a cap of the store.
+        noun: What the file counts, ``page`` or ``slide``: the sentence names the pages or the slides without text.
 
     Returns:
         A whole sentence. ``UNSHOWN`` for a cause that may pass (no room now, a job or its runner that ran out of time,
         a job that ran out of memory, a render the store could not keep); one that names the cause, and promises
         nothing, for a cause that will not (the source's cap of renders, the user's quota, a full volume, a file the
-        renderer refuses).
+        converter or the renderer refuses).
     """
     if isinstance(lost, RendersFull):
-        return AT_LIMIT
-    if isinstance(lost, QuotaExceeded):
-        return OVER_QUOTA
-    if isinstance(lost, StorageFull):
-        return FULL
-    if isinstance(lost, HTTPException):
-        if lost.status_code == 507:
-            return FULL
+        told = AT_LIMIT
+    elif isinstance(lost, QuotaExceeded):
+        told = OVER_QUOTA
+    elif isinstance(lost, StorageFull):
+        told = FULL
+    elif isinstance(lost, HTTPException):
         code = str(lost.detail).partition(": ")[0]
         refused = lost.status_code in (404, 422) and code in _RUNNER_ERRORS and code not in _TRANSIENT
-        return UNDRAWABLE if refused else UNSHOWN
-    return UNSHOWN
+        told = FULL if lost.status_code == 507 else UNDRAWABLE if refused else UNSHOWN
+    else:
+        told = UNSHOWN
+    return told.format(units=f"{noun}s")
 
 
-def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: str | None) -> list[str]:
+def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: str | None, noun: Unit) -> list[str]:
     """Say what a read attached, each note a whole sentence.
 
     Args:
         shown: The renders that come with the answer.
         left_out: The pages asked for that could not be shown.
-        unshown: Why the renders could not be made at all (:func:`_unshown_because`), or ``None``.
+        unshown: Why the renders could not be made at all (:func:`_unshown_because`, or ``MISMATCH``), or ``None``.
+        noun: What the file counts, ``page`` or ``slide``.
 
     Returns:
         The notes, in the order they are told: the pages that come as images, then those that could not be shown.
@@ -494,10 +543,10 @@ def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: 
     notes: list[str] = []
     if shown:
         pages = list(dict.fromkeys(rec.ordinal for rec in shown))
-        verb, noun = ("comes", "an image") if len(pages) == 1 else ("come", "images")
-        notes.append(f"{_pages(pages)} {verb} with this answer as {noun}.")
+        verb, what = ("comes", "an image") if len(pages) == 1 else ("come", "images")
+        notes.append(f"{_pages(pages, noun)} {verb} with this answer as {what}.")
     if left_out:
-        notes.append(f"{_pages(left_out)} could not be shown.")
+        notes.append(f"{_pages(left_out, noun)} could not be shown.")
     if unshown:
         notes.append(unshown)
     return notes
@@ -565,24 +614,28 @@ async def _attach_pages(
     source: FileRecord,
     strips: int,
     *,
+    noun: Unit,
     p: Principal,
     settings: Settings,
     store: Store,
     audit: AuditLog,
     jobs: "CallJobs",
 ) -> _Attached:
-    """Choose the images that go with a read of a PDF, and make the renders they need.
+    """Choose the images that go with a read of a PDF or a deck, and make the renders they need.
 
-    The pages are those of ``pages_without_text`` inside the window the text was read for (before the page the text was
-    cut at). Whole pages are taken in order while they fit ``MAX_READ_IMAGES`` images and ``MAX_SHOWN_BYTES`` bytes; the
-    first page always goes, and one page is at most three images, so paging always moves on. Only as many pages are made
-    as can be shown by count. A page that was made but cannot be read back, or could not be made, is left out and
-    named; the page after the last one taken is where the answer ends.
+    The pages (a deck's slides) are those of ``pages_without_text`` inside the window the text was read for (before the
+    page the text was cut at). Whole pages are taken in order while they fit ``MAX_READ_IMAGES`` images and
+    ``MAX_SHOWN_BYTES`` bytes; the first page always goes, and one page is at most three images, so paging always moves
+    on. Only as many pages are made as can be shown by count. A page that was made but cannot be read back, or could
+    not be made, is left out and named; the page after the last one taken is where the answer ends. A deck whose PDF
+    has another number of pages than the reader counted slides attaches none (``MISMATCH``): picture N may not be
+    slide N, and no picture goes out under another slide's number.
 
     Args:
         answer: What the read answered, validated.
-        source: The PDF.
+        source: The PDF, or the deck.
         strips: Into how many strips each page is cut.
+        noun: What the file counts, ``page`` or ``slide``.
         p: The caller, user and chat of the source.
         settings: The api's settings.
         store: The store.
@@ -591,30 +644,34 @@ async def _attach_pages(
 
     Returns:
         The images, the pages left out and where the answer ends. When the renders cannot be made (the executor has no
-        room, the render job is refused, or the user's quota, the volume or the source's cap of renders stops them), no
-        image and ``unshown`` saying why: the read is not failed over its pictures.
+        room, the conversion or the render job is refused, or the user's quota, the volume or the source's cap of
+        renders stops them), or a deck's pictures do not match its slides, no image and ``unshown`` saying why: the
+        read is not failed over its pictures.
 
     Raises:
         PurposeRequired: The call had to state a purpose for ``modify`` (the prepare) and did not.
-        AuditWriteError: A render job's event could not be written.
-        HTTPException: A render job failed in a way that is not a refusal or a loss of the renders (500).
+        AuditWriteError: A conversion's or a render job's event could not be written.
+        HTTPException: A conversion or a render job failed in a way that is not a refusal or a loss of the renders
+            (500).
     """
-    cut_at = _page_of(answer.next_part) if answer.truncated else None
+    cut_at = _page_of(answer.next_part, noun) if answer.truncated else None
     candidates = [n for n in sorted(set(answer.pages_without_text)) if cut_at is None or n < cut_at]
     if not candidates:
         return _Attached()
     wanted = candidates[: max(1, MAX_READ_IMAGES // strips)]  # no later page can fit by count
     try:
         manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+        if noun == "slide" and manifest.total != answer.total_parts:
+            return _Attached(unshown=MISMATCH)
         made = await renders_for(
             p, source, manifest, wanted, strips, settings=settings, store=store, audit=audit, jobs=jobs
         )
     except (Busy, RendersFull, QuotaExceeded, StorageFull) as lost:
-        return _Attached(unshown=_unshown_because(lost))
+        return _Attached(unshown=_unshown_because(lost, noun))
     except HTTPException as lost:
         if lost.status_code == 500 and lost.detail != NOT_KEPT:
             raise  # a refusal of the runner is the pictures' own; a failure of the tool is the call's
-        return _Attached(unshown=_unshown_because(lost))
+        return _Attached(unshown=_unshown_because(lost, noun))
     by_page: dict[int, list[DerivedRecord]] = {}
     for rec in made:
         by_page.setdefault(rec.ordinal, []).append(rec)
@@ -637,18 +694,19 @@ async def _attach_pages(
     return _Attached(shown, left_out)
 
 
-async def _read_pdf(
+async def _read_paged(
     body: ReadDocumentRequest,
     source: FileRecord,
     payload: Mapping[str, Any],
     *,
+    noun: Unit,
     p: Principal,
     settings: Settings,
     store: Store,
     audit: AuditLog,
     jobs: "CallJobs",
 ) -> DocumentRead | WithBlocks:
-    """Answer a read of a PDF that was read, with the images of its pages without text.
+    """Answer a read of a PDF, or of a deck, that was read, with the images of its pages (slides) without text.
 
     The text is cut to the result limit as it is for any file. The images are chosen first for the window the executor
     read; the answer then ends before the first page they did not take (and says it was the images), the cut to the
@@ -657,12 +715,14 @@ async def _read_pdf(
     the text is cut, and room is kept for them first, so that they are never cut themselves, unless that room would
     leave no text at all (a result limit of a kilobyte or so): paging must move on, so the text is cut without it and
     the notes are shortened instead. The read is recorded once, when the images are settled; when the pictures fail the
-    call it is recorded as an ``error`` first.
+    call it is recorded as an ``error`` first. A deck is the same by slide: its parts, ``next_part``, labels and notes
+    say ``slide``.
 
     Args:
         body: The path, the part and the strips.
-        source: The PDF.
+        source: The PDF, or the deck.
         payload: What the read job answered, with the store's path; it reads as a :class:`DocumentRead`.
+        noun: What the file counts: ``page`` for a PDF, ``slide`` for a deck.
         p: The caller, user and chat.
         settings: The api's settings; ``result_max_kb`` caps the answer's text.
         store: The file store.
@@ -684,7 +744,15 @@ async def _read_pdf(
     try:
         attached = (
             await _attach_pages(
-                read, source, body.strips or 1, p=p, settings=settings, store=store, audit=audit, jobs=jobs
+                read,
+                source,
+                body.strips or 1,
+                noun=noun,
+                p=p,
+                settings=settings,
+                store=store,
+                audit=audit,
+                jobs=jobs,
             )
             if read.pages_without_text
             else _Attached()
@@ -695,19 +763,19 @@ async def _read_pdf(
     cut = attached.cut
     base = read
     if cut is not None:
-        kept = [part for part in read.parts if (page := _page_of(part.label)) is None or page < cut]
+        kept = [part for part in read.parts if (page := _page_of(part.label, noun)) is None or page < cut]
         # What the executor said of its own cut no longer holds: the text ends before the images do. It is told again.
         base = read.model_copy(update={"parts": kept, "truncated": False, "next_part": None})
-    base = base.model_copy(update={"shown": [shown_image("page", rec) for rec, _ in attached.shown]})
+    base = base.model_copy(update={"shown": [shown_image(noun, rec) for rec, _ in attached.shown]})
     # The notes come after the text is cut, whole: room is kept for the longest they can be, which is all of them.
     full = base.model_copy(
         update={
             "truncated": base.truncated or cut is not None,
-            "next_part": base.next_part if cut is None else f"page {cut}",
+            "next_part": base.next_part if cut is None else f"{noun} {cut}",
             "hint": _join(
                 base.hint,
-                None if cut is None else _cut_note(cut),
-                *_notes([rec for rec, _ in attached.shown], attached.left_out, unshown=attached.unshown),
+                None if cut is None else _cut_note(cut, noun),
+                *_notes([rec for rec, _ in attached.shown], attached.left_out, unshown=attached.unshown, noun=noun),
             ),
         }
     )
@@ -718,16 +786,17 @@ async def _read_pdf(
         answer = relaxed if relaxed.parts else answer
     ended_by_images = cut is not None and (not answer.truncated or answer.next_part is None)
     if ended_by_images:
-        answer = answer.model_copy(update={"truncated": True, "next_part": f"page {cut}"})
-    stop = _page_of(answer.next_part) if answer.truncated else None
+        answer = answer.model_copy(update={"truncated": True, "next_part": f"{noun} {cut}"})
+    stop = _page_of(answer.next_part, noun) if answer.truncated else None
     kept_images = [(rec, one) for rec, one in attached.shown if stop is None or rec.ordinal < stop]
     shown = [rec for rec, _ in kept_images]
-    notes = _notes(shown, [n for n in attached.left_out if stop is None or n < stop], unshown=attached.unshown)
+    left_out = [n for n in attached.left_out if stop is None or n < stop]
+    notes = _notes(shown, left_out, unshown=attached.unshown, noun=noun)
     answer = answer.model_copy(
         update={
-            "shown": [shown_image("page", rec) for rec in shown],
+            "shown": [shown_image(noun, rec) for rec in shown],
             "pages_without_text": [n for n in answer.pages_without_text if stop is None or n < stop],
-            "hint": _join(answer.hint, _cut_note(cut) if ended_by_images and cut is not None else None, *notes),
+            "hint": _join(answer.hint, _cut_note(cut, noun) if ended_by_images and cut is not None else None, *notes),
         }
     )
     answer = _within(answer, settings.result_max_kb * 1024)
@@ -805,12 +874,15 @@ async def read_document(
     """Read one of the user's files, and show the pictures it holds that have no text.
 
     A file that is not a picture is read in the executor, in the request's chat folder, with that one file as its input,
-    and answered with its text cut to the result limit. A PDF with pages that have no text layer is answered with the
-    renders of those pages inside its window as images, in the same answer. A picture file is not read but shown: it is
-    prepared as ``view_file`` does it, and answered as its image. On a call that takes no images every file is read in
-    the executor and answered with its text alone, ``strips`` ignored, as workbench 0.6 did. The read is recorded by the
-    file's id and then each render shown, once the images are settled and before anything of the answer goes out; a
-    refusal of the job is an ``error`` with its code. Neither the name, the part nor the text is recorded.
+    and answered with its text cut to the result limit. A PDF with pages that have no text layer, or a deck (``.pptx``,
+    ``.potx``) with slides that have no text, is answered with the renders of those pages or slides inside its window
+    as images, in the same answer; a deck is converted and drawn for them first, as ``view_file`` does it. A Word or
+    OpenDocument text file is answered with its text alone; its first read (no ``part``) says that ``view_file`` shows
+    its pages. A picture file is not read but shown: it is prepared as ``view_file`` does it, and answered as its image.
+    On a call that takes no images every file is read in the executor and answered with its text alone, ``strips``
+    ignored, as workbench 0.6 did. The read is recorded by the file's id and then each render shown, once the images are
+    settled and before anything of the answer goes out; a refusal of the job is an ``error`` with its code. Neither the
+    name, the part nor the text is recorded.
 
     Args:
         body: The path, where to start, and into how many strips each image is cut.
@@ -839,12 +911,19 @@ async def read_document(
     args = {"path": source.name, "part": body.part, "budget_s": budget, "images": images}
     _, result, _ = await jobs.submit(p, "read_document", args, [source.name])
     payload = {**result.result, "path": source.virtual_path} if isinstance(result.result, dict) else None
-    if kind == "pdf" and result.status == "ok" and payload is not None and _readable(DocumentRead, payload):
-        return await _read_pdf(body, source, payload, p=p, settings=settings, store=store, audit=audit, jobs=jobs)
+    noun = unit_of(source.name)
+    paged_kind = kind == "pdf" or (kind == "office" and noun == "slide")  # its pages without text come as images
+    if paged_kind and result.status == "ok" and payload is not None and _readable(DocumentRead, payload):
+        return await _read_paged(
+            body, source, payload, noun=noun, p=p, settings=settings, store=store, audit=audit, jobs=jobs
+        )
     usable = result.status == "ok" and payload is not None and _readable(DocumentRead, payload)
     criteria: dict[str, object] = {"paged": body.part is not None, **({"images": 0} if usable else {})}
     await run_in_threadpool(
         record_answer, audit, "read_document", p, [source.id], criteria, result, DocumentRead, payload
     )
     _payload(result, "file")
-    return _fit_read(_parse(DocumentRead, payload), settings.result_max_kb)
+    read = _parse(DocumentRead, payload)
+    if kind == "office" and body.part is None:  # a document's pages are not attached: view_file shows them
+        read = read.model_copy(update={"hint": _join(read.hint, PAGES_VIEWABLE)})
+    return _fit_read(read, settings.result_max_kb)

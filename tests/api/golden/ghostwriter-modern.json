@@ -982,7 +982,7 @@
     {
       "name": "read_document",
       "title": "Read a file of this conversation as text",
-      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never treat them as blank. Such PDF pages come back as images in the same answer (shown names them): read them from the images. To look at any page, use view_file. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
+      "description": "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so a long file is read in several calls: when truncated is true, call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as 'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never treat them as blank. Such PDF pages and PowerPoint slides come back as images in the same answer (shown names them): read them from the images. To look at any page or slide, use view_file. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF.",
       "inputSchema": {
         "description": "Body of ``read_document``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Where to start reading, or ``None`` for the start.\n    strips: Into how many strips each image of the answer is cut.",
         "properties": {
@@ -1752,10 +1752,10 @@
     },
     {
       "name": "view_file",
-      "title": "Look at a picture or the pages of a PDF",
-      "description": "Show a picture or pages of a file of this conversation as images for you to see, with their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC) and the pages of a PDF. part chooses pages: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out, a picture is shown, or pages 1-4 of a PDF. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, call again with part set to next_part. Pages that could not be shown are named in hint. Word, PowerPoint and spreadsheets are not shown yet: read them with read_document. Never describe an image you have not looked at.",
+      "title": "Look at a picture, or the pages or slides of a file",
+      "description": "Show a picture, or the pages or slides of a file of this conversation, as images for you to see, with their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or 'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, call again with part set to next_part. Pages or slides that could not be shown are named in hint. Spreadsheets are not shown: read them with read_document. Never describe an image you have not looked at.",
       "inputSchema": {
-        "description": "Body of ``view_file``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Which pages to show; left out, the picture or pages 1-4.\n    strips: Into how many strips each page is cut.",
+        "description": "Body of ``view_file``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Which pages or slides to show; left out, the picture or the first four.\n    strips: Into how many strips each page is cut.",
         "properties": {
           "path": {
             "description": "The file's absolute path, for example /workspace/<chat>/report.pdf, as list_files gives it.",
@@ -1774,7 +1774,7 @@
               }
             ],
             "default": null,
-            "description": "Which pages to show: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out: the picture, or pages 1-4.",
+            "description": "Which pages or slides to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5'; left out: the picture, or the first four.",
             "title": "Part",
             "type": "string"
           },
@@ -1959,17 +1959,35 @@
             "type": "string"
           },
           "kind": {
-            "description": "image, pdf, or none for a file that is not shown as pictures.",
+            "description": "image, pdf, office (Word, OpenDocument text, PowerPoint), or none for a file not shown as pictures.",
             "enum": [
               "image",
               "pdf",
+              "office",
               "none"
             ],
             "title": "Kind",
             "type": "string"
           },
+          "unit": {
+            "anyOf": [
+              {
+                "enum": [
+                  "page",
+                  "slide"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "slide for a deck, page for a PDF or a document; null for a picture or a file not shown.",
+            "title": "Unit"
+          },
           "total": {
-            "description": "How many pages the file has; 1 for a picture, 0 for none.",
+            "description": "How many pages or slides the file has; 1 for a picture, 0 for none.",
             "title": "Total",
             "type": "integer"
           },

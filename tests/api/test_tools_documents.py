@@ -23,11 +23,14 @@ from pptx import Presentation
 
 from tests.api.conftest import CHAT, FORMER, HG, HG_B, HG_TEXT, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
+from tests.api.test_files_renders import deck
 from tests.api.test_jobs import FakeClient
 from tests.api.test_renders import capped
 from tests.api.test_tools_templates import Local
 from tests.api.test_tools_views import file_of, images, pdf, photo, raw, seen, whole_renders
 from tests.callers import TEXT_ONLY_PAGE_HINT
+from tests.conftest import FakeOffice
+from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
 from workbench.api import tools_views
 from workbench.api.audit import AuditLog
@@ -316,12 +319,16 @@ def test_an_unreadable_job_answer_is_a_fixed_error(
 def test_pages_without_text_and_the_runners_hint_pass_through(
     client: TestClient, store: Store, executor: Scripted
 ) -> None:
-    """The runner's hint is the model's; the slides are listed, and never in ``parts``."""
+    """The runner's hint is the model's; the slides are listed, and never in ``parts``.
+
+    Read without images: with them, a deck's slide without text is converted and drawn, which no scripted job does
+    (``test_a_picture_only_slide_comes_back_as_an_image``).
+    """
     put(store, "slides.pptx", p=PG)
     executor.payload = reading(
         "x", ("slide 1", "text"), kind="pptx", pages_without_text=[2], hint="slide 2 hold no text (pictures only?)."
     )
-    body = answered(read(client, f"{CHAT}/slides.pptx"))
+    body = answered(read(client, f"{CHAT}/slides.pptx", headers=HG_TEXT))
     assert body["pages_without_text"] == [2]
     assert [p["label"] for p in body["parts"]] == ["slide 1"]
     assert body["shown"] == []
@@ -783,6 +790,10 @@ AT_LIMIT = "The pages without text cannot be shown: the renders of this file are
 OVER_QUOTA = "The pages without text cannot be shown: the workspace quota is exceeded."
 FULL = "The pages without text cannot be shown: storage is full."
 UNDRAWABLE = "The pages without text cannot be shown: the file cannot be drawn."
+#: What a read of a deck is told when its slides cannot be matched to their pictures.
+MISMATCH = "The slides without text cannot be matched to their pictures here; view_file shows the slides as drawn."
+#: The end of the first read of a Word or OpenDocument text file, on a call that takes images.
+PAGES_VIEWABLE = "view_file shows its pages as images, as they would print."
 SCANNED = ["Harbour figures 2026", None, "Quay list"]
 
 
@@ -1039,23 +1050,174 @@ def test_an_encrypted_pdf_reads_as_before(
     assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "refused": "unreadable_file"}
 
 
-def test_a_pptx_attaches_nothing_yet(
-    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+def test_without_images_an_office_read_is_as_in_v07(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines, fake_office: FakeOffice
 ) -> None:
-    """Stage 1 shows pictures and PDFs only: a slide without text is listed, with no image and no render job."""
-    deck: Any = Presentation()
-    deck.slides.add_slide(deck.slide_layouts[6])
-    deck.save(str(built / "harbour-deck.pptx"))
+    """R15: a call without ``X-Accept-Images`` reads a deck and a Word file as v0.7.0 did, word for word.
+
+    No image, no note of one, no conversion and no render job; each read is recorded with no image.
+    """
+    blank: Any = Presentation()
+    blank.slides.add_slide(blank.slide_layouts[6])
+    blank.save(str(built / "harbour-deck.pptx"))
     source = put(store, "harbour-deck.pptx", (built / "harbour-deck.pptx").read_bytes(), p=PG)
+    notes = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    answer = seen(read(seeing, source.virtual_path, headers=HG_TEXT))
+
+    assert len(answer["content"]) == 1
+    assert answer["structuredContent"] == {
+        "path": source.virtual_path,
+        "kind": "pptx",
+        "parts": [],
+        "total_parts": 1,
+        "pages_without_text": [1],
+        "shown": [],
+        "truncated": False,
+        "next_part": None,
+        "hint": "slide 1 hold no text (pictures only?); read_document does no OCR.",
+        "outputs": [],
+    }
+    document = answered(read(seeing, notes.virtual_path, headers=HG_TEXT))
+    assert "view_file" not in json.dumps(document)
+    assert local.tools() == ["read_document", "read_document"]
+    assert [req.args["images"] for req in local.requests] == [False, False]
+    assert fake_office.calls == 0
+    assert store.derived_of(source) == store.derived_of(notes) == []
+    first, second = read_events(audit_lines)
+    assert (first["target"]["ids"], second["target"]["ids"]) == ([source.id], [notes.id])
+    assert first["criteria"] == second["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_picture_only_slide_comes_back_as_an_image(
+    seeing: TestClient,
+    local: Picky,
+    store: Store,
+    built: Path,
+    settings: Settings,
+    audit_lines: AuditLines,
+    fake_office: FakeOffice,
+) -> None:
+    """One call: the text of the slides that have it, and the slide that has none as an image, as for a PDF's page."""
+    source = deck(store, built, 3, picture_only=[2])
     answer = seen(read(seeing, source.virtual_path))
 
     structured = answer["structuredContent"]
-    assert (structured["kind"], structured["pages_without_text"], structured["shown"]) == ("pptx", [1], [])
-    assert structured["hint"] == "slide 1 holds no text (pictures only?) and cannot be shown yet; tell the user."
-    assert len(answer["content"]) == 1
-    assert local.tools() == ["read_document"]
+    assert (structured["kind"], structured["total_parts"], structured["pages_without_text"]) == ("pptx", 3, [2])
+    assert [part["label"] for part in structured["parts"]] == ["slide 1", "slide 3"]
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    (item,) = structured["shown"]
+    assert set(item) == SHOWN_KEYS
+    assert (item["label"], item["n"], item["mime"]) == ("slide 2", 2, "image/jpeg")
+    (block,) = images(answer)
+    render = whole_renders(store, source)[2]
+    assert raw(block) == file_of(settings, render).read_bytes()
+    assert structured["hint"] == (
+        "slide 2 holds no text (pictures only?); do not treat them as blank. "
+        "Slide 2 comes with this answer as an image."
+    )
+    assert local.tools() == ["read_document", "convert_office", "prepare_file"]
+    assert fake_office.calls == 1
     (event,) = read_events(audit_lines)
+    assert event["target"]["ids"] == [source.id, render.id]
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 1}
+
+
+def test_a_deck_window_ends_before_a_slide_that_does_not_fit(
+    seeing: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """Four images at most: the fifth slide is where the answer stops, and ``next_part`` names it as a slide."""
+    source = deck(store, built, 6, picture_only=list(range(1, 7)), chart_on=None)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [item["label"] for item in structured["shown"]] == ["slide 1", "slide 2", "slide 3", "slide 4"]
+    assert len(images(answer)) == 4
+    assert structured["parts"] == []
+    assert (structured["truncated"], structured["next_part"]) == (True, "slide 5")
+    assert structured["hint"].endswith(
+        " The answer is cut before slide 5 to keep its images within the limit."
+        ' Call read_document again with part="slide 5" to continue.'
+        " Slides 1, 2, 3, 4 come with this answer as images."
+    )
+    assert structured["pages_without_text"] == [1, 2, 3, 4]
+    rest = seen(read(seeing, source.virtual_path, structured["next_part"]))["structuredContent"]
+    assert [item["label"] for item in rest["shown"]] == ["slide 5", "slide 6"]
+    assert rest["truncated"] is False
+    assert fake_office.calls == 1
+
+
+def test_a_deck_whose_pictures_do_not_match_attaches_nothing(
+    seeing: TestClient,
+    local: Picky,
+    store: Store,
+    built: Path,
+    audit_lines: AuditLines,
+    fake_office: FakeOffice,
+) -> None:
+    """Review Focus 2: a PDF with another count of pages than the deck has slides shows no picture, and says why."""
+    fake_office.drop = {1}
+    source = deck(store, built, 3, picture_only=[2])
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (len(answer["content"]), structured["shown"]) == (1, [])
+    assert [part["label"] for part in structured["parts"]] == ["slide 1", "slide 3"]
+    assert structured["pages_without_text"] == [2]
+    assert structured["hint"] == f"slide 2 holds no text (pictures only?); do not treat them as blank. {MISMATCH}"
+    assert local.tools() == ["read_document", "convert_office", "prepare_file"]  # no render job for the slide
+    (event,) = read_events(audit_lines)
+    assert event["target"]["ids"] == [source.id]
     assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_word_file_reads_as_text_and_points_to_view_file(
+    seeing: TestClient,
+    local: Picky,
+    store: Store,
+    built: Path,
+    audit_lines: AuditLines,
+    fake_office: FakeOffice,
+) -> None:
+    """A document is read as text alone, with no conversion; its first read says view_file shows its pages."""
+    source = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (len(answer["content"]), structured["shown"]) == (1, [])
+    assert structured["parts"]
+    assert structured["hint"] == PAGES_VIEWABLE
+    paged = answered(read(seeing, source.virtual_path, "paragraph 2"))
+    assert PAGES_VIEWABLE not in (paged["hint"] or "")
+    assert local.tools() == ["read_document", "read_document"]
+    assert fake_office.calls == 0
+    assert store.derived_of(source) == []
+    first, second = read_events(audit_lines)
+    assert first["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+    assert second["criteria"] == {"caller": "ghostwriter", "paged": True, "images": 0}
+
+
+def test_a_busy_conversion_still_answers_the_text(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines, fake_office: FakeOffice
+) -> None:
+    """The text was read: a conversion the executor has no room for does not take it back."""
+    source = deck(store, built, 3, picture_only=[2])
+    local.statuses["convert_office"] = "busy"
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [part["label"] for part in structured["parts"]] == ["slide 1", "slide 3"]
+    assert (structured["shown"], structured["pages_without_text"]) == ([], [2])
+    assert len(answer["content"]) == 1
+    assert structured["hint"].endswith(" The slides without text could not be shown now; view_file shows them.")
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    (event,) = read_events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("ok", [source.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+    del local.statuses["convert_office"]  # the next call has room, and shows the slide
+    assert [item["label"] for item in seen(read(seeing, source.virtual_path))["structuredContent"]["shown"]] == [
+        "slide 2"
+    ]
 
 
 @pytest.mark.parametrize("strips", [None, 2])
@@ -1566,14 +1728,14 @@ def test_paging_moves_on_at_the_lowest_result_limit_however_long_the_notes(
 
 
 def test_the_model_is_told_where_the_images_of_a_read_are(client: TestClient) -> None:
-    """The description names the pictures it reads, the pages that come as images, and view_file; no OCR."""
+    """The description names the pictures it reads, the pages and slides that come as images, and view_file; no OCR."""
     tools = listed(client)
     text = tools["read_document"]["description"]
     assert "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image" in text
     assert (
         "pages_without_text lists pages or slides with no text layer (scans, pictures); never treat them as blank. "
-        "Such PDF pages come back as images in the same answer (shown names them): read them from the images. "
-        "To look at any page, use view_file."
+        "Such PDF pages and PowerPoint slides come back as images in the same answer (shown names them): read them "
+        "from the images. To look at any page or slide, use view_file."
     ) in text
     assert "OCR" not in text
     assert "pillow, pypdfium2" in tools["run_python"]["description"]

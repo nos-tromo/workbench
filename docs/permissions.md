@@ -56,9 +56,9 @@ Every tool that runs in the executor also leaves a job record (see
 | Tool | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | `list_files` | names, sizes, dates and kinds of the chat's files, from the database | nothing | not recorded: the user's own metadata | nothing |
-| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer also has the renders of those pages, which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer | for a picture or a PDF with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
+| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer, or a deck (`.pptx`, `.potx`) with slides that have no text, also has the renders of those pages or slides (a deck converted to a PDF first, in a job), which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer | for a picture, or a PDF or a deck with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet, and a deck's PDF; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
-| `view_file` | one picture or PDF of the chat, as a copy in a job when a page is not rendered yet; its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
+| `view_file` | one picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`) of the chat, as a copy in a job when a page is not rendered yet (an Office file is converted to a PDF first, in the same turn); its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet, and an Office file's PDF; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
 | `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
 | `inspect_template` | one template or slide master, as a copy in a job; no file without a path (the plain slide master) | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
@@ -190,28 +190,40 @@ things, the limits that matter to users:
   which loads it in code and writes `out/` as `.xlsx` or `.csv`; its rows are
   not copied into `write_table`. `read_document` shows a JSON file indented,
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
-- Pages and pictures come back as images for the model alone, on a call that
-  takes them (`X-Accept-Images: 1`, see [Callers and
+- Pages, slides and pictures come back as images for the model alone, on a
+  call that takes them (`X-Accept-Images: 1`, see [Callers and
   doors](#callers-and-doors)), after the answer's text, and `shown` names each
   in order (image block `i` is `shown[i]`). `read_document` lists the pages of
-  a PDF that have no text layer in `pages_without_text`, never as blank, and
-  attaches their images in the same answer: the pages of its window, whole, at
-  most 4 images and 2.5 MiB, and the answer ends before the first page that
-  does not fit, with `next_part` naming it. A picture file is read as its
-  image. `view_file` shows any page or picture, at most 8 images; with no
-  part, the first four pages of a PDF, and its hint names the pages after them
-  and the part that shows the next four. A picture of several frames is shown
-  as its first, and the hint says so; a page that could not be shown is named
-  in a sentence. A read whose images cannot be made (the executor has no room,
-  the render is refused, the user's quota or the file's cap of renders is
-  spent) still answers the text, with `shown` empty and a hint: for a cause
-  that may pass (no room now, a job or its reading that ran out of time) that
-  `view_file` shows the pages, and for one that will not (the file's cap of
-  renders, the quota, a full volume, a file that cannot be drawn) the cause,
-  with no promise of `view_file`; a page that cannot be read back is named in
-  the hint. When the images end the answer early, the hint says so and
-  `pages_without_text` lists only the pages before `next_part`. A picture file
-  has no text to fall back on, so its read fails with the render.
+  a PDF that have no text layer, and the slides of a deck (`.pptx`, `.potx`)
+  that have no text, in `pages_without_text`, never as blank, and attaches
+  their images in the same answer: the pages or slides of its window, whole,
+  at most 4 images and 2.5 MiB, and the answer ends before the first that
+  does not fit, with `next_part` naming it (`page 5`, `slide 5`). A deck whose
+  drawn pages are not as many as its slides attaches none, since a picture's
+  number may not be its slide's, and the hint says that `view_file` shows the
+  slides as drawn. A Word or OpenDocument text file (`.docx`, `.dotx`, `.odt`)
+  is read as text alone, and its first read says that `view_file` shows its
+  pages. A picture file is read as its image. `view_file` shows any page,
+  slide or picture, drawn as it would print, at most 8 images; a deck's are
+  labelled and paged by slide (`slide 3`, `slides 9-12`), and `unit` says
+  which. With no part it shows the first four pages or slides, and its hint
+  names those after them and the part that shows the next four. Spreadsheets
+  are not shown, and the hint says to read them with `read_document`. A
+  picture of several frames is shown as its first, and the hint says so; a
+  deck whose drawn pages are fewer than its slides is told so; a page that
+  could not be shown is named in a sentence. A read whose images cannot be
+  made (the executor has no room, the conversion or the render is refused,
+  the user's quota or the file's cap of renders is spent) still answers the
+  text, with `shown` empty and a hint: for a cause that may pass (no room now,
+  a job or its reading that ran out of time) that `view_file` shows the pages
+  or slides, and for one that will not (the file's cap of renders, the quota,
+  a full volume, a file that cannot be drawn) the cause, with no promise of
+  `view_file`; a page that cannot be read back is named in the hint. When the
+  images end the answer early, the hint says so and `pages_without_text` lists
+  only the pages before `next_part`. A picture file has no text to fall back
+  on, so its read fails with the render. None of this is told or shown to a
+  call without `X-Accept-Images: 1`: it reads every Office file as text, as
+  0.6 did.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
 - A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place

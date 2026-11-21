@@ -85,8 +85,8 @@ def _hint(doc: readers.DocumentText, *, images: bool) -> str | None:
 
     Args:
         doc: What the reader returned.
-        images: Whether the call takes images, which the api sends with the read for the pages of a PDF that have no
-            text; without, the pages are named as workbench 0.6 named them, word for word.
+        images: Whether the call takes images, which the api sends with the read for the pages of a PDF and the slides
+            of a deck that have no text; without, they are named as workbench 0.6 named them, word for word.
 
     Returns:
         A hint, or ``None`` if there is nothing to add.
@@ -95,9 +95,9 @@ def _hint(doc: readers.DocumentText, *, images: bool) -> str | None:
     if doc.pages_without_text:
         if doc.kind == "pptx":
             slides = _numbers("slide", doc.pages_without_text)
-            if images:  # only the pages of a PDF are shown as images: a slide is not, yet
+            if images:  # the api names the slides that come as images: none is promised here
                 verb = "holds" if len(doc.pages_without_text) == 1 else "hold"
-                notes.append(f"{slides} {verb} no text (pictures only?) and cannot be shown yet; tell the user.")
+                notes.append(f"{slides} {verb} no text (pictures only?); do not treat them as blank.")
             else:
                 notes.append(f"{slides} hold no text (pictures only?); read_document does no OCR.")
         else:

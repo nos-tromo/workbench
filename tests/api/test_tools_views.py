@@ -22,8 +22,10 @@ from PIL import Image
 
 from tests.api.conftest import HD, HG, PG, AuditLines, put
 from tests.api.mcp_calls import Headers, acall, answered, refusal, result, rpc, unavailable
+from tests.api.test_files_renders import deck
 from tests.api.test_renders import capped, quay_pages
 from tests.api.test_tools_templates import Local
+from tests.conftest import FakeOffice
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
 from workbench.api import tools_views
@@ -37,7 +39,7 @@ from workbench.config import Settings
 from workbench.executor.runners import RUNNERS
 from workbench.models import DerivedRecord, FileRecord, Principal
 
-ANSWER_KEYS = {"path", "kind", "total", "shown", "truncated", "next_part", "hint", "outputs"}
+ANSWER_KEYS = {"path", "kind", "unit", "total", "shown", "truncated", "next_part", "hint", "outputs"}
 SHOWN_KEYS = {"label", "n", "width", "height", "mime"}
 NAMES = [
     "fill_template",
@@ -408,17 +410,18 @@ def test_view_file_shows_a_chart_run_python_made(
     assert answer["structuredContent"]["shown"][0]["label"] == "image"
 
 
-def test_view_file_on_a_word_file_says_read_it(
+def test_view_file_says_a_spreadsheet_is_not_shown(
     client: TestClient, store: Store, built: Path, fake_executor: Local, audit_lines: AuditLines
 ) -> None:
-    """A Word file is not shown: one text block, no job, and a call that is recorded all the same."""
-    source = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    """A spreadsheet is not shown: one text block, no job, and a call that is recorded all the same."""
+    source = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
     answer = seen(view(client, source.virtual_path))
 
     assert len(answer["content"]) == 1
     assert answer["structuredContent"] == {
         "path": source.virtual_path,
         "kind": "none",
+        "unit": None,
         "total": 0,
         "shown": [],
         "truncated": False,
@@ -430,6 +433,129 @@ def test_view_file_on_a_word_file_says_read_it(
     (event,) = events(audit_lines)
     assert (event["action"], event["outcome"], event["target"]["ids"]) == ("query", "ok", [source.id])
     assert event["criteria"] == {"caller": "ghostwriter", "images": 0, "strips": 1, "paged": False}
+
+
+def test_the_unit_is_null_for_a_picture_and_page_for_a_pdf(client: TestClient, store: Store, built: Path) -> None:
+    """The contract: ``unit`` counts what ``total`` counts, and a picture has none."""
+    still = photo(store, built)
+    source = pdf(store, built, "quay-list.pdf", quay_pages(2))
+
+    assert seen(view(client, still.virtual_path))["structuredContent"]["unit"] is None
+    assert seen(view(client, source.virtual_path))["structuredContent"]["unit"] == "page"
+
+
+# --- Office files: the pages of a document, the slides of a deck --------------------------------------------------
+
+
+def test_view_file_shows_the_slides_of_a_deck(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice, audit_lines: AuditLines
+) -> None:
+    """A deck is converted once and drawn; its slides are labelled as slides, and the rest is named by slide."""
+    source = deck(store, built, 6)
+    answer = seen(view(client, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert set(structured) == ANSWER_KEYS
+    assert (structured["kind"], structured["unit"], structured["total"]) == ("office", "slide", 6)
+    assert [shown["label"] for shown in structured["shown"]] == ["slide 1", "slide 2", "slide 3", "slide 4"]
+    assert [shown["n"] for shown in structured["shown"]] == [1, 2, 3, 4]
+    assert len(images(answer)) == 4
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    assert structured["hint"] == 'Slides 5-6 are not shown; call view_file with part "slides 5-6".'
+    assert fake_office.calls == 1
+    (event,) = events(audit_lines)
+    renders = whole_renders(store, source)
+    assert event["target"]["ids"] == [source.id, *(renders[n].id for n in (1, 2, 3, 4))]
+    assert event["criteria"] == {"caller": "ghostwriter", "images": 4, "strips": 1, "paged": False}
+
+
+def test_view_file_pages_a_deck_by_slides(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """Twelve slides asked for give eight, ``next_part`` names the rest by slide, and the slide grammar is taken."""
+    source = deck(store, built, 12)
+    answer = seen(view(client, source.virtual_path, "slides 1-12"))
+
+    structured = answer["structuredContent"]
+    assert len(images(answer)) == 8
+    assert [shown["n"] for shown in structured["shown"]] == list(range(1, 9))
+    assert (structured["truncated"], structured["next_part"]) == (True, "slides 9-12")
+    again = seen(view(client, source.virtual_path, structured["next_part"]))["structuredContent"]
+    assert [shown["label"] for shown in again["shown"]] == [f"slide {n}" for n in range(9, 13)]
+    assert again["truncated"] is False
+    for part, slides in (("slide 3", [3]), ("3", [3]), ("Slides 2-3", [2, 3]), ("2-3", [2, 3])):
+        shown = seen(view(client, source.virtual_path, part))["structuredContent"]["shown"]
+        assert [item["n"] for item in shown] == slides, part
+    assert fake_office.calls == 1
+
+
+def test_view_file_refuses_a_page_of_a_deck(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """A deck counts slides: ``page 2`` is not of its grammar, and a slide past the end names how many there are."""
+    source = deck(store, built, 3)
+
+    assert refusal(view(client, source.virtual_path, "page 2")) == (
+        "refused",
+        "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'",
+    )
+    assert refusal(view(client, source.virtual_path, "slide 4")) == (
+        "refused",
+        "no_such_part: this document has 3 slides",
+    )
+
+
+def test_view_file_shows_a_word_file_as_pages(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """A Word file is converted and drawn as pages, labelled as a PDF's are; it takes the page grammar alone."""
+    source = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    answer = seen(view(client, source.virtual_path, "page 1"))
+
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["unit"], structured["total"]) == ("office", "page", 3)
+    assert [shown["label"] for shown in structured["shown"]] == ["page 1"]
+    assert len(images(answer)) == 1
+    assert structured["hint"] is None
+    assert fake_office.decks == [False]
+    assert refusal(view(client, source.virtual_path, "slide 1")) == (
+        "refused",
+        "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'",
+    )
+
+
+def test_view_file_names_a_slide_count_that_differs(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """Review Focus 2: a build that leaves a slide out draws fewer pictures; the hint says their numbers may be off."""
+    fake_office.drop = {2}
+    source = deck(store, built, 3)
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+
+    assert (structured["total"], [shown["label"] for shown in structured["shown"]]) == (2, ["slide 1", "slide 2"])
+    assert structured["hint"] == (
+        "The deck has 3 slides and 2 were drawn, so a picture's number may not be its slide's."
+    )
+
+
+def test_view_file_shows_a_deck_written_in_the_chat(
+    client: TestClient, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deck a tool wrote is a file of the chat like any other: it is converted and shown by slide."""
+
+    def writes_a_deck(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        mk.make_deck(ctx.out_dir / "harbour-deck.pptx", 2)
+        return {"stdout": "", "stderr": "", "truncated": False}
+
+    monkeypatch.setitem(RUNNERS, "run_python", writes_a_deck)
+    (path,) = answered(acall(client, "run_python", {"code": "pass"}))["files"]
+    answer = seen(view(client, path))
+
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["unit"]) == ("office", "slide")
+    assert [shown["label"] for shown in structured["shown"]] == ["slide 1", "slide 2"]
+    assert len(images(answer)) == 2
+    assert fake_office.calls == 1
 
 
 # --- what is recorded --------------------------------------------------------------------------------------------

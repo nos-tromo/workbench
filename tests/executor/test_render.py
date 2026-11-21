@@ -1224,12 +1224,12 @@ def test_the_hint_on_a_scanned_pdf_says_what_to_do_without_the_tool_name() -> No
 @pytest.mark.parametrize(
     ("slides", "said"),
     [
-        ([3], "slide 3 holds no text (pictures only?) and cannot be shown yet; tell the user."),
-        ([3, 7], "slides 3, 7 hold no text (pictures only?) and cannot be shown yet; tell the user."),
+        ([3], "slide 3 holds no text (pictures only?); do not treat them as blank."),
+        ([3, 7], "slides 3, 7 hold no text (pictures only?); do not treat them as blank."),
     ],
 )
-def test_the_hint_on_a_deck_says_its_slides_cannot_be_shown_yet(slides: list[int], said: str) -> None:
-    """Final review M6: only PDF pages are rendered, so a slide without text is not promised as an image."""
+def test_the_hint_on_a_deck_says_not_to_treat_its_slides_as_blank(slides: list[int], said: str) -> None:
+    """The slide sentence mirrors the PDF one; the api names the slides that come as images, so none is promised."""
     doc = DocumentText(kind="pptx", parts=[], pages_without_text=slides, total_parts=8)
 
     hint = _hint(doc, images=True)
