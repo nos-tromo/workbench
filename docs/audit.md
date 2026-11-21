@@ -47,7 +47,7 @@ The `container` is the chat folder the files live in.
 | Key | `action` / `operation` | `target.ids` | `criteria` besides `caller` | Outcome |
 |---|---|---|---|---|
 | `upload` | `collect` / `file.upload` | the new file (Ghostwriter's answer names it as `id`) | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
-| `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
+| `view` | `disclose` / `file.view` | the file viewed or downloaded; for a rendition, the file and the render | — | `ok`, before the bytes go |
 | `prepare` | `modify` / `file.prepare` | the picture or PDF rendered, then every render kept | `renders`: how many renders the job made; `strips`: into how many strips each page is cut (1 for whole pages); `on_demand`: `false` for the prepare of a file, `true` for a job that makes pages or strips a later call asks for; `outputs`: how many renders are kept, `0` on an `error` | before any render is visible: `ok`, or `error` (below), which keeps no render. A file prepared already is answered from its renders, with no job and no event |
 | `chat_delete` | `delete` / `chat.delete` | every file of the chat Ghostwriter deletes, `container` that chat | — | `ok`, before anything of the chat goes, also with no file; `error` again when the deletion then failed |
 | `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |

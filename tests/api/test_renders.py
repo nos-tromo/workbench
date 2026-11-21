@@ -461,12 +461,16 @@ async def test_a_calls_jobs_render_on_demand_too(world: World) -> None:
 
 
 async def test_a_source_at_its_render_cap_says_so(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Review Focus 5: a page past the cap is left out, the pages rendered are still served; a head past it is 507."""
+    """Review Focus 5: a page past the cap is 507 when it is all that was asked; pages rendered are still served.
+
+    A call for a page that was lost and one that exists answers the one that exists. A head past the cap is 507 too.
+    """
     source = world.pdf("quay-list.pdf", quay_pages(22))
     manifest = await world.prepare(source)
     capped(world.store, monkeypatch, sum(row.size for row in world.store.derived_of(source)))
 
-    assert await world.renders(source, manifest, [21]) == []
+    with pytest.raises(RendersFull):
+        await world.renders(source, manifest, [21])
     assert [r.ordinal for r in await world.renders(source, manifest, [1, 21])] == [1]
     assert [event["outcome"] for event in world.events()][1:] == ["ok", "error", "ok", "error"]
 
@@ -491,7 +495,10 @@ async def test_two_views_of_one_later_page_at_once_run_one_job(world: World) -> 
 
 
 async def test_a_page_that_lost_a_strip_is_left_out_whole(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A page whose second strip the store could not keep is not answered as half a page, now or when asked again."""
+    """A page whose second strip the store could not keep is not answered as half a page, now or when asked again.
+
+    With no page of the call left whole, the loss itself is raised; with one left, that one is answered.
+    """
     source = world.pdf("quay-list.pdf", quay_pages(2))
     manifest = await world.prepare(source)
     real = world.store.register_derived
@@ -503,10 +510,66 @@ async def test_a_page_that_lost_a_strip_is_left_out_whole(world: World, monkeypa
 
     monkeypatch.setattr(world.store, "register_derived", refuse_second)
 
-    assert await world.renders(source, manifest, [1, 2], 2) == []
+    with pytest.raises(RendersFull):
+        await world.renders(source, manifest, [1, 2], 2)
     assert [(row.ordinal, row.strip) for row in world.store.derived_of(source) if row.strips == 2] == [(1, 1), (2, 1)]
-    assert await world.renders(source, manifest, [2], 2) == []
+    with pytest.raises(RendersFull):
+        await world.renders(source, manifest, [2], 2)
     assert len(world.executor.requests) == 3  # asked again, the page is made again
+
+
+@pytest.mark.parametrize(
+    ("error", "raised"),
+    [
+        (QuotaExceeded("workspace quota exceeded"), QuotaExceeded),
+        (RendersFull("the renders of this file are at their limit"), RendersFull),
+        (StorageFull("storage is full"), StorageFull),
+        (Conflict("render exists"), HTTPException),
+        (NotFound("file not found"), HTTPException),
+    ],
+    ids=["quota", "full", "storage-full", "duplicate", "failed"],
+)
+async def test_pages_none_of_which_came_back_raise_their_loss(
+    world: World, monkeypatch: pytest.MonkeyPatch, error: StoreError, raised: type[Exception]
+) -> None:
+    """Ruling R6: when no page asked for exists once the jobs are through, the first loss they reported is raised.
+
+    It is the store's own error as :func:`prepared` raises it for the head: the user's quota, the source's cap, a full
+    volume (each 507), and a 500 of the route's own text for any other loss. The pages that exist stay served.
+    """
+    source = world.pdf("quay-list.pdf", quay_pages(22))
+    manifest = await world.prepare(source)
+
+    def refuse(*_: Any, **__: Any) -> DerivedRecord:
+        raise error
+
+    monkeypatch.setattr(world.store, "register_derived", refuse)
+    with pytest.raises(raised) as lost:
+        await world.renders(source, manifest, [21])
+
+    if isinstance(lost.value, HTTPException):
+        assert (lost.value.status_code, lost.value.detail) == (500, "the renders of this file could not be kept")
+    else:
+        assert str(lost.value) == str(error)
+    assert [r.ordinal for r in await world.renders(source, manifest, [1])] == [1]
+    assert [r.ordinal for r in await world.renders(source, manifest, [1, 21])] == [1]
+
+
+async def test_a_page_the_job_did_not_make_is_left_out_without_a_loss(world: World) -> None:
+    """A job that answers ``ok`` without the page, and reports no loss, leaves it out: nothing to raise."""
+    source = world.pdf("quay-list.pdf", quay_pages(22))
+    manifest = await world.prepare(source)
+    world.executor.payload = {
+        "kind": "pdf",
+        "total": 22,
+        "pages_without_text": [],
+        "frames": None,
+        "hint": None,
+        "renders": [],
+    }
+
+    assert await world.renders(source, manifest, [21]) == []
+    assert len(world.executor.requests) == 2
 
 
 async def test_a_busy_queue_propagates(world: World) -> None:

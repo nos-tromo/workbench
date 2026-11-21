@@ -320,10 +320,13 @@ def _lost(message: str) -> Exception:
     Returns:
         The store's error of that loss, each a 507: the user's quota, the source's cap of renders or a full volume.
         Any other loss, such as a render that exists already (or a reserved folder that is not one) or one the store
-        did not foresee, or none, is a 500.
+        did not foresee, or none, is a 500. The first reason names the loss, except a ``duplicate`` that comes before
+        another: a job of strips draws again the strips of a page that exist, which the store refuses as duplicates
+        before it refuses the one that was lost.
     """
     found = _LOST.search(message)
-    reason = found.group(1).split(", ")[0] if found is not None else None
+    reasons: list[str] = found.group(1).split(", ") if found is not None else []
+    reason = next((why for why in reasons if why != "duplicate"), reasons[0] if reasons else None)
     if reason == "quota":
         return QuotaExceeded("workspace quota exceeded")
     if reason == "full":
@@ -430,7 +433,9 @@ async def renders_for(
     read again inside it, by one job per at most ``RENDERS_PER_JOB // strips`` pages. Each job is recorded before any
     render it made is visible, and does not look for the facts again: the manifest holds them (ruling R4). A page the
     job did not make, or whose renders the store could not keep (the user's quota, the source's cap, a full volume), is
-    left out: the answer is only rows that exist.
+    left out: the answer is only rows that exist. When none of the pages asked for exists once the jobs are through, and
+    a job reported that renders could not be kept, the first such loss is raised, as :func:`prepared` raises the loss of
+    the head (:func:`_lost`); a page left out beside others that exist is not an error.
 
     Args:
         p: The caller, user and chat of the source.
@@ -452,7 +457,11 @@ async def renders_for(
         AuditWriteError: A job's event could not be written; none of its renders is kept.
         Busy: The lock or the queue did not come free in time, or the executor is busy.
         HTTPException: The runner refused the file (its code's status), the job ran out of time (422), or failed or
-            answered what cannot be read (500).
+            answered what cannot be read (500); or no page asked for exists and the loss a job reported is not one of
+            the three below (500).
+        QuotaExceeded: No page asked for exists, and the first loss was the user's quota (507).
+        RendersFull: No page asked for exists, and the first loss was the source's cap of renders (507).
+        StorageFull: No page asked for exists, and the first loss was a full volume (507).
     """
     if not 1 <= strips <= MAX_STRIPS:
         raise ValueError(f"strips is 1 to {MAX_STRIPS}")
@@ -461,6 +470,7 @@ async def renders_for(
     role = "image" if manifest.kind == "image" else "page"
     wanted = sorted({n for n in pages if 1 <= n <= manifest.total})
     complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
+    losses: list[str] = []
     if any(n not in complete for n in wanted):
         async with jobs.source_lock(source.id):
             complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
@@ -478,8 +488,13 @@ async def renders_for(
                     keeper = _keeper(audit, p, source, strips=strips, on_demand=True)
                     _, result, _ = await jobs.submit_renders(p, source, args, keeper)
                     _parse(RenderAnswer, _payload(result, "file"))
+                    if _LOST.search(result.message) is not None:
+                        losses.append(result.message)
                 complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
-    return [rec for n in wanted if n in complete for rec in complete[n]]
+    found = [rec for n in wanted if n in complete for rec in complete[n]]
+    if wanted and not found and losses:
+        raise _lost(losses[0])
+    return found
 
 
 def read_render(store: Store, rec: DerivedRecord) -> bytes | None:

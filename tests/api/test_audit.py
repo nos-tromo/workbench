@@ -4,13 +4,12 @@ import dataclasses
 import io
 import json
 from collections.abc import Iterator
-from functools import partial
 from typing import Any, override
 
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CALL, HG, PG
+from tests.api.conftest import HG, PG
 from tests.api.mcp_calls import acall, answered
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_inline import body as inline_body
@@ -19,7 +18,6 @@ from workbench.api.audit import OPERATIONS, SERVICE, AuditLog, PurposeRequired
 from workbench.api.jobs import PNG_SIGNATURE, JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.renders import RouteJobs, prepared
 from workbench.api.store import Store
 from workbench.config import Settings, load_settings
 from workbench.models import Principal
@@ -366,11 +364,9 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         render = {"name": "p0001.png", "role": "image", "n": 1, "width": 8, "height": 8, "mime": "image/png"}
         executor.payload = {"kind": "image", "total": 1, "pages_without_text": [], "frames": None, "hint": None}
         executor.payload["renders"] = [render]
-        source = store.get(PG, f"/workspace/chat-1/{word}-scan.png")
-        portal = client.portal
-        assert portal is not None
-        jobs = RouteJobs(queue, CALL, "prepare")  # as the prepare route will run it, on the app's own loop
-        portal.call(partial(prepared, PG, source, settings=settings, store=store, audit=audit, jobs=jobs))
+        scan_path = f"/workspace/chat-1/{word}-scan.png"
+        source = store.get(PG, scan_path)
+        assert client.post("/files/prepare", params={"path": scan_path}, headers=HG).status_code == 200
         assert len(store.derived_of(source)) == 1
         executor.files = {}
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}

@@ -13,15 +13,15 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the nine) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and five file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the nine) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`. Every such `404` is
   `{"detail": "not found"}`.
-- Ghostwriter's key reaches `/mcp` and four file routes: `/files/upload`,
-  `/files/view`, `/files/list` and `/files/chat`. A purpose it must state and
-  did not is `428` on a file route.
+- Ghostwriter's key reaches `/mcp` and five file routes: `/files/upload`,
+  `/files/prepare`, `/files/view`, `/files/list` and `/files/chat`. A purpose
+  it must state and did not is `428` on a file route.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
@@ -71,7 +71,8 @@ chat.
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
-| view and download, `GET /files/view` | one file's bytes, sent to the caller | nothing | `disclose` / `file.view` | nothing |
+| prepare, `POST /files/prepare` | a picture or PDF, as a copy in a job of the executor; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF, or the picture | `modify` / `file.prepare`, before any render is visible | the renders, until the source goes; the answer is their manifest |
+| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
 | `DELETE /files/chat` | nothing | the chat's files and rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
 

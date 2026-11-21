@@ -13,6 +13,7 @@ from workbench.api.auth import (
     require_file_principal,
 )
 from workbench.api.errors import INVALID_PURPOSE
+from workbench.api.jobs import Busy, JobQueue
 from workbench.api.store import Store
 from workbench.config import Settings
 from workbench.models import Principal
@@ -45,6 +46,37 @@ async def get_store(request: Request) -> Store:
     return store
 
 
+async def get_maybe_jobs(request: Request) -> JobQueue | None:
+    """Return the job queue the application was created with, if it has one.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The queue, or ``None`` for an app built without one.
+    """
+    jobs: JobQueue | None = request.app.state.jobs
+    return jobs
+
+
+async def get_jobs(request: Request) -> JobQueue:
+    """Return the job queue the application was created with, for a route that cannot do without it.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The queue.
+
+    Raises:
+        Busy: The app was built without a queue, so no job can run: ``executor_busy``, as the tools answer it.
+    """
+    jobs = await get_maybe_jobs(request)
+    if jobs is None:
+        raise Busy("executor_busy")
+    return jobs
+
+
 async def call_audit(
     request: Request,
     _caller: Annotated[Caller, Depends(require_file_caller)],
@@ -74,9 +106,14 @@ async def call_audit(
     return audit.bound(purpose, request_id, required=settings.require_purpose)
 
 
-#: Route parameter types: the user and chat on a file route, the log it records through, and the collaborators the app
-#: was built with.
+#: Route parameter types: the user and chat on a file route, the caller, the log it records through, and the
+#: collaborators the app was built with.
 FilePrincipalDep = Annotated[Principal, Depends(require_file_principal)]
+CallerDep = Annotated[Caller, Depends(require_file_caller)]
 CallAuditDep = Annotated[AuditLog, Depends(call_audit)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 StoreDep = Annotated[Store, Depends(get_store)]
+#: The job queue, refusing as busy when the app has none; and the queue or ``None``, for a route that needs it only
+#: for some requests.
+JobsDep = Annotated[JobQueue, Depends(get_jobs)]
+MaybeJobsDep = Annotated[JobQueue | None, Depends(get_maybe_jobs)]

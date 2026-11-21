@@ -53,8 +53,11 @@ MCP_PATH: Final = "/mcp"
 #: The chat delete, a confined caller's alone.
 CHAT_PATH: Final = "/files/chat"
 
+#: The prepare of a picture or a PDF, a confined caller's alone.
+PREPARE_PATH: Final = "/files/prepare"
+
 #: The file routes a confined caller reaches besides the MCP door.
-FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", CHAT_PATH})
+FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", PREPARE_PATH, CHAT_PATH})
 
 #: The texts of the two refusals of the user and chat headers, on the MCP door and the file routes.
 INVALID_USER: Final = "missing or invalid user"
