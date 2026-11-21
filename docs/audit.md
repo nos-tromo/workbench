@@ -48,6 +48,7 @@ The `container` is the chat folder the files live in.
 |---|---|---|---|---|
 | `upload` | `collect` / `file.upload` | the new file (Ghostwriter's answer names it as `id`) | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
 | `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
+| `prepare` | `modify` / `file.prepare` | the picture or PDF rendered, then every render kept | `renders`: how many renders the job made; `strips`: into how many strips each page is cut (1 for whole pages); `on_demand`: `false` for the prepare of a file, `true` for a job that makes pages or strips a later call asks for; `outputs`: how many renders are kept, `0` on an `error` | before any render is visible: `ok`, or `error` (below), which keeps no render. A file prepared already is answered from its renders, with no job and no event |
 | `chat_delete` | `delete` / `chat.delete` | every file of the chat Ghostwriter deletes, `container` that chat | — | `ok`, before anything of the chat goes, also with no file; `error` again when the deletion then failed |
 | `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
 | `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
@@ -82,7 +83,9 @@ A tool that makes files writes a second, `error` event, with `outputs` counting
 them, for new files its event named that did not end as it said: not stored
 after all (the user's quota, a full disk, an invalid name, any other error of
 the store), or stored and then removed again, or not removed, when the call
-failed or its caller went away (`workbench/api/jobs.py:JobQueue`).
+failed or its caller went away (`workbench/api/jobs.py:JobQueue`). A `prepare`
+does the same for its renders, among them one past its source's cap of renders
+or one that exists already (`workbench/api/renders.py`).
 
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.

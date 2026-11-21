@@ -226,6 +226,24 @@ class DocumentPart(BaseModel):
     text: str = Field(description="The text.")
 
 
+class ShownImage(BaseModel):
+    """An image that comes with the answer for you to see: a picture, a page, or a strip of either.
+
+    Attributes:
+        label: What it is: ``image``, ``page 3``, ``page 3, strip 1 of 2``.
+        n: The page, counted from 1; 1 for a picture.
+        width: Its width in pixels.
+        height: Its height in pixels.
+        mime: Its type.
+    """
+
+    label: str = Field(max_length=100, description="What the image is: 'image', 'page 3' or 'page 3, strip 1 of 2'.")
+    n: int = Field(description="The page, counted from 1; 1 for a picture.")
+    width: int = Field(description="Its width in pixels.")
+    height: int = Field(description="Its height in pixels.")
+    mime: Literal["image/jpeg", "image/png"] = Field(description="Its media type.")
+
+
 class DocumentRead(BaseModel):
     """What ``read_document`` answers.
 

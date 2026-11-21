@@ -53,6 +53,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "write_document": ("collect", "tool.write_document"),
     "write_presentation": ("modify", "tool.write_presentation"),
     "chat_delete": ("delete", "chat.delete"),
+    "prepare": ("modify", "file.prepare"),
 }
 
 _SYSTEM_ACTOR: Final = Actor(user=None, via="system")
