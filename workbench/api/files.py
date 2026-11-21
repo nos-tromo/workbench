@@ -37,7 +37,7 @@ from workbench.api.auth import CHAT_PATH, PREPARE_PATH, Caller
 from workbench.api.deps import CallAuditDep, CallerDep, FilePrincipalDep, JobsDep, MaybeJobsDep, SettingsDep, StoreDep
 from workbench.api.errors import INTERNAL
 from workbench.api.jobs import MCP_QUEUE_WAIT_S, PREPARE_QUEUE_WAIT_S, Busy, CallLimits, Gate, JobQueue
-from workbench.api.renders import RouteJobs, prepared, read_render, renders_for
+from workbench.api.renders import Noun, RouteJobs, noun_of, prepared, read_render, renders_for
 from workbench.api.routing import EncodableRoute
 from workbench.api.store import NotFound, Store
 from workbench.api.tools_mcp import PREVIEW_RESERVE_S
@@ -280,11 +280,13 @@ async def prepare_file(
     jobs: JobsDep,
     strips: Annotated[int, Query(ge=1, le=3)] = 1,
 ) -> dict[str, object]:
-    """Render a picture or a PDF once, and answer its manifest.
+    """Render a picture, a PDF or an Office file once, and answer its manifest.
 
     The first prepare of a file draws its first pages in one job, recorded before any render is visible; every later
-    one answers from the renders kept, with no job and no event. A file that is neither a picture nor a PDF is
-    answered at once as ``kind: none``. The request has no body. It waits at most
+    one answers from the renders kept, with no job and no event. An Office file (``kind: office``, counted by ``unit``)
+    is converted once to a PDF first, kept as a derived file of it, in a second job of the same turn of the prepare
+    gate; each of the two is recorded before what it made is visible. A file that is none of these is answered at once
+    as ``kind: none``. The request has no body. It waits at most
     :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its turn, on the caller's prepare gate, and so never takes the
     user's own turn from a chat in progress. With ``strips`` of 2 or 3, a picture is also cut into that many strips,
     in a second job on the same gate (none once they exist), so that a model that sees it in strips pays no job on
@@ -314,21 +316,23 @@ async def prepare_file(
     return manifest.model_dump(mode="json")
 
 
-def _rendition_disposition(source: FileRecord, render: DerivedRecord) -> str:
+def _rendition_disposition(source: FileRecord, render: DerivedRecord, noun: Noun) -> str:
     """Build the ``Content-Disposition`` of a render: the source's name, the page and the strip, in RFC 5987 form.
 
     Args:
         source: The file the render is of.
         render: The render.
+        noun: What the file's renders show (:func:`~workbench.api.renders.noun_of`): ``slide`` names a deck's.
 
     Returns:
-        ``inline`` and the name ``<stem>-page-3-strip-1-of-2.jpg``: a picture shown whole has its stem alone, a page
-        its number, a strip its place among the strips of its page. Never the render's own name, which is an id.
+        ``inline`` and the name ``<stem>-page-3-strip-1-of-2.jpg`` (``<stem>-slide-3.jpg`` for a slide): a picture
+        shown whole has its stem alone, a page or slide its number, a strip its place among the strips of its page.
+        Never the render's own name, which is an id.
     """
     stem = posixpath.splitext(posixpath.basename(source.name))[0]
     parts = [stem]
     if render.role == "page":
-        parts.append(f"page-{render.ordinal}")
+        parts.append(f"{'slide' if noun == 'slide' else 'page'}-{render.ordinal}")
     if render.strips > 1:
         parts.append(f"strip-{render.strip}-of-{render.strips}")
     name = "-".join(parts) + posixpath.splitext(render.name)[1]
@@ -351,7 +355,7 @@ async def _view_rendition(
 
     Args:
         path: The file's virtual path.
-        rendition: The page, counted from 1; 1 for a picture.
+        rendition: The page or slide, counted from 1; 1 for a picture.
         strips: Into how many strips the page is cut.
         strip: Which strip to send, counted from 1.
         p: The caller, user and chat.
@@ -385,9 +389,8 @@ async def _view_rendition(
     if render is None or data is None:
         raise HTTPException(status_code=500, detail=INTERNAL)
     await run_in_threadpool(audit.record, "view", p, file_ids=[source.id, render.id])
-    return Response(
-        data, media_type=render.mime, headers={"Content-Disposition": _rendition_disposition(source, render)}
-    )
+    disposition = _rendition_disposition(source, render, noun_of(manifest))
+    return Response(data, media_type=render.mime, headers={"Content-Disposition": disposition})
 
 
 @router.get("/files/view")
@@ -427,7 +430,7 @@ async def view_file(
         store: The file store.
         audit: The audit log, bound to the call.
         queue: The app's job queue, if it has one.
-        rendition: The page, counted from 1; absent for the file itself.
+        rendition: The page or slide, counted from 1; absent for the file itself.
         strips: Into how many strips the page is cut, 1 to 3.
         strip: Which strip to send, counted from 1.
 

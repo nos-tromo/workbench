@@ -47,6 +47,8 @@ from workbench.api.renders import (
     NOT_KEPT,
     WithBlocks,
     image_block,
+    not_shown,
+    noun_of,
     page_window,
     prepared,
     read_render,
@@ -314,12 +316,15 @@ async def view_file(
         Busy: The lock or the queue did not come free in time, or the executor is busy.
     """
     source = await run_in_threadpool(store.get, p, body.path)
-    manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+    if kind_of(source.name) == "office":  # not shown by view_file yet: answered as a file that is not shown, no job
+        manifest = not_shown(source)
+    else:
+        manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
     strips = body.strips or 1
     paged = body.part is not None
     kind = manifest.kind
     limit = settings.result_max_kb * 1024
-    if kind == "none":
+    if kind == "none" or kind == "office":
         await run_in_threadpool(_record, audit, p, source, [], strips, paged=paged)
         nothing = ViewedFile(
             path=source.virtual_path,
@@ -377,7 +382,7 @@ async def view_file(
         path=source.virtual_path,
         kind=kind,
         total=manifest.total,
-        shown=[shown_image(kind, rec) for rec in taken.renders],
+        shown=[shown_image(noun_of(manifest), rec) for rec in taken.renders],
         truncated=rest is not None,
         next_part=rest,
         hint=_capped(_join(*notes), MAX_HINT),
@@ -693,7 +698,7 @@ async def _read_pdf(
         kept = [part for part in read.parts if (page := _page_of(part.label)) is None or page < cut]
         # What the executor said of its own cut no longer holds: the text ends before the images do. It is told again.
         base = read.model_copy(update={"parts": kept, "truncated": False, "next_part": None})
-    base = base.model_copy(update={"shown": [shown_image("pdf", rec) for rec, _ in attached.shown]})
+    base = base.model_copy(update={"shown": [shown_image("page", rec) for rec, _ in attached.shown]})
     # The notes come after the text is cut, whole: room is kept for the longest they can be, which is all of them.
     full = base.model_copy(
         update={
@@ -720,7 +725,7 @@ async def _read_pdf(
     notes = _notes(shown, [n for n in attached.left_out if stop is None or n < stop], unshown=attached.unshown)
     answer = answer.model_copy(
         update={
-            "shown": [shown_image("pdf", rec) for rec in shown],
+            "shown": [shown_image("page", rec) for rec in shown],
             "pages_without_text": [n for n in answer.pages_without_text if stop is None or n < stop],
             "hint": _join(answer.hint, _cut_note(cut) if ended_by_images and cut is not None else None, *notes),
         }

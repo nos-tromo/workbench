@@ -1,4 +1,4 @@
-"""Ghostwriter's file routes for pictures and PDFs: ``POST /files/prepare`` and the views of a rendition.
+"""Ghostwriter's file routes for pictures, PDFs and Office files: ``POST /files/prepare`` and the views of a rendition.
 
 The app runs the real ``prepare_file`` runner in this process (:class:`~tests.api.test_tools_templates.Local`) over
 files built at test time; every name, text and id is invented. Here the routes' part: what each answers, what it
@@ -18,8 +18,10 @@ from fastapi.testclient import TestClient
 from tests.api.conftest import HG, PG, AuditLines, put
 from tests.api.test_renders import capped, quay_pages
 from tests.api.test_tools_templates import Local
+from tests.conftest import FakeOffice
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_templates as mt
 from workbench.api.audit import AuditLog
 from workbench.api.hardening import FILE_HEADERS
 from workbench.api.jobs import JobQueue
@@ -35,7 +37,7 @@ HEADERS = {**HG, **PURPOSE}
 P2 = Principal("ghostwriter", "user-a", "chat-2", confined=True)
 NOT_FOUND = (404, {"detail": "not found"})
 BUSY = (503, {"detail": "busy, retry later"})
-MANIFEST_KEYS = {"path", "kind", "total", "pages_without_text", "renditions", "frames", "hint"}
+MANIFEST_KEYS = {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
 RENDITION_KEYS = {"n", "width", "height", "mime", "bytes"}
 
 
@@ -74,6 +76,11 @@ def photo(store: Store, built: Path) -> FileRecord:
 def pdf(store: Store, built: Path, name: str, pages: list[str | None], *, password: str | None = None) -> FileRecord:
     """A PDF of those pages, uploaded to Ghostwriter's chat."""
     return put(store, name, mk.make_pdf(built / name, pages, password=password).read_bytes(), p=PG)
+
+
+def deck(store: Store, built: Path, slides: int, name: str = "harbour-deck.pptx", **more: Any) -> FileRecord:
+    """A deck of ``slides`` invented slides (``make_deck``'s other arguments in ``more``), uploaded to the chat."""
+    return put(store, name, mk.make_deck(built / name, slides, **more).read_bytes(), p=PG)
 
 
 def prepare(client: TestClient, path: str, headers: Mapping[str, Any] = HEADERS, strips: int | None = None) -> Any:
@@ -203,16 +210,16 @@ def test_prepare_strips_are_one_to_three(client: TestClient, photo: FileRecord, 
     assert executor.requests == []
 
 
-def test_prepare_of_a_word_file_is_kind_none_without_a_job(
+def test_prepare_of_a_spreadsheet_is_kind_none_without_a_job(
     client: TestClient, store: Store, executor: Local, audit_lines: AuditLines, built: Path
 ) -> None:
-    """Neither a picture nor a PDF: answered at once, with every key, no job and no event."""
-    source = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    """Neither a picture, a PDF nor a document or deck: answered at once, with every key, no job and no event."""
+    source = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
     r = prepare(client, source.virtual_path)
 
     assert r.status_code == 200
     assert set(r.json()) == MANIFEST_KEYS
-    assert (r.json()["kind"], r.json()["total"], r.json()["renditions"]) == ("none", 0, [])
+    assert (r.json()["kind"], r.json()["unit"], r.json()["total"], r.json()["renditions"]) == ("none", "page", 0, [])
     assert executor.requests == []
     assert events_of(audit_lines, "file.prepare") == []
 
@@ -283,6 +290,137 @@ def test_prepare_wants_a_path(client: TestClient, executor: Local) -> None:
     """A prepare without ``path`` does not validate, and makes no job."""
     assert client.post("/files/prepare", headers=HEADERS).status_code == 422
     assert executor.requests == []
+
+
+# --- Office files ------------------------------------------------------------------------------------------------
+
+
+def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
+    client: TestClient,
+    store: Store,
+    built: Path,
+    executor: Local,
+    queue: JobQueue,
+    audit_lines: AuditLines,
+    fake_office: FakeOffice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deck's manifest has the eight keys, ``unit`` after ``kind``; its two jobs run in one turn of the prepare gate.
+
+    The conversion and the drawing each have their event, with the call's purpose and request id.
+    """
+    sent: list[tuple[str, str, object]] = []
+    renders, conversion = queue.submit_renders, queue.submit_conversion
+
+    async def render(*args: Any, **more: Any) -> Any:
+        sent.append(("prepare_file", more["gate"], more["turn"]))
+        return await renders(*args, **more)
+
+    async def convert(*args: Any, **more: Any) -> Any:
+        sent.append(("convert_office", more["gate"], more["turn"]))
+        return await conversion(*args, **more)
+
+    monkeypatch.setattr(queue, "submit_renders", render)
+    monkeypatch.setattr(queue, "submit_conversion", convert)
+    source = deck(store, built, 3, picture_only=[2])
+    r = prepare(client, source.virtual_path)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
+    assert list(body)[:3] == ["path", "kind", "unit"]
+    assert (body["path"], body["kind"], body["unit"], body["total"], body["pages_without_text"]) == (
+        source.virtual_path,
+        "office",
+        "slide",
+        3,
+        [2],
+    )
+    assert (body["frames"], body["hint"]) == (None, None)
+    assert [item["n"] for item in body["renditions"]] == [1, 2, 3]
+    for item in body["renditions"]:
+        assert set(item) == RENDITION_KEYS
+        assert item["mime"] == "image/jpeg"
+    assert [req.tool for req in executor.requests] == ["convert_office", "prepare_file"]
+    (_, _, turn), _ = sent
+    assert turn is not None
+    assert sent == [("convert_office", "prepare", turn), ("prepare_file", "prepare", turn)]
+    events = events_of(audit_lines, "file.prepare")
+    assert [(event["action"], event["outcome"]) for event in events] == [("modify", "ok"), ("modify", "ok")]
+    assert [event["criteria"].get("converted") for event in events] == [True, None]
+    assert all(event["purpose"] == {"reason": "ghostwriter chat"} for event in events)
+    assert all(event["request_id"] == "req-1" for event in events)
+    assert store.files_in_chat(PG) == [source]
+
+
+def test_every_manifest_carries_unit(client: TestClient, store: Store, built: Path, photo: FileRecord) -> None:
+    """A picture, a PDF and a file of kind ``none`` count by page; every manifest has the same eight keys."""
+    scan = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026"])
+    sheet = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
+    for source, kind in ((photo, "image"), (scan, "pdf"), (sheet, "none")):
+        r = prepare(client, source.virtual_path)
+        assert r.status_code == 200
+        assert set(r.json()) == MANIFEST_KEYS
+        assert (r.json()["kind"], r.json()["unit"]) == (kind, "page")
+
+
+def test_a_slide_rendition_is_named_by_its_slide(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, fake_office: FakeOffice
+) -> None:
+    """A slide's render is named by its slide, a document's by its page; a view first converts and draws on its own."""
+    source = deck(store, built, 3)
+    notes = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    named = {
+        (source.virtual_path, 2, None, None): "harbour-deck-slide-2.jpg",
+        (source.virtual_path, 2, 2, 1): "harbour-deck-slide-2-strip-1-of-2.jpg",
+        (notes.virtual_path, 1, None, None): "harbour-notes-page-1.jpg",
+    }
+    for (path, n, strips, strip), expected in named.items():
+        r = rendition(client, path, n, strips=strips, strip=strip)
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "image/jpeg"
+        assert r.headers["content-disposition"] == f"inline; filename*=UTF-8''{expected}"
+        hardened(r)
+    slide = next(row for row in store.derived_of(source) if row.role == "page" and row.ordinal == 2)
+    first, *_ = events_of(audit_lines, "file.view")
+    assert first["target"]["ids"] == [source.id, slide.id]
+    assert fake_office.calls == 2
+
+
+def test_prepare_of_an_encrypted_odt_is_422(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, fake_office: FakeOffice
+) -> None:
+    """Review Focus 1: an OpenDocument text whose members are encrypted is refused before it is converted."""
+    source = put(store, "survey-notes.odt", mk.make_encrypted_odt(built / "survey-notes.odt").read_bytes(), p=PG)
+    r = prepare(client, source.virtual_path)
+
+    assert r.status_code == 422
+    assert r.json()["detail"].startswith("unreadable_file:")
+    assert "password-protected" in r.json()["detail"]
+    assert store.derived_of(source) == []
+    assert fake_office.calls == 0
+    (event,) = events_of(audit_lines, "file.prepare")
+    assert (event["outcome"], event["criteria"]["refused"], event["criteria"]["converted"]) == (
+        "error",
+        "unreadable_file",
+        True,
+    )
+    assert event["target"]["ids"] == [source.id]
+
+
+def test_prepare_of_a_master_without_slides_is_422_unsupported_format(
+    client: TestClient, store: Store, built: Path, executor: Local, fake_office: FakeOffice
+) -> None:
+    """Review Focus 4: a slide master with layouts and no slides is told so at once, with nothing converted or kept."""
+    master = mt.as_potx(mt.make_master(built / "harbour-master.pptx", examples=0), built / "harbour-master.potx")
+    source = put(store, "harbour-master.potx", master.read_bytes(), p=PG)
+    r = prepare(client, source.virtual_path)
+
+    assert r.status_code == 422
+    assert r.json()["detail"].startswith("unsupported_format: the deck has no slides")
+    assert store.derived_of(source) == []
+    assert [req.tool for req in executor.requests] == ["convert_office"]
+    assert fake_office.calls == 0
 
 
 # --- a rendition -------------------------------------------------------------------------------------------------
@@ -431,15 +569,15 @@ def test_prepare_422_details_start_with_their_token(
     assert store.derived_of(source) == []
 
 
-def test_a_rendition_out_of_range_or_of_a_word_file_is_404(
+def test_a_rendition_out_of_range_or_of_a_spreadsheet_is_404(
     client: TestClient, store: Store, built: Path, executor: Local, audit_lines: AuditLines
 ) -> None:
     """A page past the last, or any rendition of a file that is not shown, is not found, hardened and unrecorded."""
     scan = pdf(store, built, "quay-list.pdf", quay_pages(2))
-    word = put(store, "harbour-notes.docx", mk.make_docx(built / "harbour-notes.docx").read_bytes(), p=PG)
+    sheet = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
     assert prepare(client, scan.virtual_path).status_code == 200
     jobs = len(executor.requests)
-    for path, n in ((scan.virtual_path, 3), (word.virtual_path, 1), (scan.virtual_path + "x", 1)):
+    for path, n in ((scan.virtual_path, 3), (sheet.virtual_path, 1), (scan.virtual_path + "x", 1)):
         r = rendition(client, path, n)
         assert (r.status_code, r.json()) == NOT_FOUND
         hardened(r)
