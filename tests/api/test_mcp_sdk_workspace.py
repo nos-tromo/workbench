@@ -1,4 +1,4 @@
-"""The official MCP SDK's client against Ghostwriter's door, on loopback: the nine workspace tools, listed and called.
+"""The official MCP SDK's client against Ghostwriter's door, on loopback: the ten workspace tools, listed and called.
 
 The api runs the real runners (the in-process executor of ``tests/api/test_tools_templates.py``), so the table
 preview of a written csv is the executor's own. The client reaches nothing but the socket ``served`` binds.
@@ -39,6 +39,7 @@ HEADERS: Final = {
     "X-Session-Id": "chat-1",
     "X-Audit-Purpose": "reason=ghostwriter+chat",
     "X-Request-ID": "req-1",
+    "X-Accept-Images": "1",
 }
 
 
@@ -68,7 +69,7 @@ async def converse(url: str) -> tuple[list[Any], Any, Any]:
 def test_the_official_client_lists_and_calls_the_workspace_tools(
     app_with_local_executor: FastAPI, audit_lines: AuditLines
 ) -> None:
-    """Nine tools, each with schemas the validator accepts; a table written with its preview, then listed."""
+    """Ten tools, each with schemas the validator accepts; a table written with its preview, then listed."""
     with served(app_with_local_executor) as (url, recorded):
         tools, written, files = asyncio.run(asyncio.wait_for(converse(url), scaled(60)))
     assert [tool.name for tool in tools] == sorted(GHOSTWRITER_TOOLS)

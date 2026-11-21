@@ -338,7 +338,7 @@ def test_a_confined_read_of_another_chats_file_is_not_found_and_reads_nothing(
     document = spelling.format(keep(store, P2, "harbour-report.docx").name)
     template = spelling.format(keep(store, P2, "quarterly-template.docx").name)
     with pytest.raises(NotFound) as refused:
-        asyncio.run(read_document(ReadDocumentRequest(path=document), PG, settings, store, audit, jobs))
+        asyncio.run(read_document(ReadDocumentRequest(path=document), PG, settings, store, audit, jobs, True))
     assert describe(refused.value) == (404, "not found")
     with pytest.raises(NotFound) as refused:
         asyncio.run(inspect_template(InspectTemplateRequest(path=template), PG, settings, store, audit, jobs))

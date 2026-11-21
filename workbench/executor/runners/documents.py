@@ -80,11 +80,13 @@ def _numbers(noun: str, numbers: list[int]) -> str:
     return f"{noun} {shown}" if len(numbers) == 1 else f"{noun}s {shown}"
 
 
-def _hint(doc: readers.DocumentText) -> str | None:
+def _hint(doc: readers.DocumentText, *, images: bool) -> str | None:
     """Say what the model should tell the user about what a read left out.
 
     Args:
         doc: What the reader returned.
+        images: Whether the call takes images, which the api sends with the read for the pages of a PDF that have no
+            text; without, the pages are named as workbench 0.6 named them, word for word.
 
     Returns:
         A hint, or ``None`` if there is nothing to add.
@@ -93,12 +95,19 @@ def _hint(doc: readers.DocumentText) -> str | None:
     if doc.pages_without_text:
         if doc.kind == "pptx":
             noun, what = "slide", "hold no text (pictures only?)"
-            notes.append(f"{_numbers(noun, doc.pages_without_text)} {what}.")
+            ending = "." if images else "; read_document does no OCR."
+            notes.append(f"{_numbers(noun, doc.pages_without_text)} {what}{ending}")
         else:
             noun = "page"
+            what = (
+                "; do not treat them as blank."
+                if images
+                else ". read_document does no OCR: the file needs OCR elsewhere before they can be read. "
+                "Tell the user; do not treat them as blank."
+            )
             notes.append(
-                f"{_numbers(noun, doc.pages_without_text)} of those looked at have no text layer (scans or "
-                "pictures); do not treat them as blank."
+                f"{_numbers(noun, doc.pages_without_text)} of those looked at have no text layer (scans or pictures)"
+                + what
             )
     if doc.cut is not None:
         notes.append(f"{doc.cut} is longer than the result limit and is cut; its rest cannot be read by paging.")
@@ -111,8 +120,8 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Read one file of the chat from ``part`` on.
 
     Args:
-        args: ``path``, relative to the chat folder; ``part``, where to start or ``None``; and ``budget_s``, the
-            seconds after which reading stops.
+        args: ``path``, relative to the chat folder; ``part``, where to start or ``None``; ``budget_s``, the
+            seconds after which reading stops; and ``images``, whether the call takes images (the hint's words).
         ctx: The job's surroundings.
 
     Returns:
@@ -154,7 +163,7 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     }
     if doc.next_part is not None:
         result["next_part"] = doc.next_part
-    hint = _hint(doc)
+    hint = _hint(doc, images=bool(args.get("images", False)))
     if hint is not None:
         result["hint"] = hint
     return result

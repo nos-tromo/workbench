@@ -568,7 +568,7 @@ def tools_listed(client: TestClient) -> dict[str, dict[str, Any]]:
 
 
 def test_ghostwriter_is_offered_write_presentation(client: TestClient) -> None:
-    """Nine tools, in name order; the description says to agree the outline first and how a slide is filled."""
+    """Ten tools, in name order; the description says to agree the outline first and how a slide is filled."""
     tools = result(rpc(client, "tools/list", headers=HG))["tools"]
     assert [tool["name"] for tool in tools] == sorted(GHOSTWRITER_TOOLS)
     assert len(tools) == 10

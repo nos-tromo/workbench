@@ -59,6 +59,9 @@ PREPARE_PATH: Final = "/files/prepare"
 #: The file routes a confined caller reaches besides the MCP door.
 FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", PREPARE_PATH, CHAT_PATH})
 
+#: The header a caller sends on the MCP door to say it takes images (:func:`accepts_images`), in lower case.
+ACCEPT_IMAGES: Final = "x-accept-images"
+
 #: The texts of the two refusals of the user and chat headers, on the MCP door and the file routes.
 INVALID_USER: Final = "missing or invalid user"
 INVALID_SESSION: Final = "invalid session"
@@ -441,6 +444,23 @@ def purpose_from_headers(headers: Mapping[str, str]) -> Purpose | None:
     except PurposeError:
         raise InvalidPurpose(INVALID_PURPOSE) from None
     return Purpose(case_ref=case_ref, reason=reason) if case_ref or reason else None
+
+
+def accepts_images(headers: Mapping[str, str]) -> bool:
+    """Tell whether a call takes images: whether its ``X-Accept-Images`` header is ``1``.
+
+    The header chooses only what the model is told and shown (:class:`~workbench.api.registry.Registry`): with it,
+    ``view_file`` is listed and the tools send pictures and pages as image blocks; without it, a call is told and
+    shown what workbench 0.6 told and showed. It grants nothing: the key, the tool list and the paths decide access
+    whatever it says.
+
+    Args:
+        headers: The request's headers.
+
+    Returns:
+        Whether the header is there and is ``1``.
+    """
+    return _header(headers, ACCEPT_IMAGES) == "1"
 
 
 def _principal(request: Request, caller: Caller) -> Principal:

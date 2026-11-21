@@ -268,6 +268,7 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
             "store": env.store,
             "audit": audit,
             "jobs": jobs,
+            "images": env.images,
         }
         given = {name: offered[name] for name in takes}
         answer = await endpoint(**given) if asynchronous else await run_in_threadpool(endpoint, **given)
@@ -293,7 +294,8 @@ def workspace_tools() -> tuple[ToolSpec, ...]:
     Returns:
         A spec per row of :data:`~workbench.api.tool_table.WORKSPACE_TABLE`, in its order: its ``run`` calls the row's
         function (:func:`workspace_run`), its input model is the row's or :class:`NoArguments`, its output model the
-        row's with ``outputs`` (:func:`with_outputs`), and both schemas are those models' own.
+        row's with ``outputs`` (:func:`with_outputs`), and both schemas are those models' own, the same on a call that
+        takes images and on one that does not; what the row says of images is the spec's too.
     """
     specs: list[ToolSpec] = []
     for tool in WORKSPACE_TABLE:
@@ -310,6 +312,8 @@ def workspace_tools() -> tuple[ToolSpec, ...]:
                 run=workspace_run(tool.function, tool.name),
                 input_schema=partial(_model_schema, input_model),
                 output_schema=partial(_model_schema, output_model),
+                images_only=tool.images_only,
+                text_description=tool.text_description,
             )
         )
     return tuple(specs)

@@ -21,12 +21,13 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from pptx import Presentation
 
-from tests.api.conftest import CHAT, FORMER, HG, HG_B, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CHAT, FORMER, HG, HG_B, HG_TEXT, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_jobs import FakeClient
 from tests.api.test_renders import capped
 from tests.api.test_tools_templates import Local
 from tests.api.test_tools_views import file_of, images, pdf, photo, raw, seen, whole_renders
+from tests.callers import TEXT_ONLY_PAGE_HINT
 from tests.fixtures import make_images as mi
 from workbench.api import tools_views
 from workbench.api.audit import AuditLog
@@ -123,7 +124,7 @@ def test_read_document_sends_only_the_requested_file(client: TestClient, store: 
     (req,) = executor.requests
     assert req.tool == "read_document"
     assert req.input_files == ["review.docx"]
-    assert req.args == {"path": "review.docx", "part": "paragraph 1", "budget_s": 86}
+    assert req.args == {"path": "review.docx", "part": "paragraph 1", "budget_s": 86, "images": True}
     assert (req.caller, req.user_id, req.chat_id) == ("ghostwriter", "user-a", "chat-1")
     assert req.max_chars == 16 * 1024
     assert answer == {
@@ -155,7 +156,7 @@ def test_no_part_is_sent_as_none(client: TestClient, store: Store, executor: Scr
     executor.payload = reading("x", ("lines 1-1", "a"))
     answered(read(client, f"{CHAT}/a.txt"))
     answered(acall(client, "read_document", {"path": f"{CHAT}/a.txt", "part": None}))
-    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 86}] * 2
+    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 86, "images": True}] * 2
 
 
 def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store, executor: Scripted) -> None:
@@ -165,7 +166,7 @@ def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store,
     answer = answered(read(client, f"{CHAT}/orders.json"))
     (req,) = executor.requests
     assert req.input_files == ["orders.json"]
-    assert req.args == {"path": "orders.json", "part": None, "budget_s": 86}
+    assert req.args == {"path": "orders.json", "part": None, "budget_s": 86, "images": True}
     assert answer["kind"] == "json"
     assert answer["parts"] == [{"label": "lines 1-4", "text": '{\n  "order": "A-0001",\n  "qty": 2\n}'}]
 
@@ -1056,6 +1057,43 @@ def test_a_pptx_attaches_nothing_yet(
     assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
 
 
+@pytest.mark.parametrize("strips", [None, 2])
+def test_a_scanned_pdf_read_without_images_is_read_as_in_0_6(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines, strips: int | None
+) -> None:
+    """Final review I1: a call without ``X-Accept-Images`` gets no image, no note of one and 0.6's hint; no render job.
+
+    ``strips`` is ignored.
+    """
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    answer = seen(read(seeing, source.virtual_path, headers=HG_TEXT, strips=strips))
+
+    assert len(answer["content"]) == 1
+    structured = answer["structuredContent"]
+    assert (structured["pages_without_text"], structured["shown"]) == ([2], [])
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert structured["hint"] == TEXT_ONLY_PAGE_HINT
+    assert "comes with this answer" not in answer["content"][0]["text"]
+    assert local.tools() == ["read_document"]
+    assert local.requests[0].args["images"] is False
+    assert store.derived_of(source) == []
+    (event,) = read_events(audit_lines)
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_picture_read_without_images_is_refused_as_in_0_6(
+    seeing: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """A picture is read by the reader, which refuses it as it did in 0.6: no prepare, no render row."""
+    source = photo(store, built)
+    reason, text = refusal(read(seeing, source.virtual_path, headers=HG_TEXT))
+
+    assert reason == "refused"
+    assert text.startswith("unsupported_format: .jpg cannot be read here")
+    assert local.tools() == ["read_document"]
+    assert store.derived_of(source) == []
+
+
 def test_the_images_are_recorded_with_the_read(
     seeing: TestClient, store: Store, built: Path, audit_lines: AuditLines
 ) -> None:
@@ -1275,7 +1313,7 @@ def test_a_cancelled_call_records_its_read_and_stays_cancelled(
     jobs = CallJobs(JobQueue(settings, local, store, Metrics(settings.data_dir)), CallLimits(120, 60))
     body = ReadDocumentRequest(path=source.virtual_path)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(tools_views.read_document(body, PG, settings, store, audit, jobs))
+        asyncio.run(tools_views.read_document(body, PG, settings, store, audit, jobs, images=True))
     (event,) = read_events(audit_lines)
     assert (event["outcome"], event["target"]["ids"]) == ("error", [source.id])
     assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}

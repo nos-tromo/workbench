@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from tests.callers import TEXT_ONLY_PAGE_HINT
 from tests.conftest import scaled
 from tests.fixtures import make_fixtures as fx
 from workbench.executor import readers, timer
@@ -40,9 +41,9 @@ def search(work: Path, query: str, **args: Any) -> dict[str, Any]:
     return RUNNERS["search_files"]({"query": query, **args}, context(work))
 
 
-def read_doc(work: Path, path: str, part: str | None = None, **ctx: Any) -> dict[str, Any]:
-    """Run the read runner on a working folder."""
-    return RUNNERS["read_document"]({"path": path, "part": part}, context(work, **ctx))
+def read_doc(work: Path, path: str, part: str | None = None, *, images: bool = False, **ctx: Any) -> dict[str, Any]:
+    """Run the read runner on a working folder, for a call that takes images or, by default, one that does not."""
+    return RUNNERS["read_document"]({"path": path, "part": part, "images": images}, context(work, **ctx))
 
 
 def populate(work: Path) -> None:
@@ -632,12 +633,20 @@ def test_a_file_in_a_folder_keeps_its_folder_in_the_path(work: Path) -> None:
 def test_a_pdf_with_a_scanned_page_carries_a_hint_not_to_call_it_blank(work: Path) -> None:
     """The page is listed, never returned as blank, and the model is told what to do (it can look at the page)."""
     fx.make_pdf(work / "scan.pdf", ["text on page one", None])
-    result = read_doc(work, "scan.pdf")
+    result = read_doc(work, "scan.pdf", images=True)
     assert [p["label"] for p in result["parts"]] == ["page 1"]
     assert result["pages_without_text"] == [2]
     assert result["hint"] == (
         "page 2 of those looked at have no text layer (scans or pictures); do not treat them as blank."
     )
+
+
+def test_a_scanned_page_read_for_a_call_that_takes_no_images_carries_the_hint_about_ocr(work: Path) -> None:
+    """Without images, the model is told what 0.6 told it: the page needs OCR elsewhere."""
+    fx.make_pdf(work / "scan.pdf", ["text on page one", None])
+    result = read_doc(work, "scan.pdf")
+    assert result["pages_without_text"] == [2]
+    assert result["hint"] == TEXT_ONLY_PAGE_HINT
 
 
 def test_a_deck_with_a_picture_slide_says_slides_not_pages(work: Path) -> None:

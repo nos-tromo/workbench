@@ -28,6 +28,18 @@ file routes are not tools, so the model cannot call them.
   that chat is refused (`404` on a route).
 - The tool list is enforced on `/mcp`: `tools/call` answers a tool not on the
   caller's list `400`, `-32602`, "unknown tool".
+- `X-Accept-Images: 1` on `/mcp` says the call takes images; Ghostwriter 0.3.0
+  sends it on every request (`workbench/api/auth.py:accepts_images`). Only then
+  is `view_file` listed and callable, and do `read_document` and `view_file`
+  send image blocks. A call without it (any other value counts as none), such as
+  an older Ghostwriter's, is told and shown what workbench 0.6 told and showed:
+  nine tools, `read_document`'s 0.6 description and hints, the 0.6 server
+  instructions, no image and no render; a picture file is refused as
+  `unsupported_format`, and `view_file` is "unknown tool". The schemas are the
+  same either way. The header is never trusted for access: the key, the tool
+  list and the chat decide that, and it only chooses what the model is told and
+  shown. The file routes need no such header: only a client that knows
+  `/files/prepare` and `/files/view?rendition=` calls them.
 - A caller is a namespace: users are `(caller, user-id)`. docint has no folder
   under `workspaces/`.
 

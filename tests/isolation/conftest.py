@@ -148,7 +148,9 @@ def api() -> Iterator[httpx.Client]:
         yield client
 
 
-def _tools_call(key: str, tool: str, arguments: dict[str, Any], *, user: str, session: str) -> httpx.Response:
+def _tools_call(
+    key: str, tool: str, arguments: dict[str, Any], *, user: str, session: str, extra: dict[str, str] | None = None
+) -> httpx.Response:
     """Call a tool on the MCP door: a modern ``tools/call`` with :data:`PURPOSE`.
 
     Args:
@@ -157,11 +159,13 @@ def _tools_call(key: str, tool: str, arguments: dict[str, Any], *, user: str, se
         arguments: The tool's arguments.
         user: The user pseudonym the caller would send.
         session: The session pseudonym the caller would send.
+        extra: More headers the caller sends, if any.
 
     Returns:
         The api's answer.
     """
     headers = {
+        **(extra or {}),
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
@@ -223,6 +227,8 @@ def ghostwriter_mcp(
 ) -> httpx.Response:
     """Call a workspace tool through Ghostwriter's door: a modern ``tools/call``, as :func:`mcp_call` builds one.
 
+    It says it takes images (``X-Accept-Images: 1``), as Ghostwriter 0.3.0 does.
+
     Args:
         api_info: ``docker inspect`` of the api's container, whose environment holds Ghostwriter's key.
         tool: The tool's name.
@@ -234,7 +240,7 @@ def ghostwriter_mcp(
         The api's answer.
     """
     key = environment(api_info)["GHOSTWRITER_WORKBENCH_KEY"]
-    return _tools_call(key, tool, arguments, user=user, session=chat)
+    return _tools_call(key, tool, arguments, user=user, session=chat, extra={"X-Accept-Images": "1"})
 
 
 def run_python(api_info: dict[str, Any], code: str, *, user: str = "user-a", chat: str = "chat-1") -> dict[str, Any]:

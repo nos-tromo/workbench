@@ -1073,10 +1073,10 @@ def test_a_strip_count_out_of_range_is_refused(job: Job) -> None:
 
 
 def test_the_hint_on_a_scanned_pdf_says_what_to_do_without_the_tool_name() -> None:
-    """The PDF sentence names the pages and tells the model not to treat them as blank."""
+    """The PDF sentence names the pages and tells the model not to treat them as blank: the api sends their images."""
     doc = DocumentText(kind="pdf", parts=[], pages_without_text=[2, 5], total_parts=9)
 
-    assert _hint(doc) == (
+    assert _hint(doc, images=True) == (
         "pages 2, 5 of those looked at have no text layer (scans or pictures); do not treat them as blank."
     )
 
@@ -1085,10 +1085,22 @@ def test_the_hint_on_a_deck_keeps_its_words_without_the_tool_name() -> None:
     """The slide sentence is as it was, less the clause about OCR."""
     doc = DocumentText(kind="pptx", parts=[], pages_without_text=[3], total_parts=4)
 
-    hint = _hint(doc)
+    hint = _hint(doc, images=True)
 
     assert hint == "slide 3 hold no text (pictures only?)."
     assert "OCR" not in (hint or "")
+
+
+def test_a_read_that_takes_no_images_is_told_what_0_6_told_it() -> None:
+    """Final review I1: without images (a Ghostwriter before 0.3.0), both sentences are 0.6's, word for word."""
+    pdf = DocumentText(kind="pdf", parts=[], pages_without_text=[2, 5], total_parts=9)
+    deck = DocumentText(kind="pptx", parts=[], pages_without_text=[3], total_parts=4)
+
+    assert _hint(pdf, images=False) == (
+        "pages 2, 5 of those looked at have no text layer (scans or pictures). read_document does no OCR: the file "
+        "needs OCR elsewhere before they can be read. Tell the user; do not treat them as blank."
+    )
+    assert _hint(deck, images=False) == "slide 3 hold no text (pictures only?); read_document does no OCR."
 
 
 # --- facts: the look at every page for text, which an on-demand render does not need --------

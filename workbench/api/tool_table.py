@@ -1,8 +1,9 @@
 """The workspace tools, one row each: what the MCP door tells the model of every tool, and what runs it.
 
-A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
-and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`,
-:mod:`workbench.api.tools_output`, :mod:`workbench.api.tools_presentations` and :mod:`workbench.api.tools_views`).
+A row names the tool, its title, its description written for the model (and, for a tool told otherwise to a call that
+takes no images, that text too), the model of its arguments and of its answer, and the function that runs it (in
+:mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`, :mod:`workbench.api.tools_output`,
+:mod:`workbench.api.tools_presentations` and :mod:`workbench.api.tools_views`).
 :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the registry. A new workspace tool is a row
 here.
 """
@@ -27,7 +28,10 @@ class WorkspaceTool:
         description: What it does, written for the model.
         input_model: The model of its arguments, or ``None`` when it takes none (``list_files``).
         output_model: The model of its answer, before the door adds ``outputs``.
-        function: Runs it; it takes, by name, any of ``body``, ``p``, ``settings``, ``store``, ``audit`` and ``jobs``.
+        function: Runs it; it takes, by name, any of ``body``, ``p``, ``settings``, ``store``, ``audit``, ``jobs`` and
+            ``images`` (whether the call takes images).
+        images_only: Whether it only shows images, and so is offered only to a call that takes them.
+        text_description: What a call that takes no images is told of it instead, or ``None`` for ``description``.
     """
 
     name: str
@@ -36,6 +40,8 @@ class WorkspaceTool:
     input_model: type[BaseModel] | None
     output_model: type[BaseModel]
     function: Callable[..., Any]
+    images_only: bool = False
+    text_description: str | None = None
 
 
 #: The workspace tools, in name order.
@@ -113,6 +119,20 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools.ReadDocumentRequest,
         output_model=tools.DocumentRead,
         function=tools_views.read_document,
+        # workbench 0.6's words, for a call that takes no images: they promise none.
+        text_description=(
+            "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
+            "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
+            "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
+            "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
+            "call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
+            "paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as "
+            "'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: "
+            "cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by "
+            "these references. pages_without_text lists pages or slides with no text layer (scans, pictures): this "
+            "tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg "
+            "files cannot be read: ask the user to save them as .eml or PDF."
+        ),
     ),
     WorkspaceTool(
         name="run_python",
@@ -167,6 +187,7 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools_views.ViewFileRequest,
         output_model=tools_views.ViewedFile,
         function=tools_views.view_file,
+        images_only=True,
     ),
     WorkspaceTool(
         name="write_document",

@@ -12,7 +12,9 @@ that is not what its row says, a page the store could not keep (the user's quota
 renders). The answer and its blocks go out together: image block ``i`` is ``shown[i]``, in order, always.
 
 ``read_document`` reads the text as ever, in the executor, and adds the pictures, so that a scan costs the model no
-second round. A PDF read that finds pages without a text layer attaches the renders of those pages inside its window,
+second round, on a call that takes images (``X-Accept-Images: 1``). A call that takes none is read as workbench 0.6
+read it: no image, no render, no note of one, the reader's own hint as 0.6 wrote it, and a picture file refused by
+the reader. A PDF read that finds pages without a text layer attaches the renders of those pages inside its window,
 under the same rules but with ``MAX_READ_IMAGES`` images; a picture file is read as its image, with no read job. The
 pictures never fail a PDF read, whose text was read already: when they cannot be made (the executor has no room, the
 render job is refused, the user's quota, a full volume or the source's cap of renders stops them) the text is answered
@@ -759,15 +761,17 @@ async def read_document(
     store: Store,
     audit: AuditLog,
     jobs: "CallJobs",
+    images: bool,
 ) -> DocumentRead | WithBlocks:
     """Read one of the user's files, and show the pictures it holds that have no text.
 
     A file that is not a picture is read in the executor, in the request's chat folder, with that one file as its input,
     and answered with its text cut to the result limit. A PDF with pages that have no text layer is answered with the
     renders of those pages inside its window as images, in the same answer. A picture file is not read but shown: it is
-    prepared as ``view_file`` does it, and answered as its image. The read is recorded by the file's id and then each
-    render shown, once the images are settled and before anything of the answer goes out; a refusal of the job is an
-    ``error`` with its code. Neither the name, the part nor the text is recorded.
+    prepared as ``view_file`` does it, and answered as its image. On a call that takes no images every file is read in
+    the executor and answered with its text alone, ``strips`` ignored, as workbench 0.6 did. The read is recorded by the
+    file's id and then each render shown, once the images are settled and before anything of the answer goes out; a
+    refusal of the job is an ``error`` with its code. Neither the name, the part nor the text is recorded.
 
     Args:
         body: The path, where to start, and into how many strips each image is cut.
@@ -776,6 +780,7 @@ async def read_document(
         store: The file store.
         audit: The audit log.
         jobs: The queue, within the call's limits.
+        images: Whether the call takes images (``X-Accept-Images: 1``).
 
     Returns:
         The parts read, the pages without text, the images that come with them and how to go on; the answer alone when
@@ -788,10 +793,11 @@ async def read_document(
         Busy: The queue or the executor has no room for the read, or for a picture's render.
     """
     source = await run_in_threadpool(store.get, p, body.path)
-    kind = kind_of(source.name)
+    kind = kind_of(source.name) if images else "none"  # a call that takes no images is read as text alone
     if kind == "image":
         return await _read_picture(body, source, p=p, settings=settings, store=store, audit=audit, jobs=jobs)
-    args = {"path": source.name, "part": body.part, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
+    budget = max(1, settings.job_wall_s * 3 // 4)
+    args = {"path": source.name, "part": body.part, "budget_s": budget, "images": images}
     _, result, _ = await jobs.submit(p, "read_document", args, [source.name])
     payload = {**result.result, "path": source.virtual_path} if isinstance(result.result, dict) else None
     if kind == "pdf" and result.status == "ok" and payload is not None and _readable(DocumentRead, payload):

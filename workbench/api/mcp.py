@@ -7,6 +7,10 @@ tool on the caller's list, reads who it is for and why from the headers (never f
 arguments with the caller's wall cap and runs the tool. A tool that refuses answers a result with ``isError`` and its
 reason token (:func:`call_failure`); only a failed audit write and an error no rule expected are JSON-RPC errors.
 
+``X-Accept-Images: 1`` says a call takes images (:func:`~workbench.api.auth.accepts_images`), and is read on every
+method as the other headers are: ``server/discover``, ``tools/list`` and ``tools/call`` without it tell and show what
+workbench 0.6 did, with no ``view_file`` and no image block. It only chooses what the model is told and shown.
+
 Every answer is JSON and none opens a session: no ``Mcp-Session-Id`` is minted, and one that is sent is ignored, as
 is ``Last-Event-ID``. Nothing a client chose reaches a log line: the one line written names a method only if the
 door serves it.
@@ -27,6 +31,7 @@ from workbench.api.auth import (
     Caller,
     InvalidPrincipal,
     InvalidPurpose,
+    accepts_images,
     principal_from_headers,
     purpose_from_headers,
     require_mcp_caller,
@@ -114,7 +119,8 @@ async def _call(request: Request, caller: Caller, params: dict[str, Any]) -> dic
     """Run a ``tools/call``: the tool, who it is for, why, its arguments, then the tool itself.
 
     Args:
-        request: The request; its headers name the user, the session, the purpose and the request id.
+        request: The request; its headers name the user, the session, the purpose, the request id and whether the call
+            takes images.
         caller: The authenticated caller.
         params: The call's params.
 
@@ -122,13 +128,15 @@ async def _call(request: Request, caller: Caller, params: dict[str, Any]) -> dic
         The tool's result, or an ``isError`` result for arguments that do not validate or a tool's refusal.
 
     Raises:
-        WireError: ``-32602`` for a tool not on the caller's list, ``-32600`` for a user or session header that is
-            missing or not a plain id, ``-32602`` for a malformed purpose.
+        WireError: ``-32602`` for a tool not on the caller's list (or one that only shows images, on a call that takes
+            none), ``-32600`` for a user or session header that is missing or not a plain id, ``-32602`` for a
+            malformed purpose.
         Exception: What the tool raised that is no refusal of its, such as a failed audit write.
     """
     registry: Registry = request.app.state.registry
+    images = accepts_images(request.headers)
     name = params.get("name")
-    spec = registry.find(caller, name) if isinstance(name, str) else None
+    spec = registry.find(caller, name, images=images) if isinstance(name, str) else None
     if spec is None or spec.input_model is None:
         raise WireError(400, INVALID_PARAMS, "unknown tool")
     try:
@@ -155,6 +163,7 @@ async def _call(request: Request, caller: Caller, params: dict[str, Any]) -> dic
         jobs=state.jobs,
         purpose=purpose,
         request_id=request_id,
+        images=images,
     )
     try:
         outcome = await spec.run(body, env)
@@ -188,10 +197,10 @@ async def _dispatch(request: Request, caller: Caller, message: Message) -> dict[
     if message.method == "ping":
         result: dict[str, Any] = {}
     elif message.method == "server/discover":
-        result = discover_result(caller)
+        result = discover_result(caller, images=accepts_images(request.headers))
     elif message.method == "tools/list":
         registry: Registry = request.app.state.registry
-        result = tools_list_result(registry.for_caller(caller), caller, era)
+        result = tools_list_result(registry.for_caller(caller, images=accepts_images(request.headers)), caller, era)
     else:
         result = await _call(request, caller, message.params)
     return modern(result) if era.modern else result
