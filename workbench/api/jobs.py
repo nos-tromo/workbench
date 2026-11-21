@@ -38,7 +38,9 @@ the call failed, is recorded again as an error. A call without a keeper keeps no
 An inline job keeps none either: its :class:`Taker` records it, with the outputs that come back,
 before anything of it goes out. A render job (:meth:`JobQueue.submit_renders`) keeps its outputs the same way, but
 as derived files of its source (:meth:`~workbench.api.store.Store.register_derived`), never as files of the chat;
-:meth:`JobQueue.source_lock` lets one call at a time make or read back the renders of a source.
+:meth:`JobQueue.source_lock` lets one call at a time make or read back the renders of a source. An Office file's
+conversion (:meth:`JobQueue.submit_conversion`) keeps its one PDF so too, and its renders read that PDF. The two run in
+one turn (:meth:`JobQueue.turn`), so no other job of their gate comes between them.
 """
 
 import asyncio
@@ -86,7 +88,18 @@ from workbench.protocol import (
     encodable,
     encode,
 )
-from workbench.renders import RENDER_MAX_BYTES, SIGNATURES, RenderAnswer, RenderFacts, signature_ok
+from workbench.renders import (
+    CONVERTED_MAX_BYTES,
+    CONVERTED_MIME,
+    CONVERTED_NAME,
+    CONVERTED_SIGNATURE,
+    RENDER_MAX_BYTES,
+    SIGNATURES,
+    ConvertAnswer,
+    RenderAnswer,
+    RenderFacts,
+    signature_ok,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -159,6 +172,24 @@ class CallLimits:
         """
         if self.wall_s < 1 or self.wait_s < 0 or (self.slots is not None and self.slots < 1):
             raise ValueError("call limits need a wall of at least 1 s, a wait of at least 0 s and at least 1 slot")
+
+
+@dataclasses.dataclass(frozen=True)
+class Turn:
+    """A turn of the queue, held: what :meth:`JobQueue.turn` yields, proof that its holder is inside that turn.
+
+    A job sent with it runs inside it and takes no turn of its own. The queue serves it only while it is held, and only
+    to its own caller, user and gate: a copy, or a turn let go, serves no job.
+
+    Attributes:
+        caller: The caller it was taken for.
+        user_id: The user it was taken for, of any of their chats.
+        gate: The user's own turn, or the caller's prepare gate.
+    """
+
+    caller: str
+    user_id: str
+    gate: Gate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -546,6 +577,45 @@ def _check_inputs(input_files: Sequence[str]) -> None:
             check_filename(segment)
 
 
+def _check_source(p: Principal, source: FileRecord) -> None:
+    """Refuse a job over a file that is to run for another chat than the file's own.
+
+    Args:
+        p: The caller, user and chat the job is to run for.
+        source: The file.
+
+    Raises:
+        ValueError: ``p`` is not the source's caller, user and chat; that is a programming error.
+    """
+    if (p.caller, p.user_id, p.chat_id) != (source.caller, source.user_id, source.chat_id):
+        raise ValueError("a job over a file runs for its source's own chat")
+
+
+def _converted_input(source: FileRecord, converted: DerivedRecord) -> str:
+    """The input of a render job over an Office file's PDF: the PDF's derived path, taken from its record alone.
+
+    Args:
+        source: The Office file.
+        converted: The PDF it was converted to, as the store keeps it.
+
+    Returns:
+        ``.derived/<source-id>/<id>.pdf``, relative to the chat folder.
+
+    Raises:
+        ValueError: ``converted`` is not the source's own PDF: another role or type, another source or owner, or a name
+            that is not its id's; that is a programming error.
+    """
+    if (
+        converted.role != "pdf"
+        or converted.mime != CONVERTED_MIME
+        or converted.name != f"{converted.id}.pdf"
+        or (converted.source_id, converted.caller, converted.user_id, converted.chat_id)
+        != (source.id, source.caller, source.user_id, source.chat_id)
+    ):
+        raise ValueError("a render job reads its source's own converted PDF")
+    return converted.relative_path
+
+
 class JobQueue:
     """Runs jobs in the executor within the global, per-caller, per-user, prepare and queue limits.
 
@@ -571,6 +641,8 @@ class JobQueue:
         self._caller_gates: dict[str, _CallerGate] = {}
         self._prepare_gates: dict[str, _UserGate] = {}
         self._source_locks: dict[str, _SourceLock] = {}
+        self._turns: dict[int, Turn] = {}  # the turns held now, by the id of the object each holder got
+        self._turns_running: set[int] = set()  # those of them with a job running
         self._waiting = 0
         self._user_waiting_max = max(1, settings.queue_max // settings.executor_slots)
         self._staging = settings.data_dir / STAGING
@@ -654,29 +726,38 @@ class JobQueue:
         *,
         call: CallLimits,
         gate: Gate = "user",
+        turn: Turn | None = None,
+        converted: DerivedRecord | None = None,
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render a picture or pages of a PDF in the executor, when its turn comes, and keep the renders.
 
-        The job is ``prepare_file`` with the source as its one input and its ``path``. Its outputs become derived files
-        of the source, never files of the chat: the keeper records the job by the ids planned for them first, as for
-        :meth:`submit`, and each output it chose is kept only as the render the answer names (:meth:`_render_place`).
+        The job is ``prepare_file`` with the source as its one input and its ``path``; or, for an Office file, the PDF
+        it was converted to, at its derived path. Its outputs become derived files of the source, never files of the
+        chat: the keeper records the job by the ids planned for them first, as for :meth:`submit`, and each output it
+        chose is kept only as the render the answer names (:meth:`_render_place`).
 
         Args:
             p: The caller, user and chat the job runs for: the source's own.
             source: The file to render.
-            args: The runner's other arguments (``pages``, ``strips``, ``have``, ``budget_s``, ``facts``); ``path`` is
-                set to the source's whatever they hold.
+            args: The runner's other arguments (``pages``, ``strips``, ``have``, ``budget_s``, ``facts``, ``office``);
+                ``path`` is set to the input's whatever they hold.
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             call: The call's wall, wait and caller slots.
             gate: ``user`` waits for the user's own turn, as every other job; ``prepare`` waits for the caller's
                 prepare gate instead, so an attachment's prepare never takes the user's turn (:meth:`_turn`).
+            turn: A turn of ``gate`` that the holder is inside (:meth:`turn`); the job runs in it and takes none.
+                ``None`` waits for a turn of the job's own.
+            converted: The source's own PDF (role ``pdf``), which the job reads in place of the source; ``None`` reads
+                the source itself.
 
         Returns:
             The job record with its final status, the executor's answer without its staged outputs (its message names
             the renders that could not be kept) and the renders kept, in the order the job staged them.
 
         Raises:
-            ValueError: ``p`` is not the source's caller, user and chat; that is a programming error.
+            ValueError: ``p`` is not the source's caller, user and chat; ``converted`` is not the source's own PDF; or
+                ``turn`` is not held, or is another caller's, user's or gate's, or runs a job already. Each is a
+                programming error, raised before any job record.
             PathError: The source's name is not a plain path below the chat folder, or an id is not a safe id.
             Busy: The queue or the prepare gate is full, the user's or the caller's share is, the turn did not come in
                 time, or the executor has no free slot or cannot be reached.
@@ -684,16 +765,16 @@ class JobQueue:
             Exception: What the keeper raised (no render is kept), or what the store raises, such as a failure to
                 settle the job's record; the renders kept are removed again first, and the keeper records each again.
         """
-        if (p.caller, p.user_id, p.chat_id) != (source.caller, source.user_id, source.chat_id):
-            raise ValueError("a render job runs for its source's own chat")
-        input_files = [source.name]
+        _check_source(p, source)
+        path = source.name if converted is None else _converted_input(source, converted)
+        input_files = [path]
         _check_inputs(input_files)
         facts = args.get("facts", True) is True  # an answer of a job told not to look has no real facts
-        async with self._turn(p, call, gate=gate):
+        async with self._within(p, call, gate, turn):
             return await self._run(
                 p,
                 "prepare_file",
-                {**args, "path": source.name},
+                {**args, "path": path},
                 input_files,
                 keeper,
                 call,
@@ -701,6 +782,92 @@ class JobQueue:
                 lambda _, result: self._render_place(source, result, facts=facts),
                 self._store.remove_derived,
             )
+
+    async def submit_conversion(
+        self,
+        p: Principal,
+        source: FileRecord,
+        args: dict[str, Any],
+        keeper: Keeper,
+        *,
+        call: CallLimits,
+        gate: Gate = "user",
+        turn: Turn | None = None,
+    ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+        """Convert an Office file to a PDF in the executor, when its turn comes, and keep the PDF beside it.
+
+        The job is ``convert_office`` with the source as its one input and its ``path``. Its output becomes the
+        source's derived file of role ``pdf``, never a file of the chat: the keeper records the job by the id planned
+        for it first, as for :meth:`submit`, and it is kept only as the PDF a successful answer names
+        (:meth:`_converted_place`). An answer that is not ``ok`` keeps nothing, whatever the job staged.
+
+        Args:
+            p: The caller, user and chat the job runs for: the source's own.
+            source: The Office file to convert.
+            args: The runner's other arguments (``budget_s``); ``path`` is set to the source's whatever they hold.
+            keeper: Records the job before the PDF becomes visible, and picks the outputs to keep.
+            call: The call's wall, wait and caller slots.
+            gate: ``user`` waits for the user's own turn; ``prepare`` for the caller's prepare gate (:meth:`_turn`).
+            turn: A turn of ``gate`` that the holder is inside (:meth:`turn`); the job runs in it and takes none.
+                ``None`` waits for a turn of the job's own.
+
+        Returns:
+            The job record with its final status, the executor's answer without its staged outputs (its message names
+            an output that could not be kept) and the PDF kept, if it was.
+
+        Raises:
+            ValueError: ``p`` is not the source's caller, user and chat, or ``turn`` is not held, is another caller's,
+                user's or gate's, or runs a job already. Each is a programming error, raised before any job record.
+            PathError: The source's name is not a plain path below the chat folder, or an id is not a safe id.
+            Busy: The queue or the prepare gate is full, the user's or the caller's share is, the turn did not come in
+                time, or the executor has no free slot or cannot be reached.
+            RequestTooLarge: The request does not fit the protocol's line.
+            Exception: What the keeper raised (nothing is kept), or what the store raises, such as a failure to settle
+                the job's record; the PDF kept is removed again first, and the keeper records it again.
+        """
+        _check_source(p, source)
+        input_files = [source.name]
+        _check_inputs(input_files)
+        async with self._within(p, call, gate, turn):
+            return await self._run(
+                p,
+                "convert_office",
+                {**args, "path": source.name},
+                input_files,
+                keeper,
+                call,
+                False,
+                lambda _, result: self._converted_place(source, result),
+                self._store.remove_derived,
+            )
+
+    @contextlib.asynccontextmanager
+    async def turn(self, p: Principal, *, call: CallLimits, gate: Gate = "user") -> AsyncIterator[Turn]:
+        """Hold one turn of a gate for jobs that belong together, such as an Office file's conversion and its renders.
+
+        The turn is taken as a job takes one (:meth:`_turn`): the user's own, or the caller's prepare gate, then the
+        caller's gate and a global slot. Each job sent with the :class:`Turn` it yields runs in it, one at a time, and
+        takes no turn of its own, so that no other job of the gate comes between them. The holder awaits its jobs
+        inside the context.
+
+        Args:
+            p: The caller and user; the jobs may be of any of the user's chats.
+            call: The call's wait and caller slots. Each job's wall is its own call's.
+            gate: The user's own turn, or the caller's prepare gate.
+
+        Yields:
+            The turn, held until the context ends; a job sent with it after that is refused.
+
+        Raises:
+            Busy: ``queue_full`` or ``wait_timeout`` (:meth:`_admit`).
+        """
+        async with self._turn(p, call, gate=gate):
+            held = Turn(p.caller, p.user_id, gate)
+            self._turns[id(held)] = held
+            try:
+                yield held
+            finally:
+                del self._turns[id(held)]
 
     @contextlib.asynccontextmanager
     async def source_lock(self, source_id: str, wait_s: float) -> AsyncIterator[None]:
@@ -826,6 +993,39 @@ class JobQueue:
                     del self._prepare_gates[p.caller]
                 else:
                     del self._gates[key]
+
+    @contextlib.asynccontextmanager
+    async def _within(self, p: Principal, call: CallLimits, gate: Gate, turn: Turn | None) -> AsyncIterator[None]:
+        """Hold a turn for one job: one of its own (:meth:`_turn`), or the one its holder is inside (:meth:`turn`).
+
+        Args:
+            p: The caller and user.
+            call: The call's wait and caller slots, for a turn of the job's own.
+            gate: The user's own turn, or the caller's prepare gate.
+            turn: The turn the holder is inside; ``None`` waits for one of the job's own.
+
+        Yields:
+            Once the job may run.
+
+        Raises:
+            ValueError: ``turn`` is not held, being a copy or let go; it is another caller's, user's or gate's; or a
+                job of it runs already. Each is a programming error, raised before the job's record exists.
+            Busy: ``queue_full`` or ``wait_timeout`` (:meth:`_admit`), for a turn of the job's own.
+        """
+        if turn is None:
+            async with self._turn(p, call, gate=gate):
+                yield
+            return
+        key = id(turn)
+        if self._turns.get(key) is not turn or (turn.caller, turn.user_id, turn.gate) != (p.caller, p.user_id, gate):
+            raise ValueError("a turn serves its own caller, user and gate, and only while it is held")
+        if key in self._turns_running:
+            raise ValueError("a turn runs one job at a time")
+        self._turns_running.add(key)
+        try:
+            yield
+        finally:
+            self._turns_running.discard(key)
 
     def _prepare_gate(self, caller: str) -> _UserGate:
         """The prepare gate of a caller, made when a prepare of the caller comes and none waits or runs.
@@ -1504,6 +1704,58 @@ class JobQueue:
             if head is not None and entry.n == 1 and entry.strips == 1:
                 meta["facts"] = head
             spec = DerivedSpec(entry.role, entry.n, entry.mime, entry.width, entry.height, meta)
+            return self._store.register_derived(source, staged, spec, file_id=file_id, quota_bytes=quota)
+
+        return place
+
+    def _converted_place(self, source: FileRecord, result: JobResult) -> Place[DerivedRecord]:
+        """How a conversion's output is kept: only as the PDF a successful answer names, of role ``pdf`` of the source.
+
+        The answer must be ``ok`` and read as a :class:`~workbench.renders.ConvertAnswer`; the output must be named
+        ``CONVERTED_NAME``, begin with ``CONVERTED_SIGNATURE`` and hold at most ``CONVERTED_MAX_BYTES`` (the api decodes
+        nothing). It is registered as the source's ``pdf`` 0, with no size in pixels, and the answer's pages and
+        slides.
+
+        Args:
+            source: The Office file the PDF is of.
+            result: The executor's answer.
+
+        Returns:
+            The place. It raises ``_Invalid`` (lost as ``invalid``) for an answer that is no successful conversion, an
+            output of another name, a wrong signature, a file too large or one that cannot be read; else what
+            :meth:`~workbench.api.store.Store.register_derived` raises.
+        """
+        try:
+            answer = ConvertAnswer.model_validate(result.result) if result.status == "ok" else None
+        except ValidationError:
+            answer = None
+        quota = self._settings.workspace_max_mb * _MIB
+
+        def place(staged: Path, output: OutputFile, file_id: str) -> DerivedRecord:
+            """Keep the converted PDF.
+
+            Args:
+                staged: Its staged file, checked to be the job's own.
+                output: The output, by the name the job gave it.
+                file_id: The id the keeper's event named it by.
+
+            Returns:
+                The new derived file.
+
+            Raises:
+                _Invalid: It is not the PDF a successful answer names.
+            """
+            if answer is None:
+                raise _Invalid("not a conversion answer")
+            if output.name != CONVERTED_NAME:
+                raise _Invalid("not the converted PDF")
+            try:
+                first, size = _read_regular(staged, len(CONVERTED_SIGNATURE))
+            except OSError:
+                raise _Invalid("unreadable") from None
+            if size > CONVERTED_MAX_BYTES or not first.startswith(CONVERTED_SIGNATURE):
+                raise _Invalid("not a PDF")
+            spec = DerivedSpec("pdf", 0, CONVERTED_MIME, None, None, {"pages": answer.pages, "slides": answer.slides})
             return self._store.register_derived(source, staged, spec, file_id=file_id, quota_bytes=quota)
 
         return place

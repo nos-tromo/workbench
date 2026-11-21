@@ -18,11 +18,11 @@ The store never deletes a file of its own accord; :meth:`Store.remove` is called
 only once its deletion is recorded, and :meth:`Store.delete_chat` records a chat's
 deletion itself before anything of it goes.
 
-A derived file, the render of a picture or of a page of a PDF, is kept beside its source, in the reserved folder
-``<chat>/.derived/<source-id>/``, under its own table. It is bound to its source: it is as old as it, counts in the
-user's quota, is deleted with it, and is reachable by no path: ``.derived`` is found by no path of any principal,
-listed in no folder, and no upload, output or folder is named so. The caller records a render before it is registered,
-as it records an output.
+A derived file, the render of a picture or of a page of a PDF, or the PDF an Office file was converted to, is kept
+beside its source, in the reserved folder ``<chat>/.derived/<source-id>/``, under its own table. It is bound to its
+source: it is as old as it, counts in the user's quota, is deleted with it, and is reachable by no path: ``.derived``
+is found by no path of any principal, listed in no folder, and no upload, output or folder is named so. The caller
+records a render before it is registered, as it records an output.
 """
 
 import dataclasses
@@ -49,7 +49,7 @@ from typing import Any, BinaryIO, Final, Literal, TypeGuard
 from workbench.layout import DERIVED
 from workbench.models import VIRTUAL_ROOT, DerivedRecord, DerivedSpec, DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
-from workbench.renders import DERIVED_MAX_BYTES
+from workbench.renders import CONVERTED_MIME, DERIVED_MAX_BYTES
 from workbench.utils.audit_event import MAX_IDS
 
 _log = logging.getLogger(__name__)
@@ -73,11 +73,11 @@ _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
 
-#: The name of a render: its file id and its extension.
-_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png)")
+#: The name of a derived file: its file id and its extension, a render's or the converted PDF's.
+_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png|pdf)")
 
-#: The extension of each type of render the store keeps.
-_RENDER_EXTENSIONS: Final = {"image/jpeg": "jpg", "image/png": "png"}
+#: The extension of each type of derived file the store keeps: the renders, and the PDF an Office file is converted to.
+_DERIVED_EXTENSIONS: Final = {"image/jpeg": "jpg", "image/png": "png", CONVERTED_MIME: "pdf"}
 
 #: Most source ids one query of ``derived`` names, under the oldest SQLite's limit of 999 variables.
 _IN_CHUNK: Final = 500
@@ -280,8 +280,8 @@ def _orphan_ids(paths: Sequence[Path]) -> list[str]:
         paths: The orphans.
 
     Returns:
-        The id of each ``<id>.part``, and of each ``<id>.jpg`` or ``<id>.png`` in a folder ``.derived/<source-id>``; the
-        others carry none.
+        The id of each ``<id>.part``, and of each ``<id>.jpg``, ``<id>.png`` or ``<id>.pdf`` in a folder
+        ``.derived/<source-id>``; the others carry none.
     """
     ids: list[str] = []
     for path in paths:
@@ -1590,11 +1590,12 @@ class Store:
     ) -> DerivedRecord:
         """Move a render a job produced into the reserved folder of its source, under an id its event already names.
 
-        The render is kept as ``<chat>/.derived/<source-id>/<file-id>.jpg`` (``.png`` for a PNG): the folders are
-        private, the file is private, and it is renamed into place and then its row inserted, as :meth:`_place` does
-        for every file. It is as old as its source (``created_at``) and counts in the user's quota. All the checks and
-        the placing hold the store's lock, which :meth:`remove` and :meth:`delete_chat` hold: a render is never added
-        to a source that has gone, or to a chat that was deleted.
+        The render is kept as ``<chat>/.derived/<source-id>/<file-id>.jpg`` (``.png`` for a PNG, ``.pdf`` for the PDF
+        an Office file was converted to, which is kept as its renders are): the folders are private, the file is
+        private, and it is renamed into place and then its row inserted, as :meth:`_place` does for every file. It is
+        as old as its source (``created_at``) and counts in the user's quota. All the checks and the placing hold the
+        store's lock, which :meth:`remove` and :meth:`delete_chat` hold: a render is never added to a source that has
+        gone, or to a chat that was deleted.
 
         The caller records the render by ``file_id`` before it calls, so that it is never visible without its event,
         and records it again as ``error`` if this raises. It checks the render's signature and size; the store takes
@@ -1603,7 +1604,8 @@ class Store:
         Args:
             source: The file it is a render of; its row must still be there, for its owner and chat.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
-            spec: What it is. ``spec.mime`` is ``image/jpeg`` or ``image/png``.
+            spec: What it is. ``spec.mime`` is ``image/jpeg`` or ``image/png``; or ``application/pdf`` for role ``pdf``
+                alone, with no width or height.
             file_id: The render's id, chosen and recorded by the caller: 32 lowercase hex digits.
             quota_bytes: Most bytes the user may hold in all chats together, renders included.
             cap_bytes: Most bytes of renders the source may have.
@@ -1612,7 +1614,8 @@ class Store:
             The new record.
 
         Raises:
-            PathError: If ``spec.mime`` is no type of render, or ``staged`` is not a regular file.
+            PathError: If ``spec.mime`` is no type of derived file, ``spec.role`` and ``spec.mime`` are not both a PDF's
+                or both not, a PDF has a width or height, or ``staged`` is not a regular file.
             ValueError: If ``file_id`` is not 32 lowercase hex digits.
             NotFound: If ``staged`` does not exist; ``staged`` stays.
             Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`; ``staged``
@@ -1623,9 +1626,12 @@ class Store:
             RendersFull: If it would take the source over ``cap_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
-        extension = _RENDER_EXTENSIONS.get(spec.mime)
+        extension = _DERIVED_EXTENSIONS.get(spec.mime)
         if extension is None:
             raise PathError("not a type of render")
+        is_pdf = spec.role == "pdf"
+        if is_pdf != (spec.mime == CONVERTED_MIME) or (is_pdf and (spec.width, spec.height) != (None, None)):
+            raise PathError("a converted PDF is role pdf, of its type alone and with no size in pixels")
         meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
         st = _take_staged(staged)
         if _FILE_ID.fullmatch(file_id) is None:

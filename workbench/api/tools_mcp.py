@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from workbench.api.audit import OPERATIONS
 from workbench.api.auth import Caller
-from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper
+from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper, Turn
 from workbench.api.mcp_wire import _compact_json
 from workbench.api.registry import ToolEnv, ToolOutcome, ToolSpec
 from workbench.api.renders import WithBlocks
@@ -145,22 +145,61 @@ class CallJobs:
         return job, result, made
 
     async def submit_renders(
-        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper
+        self,
+        p: Principal,
+        source: FileRecord,
+        args: dict[str, Any],
+        keeper: Keeper,
+        *,
+        turn: Turn | None = None,
+        converted: DerivedRecord | None = None,
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render a picture or pages of a PDF as :meth:`JobQueue.submit_renders` does, within the call's limits.
 
-        It waits for the user's own turn; the renders are not the call's outputs.
+        It waits for the user's own turn, or runs in the one held; the renders are not the call's outputs.
 
         Args:
             p: The caller, user and chat the job runs for: the source's own.
             source: The file to render.
             args: The runner's other arguments.
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
+            turn: The user's turn the call holds (:meth:`turn`), or ``None`` to wait for one.
+            converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
 
         Returns:
             What :meth:`JobQueue.submit_renders` returns.
         """
-        return await self._queue.submit_renders(p, source, args, keeper, call=self.call)
+        return await self._queue.submit_renders(p, source, args, keeper, call=self.call, turn=turn, converted=converted)
+
+    async def submit_conversion(
+        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper, *, turn: Turn | None = None
+    ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+        """Convert an Office file to a PDF as :meth:`JobQueue.submit_conversion` does, within the call's limits.
+
+        It waits for the user's own turn, or runs in the one held; the PDF is not the call's output.
+
+        Args:
+            p: The caller, user and chat the job runs for: the source's own.
+            source: The Office file to convert.
+            args: The runner's other arguments.
+            keeper: Records the job before the PDF becomes visible, and picks the outputs to keep.
+            turn: The user's turn the call holds (:meth:`turn`), or ``None`` to wait for one.
+
+        Returns:
+            What :meth:`JobQueue.submit_conversion` returns.
+        """
+        return await self._queue.submit_conversion(p, source, args, keeper, call=self.call, turn=turn)
+
+    def turn(self, p: Principal) -> AbstractAsyncContextManager[Turn]:
+        """Hold the user's own turn for jobs that belong together, within the call's limits, as :meth:`JobQueue.turn`.
+
+        Args:
+            p: The caller and user.
+
+        Returns:
+            The turn, held while the context runs; entering it raises ``Busy`` as a job's turn does.
+        """
+        return self._queue.turn(p, call=self.call)
 
     def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the lock of one source's renders, waiting at most the call's wait, as :meth:`JobQueue.source_lock`.

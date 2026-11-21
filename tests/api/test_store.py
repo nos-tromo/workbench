@@ -1492,6 +1492,83 @@ def test_a_derived_png_is_a_png_and_another_type_is_refused(store: Store, alice:
     assert store.derived_of(source) == [png]
 
 
+#: The first bytes of a PDF, then invented ones: what an Office file is converted to.
+CONVERTED = b"%PDF-1.7 synthetic converted pages"
+
+
+def converted_spec(meta: Mapping[str, object] | None = None) -> DerivedSpec:
+    """The spec of the PDF an Office file was converted to: role ``pdf``, no size in pixels."""
+    return DerivedSpec("pdf", 0, "application/pdf", None, None, {"pages": 3} if meta is None else meta)
+
+
+def test_a_converted_pdf_is_a_derived_file(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """An Office file's PDF is ``.derived/<source id>/<id>.pdf``, private and counted in the quota; a second conflicts.
+
+    The second's staged file stays, and the source keeps the one PDF.
+    """
+    source = put(store, alice, "harbour-deck.pptx")
+    used = store.usage(alice)
+    file_id = new_file_id()
+    rec = store.register_derived(
+        source, staged(tmp_path, CONVERTED, "converted.pdf"), converted_spec(), file_id=file_id, quota_bytes=QUOTA
+    )
+    real = workspaces.chat_dir(alice) / ".derived" / source.id / f"{file_id}.pdf"
+    assert real.read_bytes() == CONVERTED
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    assert rec.relative_path == f".derived/{source.id}/{file_id}.pdf"
+    assert (rec.role, rec.ordinal, rec.mime, rec.width, rec.height, rec.size, dict(rec.meta)) == (
+        "pdf",
+        0,
+        "application/pdf",
+        None,
+        None,
+        len(CONVERTED),
+        {"pages": 3},
+    )
+    assert store.usage(alice) == used + len(CONVERTED)
+    second = staged(tmp_path, CONVERTED, "converted.pdf")
+    with pytest.raises(Conflict):
+        store.register_derived(source, second, converted_spec(), file_id=new_file_id(), quota_bytes=QUOTA)
+    assert second.exists()
+    assert store.derived_of(source) == [rec]
+
+
+@pytest.mark.parametrize(
+    ("role", "mime", "width", "height"),
+    [
+        ("pdf", "image/jpeg", None, None),
+        ("page", "application/pdf", None, None),
+        ("image", "application/pdf", None, None),
+        ("pdf", "application/pdf", 10, 20),
+        ("pdf", "application/pdf", None, 20),
+    ],
+    ids=["pdf-as-jpeg", "page-as-pdf", "image-as-pdf", "pdf-with-a-size", "pdf-with-a-height"],
+)
+def test_a_pdf_role_needs_its_type(
+    role: DerivedRole,
+    mime: str,
+    width: int | None,
+    height: int | None,
+    store: Store,
+    alice: Principal,
+    tmp_path: Path,
+) -> None:
+    """Role ``pdf`` is ``application/pdf`` with no size in pixels, and that type is no other role's: else a path error.
+
+    The staged file stays, and no row is made.
+    """
+    source = put(store, alice, "harbour-report.docx")
+    odd = staged(tmp_path, CONVERTED, "converted.pdf")
+    with pytest.raises(PathError):
+        store.register_derived(
+            source, odd, DerivedSpec(role, 0, mime, width, height, {}), file_id=new_file_id(), quota_bytes=QUOTA
+        )
+    assert odd.exists()
+    assert store.derived_of(source) == []
+
+
 def test_a_derived_file_needs_its_source(
     store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
 ) -> None:
@@ -2022,6 +2099,33 @@ def test_the_orphan_sweep_keeps_derived_files_and_names_orphans_by_id(
     assert not lost.exists()
     assert (chat / kept.relative_path).is_file()
     assert (chat / source.name).is_file()
+    assert store.derived_of(source) == [kept]
+
+
+def test_an_orphan_pdf_is_swept_by_its_id(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A converted PDF with its row stays; one a kill left without its row goes, recorded by the id its name carries."""
+    source = put(store, alice, "harbour-deck.pptx")
+    kept = store.register_derived(
+        source, staged(tmp_path, CONVERTED, "converted.pdf"), converted_spec(), file_id=new_file_id(), quota_bytes=QUOTA
+    )
+    chat = workspaces.chat_dir(alice)
+    lost_id = new_file_id()
+    lost = chat / ".derived" / source.id / f"{lost_id}.pdf"
+    lost.write_bytes(CONVERTED)
+    seen: list[tuple[str, list[str], int, str]] = []
+    outcome = store.sweep_user(
+        "ghostwriter",
+        "user-a",
+        untouched_before=time.time() + 3600,
+        device=os.stat(tmp_path / "data").st_dev,
+        record=lambda chat_id, ids, count, outcome: seen.append((chat_id, list(ids), count, outcome)),
+    )
+    assert outcome == (1, 0)
+    assert seen == [("chat-1", [lost_id], 1, "ok")]
+    assert not lost.exists()
+    assert (chat / kept.relative_path).is_file()
     assert store.derived_of(source) == [kept]
 
 
