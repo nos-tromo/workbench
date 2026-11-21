@@ -1529,6 +1529,39 @@ def test_a_cut_of_the_text_before_the_images_end_keeps_its_own_reason(
     assert "images within the limit" not in structured["hint"]
 
 
+def test_paging_moves_on_at_the_lowest_result_limit_however_long_the_notes(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """Task 10 minor a: at 1 KB, the room kept for the notes of four images never leaves the answer without text.
+
+    Text on pages 1 and 3, scans on 2, 4, 5 and 6, the read cut at page 7, the runner's own hint and paths of many
+    lengths: the first part is kept, cut if it must be, so that ``next_part`` is never the page the call began at; the
+    notes may then be shortened. Without the guard, names of about 100 to 150 characters stalled on page 1. (Past
+    that, the path, the hint and four ``shown`` entries alone fill 1 KB, whatever room the notes are given.)
+    """
+    for length in range(20, 152, 3):
+        name = f"harbour-{'q' * length}.pdf"
+        source = pdf(store, built, name, ["A", None, "B", None, None, None, "C", "D"])
+        local.scripted["read_document"] = reading(
+            "x",
+            ("page 1", "w" * 400),
+            ("page 3", "w" * 400),
+            kind="pdf",
+            total_parts=8,
+            pages_without_text=[2, 4, 5, 6],
+            truncated=True,
+            next_part="page 7",
+            hint=(
+                "pages 2, 4, 5, 6 of those looked at have no text layer (scans or pictures); do not treat them as "
+                "blank. page 3 is longer than the result limit and is cut; its rest cannot be read by paging."
+            ),
+        )
+        structured = answered(read(seeing_small, source.virtual_path))
+        assert structured["parts"], length
+        assert structured["next_part"] != "page 1", length
+        assert sent_size(structured) <= 1024, length
+
+
 # --- read_document: what the model is told ------------------------------------------------------------------------
 
 

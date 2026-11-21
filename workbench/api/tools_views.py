@@ -649,8 +649,10 @@ async def _read_pdf(
     read; the answer then ends before the first page they did not take (and says it was the images), the cut to the
     result limit may end it earlier, and the images of a page the text no longer reaches wait for the call that reads
     on, as do the pages named in ``pages_without_text`` from where it ends. The notes about the images are added after
-    the text is cut, and room is kept for them first, so that they are never cut themselves. The read is recorded once,
-    when the images are settled; when the pictures fail the call it is recorded as an ``error`` first.
+    the text is cut, and room is kept for them first, so that they are never cut themselves, unless that room would
+    leave no text at all (a result limit of a kilobyte or so): paging must move on, so the text is cut without it and
+    the notes are shortened instead. The read is recorded once, when the images are settled; when the pictures fail the
+    call it is recorded as an ``error`` first.
 
     Args:
         body: The path, the part and the strips.
@@ -705,6 +707,10 @@ async def _read_pdf(
         }
     )
     answer = _fit_read(base, settings.result_max_kb, reserve=_json_size(full) - _json_size(base))
+    if base.parts and not answer.parts:
+        # Paging must move on: when the room kept for the notes leaves no text at all, the notes give way.
+        relaxed = _fit_read(base, settings.result_max_kb)
+        answer = relaxed if relaxed.parts else answer
     ended_by_images = cut is not None and (not answer.truncated or answer.next_part is None)
     if ended_by_images:
         answer = answer.model_copy(update={"truncated": True, "next_part": f"page {cut}"})
