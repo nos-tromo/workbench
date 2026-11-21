@@ -1,10 +1,11 @@
-"""The bounds and rules of the renders of a picture or a PDF, shared by the api and the executor.
+"""The bounds and rules of the renders of a picture, a PDF or an Office file, shared by the api and the executor.
 
-A render is a JPEG or PNG a model can look at: a photograph scaled down, or a page of a PDF drawn at a fixed size. The
-executor, which holds the files and the imaging libraries, makes them and answers with a :class:`RenderAnswer`; the api,
-which has no imaging library, checks that answer, a render's signature and its size, and never decodes a file. Neither
-side copies the other: both import this module, as both import :mod:`workbench.decks`. It imports no imaging library,
-so the api's image can load it.
+A render is a JPEG or PNG a model can look at: a photograph scaled down, or a page of a PDF drawn at a fixed size. An
+Office file (a text document or a deck) is converted to a PDF once, and its pages or slides are then drawn from that
+PDF as any other. The executor, which holds the files and the imaging libraries, makes the renders and answers with a
+:class:`RenderAnswer`; the api, which has no imaging library, checks that answer, a render's signature and its size,
+and never decodes a file. Neither side copies the other: both import this module, as both import
+:mod:`workbench.decks`. It imports no imaging library, and nothing of LibreOffice, so the api's image can load it.
 """
 
 import math
@@ -18,8 +19,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 IMAGE_SUFFIXES: Final = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif"})
 PDF_SUFFIX: Final = ".pdf"
 
-#: What a file is to the render tools: a picture, a PDF, or neither.
-Kind = Literal["image", "pdf", "none"]
+#: The extensions of the Office files that are converted to a PDF and then drawn: text documents and decks, and the
+#: templates of either. Spreadsheets, ODF presentations and the old binary formats are left out.
+OFFICE_SUFFIXES: Final = frozenset({".docx", ".dotx", ".pptx", ".potx", ".odt"})
+
+#: Those of them that are decks, whose pages are counted as slides.
+SLIDE_SUFFIXES: Final = frozenset({".pptx", ".potx"})
+
+#: What a file is to the render tools: a picture, a PDF, an Office file, or none of them.
+Kind = Literal["image", "pdf", "office", "none"]
+
+#: What a render of a PDF page counts: a page of a document, or a slide of a deck.
+Unit = Literal["page", "slide"]
 
 #: Most pixels (120 megapixels) of a source picture the executor decodes; a larger one is refused before it is read.
 SOURCE_MAX_PIXELS: Final = 120_000_000
@@ -56,6 +67,13 @@ STRIP_OVERLAP: Final = 0.06
 #: Most bytes of renders one source file may have, counted in the user's quota.
 DERIVED_MAX_BYTES: Final = 64 * 1024 * 1024
 
+#: The PDF an Office file is converted to: its name in the job's output, its type, the first bytes the api checks, and
+#: the most bytes it may have (it counts toward ``DERIVED_MAX_BYTES``).
+CONVERTED_NAME: Final = "converted.pdf"
+CONVERTED_MIME: Final = "application/pdf"
+CONVERTED_SIGNATURE: Final = b"%PDF-"
+CONVERTED_MAX_BYTES: Final = 32 * 1024 * 1024
+
 #: The first bytes of each type of render; the api checks them without decoding anything.
 SIGNATURES: Final[Mapping[str, bytes]] = {"image/jpeg": b"\xff\xd8\xff", "image/png": b"\x89PNG\r\n\x1a\n"}
 
@@ -74,14 +92,30 @@ def kind_of(name: str) -> Kind:
         name: A file name or path.
 
     Returns:
-        ``"image"`` for a picture suffix, ``"pdf"`` for ``.pdf`` (either in any case), else ``"none"``.
+        ``"image"`` for a picture suffix, ``"pdf"`` for ``.pdf``, ``"office"`` for a suffix of ``OFFICE_SUFFIXES`` (any
+        of them in any case), else ``"none"``.
     """
     suffix = PurePosixPath(name).suffix.lower()
     if suffix in IMAGE_SUFFIXES:
         return "image"
     if suffix == PDF_SUFFIX:
         return "pdf"
+    if suffix in OFFICE_SUFFIXES:
+        return "office"
     return "none"
+
+
+def unit_of(name: str) -> Unit:
+    """Tell what the renders of a file count, by its suffix alone.
+
+    Args:
+        name: A file name or path.
+
+    Returns:
+        ``"slide"`` for a suffix of ``SLIDE_SUFFIXES`` in any case, else ``"page"``: a picture, a PDF and a file of no
+        kind count by page too, so that a unit is always an answer.
+    """
+    return "slide" if PurePosixPath(name).suffix.lower() in SLIDE_SUFFIXES else "page"
 
 
 def signature_ok(data: bytes, mime: str) -> bool:
@@ -217,19 +251,49 @@ class RenderEntry(_Strict):
         return self
 
 
+class ConvertAnswer(_Strict):
+    """The runner's whole answer to a conversion job: the PDF it made out of an Office file, which it names.
+
+    Attributes:
+        name: The file in the job's output, always ``CONVERTED_NAME``.
+        pages: The pages of the PDF, at least 1.
+        slides: The slides the reader counted in a deck, at least 1; ``None`` for a text document. A deck whose PDF has
+            another number of pages than this is told in the manifest's hint.
+    """
+
+    name: Literal["converted.pdf"]
+    pages: int = Field(ge=1)
+    slides: int | None = Field(default=None, ge=1)
+
+
+class OfficeRequest(_Strict):
+    """The ``office`` argument of a ``prepare_file`` job over a converted PDF: what the PDF stands for.
+
+    Attributes:
+        unit: What its pages count, ``slide`` for a deck, else ``page``.
+        slides: The slides the reader counted in a deck, at least 1; ``None`` for a text document.
+    """
+
+    unit: Unit
+    slides: int | None = Field(default=None, ge=1)
+
+
 class RenderFacts(_Strict):
     """What the executor found out about a file besides its renders.
 
     Attributes:
-        kind: ``image`` or ``pdf``.
-        total: Pictures are 1; for a PDF, its pages.
-        pages_without_text: The pages, counted from 1, of a PDF with no text of their own, at most
+        kind: ``image``, ``pdf`` or ``office``.
+        unit: What ``total`` and the pages count: ``slide`` for a deck, else ``page``. A head kept before this was
+            written has none, and reads as ``page``.
+        total: Pictures are 1; for a PDF or an Office file, its pages or slides.
+        pages_without_text: The pages, counted from 1, of a PDF or an Office file with no text of their own, at most
             ``PAGES_CHECKED_MAX`` checked.
         frames: The frame count of a picture with several (only the first is rendered); ``None`` otherwise.
         hint: A short note for the model, such as why only some pages were checked; ``None`` for none.
     """
 
-    kind: Literal["image", "pdf"]
+    kind: Literal["image", "pdf", "office"]
+    unit: Unit = "page"
     total: int = Field(ge=1)
     pages_without_text: list[int] = Field(max_length=PAGES_CHECKED_MAX)
     frames: int | None = Field(ge=2)

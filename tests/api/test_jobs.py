@@ -2381,7 +2381,7 @@ async def test_renders_are_recorded_before_they_are_kept(
     assert [(r.role, r.ordinal, r.mime, r.width, r.height, r.size) for r in rows] == [
         ("page", n, "image/jpeg", 120, 160, len(JPEG)) for n in (1, 2, 3)
     ]
-    assert rows[0].meta["facts"] == FACTS
+    assert rows[0].meta["facts"] == {**FACTS, "unit": "page"}  # an answer without a unit reads as pages, and keeps it
     assert [dict(rec.meta) for rec in rows[1:]] == [{}, {}]
     assert [rec.id for rec in store.files_in_chat(me)] == [source.id]
     assert (job.status, result.message, result.outputs, keeper.again_ids) == ("ok", "", [], [])

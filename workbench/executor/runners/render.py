@@ -321,7 +321,7 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     if name.split("/")[0] == "out" or not real.is_file():
         return error("file_not_found", "there is no such file in this conversation's workspace")
     kind = kind_of(name)
-    if kind == "none":
+    if kind in ("none", "office"):  # Office files are not drawn yet
         return error("unsupported_format", "only pictures and PDFs can be shown")
     request = _Request.of(args)
     budget = float(args.get("budget_s", _BUDGET_S))

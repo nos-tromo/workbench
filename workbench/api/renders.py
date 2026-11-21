@@ -253,12 +253,13 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
 
     Returns:
         The manifest: the facts of the whole render of page 1 and every whole render of its role, by page. ``None``
-        when there is no whole render of page 1 that carries its facts: the file is not prepared yet.
+        when there is no whole render of page 1 that carries its facts: the file is not prepared yet. Office files are
+        not drawn yet, so a head of kind ``office`` is no manifest either.
     """
     whole = [rec for rec in rows if _is_render(rec) and rec.strips == 1]
     head = next((rec for rec in whole if rec.ordinal == 1), None)
     facts = None if head is None else _facts(head)
-    if head is None or facts is None:
+    if head is None or facts is None or facts.kind == "office":
         return None
     renditions = [
         Rendition.model_validate(
@@ -384,7 +385,7 @@ async def prepared(
         StorageFull: The volume is full (507).
         NotFound: The file went while the job ran, with its chat (404).
     """
-    if kind_of(source.name) == "none":
+    if kind_of(source.name) in ("none", "office"):  # Office files are not drawn yet
         return Manifest(
             path=source.virtual_path,
             kind="none",

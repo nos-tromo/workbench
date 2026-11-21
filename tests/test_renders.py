@@ -110,7 +110,7 @@ def test_a_side_is_never_scaled_to_nothing() -> None:
         ("scan.pdf", "pdf"),
         ("photo.HEIC", "image"),
         ("photo.jpeg", "image"),
-        ("deck.pptx", "none"),
+        ("deck.pptx", "office"),
         ("noext", "none"),
         (".png", "none"),
     ],
@@ -118,6 +118,40 @@ def test_a_side_is_never_scaled_to_nothing() -> None:
 def test_the_kind_of_a_file_is_told_by_its_lower_cased_suffix(name: str, kind: str) -> None:
     """A file is an image, a PDF or neither by its suffix alone, in any case."""
     assert renders.kind_of(name) == kind
+
+
+@pytest.mark.parametrize("name", ["Deck.PPTX", "master.potx", "report.docx", "form.dotx", "notes.odt", "Notes.ODT"])
+def test_an_office_file_is_told_by_its_lower_cased_suffix(name: str) -> None:
+    """A text document, a deck or a template of either is kind office, in any case."""
+    assert renders.kind_of(name) == "office"
+
+
+@pytest.mark.parametrize("name", ["sheet.xlsx", "book.ods", "show.odp", "old.doc", "old.ppt", "memo.rtf"])
+def test_the_office_types_left_out_are_none(name: str) -> None:
+    """A spreadsheet, an ODF presentation and the old binary formats are not drawn as pages."""
+    assert renders.kind_of(name) == "none"
+
+
+def test_the_office_suffixes_are_the_five_and_the_slide_ones_are_two_of_them() -> None:
+    """The decks are a subset of the office suffixes."""
+    assert renders.OFFICE_SUFFIXES == {".docx", ".dotx", ".pptx", ".potx", ".odt"}
+    assert renders.SLIDE_SUFFIXES == {".pptx", ".potx"}
+    assert renders.SLIDE_SUFFIXES < renders.OFFICE_SUFFIXES
+
+
+@pytest.mark.parametrize(
+    ("name", "unit"),
+    [("a.POTX", "slide"), ("a.pptx", "slide"), ("a.odt", "page"), ("a.docx", "page"), ("a.dotx", "page")],
+)
+def test_a_deck_is_drawn_by_slide_and_a_document_by_page(name: str, unit: str) -> None:
+    """The unit is told by the lower-cased suffix: a slide for a deck or its template, else a page."""
+    assert renders.unit_of(name) == unit
+
+
+@pytest.mark.parametrize("name", ["scan.pdf", "photo.png", "noext"])
+def test_what_is_not_a_deck_is_drawn_by_page(name: str) -> None:
+    """A PDF, a picture and a file of no kind count by page, so ``unit`` is always an answer."""
+    assert renders.unit_of(name) == "page"
 
 
 def test_every_image_suffix_is_one_kind_of_image() -> None:
@@ -215,6 +249,25 @@ def test_render_facts_refuse_what_is_out_of_bounds(fields: dict[str, Any]) -> No
         renders.RenderFacts(**_facts(**fields))
 
 
+def test_facts_a_v07_head_kept_without_a_unit_still_read_as_pages() -> None:
+    """The five keys v0.7 kept read, and the unit is a page."""
+    facts = renders.RenderFacts.model_validate(_facts())
+    assert facts.unit == "page"
+
+
+def test_facts_of_a_deck_say_slide() -> None:
+    """An Office file's facts take kind office and unit slide."""
+    facts = renders.RenderFacts(**_facts(kind="office", unit="slide"))
+    assert (facts.kind, facts.unit) == ("office", "slide")
+
+
+@pytest.mark.parametrize("fields", [{"unit": "sheet"}, {"kind": "office", "unit": "sheet"}, {"unit": None}])
+def test_facts_refuse_a_unit_that_is_not_a_page_or_a_slide(fields: dict[str, Any]) -> None:
+    """A unit other than page or slide is refused."""
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_facts(**fields))
+
+
 def test_render_facts_take_the_longest_hint_and_the_most_pages_it_may() -> None:
     """Facts at the bounds are whole."""
     facts = renders.RenderFacts(
@@ -241,6 +294,50 @@ def test_a_refusal_never_quotes_what_it_was_given() -> None:
     with pytest.raises(ValidationError) as caught:
         renders.RenderFacts(**_facts(hint="secret-" + "x" * 300))
     assert "secret-" not in str(caught.value)
+
+
+def test_the_converted_pdf_has_one_name_one_type_and_a_cap() -> None:
+    """A converted PDF is ``converted.pdf``, a PDF by its signature, and at most 32 MiB."""
+    assert renders.CONVERTED_NAME == "converted.pdf"
+    assert renders.CONVERTED_MIME == "application/pdf"
+    assert renders.CONVERTED_SIGNATURE == b"%PDF-"
+    assert renders.CONVERTED_MAX_BYTES == 32 * 1024 * 1024
+
+
+def test_a_convert_answer_takes_a_deck_and_a_document() -> None:
+    """A document has pages only; a deck has the reader's slide count too."""
+    assert renders.ConvertAnswer(name="converted.pdf", pages=12).slides is None
+    assert renders.ConvertAnswer(name="converted.pdf", pages=12, slides=12).slides == 12
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"name": "a.pdf"},
+        {"name": "../converted.pdf"},
+        {"pages": 0},
+        {"slides": 0},
+        {"extra": "x"},
+    ],
+)
+def test_a_convert_answer_refuses_what_is_not_the_converted_pdf(fields: dict[str, Any]) -> None:
+    """The answer names only ``converted.pdf``, has a page, and has no stray key."""
+    with pytest.raises(ValidationError):
+        renders.ConvertAnswer.model_validate({"name": "converted.pdf", "pages": 3} | fields)
+
+
+def test_an_office_request_takes_a_unit_and_the_slide_count() -> None:
+    """The request carries the unit, and a deck's slide count when the reader had one."""
+    assert renders.OfficeRequest(unit="page").slides is None
+    request = renders.OfficeRequest.model_validate({"unit": "slide", "slides": 24})
+    assert (request.unit, request.slides) == ("slide", 24)
+
+
+@pytest.mark.parametrize("fields", [{"unit": "sheet"}, {"slides": 0}, {"extra": "x"}])
+def test_an_office_request_refuses_what_is_out_of_bounds(fields: dict[str, Any]) -> None:
+    """A request is refused for another unit, no slide or a stray key."""
+    with pytest.raises(ValidationError):
+        renders.OfficeRequest.model_validate({"unit": "slide"} | fields)
 
 
 def test_a_jpeg_is_known_by_its_signature() -> None:
