@@ -115,9 +115,11 @@ def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, 
     ("key", "path", "passes"),
     [
         (GHOSTWRITER_KEY, "/files/upload", True),
+        (GHOSTWRITER_KEY, "/files/prepare", True),
         (GHOSTWRITER_KEY, "/files/other", False),
         (GHOSTWRITER_KEY, "/nowhere", False),
         (DOCINT_KEY, "/files/chat", False),
+        (DOCINT_KEY, "/files/prepare", False),
     ],
 )
 def test_ghostwriters_door_answers_before_any_body_is_read(
@@ -254,17 +256,21 @@ def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: s
 @pytest.mark.parametrize(
     ("caller", "path", "allowed"),
     [
-        *[(GHOSTWRITER, path, True) for path in ["/mcp", "/files/upload", "/files/view", "/files/list", "/files/chat"]],
+        *[
+            (GHOSTWRITER, path, True)
+            for path in ["/mcp", "/files/upload", "/files/prepare", "/files/view", "/files/list", "/files/chat"]
+        ],
         *[
             (GHOSTWRITER, path, False)
             for path in ["/files", "/files/", "/files/other", "/files/listing", "/mcp/", "/nowhere"]
         ],
         (DOCINT, "/files/chat", False),
         (DOCINT, "/files/upload", False),
+        (DOCINT, "/files/prepare", False),
     ],
 )
-def test_door_allows_the_ghostwriter_its_door_and_four_file_routes(caller: Caller, path: str, allowed: bool) -> None:
-    """Ghostwriter has ``/mcp`` and the four file routes; the chat delete is no other caller's."""
+def test_door_allows_the_ghostwriter_its_door_and_five_file_routes(caller: Caller, path: str, allowed: bool) -> None:
+    """Ghostwriter has ``/mcp`` and the five file routes; the chat delete is no other caller's."""
     assert door_allows(caller, path) is allowed
 
 

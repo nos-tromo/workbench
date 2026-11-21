@@ -47,10 +47,12 @@ The `container` is the chat folder the files live in.
 | Key | `action` / `operation` | `target.ids` | `criteria` besides `caller` | Outcome |
 |---|---|---|---|---|
 | `upload` | `collect` / `file.upload` | the new file (Ghostwriter's answer names it as `id`) | — | `ok`, before the file is visible; `error` again when it could not be stored after that |
-| `view` | `disclose` / `file.view` | the file viewed or downloaded | — | `ok`, before the bytes go |
-| `chat_delete` | `delete` / `chat.delete` | every file of the chat Ghostwriter deletes, `container` that chat | — | `ok`, before anything of the chat goes, also with no file; `error` again when the deletion then failed |
-| `read_document` | `query` / `tool.read_document` | the file read | `paged`: whether the call asked for a part | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
+| `view` | `disclose` / `file.view` | the file viewed or downloaded; for a rendition, the file and the render | — | `ok`, before the bytes go |
+| `prepare` | `modify` / `file.prepare` | the picture or PDF rendered, then every render kept | `renders`: how many renders the job made; `strips`: into how many strips each page is cut (1 for whole pages); `on_demand`: `false` for the prepare of a file (its first pages and its facts), `true` for a later job that makes pages or strips: those a call asks for, or a picture's strips that a prepare with `strips` cuts; `outputs`: how many renders are kept, `0` on an `error` | before any render is visible: `ok`, or `error` (below), which keeps no render. A file prepared already is answered from its renders, with no job and no event |
+| `chat_delete` | `delete` / `chat.delete` | every file of the chat Ghostwriter deletes, then the ids of the chat's renders, `container` that chat | — | `ok`, before anything of the chat goes, also with no file; `error` again when the deletion then failed |
+| `read_document` | `query` / `tool.read_document` | the file read; for a PDF or a picture, then each render shown, in the order of the answer's images | `paged`: whether the call asked for a part; `images`: how many images go out, `0` when none, on every `ok` read and on the `error` of a PDF read whose pictures then failed the call (not on the `error` of a job that refused or failed) | once the job has answered and the images are settled, before anything of the answer goes: `ok`, or `error` (below). A PDF read whose renders then fail the call in a way that is not their own loss (a failed render job, a purpose the renders need, a cancellation) is recorded as an `error` naming the file alone. A picture file runs no read job: it is recorded once its render is read back. The renders made for the call have their own `prepare` event |
 | `search_files` | `query` / `tool.search_files` | every file the search was given | `regex`: whether the query is a regular expression; `max_hits` | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
+| `view_file` | `query` / `tool.view_file` | the picture or PDF, then each render shown, in the order of the answer's images; only the file when no image is shown (a file that is neither a picture nor a PDF, or a window whose pages could not be shown) | `images`: how many images go out; `strips`: into how many strips each page is cut (1 for whole pages); `paged`: whether the call asked for a part | before any image leaves, once the renders are read back: `ok`. A call that is refused before it shows anything (a file that is not found, a part that is not a page, a file that cannot be rendered) writes none: the prepare of the file, if one ran, has its own event (`prepare`) |
 | `run_python` | `combine` / `tool.run_python` | every file the job was given, then every file it made that is kept | `outputs`: how many files it made that are kept | before any file it made is visible and before the answer goes. `ok` when the job ran to an answer: the code may have raised (its traceback is the answer) or run out of its own time, 9/10 of the wall time (stderr then says it timed out); `error` when the job failed, was stopped at the wall time or on a resource limit, its outputs broke the executor's limits, or its answer could not be used |
 | `run_python_inline` | `combine` / `tool.run_python.inline` | none: `target.kind` is `inline_data`, `count` the data entries, `container` `chat:<session>` | `job`, `input_bytes`, `outputs` (returned), `dropped`; `refused` on a refusal | once the job has answered, before anything of the answer goes: `ok`, or `error`; `denied`, without a target, for a missing required purpose |
 | `inspect_template` | `query` / `tool.inspect_template` | the template; none without a path, for the plain slide master (`count` 0) | — | once the job has answered, before anything of the answer goes: `ok`, or `error` (below) |
@@ -82,7 +84,9 @@ A tool that makes files writes a second, `error` event, with `outputs` counting
 them, for new files its event named that did not end as it said: not stored
 after all (the user's quota, a full disk, an invalid name, any other error of
 the store), or stored and then removed again, or not removed, when the call
-failed or its caller went away (`workbench/api/jobs.py:JobQueue`).
+failed or its caller went away (`workbench/api/jobs.py:JobQueue`). A `prepare`
+does the same for its renders, among them one past its source's cap of renders
+or one that exists already (`workbench/api/renders.py`).
 
 [permissions.md](permissions.md#which-runs-are-audited) says which runs are
 recorded and which are not.
@@ -135,8 +139,9 @@ No event sets `ids_truncated`. `search_files` and `run_python`, which can be
 given up to 1000 files, can need continuations, and so can `fill_template` with
 many file sources and `write_presentation` with many pictures and source files
 (`workbench/api/audit.py:AuditLog._emit`, with the shared
-`audit_runtime.id_chunks`). Retention never does: its batches are of at most
-200 files.
+`audit_runtime.id_chunks`). Retention's batches are of at most 200 files, but
+a batch names the renders of its files after them, so a record of files with
+many renders can need continuations too.
 
 ## Retention events
 
@@ -153,7 +158,8 @@ What `criteria` and `target` hold depends on what is removed:
 
 | Removed | `criteria` | `target` |
 |---|---|---|
-| Files past the period, one batch of one user | `period_days`, `cutoff` (the moment before which files are due, ISO 8601), `caller`, `owner` (the user id), `count`; no `rule` | `ids` of the batch, at most 200; `count` |
+| Files past the period, one batch of one user | `period_days`, `cutoff` (the moment before which files are due, ISO 8601), `caller`, `owner` (the user id), `count` (files), `derived` (their renders); no `rule` | `ids` of the batch's files, at most 200, then the ids of their renders; `count` is the number of ids |
+| Renders with no source, or due without it staying: one batch of one user | `rule: derived`, `period_days`, `cutoff`, `caller`, `owner`, `count` | `ids` of the renders; `count` |
 | A job's staging residue: outputs nobody registered, older than an hour | `rule: staging`, `job` (the job's id), `count` of its regular files, and `caller` and `owner` while the job's record exists | `count`, no ids; `container: chat:<chat-id>` while the job's record exists |
 | Orphans of one chat folder: files with no row, older than an hour | `rule: orphan`, `caller`, `owner`, `count` | `ids`: the file ids the names of interrupted uploads carry (`<id>.part`), never a name; `count`; `container: chat:<chat-id>` |
 

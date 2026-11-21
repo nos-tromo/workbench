@@ -1,8 +1,9 @@
 """The workspace tools, one row each: what the MCP door tells the model of every tool, and what runs it.
 
-A row names the tool, its title, its description written for the model, the model of its arguments and of its answer,
-and the function that runs it (in :mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`,
-:mod:`workbench.api.tools_output` and :mod:`workbench.api.tools_presentations`).
+A row names the tool, its title, its description written for the model (and, for a tool told otherwise to a call that
+takes no images, that text too), the model of its arguments and of its answer, and the function that runs it (in
+:mod:`workbench.api.tools`, :mod:`workbench.api.tools_templates`, :mod:`workbench.api.tools_output`,
+:mod:`workbench.api.tools_presentations` and :mod:`workbench.api.tools_views`).
 :func:`~workbench.api.tools_mcp.workspace_tools` makes each row a spec of the registry. A new workspace tool is a row
 here.
 """
@@ -13,7 +14,7 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
-from workbench.api import tools, tools_output, tools_presentations, tools_templates
+from workbench.api import tools, tools_output, tools_presentations, tools_templates, tools_views
 from workbench.tables import MAX_WORD_COLUMNS
 
 
@@ -27,7 +28,10 @@ class WorkspaceTool:
         description: What it does, written for the model.
         input_model: The model of its arguments, or ``None`` when it takes none (``list_files``).
         output_model: The model of its answer, before the door adds ``outputs``.
-        function: Runs it; it takes, by name, any of ``body``, ``p``, ``settings``, ``store``, ``audit`` and ``jobs``.
+        function: Runs it; it takes, by name, any of ``body``, ``p``, ``settings``, ``store``, ``audit``, ``jobs`` and
+            ``images`` (whether the call takes images).
+        images_only: Whether it only shows images, and so is offered only to a call that takes them.
+        text_description: What a call that takes no images is told of it instead, or ``None`` for ``description``.
     """
 
     name: str
@@ -36,6 +40,8 @@ class WorkspaceTool:
     input_model: type[BaseModel] | None
     output_model: type[BaseModel]
     function: Callable[..., Any]
+    images_only: bool = False
+    text_description: str | None = None
 
 
 #: The workspace tools, in name order.
@@ -96,6 +102,25 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         name="read_document",
         title="Read a file of this conversation as text",
         description=(
+            "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, "
+            "XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and "
+            "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path "
+            "from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so "
+            "a long file is read in several calls: when truncated is true, call again with part set to next_part. "
+            "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
+            "paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as "
+            "'table 2, row 350' opens there), ranges of up to 200 sheet rows ('Sheet1!A201:F400', each line 'row: "
+            "cell | cell'; a sheet's name starts at its first row) and lines ('lines 100-200'). Cite what you read by "
+            "these references. pages_without_text lists pages or slides with no text layer (scans, pictures); never "
+            "treat them as blank. Such PDF pages come back as images in the same answer (shown names them): read them "
+            "from the images. To look at any page, use view_file. Outlook .msg files cannot be read: ask the user to "
+            "save them as .eml or PDF."
+        ),
+        input_model=tools.ReadDocumentRequest,
+        output_model=tools.DocumentRead,
+        function=tools_views.read_document,
+        # workbench 0.6's words, for a call that takes no images: they promise none.
+        text_description=(
             "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
             "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
             "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
@@ -108,9 +133,6 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "tool does no OCR, so tell the user those need OCR elsewhere, and never treat them as blank. Outlook .msg "
             "files cannot be read: ask the user to save them as .eml or PDF."
         ),
-        input_model=tools.ReadDocumentRequest,
-        output_model=tools.DocumentRead,
-        function=tools.read_document,
     ),
     WorkspaceTool(
         name="run_python",
@@ -122,13 +144,13 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "new file of the workspace, and files lists their paths (at most 20 files a run). Save charts as image "
             "files there, for example plt.savefig('out/chart.png'); nothing is shown inline, so the user sees each "
             "file in out/ as a card in the chat. Installed: pandas, numpy, scipy, matplotlib, openpyxl, xlsxwriter, "
-            "python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4. To turn a data file (JSON, CSV, "
-            "XLSX) into a table file, load it in code (json, pandas.json_normalize) and write it to out/ as .xlsx or "
-            ".csv; do not copy its rows into write_table. There is no network and nothing can be installed. Use "
-            "threads, not multiprocessing: process pools and multiprocessing do not work here. The code runs as a "
-            "script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in the middle when "
-            "long (truncated is then true), so print summaries, not whole tables. Cite job_id as the source of "
-            "figures the code computed."
+            "python-docx, docxtpl, python-pptx, pypdf, odfpy, lxml, beautifulsoup4, pillow, pypdfium2. To turn a "
+            "data file (JSON, CSV, XLSX) into a table file, load it in code (json, pandas.json_normalize) and write "
+            "it to out/ as .xlsx or .csv; do not copy its rows into write_table. There is no network and nothing can "
+            "be installed. Use threads, not multiprocessing: process pools and multiprocessing do not work here. The "
+            "code runs as a script with a time limit; an error or timeout is in stderr. stdout and stderr are cut in "
+            "the middle when long (truncated is then true), so print summaries, not whole tables. Cite job_id as the "
+            "source of figures the code computed."
         ),
         input_model=tools.RunPythonRequest,
         output_model=tools.PythonRun,
@@ -148,6 +170,24 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools.SearchFilesRequest,
         output_model=tools.SearchResult,
         function=tools.search_files,
+    ),
+    WorkspaceTool(
+        name="view_file",
+        title="Look at a picture or the pages of a PDF",
+        description=(
+            "Show a picture or pages of a file of this conversation as images for you to see, with their metadata "
+            "removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC) and the pages of a PDF. part chooses "
+            "pages: 'page 3' shows page 3, 'pages 2-5' pages 2 to 5; left out, a picture is shown, or pages 1-4 of a "
+            "PDF. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to "
+            "look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at "
+            "once: when truncated is true, call again with part set to next_part. Pages that could not be shown are "
+            "named in hint. Word, PowerPoint and spreadsheets are not shown yet: read them with read_document. "
+            "Never describe an image you have not looked at."
+        ),
+        input_model=tools_views.ViewFileRequest,
+        output_model=tools_views.ViewedFile,
+        function=tools_views.view_file,
+        images_only=True,
     ),
     WorkspaceTool(
         name="write_document",

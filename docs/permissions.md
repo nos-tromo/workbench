@@ -13,21 +13,33 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and four file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the nine) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and five file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`. Every such `404` is
   `{"detail": "not found"}`.
-- Ghostwriter's key reaches `/mcp` and four file routes: `/files/upload`,
-  `/files/view`, `/files/list` and `/files/chat`. A purpose it must state and
-  did not is `428` on a file route.
+- Ghostwriter's key reaches `/mcp` and five file routes: `/files/upload`,
+  `/files/prepare`, `/files/view`, `/files/list` and `/files/chat`. A purpose
+  it must state and did not is `428` on a file route.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
   that chat is refused (`404` on a route).
 - The tool list is enforced on `/mcp`: `tools/call` answers a tool not on the
   caller's list `400`, `-32602`, "unknown tool".
+- `X-Accept-Images: 1` on `/mcp` says the call takes images; Ghostwriter 0.3.0
+  sends it on every request (`workbench/api/auth.py:accepts_images`). Only then
+  is `view_file` listed and callable, and do `read_document` and `view_file`
+  send image blocks. A call without it (any other value counts as none), such as
+  an older Ghostwriter's, is told and shown what workbench 0.6 told and showed:
+  nine tools, `read_document`'s 0.6 description and hints, the 0.6 server
+  instructions, no image and no render; a picture file is refused as
+  `unsupported_format`, and `view_file` is "unknown tool". The schemas are the
+  same either way. The header is never trusted for access: the key, the tool
+  list and the chat decide that, and it only chooses what the model is told and
+  shown. The file routes need no such header: only a client that knows
+  `/files/prepare` and `/files/view?rendition=` calls them.
 - A caller is a namespace: users are `(caller, user-id)`. docint has no folder
   under `workspaces/`.
 
@@ -44,8 +56,9 @@ Every tool that runs in the executor also leaves a job record (see
 | Tool | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | `list_files` | names, sizes, dates and kinds of the chat's files, from the database | nothing | not recorded: the user's own metadata | nothing |
-| `read_document` | one file, as a copy in a job | nothing | `query` / `tool.read_document` | a job record |
+| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer also has the renders of those pages, which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer | for a picture or a PDF with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
 | `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
+| `view_file` | one picture or PDF of the chat, as a copy in a job when a page is not rendered yet; its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
 | `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
 | `inspect_template` | one template or slide master, as a copy in a job; no file without a path (the plain slide master) | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
@@ -54,14 +67,15 @@ Every tool that runs in the executor also leaves a job record (see
 | `write_presentation` | the slide master (`.pptx` or `.potx`), if one is given, every picture of the chat a slide shows (PNG, JPEG or GIF) and every file a slide's source names, as copies in a job | one new `.pptx` in the master's chat, or without a master in the request's chat (a `.potx` master gives a `.pptx`); the master, the pictures and the sources are not changed | `modify` / `tool.write_presentation` | the new file and a job record |
 | `run_python` (inline, docint) | the data of the call, as read-only files of a job | the job's `out/`, `home/` and `tmp/`, removed with the job; the outputs of the allowed types come back in the answer | `combine` / `tool.run_python.inline` | a job record; no file |
 
-The nine tools answer Ghostwriter with `outputs` besides their own answer: the
+The ten tools answer Ghostwriter with `outputs` besides their own answer: the
 id of each file the call wrote and, for a csv or xlsx file, a preview of it.
 
 Sources in the code: `workbench/api/tools.py` (`list_files`,
-`read_document`, `search_files`, `run_python`),
+`search_files`, `run_python`),
 `workbench/api/tools_templates.py` (`inspect_template`, `fill_template`),
 `workbench/api/tools_output.py` (`write_table`, `write_document`),
-`workbench/api/tools_presentations.py` (`write_presentation`).
+`workbench/api/tools_presentations.py` (`write_presentation`),
+`workbench/api/tools_views.py` (`read_document`, `view_file`).
 
 ### File routes
 
@@ -71,8 +85,9 @@ chat.
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
-| view and download, `GET /files/view` | one file's bytes, sent to the caller | nothing | `disclose` / `file.view` | nothing |
-| `DELETE /files/chat` | nothing | the chat's files and rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
+| prepare, `POST /files/prepare` | a picture or PDF, as a copy in a job of the executor; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF, or the picture; with `strips` 2 or 3 (default 1; any other is `422`), also the picture's strips, in a second job on the same prepare gate, while a PDF's pages stay to be cut when viewed | `modify` / `file.prepare`, before any render is visible, one for each job | the renders, until the source goes; the answer is their manifest, the same whatever `strips` is |
+| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
+| `DELETE /files/chat` | nothing | the chat's files and renders and their rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
 
 The service routes (`/healthz`, `/metrics`) read no file content and are not
@@ -175,6 +190,28 @@ things, the limits that matter to users:
   which loads it in code and writes `out/` as `.xlsx` or `.csv`; its rows are
   not copied into `write_table`. `read_document` shows a JSON file indented,
   one value per line, and JSON Lines (`.jsonl`, `.ndjson`) line by line.
+- Pages and pictures come back as images for the model alone, on a call that
+  takes them (`X-Accept-Images: 1`, see [Callers and
+  doors](#callers-and-doors)), after the answer's text, and `shown` names each
+  in order (image block `i` is `shown[i]`). `read_document` lists the pages of
+  a PDF that have no text layer in `pages_without_text`, never as blank, and
+  attaches their images in the same answer: the pages of its window, whole, at
+  most 4 images and 2.5 MiB, and the answer ends before the first page that
+  does not fit, with `next_part` naming it. A picture file is read as its
+  image. `view_file` shows any page or picture, at most 8 images; with no
+  part, the first four pages of a PDF, and its hint names the pages after them
+  and the part that shows the next four. A picture of several frames is shown
+  as its first, and the hint says so; a page that could not be shown is named
+  in a sentence. A read whose images cannot be made (the executor has no room,
+  the render is refused, the user's quota or the file's cap of renders is
+  spent) still answers the text, with `shown` empty and a hint: for a cause
+  that may pass (no room now, a job or its reading that ran out of time) that
+  `view_file` shows the pages, and for one that will not (the file's cap of
+  renders, the quota, a full volume, a file that cannot be drawn) the cause,
+  with no promise of `view_file`; a page that cannot be read back is named in
+  the hint. When the images end the answer early, the hint says so and
+  `pages_without_text` lists only the pages before `next_part`. A picture file
+  has no text to fall back on, so its read fails with the render.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
 - A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place
@@ -206,5 +243,4 @@ things, the limits that matter to users:
   layouts.
 - Other limits: at most 20 new files per `run_python` call; a job is given the
   newest 1000 files of the chat; answers are cut at `WORKBENCH_RESULT_MAX_KB`
-  and say how to go on; `read_document` does no OCR and lists pages without a
-  text layer; Outlook `.msg` files cannot be read.
+  and say how to go on; Outlook `.msg` files cannot be read.

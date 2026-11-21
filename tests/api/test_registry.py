@@ -23,7 +23,7 @@ from workbench.api.registry import (
     ToolSpec,
     allowed_tools,
 )
-from workbench.api.store import Conflict, NotFound, QuotaExceeded, StoreError
+from workbench.api.store import Conflict, NotFound, QuotaExceeded, RendersFull, StorageFull, StoreError
 from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.api.tools import FileList, PythonRun, RunPythonRequest
 from workbench.api.tools_mcp import NoArguments, workspace_tools
@@ -32,7 +32,7 @@ from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
 
 #: Every parameter a tool function may take: what the MCP door's adapter passes by name.
-KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs"})
+KNOWN: Final = frozenset({"body", "p", "settings", "store", "audit", "jobs", "images"})
 
 # --- the table ------------------------------------------------------------------------------------------------------
 
@@ -66,7 +66,14 @@ def test_the_workspace_specs_are_the_tables_rows(app: FastAPI) -> None:
     assert {s.name: s.input_model for s in specs}["list_files"] is NoArguments
     registry: Registry = app.state.registry
     ghostwriter = cast(CallerRegistry, app.state.callers).get("ghostwriter")
-    assert [s.name for s in registry.for_caller(ghostwriter)] == sorted(WORKSPACE_TOOLS)
+    assert [s.name for s in registry.for_caller(ghostwriter, images=True)] == sorted(WORKSPACE_TOOLS)
+    assert [s.name for s in registry.for_caller(ghostwriter, images=False)] == sorted(WORKSPACE_TOOLS - {"view_file"})
+    told = {s.name: s.description for s in registry.for_caller(ghostwriter, images=False)}
+    assert told == {
+        tool.name: tool.text_description or tool.description for tool in WORKSPACE_TABLE if not tool.images_only
+    }
+    assert [tool.name for tool in WORKSPACE_TABLE if tool.images_only] == ["view_file"]
+    assert [tool.name for tool in WORKSPACE_TABLE if tool.text_description] == ["read_document"]
 
 
 async def _never(_body: Any, _env: ToolEnv) -> ToolOutcome:
@@ -94,14 +101,33 @@ def test_a_caller_sees_the_tools_of_its_form_in_name_order() -> None:
     registry = Registry([b, a, c])
     workspace = Caller("ghostwriter", GHOSTWRITER_KEY, frozenset({"a", "b", "c"}))
     inline = Caller("docint", DOCINT_KEY, frozenset({"c"}), files="inline")
-    assert registry.for_caller(workspace) == [a, b]
-    assert registry.for_caller(inline) == [c]
-    assert registry.find(inline, "a") is None
-    assert registry.find(inline, "c") is c
-    assert registry.find(workspace, "c") is None
-    assert registry.find(dataclasses.replace(workspace, tools=frozenset({"b"})), "a") is None
+    assert registry.for_caller(workspace, images=True) == [a, b]
+    assert registry.for_caller(inline, images=True) == [c]
+    assert registry.find(inline, "a", images=True) is None
+    assert registry.find(inline, "c", images=True) is c
+    assert registry.find(workspace, "c", images=True) is None
+    assert registry.find(dataclasses.replace(workspace, tools=frozenset({"b"})), "a", images=True) is None
     with pytest.raises(ValueError, match="two tools"):
         Registry([a, _spec("a", "workspace")])
+
+
+def test_a_call_that_takes_no_images_finds_no_tool_that_only_shows_them() -> None:
+    """Final review I1: an image-only tool is neither listed nor found; another is told its text-only description."""
+    seeing = dataclasses.replace(_spec("seeing", "workspace"), images_only=True)
+    told = dataclasses.replace(_spec("told", "workspace"), text_description="the words of 0.6")
+    plain = _spec("plain", "workspace")
+    registry = Registry([seeing, told, plain])
+    workspace = Caller("ghostwriter", GHOSTWRITER_KEY, frozenset({"seeing", "told", "plain"}))
+    assert registry.for_caller(workspace, images=True) == [plain, seeing, told]
+    assert [(s.name, s.description) for s in registry.for_caller(workspace, images=False)] == [
+        ("plain", plain.description),
+        ("told", "the words of 0.6"),
+    ]
+    assert registry.find(workspace, "seeing", images=True) is seeing
+    assert registry.find(workspace, "seeing", images=False) is None
+    found = registry.find(workspace, "told", images=False)
+    assert found is not None and (found.description, found.run) == ("the words of 0.6", told.run)
+    assert registry.find(workspace, "plain", images=False) is plain
 
 
 @pytest.mark.parametrize("tools", [frozenset({"list_files"}), frozenset({"run_python", "nowhere"})])
@@ -116,7 +142,7 @@ def test_a_tool_without_the_callers_form_stops_the_start(settings: Settings, too
 
 
 def test_allowed_tools_by_form() -> None:
-    """A caller with workspace files may list the nine workspace tools; one whose data comes inline, the inline."""
+    """A caller with workspace files may list the ten workspace tools; one whose data comes inline, the inline."""
     assert allowed_tools("workspace") == WORKSPACE_TOOLS == GHOSTWRITER_TOOLS
     assert allowed_tools("inline") == INLINE_TOOLS
 
@@ -137,6 +163,11 @@ def test_the_tools_of_each_form_are_read_only() -> None:
         (NotFound("x"), (404, "not found")),
         (Conflict("already exists"), (409, "already exists")),
         (QuotaExceeded("quota exceeded"), (507, "quota exceeded")),
+        (StorageFull("storage is full"), (507, "storage is full")),
+        (
+            RendersFull("the renders of this file are at their limit"),
+            (507, "the renders of this file are at their limit"),
+        ),
         (AuditWriteError("x"), (500, "audit unavailable")),
         (Busy("queue_full"), (503, "busy, retry later")),
         (RequestTooLarge("x"), (422, "request too large")),

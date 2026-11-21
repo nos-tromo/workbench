@@ -24,10 +24,12 @@ root (e.g. `docker/compose.yaml`).
 tools run on users' files, so that no app runs a code sandbox or office tooling
 of its own ("tool execution is shared, never embedded"). Ghostwriter connects
 through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
-reads and searches them, runs Python over them, inspects and fills report
-templates, builds presentations in a slide master (or a plain one), and writes
-tables and documents, through nine typed tools. Every file is recorded in the audit trail
-by id and deleted `WORKBENCH_RETENTION_DAYS` (7) days after it was made.
+reads and searches them, looks at pictures and the pages of PDFs as images, runs
+Python over them, inspects and fills report templates, builds presentations in a
+slide master (or a plain one), and writes tables and documents, through ten typed
+tools. Every file is recorded in the audit trail by id and deleted
+`WORKBENCH_RETENTION_DAYS` (7) days after it was made, the renders made of it
+with it.
 docint, the second caller, comes in through the same door and runs Python over
 data that comes with the call.
 
@@ -42,7 +44,9 @@ build plan `docs/superpowers/plans/2026-11-13-workbench-v1.md`; version 2's are
 `docs/superpowers/plans/2026-11-16-ghostwriter-workbench-v0.3.md`; v0.5.0's is
 deploy's spec `docs/superpowers/specs/2026-11-17-open-webui-retirement-design.md`;
 v0.6.0's are `docs/superpowers/specs/2026-11-18-write-presentation-design.md` and
-`docs/superpowers/plans/2026-11-18-write-presentation.md`.
+`docs/superpowers/plans/2026-11-18-write-presentation.md`; v0.7.0's are deploy's
+spec `docs/superpowers/specs/2026-11-20-ghostwriter-vision-design.md` and its plan
+`docs/superpowers/plans/2026-11-20-ghostwriter-vision-workbench-v0.7.md`.
 Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
@@ -71,8 +75,8 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   capabilities, that runs every job touching file content as a fresh process
   under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
   default 4, run at once), copy-in and copy-out, with limits. The
-  readers, the search, the templates, the writers and `run_python` all run
-  there.
+  readers, the search, the templates, the writers, `run_python` and the renders
+  of pictures and PDF pages all run there.
 - **`volume-permissions`**: a one-shot that lays out `workbench-data`
   (`workbench/executor/prepare_volume.py`) before the other two start.
 - **Networks**: the external `workbench-net`, the federation's fourth seam.
@@ -83,6 +87,11 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   (`workbench/layout.py`): `workspaces/<caller>/<user-id>/<chat-id>/`,
   `staging/<job-id>/`, `jobs/<job-id>/` and `workbench.db` (SQLite, WAL). Only
   `make nuke` removes it. `workbench-run` holds only the executor's socket.
+  The renders of a file (a picture, the pages of a PDF) are its **derived
+  files**: `<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`), each a row of
+  the `derived` table bound to its source. They are as old as it, count in the
+  user's quota, go with it, and no path reaches `.derived` (`layout.DERIVED`,
+  a reserved name that no upload, output or folder takes).
 - **Bring-up order**: inference → data → obs → workbench → apps → edge.
 
 Shared modules: `workbench/config.py` (settings for both roles),
@@ -90,8 +99,15 @@ Shared modules: `workbench/config.py` (settings for both roles),
 (the job request and answer, one JSON line each), `workbench/layout.py` (names
 on the volume), `workbench/tables.py` (table rules both sides apply),
 `workbench/decks.py` (the bounds of a deck, which the api checks before a job and
-the runner checks again, as with `tables.py`). The executor imports nothing of
-the api.
+the runner checks again, as with `tables.py`), `workbench/renders.py` (the bounds
+of a render, `RenderAnswer` and its checks, `kind_of`, the strip rule and
+`render_name`, which the api checks the executor's answer against; it imports no
+imaging library). The executor imports nothing of the api, and the api never
+decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
+a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
+the row of its page 1 render and read back leniently, an unknown one ignored, so
+**a field added to `RenderFacts` needs a default**: each version then reads the
+heads the other prepared, and a rollback never leaves a file that always 500s.
 
 ## The tool core and the doors
 
@@ -99,23 +115,64 @@ the api.
 `workbench/api/tool_table.py:WORKSPACE_TABLE`: its name, a description written
 for the model, the models of its arguments and its answer, and the function that
 runs it. The door tells each caller the tools it may call (`tools/list`, frozen
-in `tests/api/golden/`). The nine: `list_files`, `read_document`,
-`search_files`, `run_python`, `inspect_template`, `fill_template`,
+in `tests/api/golden/`). The ten: `list_files`, `read_document`,
+`search_files`, `view_file`, `run_python`, `inspect_template`, `fill_template`,
 `write_table`, `write_document`, `write_presentation`.
 
-- `workbench/api/tools.py`: `list_files`, `read_document`, `search_files`,
-  `run_python`, and the helpers the other tool modules share.
+**Images only for a call that takes them.** A call on `/mcp` that does not send
+`X-Accept-Images: 1` (`workbench/api/auth.py:accepts_images`; Ghostwriter 0.3.0
+sends it) is told and shown what 0.6 was: no `view_file` (its row is
+`images_only`), `read_document` told its row's `text_description` (0.6's words)
+and read as text alone, the read job's hint in 0.6's words (`images` in its
+arguments), the 0.6 server instructions (`mcp_wire.WORKSPACE_TEXT_INSTRUCTIONS`),
+no image block. The schemas are the same both ways. The goldens hold the listing
+with the header; `tests/api/test_tools_golden.py` derives the one without. The
+header selects what the model is told and shown, never what a caller may reach.
+
+- `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
+  models of `read_document`, and the helpers the other tool modules share.
+- `workbench/api/tools_views.py`: `read_document` and `view_file`, the tools that
+  show pictures and pages as images: MCP image blocks for the assistant alone,
+  after the answer's text, at most 8 (`read_document`: 4) and 2.5 MiB raw, image
+  block `i` being `shown[i]`, always. `workbench/api/renders.py` prepares and
+  reads the renders back and imports `tools.py`, so `tools.py` never imports it,
+  and `read_document`'s function lives here. It decides which render jobs run
+  (`prepared`, `renders_for`: a file or a page whose renders exist is answered
+  from the rows without the source's lock, and no job runs when the source's
+  renders leave no room for one more) and reads each render back by its row,
+  never one that is not what the row says. A render becomes visible only after its `modify` /
+  `file.prepare` event, and leaves only after its `disclose` / `file.view`,
+  `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
   template and output tools. A new tool gets a module of its own, as
   `workbench/api/tools_presentations.py` (`write_presentation`) has: it checks the
   master, the name, every deck bound, each picture and each source before a job,
   so a refusal names its slide and block and costs no job.
-- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, view, the
-  chat delete).
+- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
+  view, the chat delete). `POST /files/prepare` renders a picture or a PDF's
+  first 20 pages once (idempotent, answered from the rows after that; with
+  `strips` 2 or 3 it also cuts a picture into strips, on the prepare gate) and
+  `GET /files/view?rendition=` serves one render, made first on the user's own
+  turn when it does not exist yet.
 - `workbench/executor/runners/`: one runner per tool that needs file content
-  (`RUNNERS`); `presentations.py` is `write_presentation`'s.
+  (`RUNNERS`); `presentations.py` is `write_presentation`'s and `render.py` is
+  `prepare_file`'s, which the render routes and tools run.
   `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
-  its record.
+  its record. A render job (`submit_renders`) keeps its outputs as derived files
+  of its source (`Store.register_derived`), never as files of the chat. **The
+  prepare gate:** a prepare, the render job of a file just attached
+  (`gate="prepare"`), waits for its caller's prepare gate in place of its user's
+  turn, so it never takes the user's interactive one: one prepare of a caller runs
+  at a time, over all its users, within the caller's slots, and at most
+  `PREPARE_WAITING_MAX` wait, counted apart from the queue. Renders on the routes
+  and in the tools run on the user's own turn.
+- `workbench/executor/render/`: what `prepare_file` uses. `images.py` decodes a
+  picture (its content decides the format, not its name; at most 120 MP; one HEIF
+  decoder thread), brings it to the bounds of a render, to sRGB through its
+  colour profile, and upright;
+  `encode.py` writes JPEG or PNG under 768 KiB with none of the source's
+  metadata, and cuts strips; `pages.py` opens a PDF with pdfium, finds the pages
+  with no text and draws one at 1600 px. Imported by the executor only.
 - `workbench/executor/presentations/`: what the runners of a slide master use.
   `master.py` reads the layouts and their places (`inspect_template`) and opens a
   `.pptx` or `.potx`, or makes the plain master (`plain_master`: python-pptx's
@@ -134,7 +191,7 @@ in `tests/api/golden/`). The nine: `list_files`, `read_document`,
   the inline tools (`run_python` on data that comes with the call, outputs
   returned and never kept). `mcp.py` is the MCP door's dispatch and
   `mcp_wire.py` its wire rules, with no I/O.
-- `workbench/api/tools_mcp.py`: Ghostwriter's nine workspace tools on `/mcp`,
+- `workbench/api/tools_mcp.py`: Ghostwriter's ten workspace tools on `/mcp`,
   each calling its row's function. A call's `structuredContent` is the
   function's answer plus `outputs`, each file it wrote with its id and, for csv
   and xlsx, a preview that `workbench/executor/preview.py` reads in the job. The
@@ -166,8 +223,8 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and four file routes,
-workspace files, the nine tools, its own caps, confined to its chat). The key
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and five file routes,
+workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
 
@@ -182,7 +239,14 @@ starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
   below the user's root (`workbench/paths.py:Workspaces`); another user's file
   is a 404.
 - **Files live only inside chat folders.** Nothing is ever a file directly
-  under `/workspace`.
+  under `/workspace`. Renders live in the chat's reserved `.derived/` folder,
+  which no path of any principal reaches.
+- **Every render is made in the executor and stripped.** A picture or PDF is
+  decoded only in a job (Pillow, pi-heif, pdfium: hostile input, `docs/sandbox.md`
+  § Residual risks), and what comes back is a JPEG or PNG with none of the
+  source's metadata (no EXIF, GPS, ICC or XMP). The api trusts a render's stated
+  width and height only within the bounds, so a wrong value costs tokens, never
+  access.
 - **No network** in the executor, and no socket in a job (a seccomp filter of
   workbench's own). A job sees copies of its own chat's files, read-only (an
   inline job, docint's, sees only the data its call brought), and writes only
@@ -221,8 +285,10 @@ container is set up as compose sets it.
   `AUDIT_REQUIRE_PURPOSE`); no `recipient` on `disclose`.
 - **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
   is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
-  first; leftovers of interrupted work after an hour, recorded first; empty
-  folders and old job records without a record. A changed period applies at
+  first, the renders of a file with it (a batch names its files, then their
+  renders); leftovers of interrupted work after an hour, recorded first, and
+  renders with no source (`rule: derived`); empty folders and old job records
+  without a record. A changed period applies at
   once, with no notice. `make retention-dry-run [DAYS=n]`.
 
 ## Commands

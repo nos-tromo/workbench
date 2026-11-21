@@ -17,11 +17,18 @@ caller chose and recorded before it called, for the same reason.
 The store never deletes a file of its own accord; :meth:`Store.remove` is called
 only once its deletion is recorded, and :meth:`Store.delete_chat` records a chat's
 deletion itself before anything of it goes.
+
+A derived file, the render of a picture or of a page of a PDF, is kept beside its source, in the reserved folder
+``<chat>/.derived/<source-id>/``, under its own table. It is bound to its source: it is as old as it, counts in the
+user's quota, is deleted with it, and is reachable by no path: ``.derived`` is found by no path of any principal,
+listed in no folder, and no upload, output or folder is named so. The caller records a render before it is registered,
+as it records an output.
 """
 
 import dataclasses
 import errno
 import itertools
+import json
 import logging
 import mimetypes
 import os
@@ -34,13 +41,15 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Final, Literal, TypeGuard
 
-from workbench.models import VIRTUAL_ROOT, DirEntry, FileRecord, JobRecord, Principal
+from workbench.layout import DERIVED
+from workbench.models import VIRTUAL_ROOT, DerivedRecord, DerivedSpec, DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
+from workbench.renders import DERIVED_MAX_BYTES
 from workbench.utils.audit_event import MAX_IDS
 
 _log = logging.getLogger(__name__)
@@ -63,6 +72,15 @@ _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
+
+#: The name of a render: its file id and its extension.
+_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png)")
+
+#: The extension of each type of render the store keeps.
+_RENDER_EXTENSIONS: Final = {"image/jpeg": "jpg", "image/png": "png"}
+
+#: Most source ids one query of ``derived`` names, under the oldest SQLite's limit of 999 variables.
+_IN_CHUNK: Final = 500
 
 
 def new_file_id() -> str:
@@ -101,6 +119,12 @@ _EXTRA_TYPES = {
     ".eml": "message/rfc822",
     ".jsonl": "application/x-ndjson",
     ".ndjson": "application/x-ndjson",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
 }
 
 
@@ -123,6 +147,9 @@ _TYPES = _known_types()
 
 _FILE_COLUMNS = "id, caller, user_id, chat_id, name, size, mime, kind, created_at, job_id"
 _JOB_COLUMNS = "id, caller, user_id, chat_id, tool, created_at, status"
+_DERIVED_COLUMNS = (
+    "id, source_id, caller, user_id, chat_id, role, ordinal, name, size, mime, width, height, meta, created_at"
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -149,6 +176,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs (created_at);
+CREATE TABLE IF NOT EXISTS derived (
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL, caller TEXT NOT NULL, user_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('image','page','pdf','frame','transcript','nextext_jsonl','nextext_zip')),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0), name TEXT NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL,
+    width INTEGER, height INTEGER, meta TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS derived_source ON derived (source_id);
+CREATE INDEX IF NOT EXISTS derived_created ON derived (created_at);
+CREATE INDEX IF NOT EXISTS derived_owner ON derived (caller, user_id, chat_id);
 """
 
 
@@ -158,6 +195,10 @@ class StoreError(Exception):
 
 class NotFound(StoreError):
     """No such file, folder or job for this user."""
+
+
+class Gone(NotFound):
+    """The file, job or chat a new file was for went while it was made: its chat was deleted, or retention took it."""
 
 
 class TooLarge(StoreError):
@@ -174,6 +215,10 @@ class StorageFull(StoreError):
 
 class Conflict(StoreError):
     """The target already exists, or something that is not a folder is in the way."""
+
+
+class RendersFull(StoreError):
+    """A source file already holds as many bytes of renders as it may."""
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -228,16 +273,24 @@ def _unlisted(exc: OSError) -> None:
     _log.warning("a sweep skipped a folder it could not list (%s)", type(exc).__name__)
 
 
-def _part_ids(paths: Sequence[Path]) -> list[str]:
+def _orphan_ids(paths: Sequence[Path]) -> list[str]:
     """Take the file ids the names of orphans carry.
 
     Args:
         paths: The orphans.
 
     Returns:
-        The id of each ``<id>.part``; the others carry none.
+        The id of each ``<id>.part``, and of each ``<id>.jpg`` or ``<id>.png`` in a folder ``.derived/<source-id>``; the
+        others carry none.
     """
-    return [found.group(1) for path in paths if (found := _PART_NAME.fullmatch(path.name))]
+    ids: list[str] = []
+    for path in paths:
+        found = _PART_NAME.fullmatch(path.name)
+        if found is None and path.parent.parent.name == DERIVED and _FILE_ID.fullmatch(path.parent.name):
+            found = _RENDER_NAME.fullmatch(path.name)
+        if found is not None:
+            ids.append(found.group(1))
+    return ids
 
 
 def _unlink(path: Path) -> None:
@@ -324,6 +377,18 @@ def _is_full(exc: OSError) -> bool:
     return exc.errno in _FULL
 
 
+def _is_reserved(name: str) -> bool:
+    """Tell whether a name is the reserved ``.derived``, in any case: a case-blind volume would be the same folder.
+
+    Args:
+        name: One name.
+
+    Returns:
+        ``True`` for ``.derived``, ``.Derived`` and the like.
+    """
+    return name.casefold() == DERIVED
+
+
 def _check_new_name(name: str) -> str:
     """Check a name that is about to be created.
 
@@ -334,11 +399,42 @@ def _check_new_name(name: str) -> str:
         ``name``, unchanged.
 
     Raises:
-        PathError: If it ends in ``.part``, which marks a half-written upload.
+        PathError: If it ends in ``.part``, which marks a half-written upload, or is the reserved ``.derived``.
     """
-    if name.endswith(_PART):
+    if name.endswith(_PART) or _is_reserved(name):
         raise PathError("invalid file name")
     return name
+
+
+def _take_staged(staged: Path) -> os.stat_result:
+    """Check a file a job staged and make it private, before it is moved.
+
+    Args:
+        staged: The staged file.
+
+    Returns:
+        Its ``fstat``.
+
+    Raises:
+        NotFound: If it does not exist.
+        PathError: If it is a link or not a regular file.
+    """
+    try:
+        fd = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise NotFound("staged file not found") from exc
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PathError("staged output is not a regular file") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PathError("staged output is not a regular file")
+        os.fchmod(fd, _PRIVATE_FILE)
+    finally:
+        os.close(fd)
+    return st
 
 
 def _numbered(name: str, n: int) -> str:
@@ -399,6 +495,58 @@ def _file(row: tuple[Any, ...]) -> FileRecord:
         created_at=row[8],
         job_id=row[9],
     )
+
+
+def _derived(row: tuple[Any, ...]) -> DerivedRecord:
+    """Build a record from a ``derived`` row.
+
+    Args:
+        row: Columns in ``_DERIVED_COLUMNS`` order.
+
+    Returns:
+        The record.
+    """
+    meta = json.loads(row[12])
+    return DerivedRecord(
+        id=row[0],
+        source_id=row[1],
+        caller=row[2],
+        user_id=row[3],
+        chat_id=row[4],
+        role=row[5],
+        ordinal=row[6],
+        name=row[7],
+        size=row[8],
+        mime=row[9],
+        width=row[10],
+        height=row[11],
+        meta=meta if isinstance(meta, dict) else {},
+        created_at=row[13],
+    )
+
+
+def _order(rec: DerivedRecord) -> tuple[str, int, int, int, str]:
+    """Order renders as a source lists them: by role, ordinal, strips and strip.
+
+    Args:
+        rec: A render.
+
+    Returns:
+        Its sort key.
+    """
+    return rec.role, rec.ordinal, rec.strips, rec.strip, rec.id
+
+
+def _owner(rec: DerivedRecord) -> tuple[str, str, str, str]:
+    """Name a render's source and the owner of both.
+
+    Args:
+        rec: A render.
+
+    Returns:
+        Its ``(source_id, caller, user_id, chat_id)``.
+    """
+    return rec.source_id, rec.caller, rec.user_id, rec.chat_id
 
 
 def _job(row: tuple[Any, ...]) -> JobRecord:
@@ -467,6 +615,9 @@ class Store:
         Its chat is read from the path's text before anything is looked up on disk, so a path into another chat
         touches nothing of that chat's folder; the resolved path is checked again.
 
+        For every principal, confined or not, a path whose segments below the chat id include the reserved ``.derived``
+        is not found: the folder of the renders is reached through no path, whether to read, list, make or upload into.
+
         Args:
             p: The caller and user.
             virtual: Any virtual path.
@@ -476,7 +627,8 @@ class Store:
 
         Raises:
             PathError: If the path is not inside the user's root.
-            NotFound: For a confined principal, if the path is not its chat folder or below it, or is refused.
+            NotFound: For a confined principal, if the path is not its chat folder or below it, or is refused; for
+                every principal, if the path runs through ``.derived``.
         """
         if p.confined and not _names_chat(virtual, p.chat_id):
             raise NotFound("not in the chat")
@@ -489,6 +641,8 @@ class Store:
         segments = self._ws.to_virtual(p, real).split("/")[2:]
         if p.confined and segments[:1] != [p.chat_id]:
             raise NotFound("not in the chat")
+        if any(_is_reserved(segment) for segment in segments[1:]):
+            raise NotFound("not found")
         return real, segments
 
     def _file_target(self, p: Principal, virtual: str) -> tuple[Path, str, str]:
@@ -520,11 +674,11 @@ class Store:
             chat_id: The chat's id.
 
         Raises:
-            NotFound: If the chat is held.
+            Gone: If the chat is held.
         """
         deadline = self._deleted.get((caller, user_id, chat_id))
         if deadline is not None and deadline > self._monotonic():
-            raise NotFound("chat deleted")
+            raise Gone("chat deleted")
 
     def _require_folder(self, real: Path, segments: list[str]) -> None:
         """Make sure a folder exists; a chat folder is made on first use, a deeper one must exist.
@@ -748,7 +902,9 @@ class Store:
                     created_at=self._clock(),
                     job_id=None,
                 )
-                self._place(part, folder / name, rec, again=lambda: record(segments[0], file_id, "error"))
+                self._place(
+                    part, folder / name, lambda: self._insert(rec), again=lambda: record(segments[0], file_id, "error")
+                )
         except BaseException:
             try:
                 _unlink(part)
@@ -757,7 +913,9 @@ class Store:
             raise
         return rec
 
-    def _place(self, source: Path, final: Path, rec: FileRecord, *, again: Callable[[], object] | None = None) -> None:
+    def _place(
+        self, source: Path, final: Path, insert: Callable[[], object], *, again: Callable[[], object] | None = None
+    ) -> None:
         """Rename a recorded file into place and commit its row; on a failure take it back out and record that.
 
         Call it under the store's lock, once the file's event is written.
@@ -765,7 +923,7 @@ class Store:
         Args:
             source: The file, already complete.
             final: Where it goes; a free name.
-            rec: Its row.
+            insert: Commits its row.
             again: Records the file again as ``error``; a failure of it is logged by its type and never raised. ``None``
                 when the caller records the failure itself.
 
@@ -775,7 +933,7 @@ class Store:
         try:
             os.replace(source, final)
             try:
-                self._insert(rec)
+                insert()
             except BaseException:
                 _unlink(final)
                 raise
@@ -853,31 +1011,18 @@ class Store:
 
         Raises:
             PathError: If the name is invalid, or ``staged`` is not a regular file.
-            NotFound: If ``staged`` does not exist, or the job's row is gone; ``staged`` stays.
+            NotFound: If ``staged`` does not exist; ``staged`` stays.
+            Gone: If the job's row is gone, with its chat; ``staged`` stays.
             QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
         _check_new_name(check_filename(name))
-        try:
-            fd = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW)
-        except FileNotFoundError as exc:
-            raise NotFound("staged file not found") from exc
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise PathError("staged output is not a regular file") from exc
-            raise
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode):
-                raise PathError("staged output is not a regular file")
-            os.fchmod(fd, _PRIVATE_FILE)
-        finally:
-            os.close(fd)
+        st = _take_staged(staged)
         if _FILE_ID.fullmatch(file_id) is None:
             raise ValueError("a file id is 32 lowercase hex digits")
         with self._lock:  # the chat folder is found or made and the file is in it before retention may look at it
             if self.find_job(job_id) is None:
-                raise NotFound("job gone")
+                raise Gone("job gone")
             if self.usage(p) + st.st_size > quota_bytes:
                 raise QuotaExceeded("workspace quota exceeded")
             folder = self._ws.chat_dir(p)
@@ -894,14 +1039,14 @@ class Store:
                 created_at=self._clock(),
                 job_id=job_id,
             )
-            self._place(staged, folder / final_name, rec)
+            self._place(staged, folder / final_name, lambda: self._insert(rec))
         return rec
 
     def list_dir(self, p: Principal, directory: str) -> list[DirEntry]:
         """List what is on disk in a folder of the user's root.
 
-        ``/workspace`` lists the chat folders. Half-written ``.part`` files and symlinks
-        are left out. The root and a chat folder that do not exist yet list as empty.
+        ``/workspace`` lists the chat folders. Half-written ``.part`` files, symlinks and the reserved ``.derived`` are
+        left out. The root and a chat folder that do not exist yet list as empty.
 
         Args:
             p: The caller and user.
@@ -923,7 +1068,7 @@ class Store:
         entries: list[DirEntry] = []
         with os.scandir(real) as scan:
             for entry in scan:
-                if entry.name.endswith(_PART):
+                if entry.name.endswith(_PART) or _is_reserved(entry.name):
                     continue
                 try:
                     info = entry.stat(follow_symlinks=False)
@@ -1040,7 +1185,7 @@ class Store:
         return self._ws.to_virtual(p, real)
 
     def usage(self, p: Principal) -> int:
-        """Add up the sizes of all the user's files, in every chat.
+        """Add up the sizes of all the user's files, in every chat, and of their renders.
 
         Args:
             p: The caller and user.
@@ -1050,8 +1195,9 @@ class Store:
         """
         with self._db() as db:
             row = db.execute(
-                "SELECT COALESCE(SUM(size), 0) FROM files WHERE caller = ? AND user_id = ?",
-                (p.caller, p.user_id),
+                "SELECT (SELECT COALESCE(SUM(size), 0) FROM files WHERE caller = ? AND user_id = ?) "
+                "+ (SELECT COALESCE(SUM(size), 0) FROM derived WHERE caller = ? AND user_id = ?)",
+                (p.caller, p.user_id, p.caller, p.user_id),
             ).fetchone()
         return int(row[0])
 
@@ -1078,51 +1224,68 @@ class Store:
             ).fetchall()
         return [_file(row) for row in rows]
 
-    def remove(self, record: FileRecord) -> None:
-        """Delete a file's bytes and its record; already gone is fine.
+    def remove(self, record: FileRecord, derived: Sequence[DerivedRecord] = ()) -> None:
+        """Delete a file's bytes and its record, and those of the renders it names; already gone is fine.
 
         It records nothing: call it only once the deletion is recorded (the user's delete, retention), or for a file
         whose own call's event covers its removal within the same request.
 
         The file is found by ``record.id``, at the path its row has now: a record that
         went stale (the file was deleted meanwhile) never reaches a file that now sits
-        at its old path.
+        at its old path. The renders are found by their ids, as their rows are now, and only those that are this file's
+        own, of its owner, are taken; a render named that is another's stays. Under the lock, each named render's file
+        is deleted, then the file, and then the rows of both in one transaction; the folders of the renders go once
+        they are empty. A render not named stays, its row and its file: with its source gone it is a stray, which
+        retention's pass over renders (:meth:`due_derived`) takes, recorded. A source that is already gone still has
+        the renders it names taken.
 
         Args:
             record: A record, for example one ``due`` returned.
+            derived: The renders to delete with it, for example ``derived_of(record)``, which the caller has recorded.
 
         Raises:
-            PathError: If the file's path now runs through a symlink; nothing is deleted.
+            PathError: If the file's path, or a render's, now runs through a symlink; nothing is deleted.
             OSError: If the file cannot be deleted; its record stays so a later sweep retries.
         """
         with self._lock:
             with self._db() as db:
                 row = db.execute(f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?", (record.id,)).fetchone()
-            if row is None:
+            current = None if row is None else _file(row)
+            held = current or record  # the row's owner counts; a source already gone has only the record's to go by
+            owner = (held.caller, held.user_id, held.chat_id)
+            named: dict[str, DerivedRecord] = {}
+            for each in derived:
+                found = self._current(each)
+                if found is not None and _owner(found) == (record.id, *owner):
+                    named[found.id] = found
+            if current is None and not named:
                 return
-            current = _file(row)
-            owner = Principal(current.caller, current.user_id, current.chat_id)
-            _unlink(self._ws.resolve(owner, current.virtual_path))
-            self._delete_row(current.id)
-
-    def _delete_row(self, file_id: str) -> None:
-        """Delete one record.
-
-        Args:
-            file_id: The file's id.
-        """
-        with self._db() as db:
-            db.execute("DELETE FROM files WHERE id = ?", (file_id,))
+            principal = Principal(*owner)
+            doomed = [self._derived_path(found) for found in named.values()]
+            file_path = None if current is None else self._ws.resolve(principal, current.virtual_path)
+            folders = [self._derived_folder(principal, record.id)] if named else []
+            for path in doomed:
+                _unlink(path)
+            if file_path is not None:
+                _unlink(file_path)
+            with self._db() as db:
+                db.executemany("DELETE FROM derived WHERE id = ?", [(rec_id,) for rec_id in named])
+                if current is not None:
+                    db.execute("DELETE FROM files WHERE id = ?", (current.id,))
+            for folder in folders:
+                _remove_empty(folder)
+                _remove_empty(folder.parent)
 
     def delete_chat(self, p: Principal, record: ChatRecord) -> int:
-        """Delete a chat, once its deletion is recorded: its files' rows, its job rows, and its folder with the files.
+        """Delete a chat, once its deletion is recorded: its files' and renders' rows, its job rows, and its folder.
 
         All of it holds the store's lock, which every file holds on its way into a chat folder. The ids of the chat's
-        files are read, ``record`` writes the deletion by them, the file rows and the job rows go in one transaction,
-        and then the chat folder; a folder that is not there is fine. A job of the chat that is still running finds its
-        row gone, so none of its outputs lands in the chat (:meth:`register_output`). Work that reaches the store later,
-        a call that waited for its turn or an upload whose body was still coming in, finds the chat held for
-        :data:`DELETED_CHAT_HOLD_S` and is refused (:meth:`add_job`, :meth:`add_upload`). The hold lives in this
+        files are read, and then those of its renders (every one of the chat, a stray's too); ``record`` writes the
+        deletion by them, the file rows, the render rows and the job rows go in one transaction, and then the chat
+        folder, the renders' folder in it; a folder that is not there is fine. A job of the chat that is still running
+        finds its row gone, so none of its outputs lands in the chat (:meth:`register_output`). Work that reaches the
+        store later, a call that waited for its turn or an upload whose body was still coming in, finds the chat held
+        for :data:`DELETED_CHAT_HOLD_S` and is refused (:meth:`add_job`, :meth:`add_upload`). The hold lives in this
         process, as the queue and the uploads in transfer do, and goes with them on a restart.
 
         A record that cannot be written deletes nothing. A failure after the record is recorded again as ``error``, by
@@ -1134,7 +1297,7 @@ class Store:
             record: Writes the deletion's event (:data:`ChatRecord`), under the store's lock.
 
         Returns:
-            How many files the chat held.
+            How many files the chat held, its renders not counted.
 
         Raises:
             PathError: If an id is unsafe, or the chat folder is a link; the rows are gone by then.
@@ -1147,7 +1310,12 @@ class Store:
                     "SELECT id FROM files WHERE caller = ? AND user_id = ? AND chat_id = ? ORDER BY created_at, id",
                     owner,
                 ).fetchall()
-            ids = [row[0] for row in rows]
+                renders = db.execute(
+                    "SELECT id FROM derived WHERE caller = ? AND user_id = ? AND chat_id = ? ORDER BY created_at, id",
+                    owner,
+                ).fetchall()
+            files = [row[0] for row in rows]
+            ids = [*files, *(row[0] for row in renders)]
             record(ids, "ok")
             now = self._monotonic()
             self._deleted = {chat: deadline for chat, deadline in self._deleted.items() if deadline > now}
@@ -1155,6 +1323,7 @@ class Store:
             try:
                 with self._db() as db:
                     db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                    db.execute("DELETE FROM derived WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                     db.execute("DELETE FROM jobs WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                 folder = self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}")
                 try:
@@ -1167,7 +1336,7 @@ class Store:
                 except Exception as exc:  # the deletion's error is the answer; this one is only logged
                     _log.warning("could not record a chat delete that failed (%s)", type(exc).__name__)
                 raise
-        return len(ids)
+        return len(files)
 
     def checkpoint(self) -> bool:
         """Copy the write-ahead log into the database file and empty it.
@@ -1199,12 +1368,14 @@ class Store:
 
         An orphan is a regular file in a chat folder that has no row and was last changed before ``untouched_before``:
         the ``<id>.part`` of an upload the api died during, or a file a kill left between its rename into place and its
-        row's commit (``add_upload``, ``register_output``). The look and the removal hold the store's lock, which every
-        rename into place holds until its row is committed, so a file on its way in is never taken for one. Each chat
-        folder's orphans are recorded first, by ``record``, still under the lock, at most ``MAX_IDS`` to a record so
-        that no id is cut; those that could not be removed are recorded again as an error. If ``record`` raises, nothing
-        more is removed and the error goes on. Once ``stop`` is set, the sweep ends before its next batch: nothing more
-        is recorded or removed, empty folders included, and the next sweep finds the rest.
+        row's commit (``add_upload``, ``register_output``, ``register_derived``). A render with its row in ``derived``
+        is no orphan; one without is recorded by the id its name carries, ``.derived/<source-id>/<id>.<ext>``. The look
+        and the removal hold the store's lock, which every rename into place holds until its row is committed, so a
+        file on its way in is never taken for one. Each chat folder's orphans are recorded first, by ``record``, still
+        under the lock, at most ``MAX_IDS`` to a record so that no id is cut; those that could not be removed are
+        recorded again as an error. If ``record`` raises, nothing more is removed and the error goes on. Once ``stop``
+        is set, the sweep ends before its next batch: nothing more is recorded or removed, empty folders included, and
+        the next sweep finds the rest.
 
         Then every folder below the root, deepest first, the chat folders too, and the root itself go if they are
         empty and were last changed before ``untouched_before``. Their ages are taken before anything is removed, so
@@ -1259,14 +1430,19 @@ class Store:
                     rows = db.execute(
                         "SELECT chat_id, name FROM files WHERE caller = ? AND user_id = ?", (caller, user_id)
                     ).fetchall()
+                    renders = db.execute(
+                        "SELECT chat_id, source_id, name FROM derived WHERE caller = ? AND user_id = ?",
+                        (caller, user_id),
+                    ).fetchall()
                 known = {(chat, name) for chat, name in rows}
+                known |= {(chat, f"{DERIVED}/{source}/{name}") for chat, source, name in renders}
                 for chat in sorted(candidates):
                     orphans = [path for name, path in candidates[chat] if (chat, name) not in known]
                     for start in range(0, len(orphans), MAX_IDS):
                         if stop is not None and stop.is_set():
                             return removed, failed
                         batch = orphans[start : start + MAX_IDS]
-                        record(chat, _part_ids(batch), len(batch), "ok")
+                        record(chat, _orphan_ids(batch), len(batch), "ok")
                         stayed: list[Path] = []
                         for path in batch:
                             try:
@@ -1277,7 +1453,7 @@ class Store:
                             else:
                                 removed += 1
                         if stayed:
-                            record(chat, _part_ids(stayed), len(stayed), "error")
+                            record(chat, _orphan_ids(stayed), len(stayed), "error")
                             failed += len(stayed)
             for folder, st in reversed(folders):  # a folder comes after every folder above it
                 if st.st_mtime < untouched_before:
@@ -1285,6 +1461,328 @@ class Store:
             if root_st is not None and root_st.st_mtime < untouched_before:
                 _remove_empty(root)
         return removed, failed
+
+    # --- derived files -------------------------------------------------------
+
+    def _derived_row(self, derived_id: str) -> DerivedRecord | None:
+        """Look up one render's record by its id alone.
+
+        Args:
+            derived_id: The render's id.
+
+        Returns:
+            The record, or ``None`` if there is none.
+        """
+        with self._db() as db:
+            row = db.execute(f"SELECT {_DERIVED_COLUMNS} FROM derived WHERE id = ?", (derived_id,)).fetchone()
+        return None if row is None else _derived(row)
+
+    def _current(self, rec: DerivedRecord) -> DerivedRecord | None:
+        """Read a render's record as its row is now, if the row is still the record's own.
+
+        What a caller holds may be stale or forged: the row is what counts, and only when it names the same source and
+        owner as the record does.
+
+        Args:
+            rec: A record the caller holds.
+
+        Returns:
+            The row's record, or ``None`` if the row is gone or is not of that source and owner.
+        """
+        found = self._derived_row(rec.id)
+        return found if found is not None and _owner(found) == _owner(rec) else None
+
+    def _has_file(self, file_id: str, caller: str, user_id: str, chat_id: str) -> bool:
+        """Tell whether a file's row is there, for its own owner and chat.
+
+        Args:
+            file_id: The file's id.
+            caller: The owner's caller.
+            user_id: The owner's user id.
+            chat_id: The chat folder.
+
+        Returns:
+            ``True`` if it is.
+        """
+        with self._db() as db:
+            row = db.execute(
+                "SELECT 1 FROM files WHERE id = ? AND caller = ? AND user_id = ? AND chat_id = ?",
+                (file_id, caller, user_id, chat_id),
+            ).fetchone()
+        return row is not None
+
+    def _derived_folder(self, p: Principal, source_id: str) -> Path:
+        """Resolve the folder of a source's renders, ``<chat>/.derived/<source-id>``; it need not exist.
+
+        Args:
+            p: The owner, its chat the source's.
+            source_id: The source's id.
+
+        Returns:
+            The real path.
+
+        Raises:
+            PathError: If a part of it is a link.
+        """
+        return self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}/{DERIVED}/{source_id}")
+
+    def _derived_path(self, rec: DerivedRecord) -> Path:
+        """Resolve a render's file, never through a link.
+
+        Args:
+            rec: The render.
+
+        Returns:
+            The real path; the file need not exist.
+
+        Raises:
+            PathError: If a part of it is a link.
+        """
+        return self._ws.resolve(
+            Principal(rec.caller, rec.user_id, rec.chat_id), f"{VIRTUAL_ROOT}/{rec.chat_id}/{rec.relative_path}"
+        )
+
+    def _insert_derived(self, rec: DerivedRecord) -> None:
+        """Store a new render's record.
+
+        Args:
+            rec: The record.
+
+        Raises:
+            StorageFull: If the database cannot grow.
+        """
+        meta = json.dumps(rec.meta, sort_keys=True, separators=(",", ":"))
+        try:
+            with self._db() as db:
+                db.execute(
+                    f"INSERT INTO derived ({_DERIVED_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rec.id,
+                        rec.source_id,
+                        rec.caller,
+                        rec.user_id,
+                        rec.chat_id,
+                        rec.role,
+                        rec.ordinal,
+                        rec.name,
+                        rec.size,
+                        rec.mime,
+                        rec.width,
+                        rec.height,
+                        meta,
+                        rec.created_at,
+                    ),
+                )
+        except sqlite3.OperationalError as exc:
+            if "full" in str(exc):
+                raise StorageFull("storage is full") from exc
+            raise
+
+    def register_derived(
+        self,
+        source: FileRecord,
+        staged: Path,
+        spec: DerivedSpec,
+        *,
+        file_id: str,
+        quota_bytes: int,
+        cap_bytes: int = DERIVED_MAX_BYTES,
+    ) -> DerivedRecord:
+        """Move a render a job produced into the reserved folder of its source, under an id its event already names.
+
+        The render is kept as ``<chat>/.derived/<source-id>/<file-id>.jpg`` (``.png`` for a PNG): the folders are
+        private, the file is private, and it is renamed into place and then its row inserted, as :meth:`_place` does
+        for every file. It is as old as its source (``created_at``) and counts in the user's quota. All the checks and
+        the placing hold the store's lock, which :meth:`remove` and :meth:`delete_chat` hold: a render is never added
+        to a source that has gone, or to a chat that was deleted.
+
+        The caller records the render by ``file_id`` before it calls, so that it is never visible without its event,
+        and records it again as ``error`` if this raises. It checks the render's signature and size; the store takes
+        its size from the file.
+
+        Args:
+            source: The file it is a render of; its row must still be there, for its owner and chat.
+            staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
+            spec: What it is. ``spec.mime`` is ``image/jpeg`` or ``image/png``.
+            file_id: The render's id, chosen and recorded by the caller: 32 lowercase hex digits.
+            quota_bytes: Most bytes the user may hold in all chats together, renders included.
+            cap_bytes: Most bytes of renders the source may have.
+
+        Returns:
+            The new record.
+
+        Raises:
+            PathError: If ``spec.mime`` is no type of render, or ``staged`` is not a regular file.
+            ValueError: If ``file_id`` is not 32 lowercase hex digits.
+            NotFound: If ``staged`` does not exist; ``staged`` stays.
+            Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`; ``staged``
+                stays.
+            Conflict: If the source has a render of this role, ordinal, strip and strips, or ``file_id`` is taken;
+                ``staged`` stays.
+            QuotaExceeded: If it would take the user over ``quota_bytes``; ``staged`` stays.
+            RendersFull: If it would take the source over ``cap_bytes``; ``staged`` stays.
+            StorageFull: If the volume is full.
+        """
+        extension = _RENDER_EXTENSIONS.get(spec.mime)
+        if extension is None:
+            raise PathError("not a type of render")
+        meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
+        st = _take_staged(staged)
+        if _FILE_ID.fullmatch(file_id) is None:
+            raise ValueError("a file id is 32 lowercase hex digits")
+        p = Principal(source.caller, source.user_id, source.chat_id)
+        with self._lock:  # the source, the room and the folder are settled before retention or a delete may look
+            if not self._has_file(source.id, source.caller, source.user_id, source.chat_id):
+                raise Gone("file not found")
+            self._refuse_deleted(p.caller, p.user_id, p.chat_id)
+            rec = DerivedRecord(
+                id=file_id,
+                source_id=source.id,
+                caller=p.caller,
+                user_id=p.user_id,
+                chat_id=p.chat_id,
+                role=spec.role,
+                ordinal=spec.ordinal,
+                name=f"{file_id}.{extension}",
+                size=st.st_size,
+                mime=spec.mime,
+                width=spec.width,
+                height=spec.height,
+                meta=meta,
+                created_at=source.created_at,
+            )
+            held = self.derived_of(source)
+            if self._derived_row(file_id) is not None or any(
+                (each.role, each.ordinal, each.strips, each.strip) == (rec.role, rec.ordinal, rec.strips, rec.strip)
+                for each in held
+            ):
+                raise Conflict("render exists")
+            if self.usage(p) + st.st_size > quota_bytes:
+                raise QuotaExceeded("workspace quota exceeded")
+            if sum(each.size for each in held) + st.st_size > cap_bytes:
+                raise RendersFull("the renders of this file are at their limit")
+            folder = self._derived_folder(p, source.id)
+            self._ws.chat_dir(p)
+            self._make_dirs(folder)
+            self._place(staged, folder / rec.name, lambda: self._insert_derived(rec))
+        return rec
+
+    def derived_for(self, sources: Sequence[FileRecord]) -> list[DerivedRecord]:
+        """List every render of some files, each by its own owner and chat.
+
+        Args:
+            sources: The files.
+
+        Returns:
+            Their renders: source by source, in the order given, each source's by role, ordinal, strips and strip. A
+            record that names another owner or chat than its row has finds none.
+        """
+        keys = {(source.id, source.caller, source.user_id, source.chat_id) for source in sources}
+        position: dict[str, int] = {}
+        for source in sources:
+            position.setdefault(source.id, len(position))
+        ids = list(position)
+        found: list[DerivedRecord] = []
+        with self._db() as db:
+            for start in range(0, len(ids), _IN_CHUNK):
+                chunk = ids[start : start + _IN_CHUNK]
+                rows = db.execute(
+                    f"SELECT {_DERIVED_COLUMNS} FROM derived WHERE source_id IN ({','.join('?' * len(chunk))})", chunk
+                ).fetchall()
+                found += [rec for rec in map(_derived, rows) if _owner(rec) in keys]
+        return sorted(found, key=lambda rec: (position[rec.source_id], *_order(rec)))
+
+    def derived_of(self, source: FileRecord) -> list[DerivedRecord]:
+        """List the renders of one file, for its own owner and chat.
+
+        Args:
+            source: The file.
+
+        Returns:
+            Its renders, by role, ordinal, strips and strip.
+        """
+        return self.derived_for([source])
+
+    def open_derived(self, rec: DerivedRecord) -> BinaryIO:
+        """Open a render for reading, as :meth:`open_file` opens a file: not through a link, and only a regular file.
+
+        The row is read as it is now, and must be the record's own, with its source still there: a render whose source
+        went, a stray, is served to no one.
+
+        Args:
+            rec: A record of a render, for example one :meth:`derived_of` returned.
+
+        Returns:
+            The file, open in binary mode; the caller closes it.
+
+        Raises:
+            PathError: If the render's path runs through a symlink.
+            NotFound: If the row is gone, is not the record's, has no source, or the file is gone from the disk.
+        """
+        current = self._current(rec)
+        if current is None or not self._has_file(current.source_id, current.caller, current.user_id, current.chat_id):
+            raise NotFound("file not found")
+        real = self._derived_path(current)
+        try:
+            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise NotFound("file not found") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise NotFound("file not found")
+            return os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def remove_derived(self, rec: DerivedRecord) -> None:
+        """Delete one render's file and row; already gone is fine.
+
+        It records nothing: call it only once the deletion is recorded. The folders of the renders go once empty.
+
+        Args:
+            rec: A record of a render, for example one :meth:`due_derived` returned; one whose row is not its own is
+                left alone.
+
+        Raises:
+            PathError: If the render's path now runs through a symlink; nothing is deleted.
+            OSError: If the file cannot be deleted; its record stays so a later sweep retries.
+        """
+        with self._lock:
+            current = self._current(rec)
+            if current is None:
+                return
+            real = self._derived_path(current)
+            _unlink(real)
+            with self._db() as db:
+                db.execute("DELETE FROM derived WHERE id = ?", (current.id,))
+            _remove_empty(real.parent)
+            _remove_empty(real.parent.parent)
+
+    def due_derived(
+        self, cutoff: float, limit: int = 200, *, after: tuple[float, str] | None = None
+    ) -> list[DerivedRecord]:
+        """List renders for the retention sweep: those made before a time, and those whose source is gone.
+
+        Args:
+            cutoff: Renders with ``created_at`` strictly below this are due, as their sources are.
+            limit: Most records to return.
+            after: Only renders past this ``(created_at, id)``, the last of the page before.
+
+        Returns:
+            The oldest due renders, of every user, in ``(created_at, id)`` order.
+        """
+        where = "(created_at < ? OR NOT EXISTS (SELECT 1 FROM files WHERE files.id = derived.source_id))"
+        params: list[object] = [cutoff]
+        if after is not None:
+            where += " AND (created_at, id) > (?, ?)"
+            params += [*after]
+        with self._db() as db:
+            rows = db.execute(
+                f"SELECT {_DERIVED_COLUMNS} FROM derived WHERE {where} ORDER BY created_at, id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [_derived(row) for row in rows]
 
     # --- jobs ----------------------------------------------------------------
 
@@ -1419,7 +1917,8 @@ def summarize_due(db_path: Path, cutoff: float) -> dict[str, DueSummary]:
         cutoff: Files with ``created_at`` strictly below this are due.
 
     Returns:
-        By kind, ``upload`` or ``output``; a kind of which there is no file is missing.
+        By kind, ``upload``, ``output`` or ``derived``; a kind of which there is no file is missing. A render is due
+        when its source is, and also when its source is gone.
 
     Raises:
         sqlite3.Error: The database does not exist or cannot be read.
@@ -1435,6 +1934,33 @@ def summarize_due(db_path: Path, cutoff: float) -> dict[str, DueSummary]:
             "FROM files GROUP BY kind",
             {"cutoff": cutoff},
         ).fetchall()
+        renders = _summarize_derived(conn, cutoff)
     finally:
         conn.close()
-    return {kind: DueSummary(int(due), oldest, newest, int(kept)) for kind, due, oldest, newest, kept in rows}
+    summary = {kind: DueSummary(int(due), oldest, newest, int(kept)) for kind, due, oldest, newest, kept in rows}
+    if renders is not None:
+        summary["derived"] = renders
+    return summary
+
+
+def _summarize_derived(conn: sqlite3.Connection, cutoff: float) -> DueSummary | None:
+    """Count the due and the kept renders.
+
+    Args:
+        conn: A connection to the store's database.
+        cutoff: Renders with ``created_at`` strictly below this are due.
+
+    Returns:
+        The counts, or ``None`` when there is no render, or the database has no table of them yet (it was made before
+        renders, and the api adds the table when it next opens it).
+    """
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'derived'").fetchone() is None:
+        return None
+    due, oldest, newest, kept, total = conn.execute(
+        "SELECT COALESCE(SUM(due), 0), MIN(CASE WHEN due THEN created_at END), MAX(CASE WHEN due THEN created_at END), "
+        "COALESCE(SUM(NOT due), 0), COUNT(*) FROM ("
+        "SELECT created_at, (created_at < :cutoff "
+        "OR NOT EXISTS (SELECT 1 FROM files WHERE files.id = derived.source_id)) AS due FROM derived)",
+        {"cutoff": cutoff},
+    ).fetchone()
+    return DueSummary(int(due), oldest, newest, int(kept)) if total else None

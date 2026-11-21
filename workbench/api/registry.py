@@ -5,11 +5,14 @@ a user keeps in a chat folder, an ``inline`` tool on data that comes with the ca
 workspace tools are the rows of :data:`~workbench.api.tool_table.WORKSPACE_TABLE`, which
 :mod:`workbench.api.tools_mcp` makes specs with an adapter that calls each row's function. A caller finds the tools of
 its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other
-(:func:`allowed_tools`).
+(:func:`allowed_tools`). A call that takes no images (no ``X-Accept-Images: 1``,
+:func:`~workbench.api.auth.accepts_images`) finds none of the tools that only show images, and is told of the others
+what workbench 0.6 told it (:attr:`ToolSpec.text_description`).
 
 ``Caller`` is imported for type checking only, since :mod:`workbench.api.auth` imports this module.
 """
 
+import dataclasses
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -70,6 +73,7 @@ class ToolEnv:
         jobs: The job queue, or ``None`` when the app has none.
         purpose: The purpose the call stated, or ``None``.
         request_id: The call's request id, or ``None``.
+        images: Whether the call takes images (``X-Accept-Images: 1``): without, no tool sends one.
     """
 
     p: Principal
@@ -80,6 +84,7 @@ class ToolEnv:
     jobs: JobQueue | None
     purpose: Purpose | None
     request_id: str | None
+    images: bool
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,10 @@ class ToolSpec:
         run: Runs it on arguments its input model has validated.
         input_schema: The arguments' JSON schema for a caller.
         output_schema: The answer's JSON schema for a caller, in place of ``output_model``'s own.
+        images_only: Whether it only shows images (``view_file``), and so is listed and called only on a call that
+            takes them.
+        text_description: What a call that takes no images is told of it instead of ``description``, or ``None`` for
+            the same: ``read_document``'s text of workbench 0.6, which promises no image.
     """
 
     name: str
@@ -122,6 +131,26 @@ class ToolSpec:
     run: Callable[[Any, ToolEnv], Awaitable[ToolOutcome]]
     input_schema: Callable[["Caller"], dict[str, Any]]
     output_schema: Callable[["Caller"], dict[str, Any]] | None = None
+    images_only: bool = False
+    text_description: str | None = None
+
+    def seen(self, *, images: bool) -> "ToolSpec | None":
+        """The tool as a call is told of it.
+
+        Args:
+            images: Whether the call takes images.
+
+        Returns:
+            The spec itself on a call that takes images; on one that does not, ``None`` for a tool that only shows
+            images, else the spec with its ``text_description``, if it has one, as its description.
+        """
+        if images:
+            return self
+        if self.images_only:
+            return None
+        if self.text_description is None:
+            return self
+        return dataclasses.replace(self, description=self.text_description)
 
 
 class Registry:
@@ -142,28 +171,36 @@ class Registry:
                 raise ValueError(f"two tools of the {spec.form} form are named {spec.name}")
             self._specs[spec.form, spec.name] = spec
 
-    def for_caller(self, caller: "Caller") -> list[ToolSpec]:
-        """List the tools a caller may call.
+    def for_caller(self, caller: "Caller", *, images: bool) -> list[ToolSpec]:
+        """List the tools a caller may call on one call, as the call is told of them.
 
         Args:
             caller: The authenticated caller.
+            images: Whether the call takes images (:meth:`ToolSpec.seen`).
 
         Returns:
-            The specs of the caller's file form whose names are on its list, in name order.
+            The specs of the caller's file form whose names are on its list, as the call sees them, in name order.
         """
-        found = [spec for (form, name), spec in self._specs.items() if form == caller.files and name in caller.tools]
+        found = [
+            seen
+            for (form, name), spec in self._specs.items()
+            if form == caller.files and name in caller.tools and (seen := spec.seen(images=images)) is not None
+        ]
         return sorted(found, key=lambda spec: spec.name)
 
-    def find(self, caller: "Caller", name: str) -> ToolSpec | None:
-        """Find a tool a caller may call.
+    def find(self, caller: "Caller", name: str, *, images: bool) -> ToolSpec | None:
+        """Find a tool a caller may call on one call.
 
         Args:
             caller: The authenticated caller.
             name: The tool's name.
+            images: Whether the call takes images (:meth:`ToolSpec.seen`).
 
         Returns:
-            The spec of that name in the caller's file form, or ``None`` if there is none or it is not on its list.
+            The spec of that name in the caller's file form as the call sees it, or ``None`` if there is none, it is
+            not on its list, or it only shows images and the call takes none.
         """
         if name not in caller.tools:
             return None
-        return self._specs.get((caller.files, name))
+        spec = self._specs.get((caller.files, name))
+        return None if spec is None else spec.seen(images=images)

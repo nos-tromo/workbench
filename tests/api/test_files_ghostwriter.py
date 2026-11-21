@@ -23,9 +23,10 @@ from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import NotFound, Store
-from workbench.api.tools import ReadDocumentRequest, read_document
+from workbench.api.tools import ReadDocumentRequest
 from workbench.api.tools_mcp import CallJobs
 from workbench.api.tools_templates import InspectTemplateRequest, inspect_template
+from workbench.api.tools_views import read_document
 from workbench.config import Settings
 from workbench.layout import WORKSPACES
 from workbench.models import FileRecord, Principal
@@ -274,9 +275,10 @@ def _request(app: FastAPI, key: str, path: str = "/files/list", root_path: str =
     return Request({**scope, "headers": [(b"authorization", f"Bearer {key}".encode())]})
 
 
-def test_the_file_caller_check_keeps_ghostwriter_to_its_four_paths(app: FastAPI) -> None:
+def test_the_file_caller_check_keeps_ghostwriter_to_its_five_paths(app: FastAPI) -> None:
     """Should a request pass the gate, the routes' own check refuses Ghostwriter off its paths and under a root path."""
-    assert asyncio.run(require_file_caller(_request(app, GHOSTWRITER_KEY))).name == "ghostwriter"
+    for path in ("/files/list", "/files/upload", "/files/prepare", "/files/view", "/files/chat"):
+        assert asyncio.run(require_file_caller(_request(app, GHOSTWRITER_KEY, path=path))).name == "ghostwriter"
     for refused in (
         _request(app, GHOSTWRITER_KEY, root_path="/prefix"),
         _request(app, GHOSTWRITER_KEY, path="/files/other"),
@@ -336,7 +338,7 @@ def test_a_confined_read_of_another_chats_file_is_not_found_and_reads_nothing(
     document = spelling.format(keep(store, P2, "harbour-report.docx").name)
     template = spelling.format(keep(store, P2, "quarterly-template.docx").name)
     with pytest.raises(NotFound) as refused:
-        asyncio.run(read_document(ReadDocumentRequest(path=document), PG, settings, store, audit, jobs))
+        asyncio.run(read_document(ReadDocumentRequest(path=document), PG, settings, store, audit, jobs, True))
     assert describe(refused.value) == (404, "not found")
     with pytest.raises(NotFound) as refused:
         asyncio.run(inspect_template(InspectTemplateRequest(path=template), PG, settings, store, audit, jobs))

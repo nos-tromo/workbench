@@ -9,6 +9,13 @@ or a name) and the ``count``; only then do its files and their rows go. A file t
 recorded again with ``outcome: error``, and is tried again by the next sweep; this sweep pages on past it, so no number
 of such files holds up the others.
 
+A derived file, the render of a picture or of a page, is as old as its source and goes with it, in the same record: the
+event names the batch's file ids and then the ids of their renders, and its ``count`` stays the number of files, with
+``derived`` the number of renders. A stray is a render whose source is gone: one made after its file's record was
+written, which stayed when the file went. A render can also be due while its source stays, when the file could not be
+deleted. After the files, the sweep takes every such render, in batches of one caller's user, each recorded first as
+``rule: derived`` by the render's id. A render that stays is recorded again as an error, as a file is.
+
 No deletion without its record: a record that cannot be written ends the process (``os._exit(1)``) before anything
 more is deleted, and ``restart: unless-stopped`` brings the api back; stderr gets the count. The other way round is
 allowed: a sweep stopped between a batch's record and the end of its removals (the api shuts down, or is killed) leaves
@@ -69,7 +76,7 @@ from workbench.api.metrics import Metrics
 from workbench.api.store import DueSummary, Store, summarize_due
 from workbench.config import ConfigError, Settings, load_settings
 from workbench.layout import DATABASE, STAGING, WORKSPACES
-from workbench.models import FileRecord
+from workbench.models import DerivedRecord, FileRecord
 from workbench.paths import PathError
 from workbench.protocol import JOB_ID
 from workbench.utils.audit_event import MAX_IDS, AuditWriteError
@@ -86,7 +93,7 @@ BATCH: Final = MAX_IDS
 FOLDER_GRACE_S: Final = 3600
 
 #: The kinds of file the dry run counts, in its order.
-KINDS: Final = ("upload", "output")
+KINDS: Final = ("upload", "output", "derived")
 
 
 @dataclass
@@ -94,8 +101,10 @@ class SweepReport:
     """What one sweep did with the due files.
 
     Attributes:
-        deleted: Files deleted, each after its record.
-        errors: Files that could not be deleted; each is recorded again as an error and stays for the next sweep.
+        deleted: Files deleted, each after its record, and the strays among the renders, each after its own: the renders
+            that went with their source are not counted.
+        errors: Files and strays that could not be deleted; each is recorded again as an error and stays for the next
+            sweep.
     """
 
     deleted: int
@@ -130,16 +139,16 @@ def _iso(moment: float) -> str:
     return datetime.fromtimestamp(moment, tz=UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _batches(page: Sequence[FileRecord]) -> list[list[FileRecord]]:
-    """Split a page of due files by owner, a caller's user, keeping their order.
+def _batches[T: (FileRecord, DerivedRecord)](page: Sequence[T]) -> list[list[T]]:
+    """Split a page of due files, or of due renders, by owner, a caller's user, keeping their order.
 
     Args:
-        page: At most :data:`BATCH` files.
+        page: At most :data:`BATCH` files, or at most :data:`BATCH` renders.
 
     Returns:
         One batch per owner.
     """
-    owners: dict[tuple[str, str], list[FileRecord]] = {}
+    owners: dict[tuple[str, str], list[T]] = {}
     for rec in page:
         owners.setdefault((rec.caller, rec.user_id), []).append(rec)
     return list(owners.values())
@@ -268,6 +277,7 @@ class Sweeper:
         forgotten = 0
         try:
             self._sweep_files(cutoff, stop, report)
+            self._sweep_derived(cutoff, stop, report)
             if not stop.is_set():
                 forgotten = self._forget_jobs(cutoff)
                 self._prune(now - FOLDER_GRACE_S, stop)
@@ -333,7 +343,11 @@ class Sweeper:
                 self._delete(batch, cutoff, stop, report)
 
     def _delete(self, batch: Sequence[FileRecord], cutoff: float, stop: threading.Event, report: SweepReport) -> None:
-        """Record one owner's batch, then delete its files; those that could not go are recorded again as errors.
+        """Record one owner's batch and its renders, then delete each file with its renders; errors are recorded again.
+
+        The event names the batch's files and then their renders, so that no render is deleted without its record. A
+        render made after the renders were read is not named: it stays when its file goes, a stray the next pass
+        takes, recorded.
 
         Args:
             batch: Due files of one caller's user.
@@ -342,27 +356,94 @@ class Sweeper:
             report: Counts what was done.
         """
         first = batch[0]
+        renders: dict[str, list[DerivedRecord]] = {rec.id: [] for rec in batch}
+        for each in self._store.derived_for(batch):
+            renders[each.source_id].append(each)
         criteria: dict[str, object] = {
             "period_days": self._settings.retention_days,
             "cutoff": _iso(cutoff),
             "caller": first.caller,
             "owner": first.user_id,
             "count": len(batch),
+            "derived": sum(map(len, renders.values())),
         }
-        self._record([rec.id for rec in batch], criteria)
+        self._record([*(rec.id for rec in batch), *(each.id for rec in batch for each in renders[rec.id])], criteria)
         failed: list[FileRecord] = []
         for rec in batch:
             if stop.is_set():
                 break
             try:
-                self._store.remove(rec)
+                self._store.remove(rec, derived=renders[rec.id])
             except Exception as exc:  # PathError and OSError above all; whatever it is, the file stays and is named
                 _log.warning("retention could not delete a file (%s)", type(exc).__name__)
                 failed.append(rec)
             else:
                 report.deleted += 1
         if failed:
-            self._record([rec.id for rec in failed], {**criteria, "count": len(failed)}, outcome="error")
+            left = [each for rec in failed for each in renders[rec.id]]
+            self._record(
+                [*(rec.id for rec in failed), *(each.id for each in left)],
+                {**criteria, "count": len(failed), "derived": len(left)},
+                outcome="error",
+            )
+            report.errors += len(failed)
+
+    def _sweep_derived(self, cutoff: float, stop: threading.Event, report: SweepReport) -> None:
+        """Delete the renders that are due on their own, page by page, batch by batch, each batch recorded first.
+
+        After :meth:`_sweep_files`, what is left is a stray, a render whose source is gone, or a render of a file that
+        could not be deleted and is as due as it.
+
+        Args:
+            cutoff: Renders made before this are due.
+            stop: Ends the sweep before its next record or removal.
+            report: Counts what was done.
+        """
+        after: tuple[float, str] | None = None
+        while not stop.is_set():
+            page = self._store.due_derived(cutoff, BATCH, after=after)
+            if not page:
+                return
+            after = (page[-1].created_at, page[-1].id)
+            for batch in _batches(page):
+                if stop.is_set():
+                    return
+                self._delete_derived(batch, cutoff, stop, report)
+
+    def _delete_derived(
+        self, batch: Sequence[DerivedRecord], cutoff: float, stop: threading.Event, report: SweepReport
+    ) -> None:
+        """Record one owner's batch of renders, then delete them; those that could not go are recorded again.
+
+        Args:
+            batch: Due renders of one caller's user.
+            cutoff: The rule's cutoff.
+            stop: Ends the removals before the next render.
+            report: Counts what was done.
+        """
+        first = batch[0]
+        criteria: dict[str, object] = {
+            "rule": "derived",
+            "period_days": self._settings.retention_days,
+            "cutoff": _iso(cutoff),
+            "caller": first.caller,
+            "owner": first.user_id,
+            "count": len(batch),
+        }
+        self._record([each.id for each in batch], criteria)
+        failed: list[DerivedRecord] = []
+        for each in batch:
+            if stop.is_set():
+                break
+            try:
+                self._store.remove_derived(each)
+            except Exception as exc:  # PathError and OSError above all; whatever it is, the render stays and is named
+                _log.warning("retention could not delete a render (%s)", type(exc).__name__)
+                failed.append(each)
+            else:
+                report.deleted += 1
+        if failed:
+            self._record([each.id for each in failed], {**criteria, "count": len(failed)}, outcome="error")
             report.errors += len(failed)
 
     def _record(

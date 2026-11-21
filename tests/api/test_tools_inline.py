@@ -76,6 +76,7 @@ def env(
         jobs=state.jobs,
         purpose=purpose,
         request_id=request_id,
+        images=False,
     )
 
 
@@ -494,7 +495,8 @@ def test_the_inline_specs_are_the_inline_tools(app: FastAPI) -> None:
     assert {spec.name for spec in INLINE_SPECS} == INLINE_TOOLS
     assert all(spec.form == "inline" for spec in INLINE_SPECS)
     registry: Registry = app.state.registry
-    assert registry.for_caller(cast(CallerRegistry, app.state.callers).get("docint")) == list(INLINE_SPECS)
+    docint = cast(CallerRegistry, app.state.callers).get("docint")
+    assert registry.for_caller(docint, images=False) == registry.for_caller(docint, images=True) == list(INLINE_SPECS)
     (spec,) = INLINE_SPECS
     for phrase in ("current folder", "read-only", "out/", "CSV", "PNG", "512 KiB", "network", "installed"):
         assert phrase in spec.description, phrase

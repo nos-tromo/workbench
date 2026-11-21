@@ -21,15 +21,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.api import test_tools_templates as template_tests
-from tests.api.conftest import FORMER, GHOSTWRITER_KEY, HD, HG, PG, PG_SETUP, AuditLines, put, unrecorded
-from tests.api.mcp_calls import acall, refused, result, rpc
+from tests.api.conftest import FORMER, GHOSTWRITER_KEY, HD, HG, HG_TEXT, PG, PG_SETUP, AuditLines, put, unrecorded
+from tests.api.mcp_calls import acall, error, refused, result, rpc
 from tests.api.test_jobs import sample, until
 from tests.api.test_mcp import call as inline_call
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.api.test_tools_templates import Local
-from tests.callers import GHOSTWRITER_TOOLS
+from tests.callers import GHOSTWRITER_TOOLS, TEXT_ONLY_INSTRUCTIONS, TEXT_ONLY_READ_DOCUMENT
 from tests.conftest import scaled
+from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import OPERATIONS, AuditLog
 from workbench.api.auth import Caller
@@ -70,6 +71,7 @@ PURPOSE: Final = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request
 GUARDED: Final[dict[str, tuple[str, dict[str, Any]]]] = {
     "read_document": ("query", {"path": f"{CHAT}/q.csv"}),
     "search_files": ("query", {"query": "user-a"}),
+    "view_file": ("query", {"path": f"{CHAT}/q.csv"}),
     "run_python": ("combine", {"code": "print(1)"}),
     "inspect_template": ("query", {"path": f"{CHAT}/form.docx"}),
     "fill_template": (
@@ -125,8 +127,8 @@ def spy_submit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, 
 # --- tools/list and server/discover --------------------------------------------------------------------------------
 
 
-def test_the_ghostwriter_lists_its_nine_tools_in_name_order(client: TestClient) -> None:
-    """The nine workspace tools, by name; each takes an object and answers its own model plus ``outputs``."""
+def test_the_ghostwriter_lists_its_ten_tools_in_name_order(client: TestClient) -> None:
+    """The ten workspace tools, by name; each takes an object and answers its own model plus ``outputs``."""
     tools = result(rpc(client, "tools/list", headers=HG))["tools"]
     assert [t["name"] for t in tools] == sorted(GHOSTWRITER_TOOLS)
     for tool in tools:
@@ -139,7 +141,7 @@ def test_the_ghostwriter_lists_its_nine_tools_in_name_order(client: TestClient) 
 
 
 def test_each_tool_has_its_own_schemas(client: TestClient) -> None:
-    """Every tool is bound to its own models: no two of the nine share an input or an output schema."""
+    """Every tool is bound to its own models: no two of the ten share an input or an output schema."""
     tools = {t["name"]: t for t in result(rpc(client, "tools/list", headers=HG))["tools"]}
     assert tools["list_files"]["inputSchema"]["properties"] == {}
     assert {"name", "rows"} <= set(tools["write_table"]["inputSchema"]["properties"])
@@ -152,6 +154,38 @@ def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> No
     """Ghostwriter, with workspace files, gets the workspace's instructions; docint, inline, version 2's."""
     assert result(rpc(client, "server/discover", headers=HG))["instructions"] == WORKSPACE_INSTRUCTIONS
     assert result(rpc(client, "server/discover", headers=HD))["instructions"] == INSTRUCTIONS
+
+
+# --- a caller that takes no images ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "0", "true", "yes"])
+def test_a_ghostwriter_that_takes_no_images_is_told_what_0_6_told_it(client: TestClient, value: str | None) -> None:
+    """Final review I1: only ``X-Accept-Images: 1`` lists view_file; any other call is listed nine tools, as in 0.6.
+
+    read_document's description and the end of the instructions are 0.6's word for word.
+    """
+    headers = HG_TEXT if value is None else {**HG_TEXT, "X-Accept-Images": value}
+    tools = result(rpc(client, "tools/list", headers=headers))["tools"]
+    assert [tool["name"] for tool in tools] == sorted(GHOSTWRITER_TOOLS - {"view_file"})
+    (read,) = [tool for tool in tools if tool["name"] == "read_document"]
+    assert read["description"] == TEXT_ONLY_READ_DOCUMENT
+    assert result(rpc(client, "server/discover", headers=headers))["instructions"] == TEXT_ONLY_INSTRUCTIONS
+
+
+def test_view_file_is_no_tool_of_a_call_that_takes_no_images(client: TestClient) -> None:
+    """Called anyway, it is a tool the call does not have: ``-32602``, as a tool off the caller's list."""
+    r = acall(client, "view_file", {"path": "/workspace/chat-1/quay-photo.jpg"}, headers=HG_TEXT)
+    assert error(r, 400, -32602)["error"]["message"] == "unknown tool"
+
+
+def test_the_header_selects_what_is_told_never_who_may_call(client: TestClient) -> None:
+    """docint, whose list is run_python alone, gets no tool more for saying it takes images."""
+    tools = result(rpc(client, "tools/list", headers={**HD, "X-Accept-Images": "1"}))["tools"]
+    assert [tool["name"] for tool in tools] == ["run_python"]
+    assert result(rpc(client, "server/discover", headers={**HD, "X-Accept-Images": "1"}))["instructions"] == (
+        INSTRUCTIONS
+    )
 
 
 # --- the result ----------------------------------------------------------------------------------------------------
@@ -190,11 +224,13 @@ def test_every_answer_holds_to_the_output_schema_it_lists(
     form = keep(store, PG, "form.docx", mt.make_controls_docx(tmp_path / "form.docx").read_bytes())
     master = keep(store, PG, "master.pptx", mt.make_master(tmp_path / "master.pptx").read_bytes())
     keep(store, PG, "q.csv")
+    photo = keep(store, PG, "quay-photo.jpg", mi.make_photo(tmp_path / "quay-photo.jpg").read_bytes())
     assistant = {"kind": "assistant"}
     calls: list[tuple[str, dict[str, Any]]] = [
         ("list_files", {}),
         ("read_document", {"path": f"{CHAT}/q.csv"}),
         ("search_files", {"query": "user-a"}),
+        ("view_file", {"path": photo.virtual_path}),
         ("inspect_template", {"path": form.virtual_path}),
         ("fill_template", {"path": form.virtual_path, "values": {"customer": {"value": "x", "source": assistant}}}),
         ("write_table", TABLE),
@@ -374,6 +410,7 @@ async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
         jobs=None,
         purpose=None,
         request_id=None,
+        images=True,
     )
     with pytest.raises(RuntimeError, match="confined to one chat"):
         await spec.run(None, env)
@@ -502,7 +539,7 @@ def strict_client(settings: Settings, store: Store, audit: AuditLog, executor: L
 
 
 def test_the_guard_covers_every_recorded_workspace_tool() -> None:
-    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other eight, each under its recorded action."""
+    """Only ``list_files`` is recorded nowhere; ``GUARDED`` holds the other nine, each under its recorded action."""
     assert set(GHOSTWRITER_TOOLS) - set(OPERATIONS) == {"list_files"}
     assert {tool: action for tool, (action, _) in GUARDED.items()} == {
         tool: OPERATIONS[tool][0] for tool in GHOSTWRITER_TOOLS - {"list_files"}

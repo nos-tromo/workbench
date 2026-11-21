@@ -17,12 +17,14 @@ from typing import Any, override
 
 import pytest
 
-from tests.api.conftest import CALL, unrecorded
+from tests.api.conftest import CALL, PG_SETUP, put, unrecorded
 from tests.conftest import scaled
 from workbench.api.jobs import (
     IMAGE_MAX,
     MCP_QUEUE_WAIT_S,
     PNG_SIGNATURE,
+    PREPARE_QUEUE_WAIT_S,
+    PREPARE_WAITING_MAX,
     RETURN_MAX,
     RETURN_TYPES,
     TEXT_MAX,
@@ -31,13 +33,15 @@ from workbench.api.jobs import (
     ExecutorClient,
     ExecutorUnavailable,
     JobQueue,
+    Keeper,
     RequestTooLarge,
     TakenOutputs,
 )
 from workbench.api.metrics import Metrics
 from workbench.api.store import QuotaExceeded, Store
+from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
-from workbench.models import FileRecord, JobRecord, Principal
+from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.paths import PathError, Workspaces
 from workbench.protocol import (
     JOB_ID,
@@ -52,6 +56,7 @@ from workbench.protocol import (
     decode_request,
     encode,
 )
+from workbench.renders import RENDER_MAX_BYTES, SIGNATURES, render_name
 from workbench.utils.audit_event import AuditWriteError
 
 pytestmark = pytest.mark.anyio
@@ -72,14 +77,19 @@ def user(name: str, chat: str = "chat-1") -> Principal:
 
 
 def sample_result(
-    job_id: str, outputs: Sequence[OutputFile] = (), *, status: str = "ok", message: str = ""
+    job_id: str,
+    outputs: Sequence[OutputFile] = (),
+    *,
+    status: str = "ok",
+    message: str = "",
+    result: dict[str, Any] | None = None,
 ) -> JobResult:
-    """An executor answer for ``job_id``."""
+    """An executor answer for ``job_id``; its runner's answer is ``result``, or ``{"answer": 42}``."""
     return JobResult.model_validate(
         {
             "job_id": job_id,
             "status": status,
-            "result": {"answer": 42},
+            "result": {"answer": 42} if result is None else result,
             "outputs": [o.model_dump() for o in outputs],
             "message": message,
         }
@@ -97,6 +107,7 @@ class FakeClient(ExecutorClient):
         gate: While set, a job that ``hold`` marks does not finish until the test sets it.
         previews: A preview, as the arguments of ``TablePreview``, by the name of the output that has it; a job that
             asked for previews (``req.previews``) gets each staged output's.
+        answer: The runner's answer it gives, such as a render answer; ``None`` for ``{"answer": 42}``.
     """
 
     def __init__(self, data_dir: Path, *, delay: float = 0.0) -> None:
@@ -115,6 +126,7 @@ class FakeClient(ExecutorClient):
         self.status = "ok"
         self.message = ""
         self.error: Exception | None = None
+        self.answer: dict[str, Any] | None = None
 
     def staged(self, job_id: str, name: str) -> Path:
         """Where the executor would stage ``name`` for ``job_id``."""
@@ -141,7 +153,7 @@ class FakeClient(ExecutorClient):
                 path.write_bytes(data)
                 preview = TablePreview(**self.previews[name]) if req.previews and name in self.previews else None
                 outputs.append(OutputFile(name=name, staged_path=str(path), size=len(data), preview=preview))
-            return sample_result(req.job_id, outputs, status=self.status, message=self.message)
+            return sample_result(req.job_id, outputs, status=self.status, message=self.message, result=self.answer)
         finally:
             self.running -= 1
 
@@ -2120,3 +2132,473 @@ async def test_a_call_without_caller_limits_is_never_capped(
     await asyncio.gather(*others, *waiting)
     assert executor.peak == 4
     assert len(executor.requests) == 7
+
+
+# --- version 0.7: render jobs, the prepare gate, a lock per source -------------------------------------------------
+
+#: The first bytes of a JPEG, then invented ones: the api checks a render's signature and size and never decodes it.
+JPEG = SIGNATURES["image/jpeg"] + b"\xe0" + b"\x00" * 27
+#: Ghostwriter's limits as its doors pass them: two slots of its own.
+GHOSTWRITER = CallLimits(wall_s=120, wait_s=60, slots=2)
+#: What the head render of :func:`rendered`'s answer carries: the answer's facts.
+FACTS: dict[str, Any] = {"kind": "pdf", "total": 3, "pages_without_text": [2], "frames": None, "hint": None}
+
+
+def scan(store: Store, p: Principal = PG_SETUP, name: str = "scan.pdf") -> FileRecord:
+    """An invented PDF of ``p``'s chat: the source of the renders."""
+    return put(store, name, b"%PDF-1.7 synthetic", p=p)
+
+
+def page(n: int, *, strip: int = 1, strips: int = 1, mime: str = "image/jpeg") -> dict[str, Any]:
+    """One entry of a render answer, named as ``render_name`` names it."""
+    return {
+        "name": render_name(n, strip, strips, mime),
+        "role": "page",
+        "n": n,
+        "strip": strip,
+        "strips": strips,
+        "width": 120,
+        "height": 160,
+        "mime": mime,
+    }
+
+
+def rendered(executor: FakeClient, *entries: dict[str, Any]) -> None:
+    """Script a render job: the answer of a 3-page PDF whose page 2 has no text, and a small JPEG staged per entry."""
+    executor.answer = {**FACTS, "renders": list(entries)}
+    executor.files = {entry["name"]: JPEG for entry in entries}
+
+
+async def prepare(
+    queue: JobQueue, p: Principal, source: FileRecord, keeper: Keeper | None = None, *, call: CallLimits = CALL
+) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+    """Prepare ``source`` as an attachment's prepare does: the first pages, whole, on the prepare gate."""
+    return await queue.submit_renders(
+        p, source, {"pages": None, "strips": 1}, keeper or KeepAll(), call=call, gate="prepare"
+    )
+
+
+def renders_kept(settings: Settings) -> int:
+    """How many derived rows the volume's database holds, whatever their source."""
+    db = sqlite3.connect(settings.data_dir / "workbench.db")
+    try:
+        return int(db.execute("SELECT COUNT(*) FROM derived").fetchone()[0])
+    finally:
+        db.close()
+
+
+def test_prepares_wait_two_minutes_and_32_of_them_at_most() -> None:
+    """One prepare takes a few seconds: 120 s covers a burst behind the one prepare slot, and 32 wait at the most."""
+    assert (PREPARE_QUEUE_WAIT_S, PREPARE_WAITING_MAX) == (120, 32)
+    assert PNG_SIGNATURE == SIGNATURES["image/png"]
+
+
+async def test_a_prepare_never_takes_a_users_turn(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """One job per user, and theirs running: their prepare starts at once, while an on-demand render waits."""
+    me = user("user-a")
+    source = scan(store)
+    executor.hold = {"ghostwriter/user-a"}
+    queue = queue_for(settings, executor, store, metrics, jobs_per_user=1)
+    interactive = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], call=CALL))
+    await until(lambda: executor.running == 1)
+    prepared = asyncio.create_task(prepare(queue, me, source))
+    await until(lambda: executor.running == 2)
+    assert [req.tool for req in executor.requests] == ["run_python", "prepare_file"]
+    assert sample(metrics, "workbench_queue_length") == 0
+    on_demand = asyncio.create_task(queue.submit_renders(me, source, {"pages": [3]}, KeepAll(), call=CALL))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    assert executor.running == 2
+    executor.gate.set()
+    await asyncio.gather(interactive, prepared, on_demand)
+    assert len(executor.requests) == 3
+    assert queue.tracked_users == 0
+
+
+async def test_one_prepare_runs_at_a_time_across_users(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The prepare gate is the caller's, so no user id shares it: user B's prepare starts only after user A's ends."""
+    b = Principal("ghostwriter", "user-b", "chat-1")
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b"}
+    queue = queue_for(settings, executor, store, metrics)
+    first = asyncio.create_task(prepare(queue, user("user-a"), scan(store)))
+    await until(lambda: executor.running == 1)
+    second = asyncio.create_task(prepare(queue, b, scan(store, b)))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    await asyncio.sleep(0.05)
+    assert (executor.running, len(executor.requests)) == (1, 1)
+    executor.gate.set()
+    await asyncio.gather(first, second)
+    assert [req.user_id for req in executor.requests] == ["user-a", "user-b"]
+    assert executor.peak == 1
+    assert sample(metrics, "workbench_queue_length") == 0
+
+
+async def test_prepare_counts_within_the_callers_slots(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Two caller slots: with two interactive jobs running a prepare waits; with a prepare running one more runs."""
+    c = Principal("ghostwriter", "user-c", "chat-1")
+    source = scan(store, c)
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c"}
+    queue = queue_for(settings, executor, store, metrics)
+    interactive = [
+        asyncio.create_task(queue.submit(user(name), "run_python", ARGS, [], call=GHOSTWRITER))
+        for name in ("user-a", "user-b")
+    ]
+    await until(lambda: executor.running == 2)
+    waiting = asyncio.create_task(prepare(queue, c, source, call=GHOSTWRITER))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    assert executor.running == 2
+    executor.gate.set()
+    await asyncio.gather(*interactive, waiting)
+    executor.gate.clear()
+    running = asyncio.create_task(prepare(queue, c, source, call=GHOSTWRITER))
+    await until(lambda: executor.running == 1)
+    one = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=GHOSTWRITER))
+    await until(lambda: executor.running == 2)
+    two = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, [], call=GHOSTWRITER))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    assert executor.running == 2
+    executor.gate.set()
+    await asyncio.gather(running, one, two)
+    assert executor.peak == 2
+    assert [req.tool for req in executor.requests][3:] == ["prepare_file", "run_python", "run_python"]
+
+
+async def test_waiting_prepares_do_not_fill_the_queue(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """32 prepares of one user wait, past the queue's 16 places, the user's 4 and the caller's 12; the 33rd is full.
+
+    Meanwhile another user's interactive call that must wait is still let into the queue, and runs.
+    """
+    me = user("user-a")
+    source = scan(store)
+    capped = CallLimits(wall_s=120, wait_s=60, slots=3)
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b"}
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(prepare(queue, me, source, call=capped))
+    await until(lambda: executor.running == 1)
+    waiting = [asyncio.create_task(prepare(queue, me, source, call=capped)) for _ in range(PREPARE_WAITING_MAX)]
+    await until(lambda: sample(metrics, "workbench_queue_length") == PREPARE_WAITING_MAX)
+    b_running = asyncio.create_task(queue.submit(user("user-b"), "run_python", ARGS, [], call=capped))
+    await until(lambda: executor.running == 2)
+    b_waiting = asyncio.create_task(queue.submit(user("user-b", "chat-2"), "run_python", ARGS, [], call=capped))
+    await until(lambda: sample(metrics, "workbench_queue_length") == PREPARE_WAITING_MAX + 1)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await prepare(queue, me, source, call=capped)
+    assert refused.value.reason == "queue_full"
+    assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
+    executor.gate.set()
+    done = await asyncio.gather(running, *waiting, b_running, b_waiting)
+    assert {result.status for _, result, _ in done} == {"ok"}
+    assert len(executor.requests) == PREPARE_WAITING_MAX + 3
+    assert sample(metrics, "workbench_queue_length") == 0
+
+
+async def test_a_prepare_waits_up_to_its_call_wait(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Behind a prepare that holds the gate, another waits its call's wait, is refused, and gives its place back."""
+    b = Principal("ghostwriter", "user-b", "chat-1")
+    executor.hold = {"ghostwriter/user-a"}
+    queue = queue_for(settings, executor, store, metrics)
+    first = asyncio.create_task(prepare(queue, user("user-a"), scan(store)))
+    await until(lambda: executor.running == 1)
+    async with asyncio.timeout(scaled(3)):
+        with pytest.raises(Busy) as refused:
+            await prepare(queue, b, scan(store, b), call=dataclasses.replace(CALL, wait_s=1))
+    assert refused.value.reason == "wait_timeout"
+    assert sample(metrics, "workbench_job_refusals_total", reason="wait_timeout") == 1
+    assert sample(metrics, "workbench_queue_wait_seconds_sum") >= 1
+    assert sample(metrics, "workbench_queue_length") == 0
+    assert len(executor.requests) == 1
+    executor.gate.set()
+    await first
+    await prepare(queue, b, scan(store, b, "other.pdf"))
+    assert len(executor.requests) == 2
+
+
+async def test_a_render_job_reads_its_source_alone(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The job is ``prepare_file`` over the source, its one input and its ``path``, whatever path the args name."""
+    me = user("user-a")
+    source = scan(store)
+    queue = queue_for(settings, executor, store, metrics)
+    job, _, _ = await queue.submit_renders(
+        me, source, {"pages": [2], "strips": 2, "path": "other.pdf"}, KeepAll(), call=CALL
+    )
+    (req,) = executor.requests
+    assert (job.tool, req.tool, req.input_files) == ("prepare_file", "prepare_file", ["scan.pdf"])
+    assert req.args == {"pages": [2], "strips": 2, "path": "scan.pdf"}
+    assert req.previews is False
+
+
+async def test_a_render_job_runs_only_for_its_sources_chat(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A source of another user or chat is a programming error: no turn, no job row, nothing sent."""
+    source = scan(store)
+    queue = queue_for(settings, executor, store, metrics)
+    for other in (user("user-b"), user("user-a", "chat-2"), Principal("docint", "user-a", "chat-1")):
+        with pytest.raises(ValueError, match="source"):
+            await queue.submit_renders(other, source, {}, KeepAll(), call=CALL, gate="prepare")
+    assert (executor.requests, jobs_recorded(settings), queue.tracked_users) == ([], 0, 0)
+
+
+async def test_renders_are_recorded_before_they_are_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The keeper sees the planned ids while no render exists; then they are derived rows, never files of the chat."""
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1), page(2), page(3))
+
+    class Watching(KeepAll):
+        """Also notes the source's renders when it records."""
+
+        def __init__(self) -> None:
+            super().__init__(store, me)
+            self.derived_seen: list[DerivedRecord] | None = None
+
+        @override
+        def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+            self.derived_seen = store.derived_of(source)
+            return super().record(result, planned)
+
+    keeper = Watching()
+    queue = queue_for(settings, executor, store, metrics)
+    job, result, kept = await prepare(queue, me, source, keeper)
+    ((status, planned, seen),) = keeper.recorded
+    assert (status, seen, keeper.derived_seen) == ("ok", ["scan.pdf"], [])
+    rows = store.derived_of(source)
+    assert [rec.id for rec in kept] == [rec.id for rec in rows] == planned
+    assert [(r.role, r.ordinal, r.mime, r.width, r.height, r.size) for r in rows] == [
+        ("page", n, "image/jpeg", 120, 160, len(JPEG)) for n in (1, 2, 3)
+    ]
+    assert rows[0].meta["facts"] == FACTS
+    assert [dict(rec.meta) for rec in rows[1:]] == [{}, {}]
+    assert [rec.id for rec in store.files_in_chat(me)] == [source.id]
+    assert (job.status, result.message, result.outputs, keeper.again_ids) == ("ok", "", [], [])
+    assert not (settings.data_dir / "staging" / job.id).exists()
+
+
+async def test_a_strip_keeps_its_place_and_no_facts(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A strip of page 1 is not the whole render: it keeps its strip and strips, and the facts stay off it."""
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1, strip=1, strips=2), page(1, strip=2, strips=2))
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, kept = await queue.submit_renders(me, source, {"pages": [1], "strips": 2}, KeepAll(), call=CALL)
+    assert [dict(rec.meta) for rec in kept] == [{"strip": 1, "strips": 2}, {"strip": 2, "strips": 2}]
+    assert [(rec.ordinal, rec.strip, rec.strips) for rec in store.derived_of(source)] == [(1, 1, 2), (1, 2, 2)]
+
+
+async def test_a_render_made_without_facts_stores_none(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A job told ``facts: False`` answers no real list of pages without text: its whole page 1 carries no facts."""
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1))
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, kept = await queue.submit_renders(me, source, {"pages": [1], "facts": False}, KeepAll(), call=CALL)
+    assert [dict(rec.meta) for rec in kept] == [{}]
+    assert [dict(rec.meta) for rec in store.derived_of(source)] == [{}]
+
+
+async def test_a_render_without_its_entry_or_signature_is_not_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """An output the answer does not name, a PNG staged as a JPEG and one of the cap's size are lost as invalid.
+
+    Each is named again by the keeper, by its planned id; the render one byte under the cap is kept.
+    """
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1), page(2), page(3), page(4))
+    executor.files = {
+        page(1)["name"]: JPEG,
+        "p0009.jpg": JPEG,
+        page(2)["name"]: PNG,
+        page(3)["name"]: JPEG.ljust(RENDER_MAX_BYTES, b"\x00"),
+        page(4)["name"]: JPEG.ljust(RENDER_MAX_BYTES - 1, b"\x00"),
+    }
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await prepare(queue, me, source, keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert [rec.id for rec in kept] == [planned[0], planned[4]]
+    assert [(rec.ordinal, rec.size) for rec in store.derived_of(source)] == [(1, len(JPEG)), (4, RENDER_MAX_BYTES - 1)]
+    assert keeper.again_ids == [planned[1:4]]
+    assert result.message == "3 outputs could not be kept (invalid)"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{"answer": 42}, {**FACTS, "renders": [{**page(1), "name": "../p0001.jpg"}]}, {**FACTS, "renders": []}],
+    ids=["no-render-answer", "a-name-not-its-own", "no-entries"],
+)
+async def test_an_answer_that_names_no_render_keeps_nothing(
+    answer: dict[str, Any], settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """An answer that is no render answer, or names no staged render, keeps none of what the job staged."""
+    me = user("user-a")
+    source = scan(store)
+    executor.answer = answer
+    executor.files = {page(1)["name"]: JPEG}
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await prepare(queue, me, source, keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [planned])
+    assert result.message == "1 output could not be kept (invalid)"
+
+
+async def test_a_render_that_exists_or_passes_the_cap_is_lost_as_duplicate_or_full(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page already rendered is ``duplicate``; one past the source's cap of renders is ``full``; both named again."""
+    me = user("user-a")
+    source = scan(store)
+    real = store.register_derived
+
+    def capped(*args: Any, **more: Any) -> DerivedRecord:
+        return real(*args, **more, cap_bytes=2 * len(JPEG))
+
+    monkeypatch.setattr(store, "register_derived", capped)
+    queue = queue_for(settings, executor, store, metrics)
+    rendered(executor, page(1))
+    await prepare(queue, me, source)
+    rendered(executor, page(1), page(2), page(3))
+    keeper = KeepAll()
+    _, result, kept = await queue.submit_renders(me, source, {"pages": [1, 2, 3]}, keeper, call=CALL)
+    ((_, planned, _),) = keeper.recorded
+    assert [rec.id for rec in kept] == [planned[1]]
+    assert [rec.ordinal for rec in store.derived_of(source)] == [1, 2]
+    assert keeper.again_ids == [[planned[0], planned[2]]]
+    assert result.message == "2 outputs could not be kept (duplicate, full)"
+
+
+async def test_a_render_of_a_deleted_chat_is_not_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The chat is deleted while the job runs: no derived row, no folder, and the render is named again, as gone."""
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a"}
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(prepare(queue, me, source, keeper))
+    await until(lambda: executor.running == 1)
+    store.delete_chat(me, unrecorded)
+    executor.gate.set()
+    _, result, kept = await running
+    ((_, planned, _),) = keeper.recorded
+    assert (kept, renders_kept(settings), keeper.again_ids) == ([], 0, [planned])
+    assert result.message == "1 output could not be kept (gone)"
+    assert not _chat_folder(settings, me).exists()
+
+
+async def test_renders_kept_before_a_failed_job_record_are_removed_and_named_again(
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller gets the store's failure and tells the model of no render, so none stays, and each is named again."""
+    me = user("user-a")
+    source = scan(store)
+    rendered(executor, page(1), page(2))
+    break_finish(store, monkeypatch)
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(sqlite3.OperationalError):
+        await prepare(queue, me, source, keeper)
+    ((_, planned, _),) = keeper.recorded
+    assert keeper.again_ids == [planned]
+    assert (renders_kept(settings), [rec.id for rec in store.files_in_chat(me)]) == (0, [source.id])
+    assert not (_chat_folder(settings, me) / ".derived").exists()
+
+
+async def test_the_source_lock_serialises_and_times_out(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """One holder per source: the next waits its turn, one past its wait is refused, another source is free.
+
+    A waiter that times out or is cancelled leaves nothing behind, and the lock is dropped once no one holds or waits.
+    """
+    queue = queue_for(settings, executor, store, metrics)
+    one, other = "1" * 32, "2" * 32
+    order: list[str] = []
+    let_go = asyncio.Event()
+
+    async def hold(name: str, release: asyncio.Event) -> None:
+        async with queue.source_lock(one, 5):
+            order.append(f"{name} in")
+            await release.wait()
+            order.append(f"{name} out")
+
+    first = asyncio.create_task(hold("first", let_go))
+    await until(lambda: order == ["first in"])
+    free = asyncio.Event()
+    free.set()
+    second = asyncio.create_task(hold("second", free))
+    cancelled = asyncio.create_task(hold("cancelled", free))
+    await asyncio.sleep(0.05)
+    async with asyncio.timeout(0.5), queue.source_lock(other, 0):
+        assert queue.tracked_sources == 2
+    with pytest.raises(Busy) as refused:
+        async with queue.source_lock(one, 0.1):
+            pytest.fail("the lock is held")
+    assert refused.value.reason == "wait_timeout"
+    assert sample(metrics, "workbench_job_refusals_total", reason="wait_timeout") == 1
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert order == ["first in"]
+    let_go.set()
+    await asyncio.gather(first, second)
+    assert order == ["first in", "first out", "second in", "second out"]
+    assert queue.tracked_sources == 0
+
+
+async def test_a_calls_jobs_render_on_the_users_turn_and_name_no_output(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """``CallJobs`` renders within its call's limits on the user's own turn; renders are never the call's outputs."""
+    me = user("user-a")
+    source = scan(store)
+    queue = queue_for(settings, executor, store, metrics, jobs_per_user=1)
+    jobs = CallJobs(queue, dataclasses.replace(GHOSTWRITER, wall_s=30, wait_s=0))
+    rendered(executor, page(1))
+    _, _, kept = await jobs.submit_renders(me, source, {"pages": [1]}, KeepAll())
+    assert [rec.ordinal for rec in kept] == [1]
+    assert jobs.outputs() == []
+    assert executor.requests[0].limits.wall_s == 30
+    executor.hold = {"ghostwriter/user-a"}
+    interactive = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], call=GHOSTWRITER))
+    await until(lambda: executor.running == 1)
+    with pytest.raises(Busy) as refused:
+        await jobs.submit_renders(me, source, {"pages": [2]}, KeepAll())
+    assert refused.value.reason == "wait_timeout"
+    async with queue.source_lock(source.id, 0):
+        with pytest.raises(Busy) as locked:
+            async with jobs.source_lock(source.id):
+                pytest.fail("the lock is held")
+    assert locked.value.reason == "wait_timeout"
+    executor.gate.set()
+    await interactive

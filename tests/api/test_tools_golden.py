@@ -1,8 +1,10 @@
 """The MCP door's ``tools/list``, frozen: what each of its callers is told it can call.
 
-Ghostwriter's nine workspace tools and docint's ``run_python`` are written once into ``tests/api/golden/``, on both
+Ghostwriter's ten workspace tools and docint's ``run_python`` are written once into ``tests/api/golden/``, on both
 revisions the door speaks. A change to a tool's name, description or schema, or to what a caller is offered, fails here
-and is made on purpose, by editing the file, never by regenerating it.
+and is made on purpose, by editing the file, never by regenerating it. Ghostwriter's files are its list on a call that
+takes images (``X-Accept-Images: 1``); without the header it is that list less ``view_file``, ``read_document`` told as
+in 0.6.
 """
 
 import json
@@ -12,8 +14,9 @@ from typing import Any, Final
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import HD, HG
+from tests.api.conftest import HD, HG, HG_TEXT
 from tests.api.test_mcp import Headers, result, rpc
+from tests.callers import TEXT_ONLY_READ_DOCUMENT
 from workbench import __version__
 from workbench.api.mcp_wire import LEGACY_DEFAULT, MODERN, SERVER_INFO
 
@@ -46,3 +49,21 @@ def test_tools_list_is_frozen(client: TestClient, caller: str, headers: Headers,
     version = MODERN if era == "modern" else LEGACY_DEFAULT
     served = frozen(result(rpc(client, "tools/list", version=version, headers=headers)))
     assert served == (GOLDEN / f"{caller}-{era}.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("era", ["modern", "legacy"])
+def test_a_ghostwriter_that_takes_no_images_is_listed_what_0_6_listed(client: TestClient, era: str) -> None:
+    """Final review I1: without ``X-Accept-Images`` (a Ghostwriter before 0.3.0), nine tools, read_document as in 0.6.
+
+    The schemas stay those of the frozen file, ``shown`` and ``strips`` included: they promise no image.
+    """
+    version = MODERN if era == "modern" else LEGACY_DEFAULT
+    served = json.loads(frozen(result(rpc(client, "tools/list", version=version, headers=HG_TEXT))))
+    listed = json.loads((GOLDEN / f"ghostwriter-{era}.json").read_text(encoding="utf-8"))
+    tools = [
+        {**tool, "description": TEXT_ONLY_READ_DOCUMENT} if tool["name"] == "read_document" else tool
+        for tool in listed["tools"]
+        if tool["name"] != "view_file"
+    ]
+    assert served == {**listed, "tools": tools}
+    assert len(tools) == 9

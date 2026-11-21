@@ -30,10 +30,10 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
 | `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
-| `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and four file routes. The same rules; unset, Ghostwriter's door is off. |
-| `GHOSTWRITER_WORKBENCH_TOOLS` | the nine workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. |
+| `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and five file routes. The same rules; unset, Ghostwriter's door is off. |
+| `GHOSTWRITER_WORKBENCH_TOOLS` | the ten workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. Since 0.7.0 the default includes `view_file`; a list set explicitly must add it, or Ghostwriter offers no images. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
-| `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
+| `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or PDF takes one of them, so at 1 prepares share the caller's one slot with its tool calls: keep 2 or more. There is no variable for prepares of their own. |
 
 The api needs at least one of the two keys, or it refuses to start; two
 callers with the same key stop the start too.
@@ -72,7 +72,15 @@ The executor has no network.
 | `WORKBENCH_JOBS_PER_USER` | 1 | Jobs one user may have **running** at once. Their further calls wait, and hold no slot while they wait. |
 | `WORKBENCH_JOB_WALL_S` | 120 | Wall-clock seconds a job may run; also its CPU-time limit. |
 | `WORKBENCH_JOB_MEMORY_MB` | 1536 | Address space one job may map, in MB. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots times this. |
-| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. |
+| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. It bounds the text only: the images of `view_file` and `read_document` come on top (below). |
+
+An answer that shows images is larger than `WORKBENCH_RESULT_MAX_KB`: its
+images are at most 2.5 MiB raw (`MAX_SHOWN_BYTES`), about 3.3 MiB as base64,
+and its text goes twice (the text block and `structuredContent`), each up to
+`WORKBENCH_RESULT_MAX_KB`, JSON-escaped. All of it must stay under the caller's
+cap on an answer, Ghostwriter's 4 MiB. At the default of 16 KB the margin is
+wide; at the most, 256 KB, it is about 150 KB, so raise the setting that far
+only with a caller whose cap leaves the room.
 
 How the queue decides (`workbench/api/jobs.py:JobQueue`); a refused call gets
 an `isError` result whose `reason` says why:
@@ -88,6 +96,19 @@ an `isError` result whose `reason` says why:
   slot and that user's turn until its wall time. Each is held to its own share
   only, so at the defaults docint and Ghostwriter together can hold all 4 slots
   and all 16 waiting places.
+- A prepare (`POST /files/prepare`, the render job of a file just attached)
+  waits for its caller's prepare gate in place of its user's turn, up to 120 s
+  (`PREPARE_QUEUE_WAIT_S`, fixed; then `503`, "busy, retry later"): one prepare
+  of a caller runs at a time, over all its users and inside its slots, and at
+  most 32 wait (`PREPARE_WAITING_MAX`), counted apart from
+  `WORKBENCH_QUEUE_MAX` and every share, so prepares never fill the places the
+  users' own calls need. A client's timeout for the route should cover the
+  120 s, the job's wall and 30 s. The renders a view or a tool makes run on the
+  user's own turn.
+- A `read_document` call on a PDF can run the read, the render of its pages
+  without text and, when strips are asked for, a strips job one after the
+  other, each as long as a job may: a caller's timeout for it should allow for
+  all three.
 - An executor with no free slot, or one the api cannot reach, is refused too
   (`executor_busy`).
 - So is a job the executor stopped because the container held more than
@@ -106,7 +127,7 @@ an `isError` result whose `reason` says why:
 | Variable | Default | Meaning |
 |---|---|---|
 | `WORKBENCH_UPLOAD_MAX_MB` | 50 | Largest upload, per file, in MB. A larger one answers `413`. A request whose body passes this plus 1 MiB is refused while it arrives (`workbench/api/body_limit.py`). It also bounds each file a job writes and a job's outputs together. |
-| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads and the files tools made, in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. It also bounds what a running job may write (see [sandbox.md](sandbox.md#limits)). |
+| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads, the files tools made and the renders of pictures and PDFs, in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. It also bounds what a running job may write (see [sandbox.md](sandbox.md#limits)). |
 
 ### Request bodies
 

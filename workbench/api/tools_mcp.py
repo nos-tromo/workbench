@@ -17,6 +17,7 @@ import dataclasses
 import inspect
 import posixpath
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from functools import partial
 from typing import Any, Final
 
@@ -28,8 +29,9 @@ from workbench.api.auth import Caller
 from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, JobQueue, Keeper
 from workbench.api.mcp_wire import _compact_json
 from workbench.api.registry import ToolEnv, ToolOutcome, ToolSpec
+from workbench.api.renders import WithBlocks
 from workbench.api.tool_table import WORKSPACE_TABLE
-from workbench.models import FileRecord, JobRecord, Principal
+from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.protocol import JobResult, OutputFile, TablePreview
 
 #: Seconds of a job's wall its runner leaves for the previews: their 2 s, and one C call that cannot be interrupted.
@@ -99,7 +101,11 @@ class _Previewing:
 
 
 class CallJobs:
-    """The queue as one MCP call sees it: within the caller's limits, with previews, keeping what the call made."""
+    """The queue as one MCP call sees it: within the caller's limits, with previews, keeping what the call made.
+
+    Its renders (:meth:`submit_renders`) run on the user's own turn, and are derived files of their source, never files
+    the call wrote: :meth:`outputs` never names them.
+    """
 
     def __init__(self, queue: JobQueue, call: CallLimits) -> None:
         """Wrap the queue for one call.
@@ -137,6 +143,35 @@ class CallJobs:
         job, result, made = await self._queue.submit(p, tool, args, input_files, noting, call=self.call, previews=True)
         self._made.extend(made)
         return job, result, made
+
+    async def submit_renders(
+        self, p: Principal, source: FileRecord, args: dict[str, Any], keeper: Keeper
+    ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+        """Render a picture or pages of a PDF as :meth:`JobQueue.submit_renders` does, within the call's limits.
+
+        It waits for the user's own turn; the renders are not the call's outputs.
+
+        Args:
+            p: The caller, user and chat the job runs for: the source's own.
+            source: The file to render.
+            args: The runner's other arguments.
+            keeper: Records the job before any render becomes visible, and picks the renders to keep.
+
+        Returns:
+            What :meth:`JobQueue.submit_renders` returns.
+        """
+        return await self._queue.submit_renders(p, source, args, keeper, call=self.call)
+
+    def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
+        """Hold the lock of one source's renders, waiting at most the call's wait, as :meth:`JobQueue.source_lock`.
+
+        Args:
+            source_id: The source's id.
+
+        Returns:
+            The lock, held while the context runs; entering it raises ``Busy("wait_timeout")`` after the wait.
+        """
+        return self._queue.source_lock(source_id, self.call.wait_s)
 
     def outputs(self) -> list[OutputRef]:
         """Name every file the call made, in the order made.
@@ -233,9 +268,13 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
             "store": env.store,
             "audit": audit,
             "jobs": jobs,
+            "images": env.images,
         }
         given = {name: offered[name] for name in takes}
         answer = await endpoint(**given) if asynchronous else await run_in_threadpool(endpoint, **given)
+        blocks: list[dict[str, Any]] = []
+        if isinstance(answer, WithBlocks):
+            answer, blocks = answer.answer, answer.blocks
         outputs: list[OutputRef] = [] if jobs is None else jobs.outputs()
         structured = {
             **answer.model_dump(mode="json"),
@@ -244,7 +283,7 @@ def workspace_run(endpoint: Callable[..., Any], key: str) -> Callable[[Any, Tool
         told = [
             {name: value for name, value in output.items() if name != "preview"} for output in structured["outputs"]
         ]
-        return ToolOutcome(structured, [], _compact_json({**structured, "outputs": told}))
+        return ToolOutcome(structured, blocks, _compact_json({**structured, "outputs": told}))
 
     return run
 
@@ -255,7 +294,8 @@ def workspace_tools() -> tuple[ToolSpec, ...]:
     Returns:
         A spec per row of :data:`~workbench.api.tool_table.WORKSPACE_TABLE`, in its order: its ``run`` calls the row's
         function (:func:`workspace_run`), its input model is the row's or :class:`NoArguments`, its output model the
-        row's with ``outputs`` (:func:`with_outputs`), and both schemas are those models' own.
+        row's with ``outputs`` (:func:`with_outputs`), and both schemas are those models' own, the same on a call that
+        takes images and on one that does not; what the row says of images is the spec's too.
     """
     specs: list[ToolSpec] = []
     for tool in WORKSPACE_TABLE:
@@ -272,6 +312,8 @@ def workspace_tools() -> tuple[ToolSpec, ...]:
                 run=workspace_run(tool.function, tool.name),
                 input_schema=partial(_model_schema, input_model),
                 output_schema=partial(_model_schema, output_model),
+                images_only=tool.images_only,
+                text_description=tool.text_description,
             )
         )
     return tuple(specs)

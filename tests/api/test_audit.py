@@ -9,13 +9,13 @@ from typing import Any, override
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import HG
+from tests.api.conftest import HG, PG
 from tests.api.mcp_calls import acall, answered
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_inline import body as inline_body
 from tests.api.test_tools_inline import call as inline_call
 from workbench.api.audit import OPERATIONS, SERVICE, AuditLog, PurposeRequired
-from workbench.api.jobs import JobQueue
+from workbench.api.jobs import PNG_SIGNATURE, JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store
@@ -30,6 +30,7 @@ EXPECTED_OPERATIONS = {
     "view": ("disclose", "file.view"),
     "read_document": ("query", "tool.read_document"),
     "search_files": ("query", "tool.search_files"),
+    "view_file": ("query", "tool.view_file"),
     "run_python": ("combine", "tool.run_python"),
     "run_python_inline": ("combine", "tool.run_python.inline"),
     "inspect_template": ("query", "tool.inspect_template"),
@@ -38,6 +39,7 @@ EXPECTED_OPERATIONS = {
     "write_document": ("collect", "tool.write_document"),
     "write_presentation": ("modify", "tool.write_presentation"),
     "chat_delete": ("delete", "chat.delete"),
+    "prepare": ("modify", "file.prepare"),
 }
 
 
@@ -310,9 +312,8 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
     run as Ghostwriter calls them, docint's inline tool as docint calls it.
     """
     executor = Scripted(settings.data_dir)
-    app = create_app(
-        settings, store=store, audit=audit, jobs=JobQueue(settings, executor, store, Metrics(settings.data_dir))
-    )
+    queue = JobQueue(settings, executor, store, Metrics(settings.data_dir))
+    app = create_app(settings, store=store, audit=audit, jobs=queue)
     word = "salaries"
     with TestClient(app) as client:
         where = {"directory": "/workspace/chat-1"}
@@ -358,9 +359,21 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         executor.payload = {"stdout": word, "stderr": "", "truncated": False}
         inline = inline_body(code=f"print('{word}')", data=[{"name": f"{word}.json", "content": f'["{word}"]'}])
         assert len(inline_call(client, inline).blocks) == 1
+        scan = {"file": (f"{word}-scan.png", PNG_SIGNATURE)}
+        assert client.post("/files/upload", params=where, headers=HG, files=scan).status_code == 200
+        executor.files = {"p0001.png": PNG_SIGNATURE}
+        render = {"name": "p0001.png", "role": "image", "n": 1, "width": 8, "height": 8, "mime": "image/png"}
+        executor.payload = {"kind": "image", "total": 1, "pages_without_text": [], "frames": None, "hint": None}
+        executor.payload["renders"] = [render]
+        scan_path = f"/workspace/chat-1/{word}-scan.png"
+        source = store.get(PG, scan_path)
+        assert client.post("/files/prepare", params={"path": scan_path}, headers=HG).status_code == 200
+        assert len(store.derived_of(source)) == 1
+        assert answered(acall(client, "view_file", {"path": scan_path}))["shown"][0]["label"] == "image"
+        executor.files = {}
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
-        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 9}
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 10}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

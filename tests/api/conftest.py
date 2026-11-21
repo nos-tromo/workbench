@@ -24,7 +24,15 @@ from workbench.utils.audit_event import AuditEmitter
 DOCINT_KEY = "d" * 32
 HD = {"Authorization": f"Bearer {DOCINT_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
 GHOSTWRITER_KEY = "a" * 32
-HG = {"Authorization": f"Bearer {GHOSTWRITER_KEY}", "X-User-Id": "user-a", "X-Session-Id": "chat-1"}
+#: Ghostwriter's headers as Ghostwriter 0.3.0 sends them: it takes images (``X-Accept-Images: 1``).
+HG = {
+    "Authorization": f"Bearer {GHOSTWRITER_KEY}",
+    "X-User-Id": "user-a",
+    "X-Session-Id": "chat-1",
+    "X-Accept-Images": "1",
+}
+#: The same as a Ghostwriter before 0.3.0 sends them: no ``X-Accept-Images``, so it is told and shown what 0.6 was.
+HG_TEXT = {name: value for name, value in HG.items() if name != "X-Accept-Images"}
 HG_B = {**HG, "X-User-Id": "user-b"}
 #: Ghostwriter's key alone, without the user and chat headers.
 HG_KEY_ONLY = {"Authorization": f"Bearer {GHOSTWRITER_KEY}"}

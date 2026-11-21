@@ -8,6 +8,7 @@ from workbench.executor.runners.documents import read_document, search_files
 from workbench.executor.runners.outputs import write_document, write_table
 from workbench.executor.runners.presentations import write_presentation
 from workbench.executor.runners.python import run_python
+from workbench.executor.runners.render import prepare_file
 from workbench.executor.runners.templates import fill_template, inspect_template
 
 __all__ = ["RUNNERS", "JobContext", "echo"]
@@ -36,4 +37,5 @@ RUNNERS: dict[str, Callable[[dict[str, Any], JobContext], dict[str, Any]]] = {
     "write_table": write_table,
     "write_document": write_document,
     "write_presentation": write_presentation,
+    "prepare_file": prepare_file,
 }

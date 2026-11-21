@@ -66,6 +66,10 @@ _OLE_HEADER: Final = bytes.fromhex("d0cf11e0a1b11ae1")
 
 DAMAGED: Final = "the file is damaged or truncated, or is not what its extension says"
 TOO_BIG: Final = "the file is too large to read within the memory limit"
+
+#: What a PDF that asks for a password to open is told; here so that the page renderer, which needs no PDF library for
+#: it, does not import one for a string.
+PDF_ENCRYPTED: Final = "the PDF is password-protected (encrypted)"
 _OFFICE_ENCRYPTED: Final = (
     "the file is password-protected (encrypted) or in an old binary format: "
     "remove the password and save it as a current .docx, .xlsx or .pptx"

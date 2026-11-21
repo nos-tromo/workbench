@@ -5,27 +5,39 @@ it to, and the api's part is checked: which files go to the job, what is recorde
 told, what is capped, and that no error carries more than a short fixed text.
 """
 
+import asyncio
 import dataclasses
 import io
 import itertools
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, override
 
 import httpx2
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from PIL import Image
+from pptx import Presentation
 
-from tests.api.conftest import CHAT, FORMER, HG, HG_B, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CHAT, FORMER, HG, HG_B, HG_TEXT, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_jobs import FakeClient
+from tests.api.test_renders import capped
+from tests.api.test_tools_templates import Local
+from tests.api.test_tools_views import file_of, images, pdf, photo, raw, seen, whole_renders
+from tests.callers import TEXT_ONLY_PAGE_HINT
+from tests.fixtures import make_images as mi
+from workbench.api import tools_views
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import JobQueue
+from workbench.api.jobs import Busy, CallLimits, JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.store import Store
+from workbench.api.renders import NOT_KEPT
+from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
+from workbench.api.tools import ReadDocumentRequest
+from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
 from workbench.models import Principal
 from workbench.protocol import JobRequest, JobResult
@@ -80,11 +92,15 @@ def reading(path: str, *parts: tuple[str, str], **extra: Any) -> dict[str, Any]:
     }
 
 
-def read(client: TestClient, path: str, part: str | None = None, headers: Headers = HG) -> httpx2.Response:
+def read(
+    client: TestClient, path: str, part: str | None = None, headers: Headers = HG, strips: int | None = None
+) -> httpx2.Response:
     """Call ``read_document`` as Ghostwriter does, on the MCP door."""
     arguments: dict[str, Any] = {"path": path}
     if part is not None:
         arguments["part"] = part
+    if strips is not None:
+        arguments["strips"] = strips
     return acall(client, "read_document", arguments, headers=headers)
 
 
@@ -108,7 +124,7 @@ def test_read_document_sends_only_the_requested_file(client: TestClient, store: 
     (req,) = executor.requests
     assert req.tool == "read_document"
     assert req.input_files == ["review.docx"]
-    assert req.args == {"path": "review.docx", "part": "paragraph 1", "budget_s": 86}
+    assert req.args == {"path": "review.docx", "part": "paragraph 1", "budget_s": 86, "images": True}
     assert (req.caller, req.user_id, req.chat_id) == ("ghostwriter", "user-a", "chat-1")
     assert req.max_chars == 16 * 1024
     assert answer == {
@@ -117,6 +133,7 @@ def test_read_document_sends_only_the_requested_file(client: TestClient, store: 
         "parts": [{"label": "paragraph 1", "text": "Hello"}],
         "total_parts": 1,
         "pages_without_text": [],
+        "shown": [],
         "truncated": False,
         "next_part": None,
         "hint": None,
@@ -139,7 +156,7 @@ def test_no_part_is_sent_as_none(client: TestClient, store: Store, executor: Scr
     executor.payload = reading("x", ("lines 1-1", "a"))
     answered(read(client, f"{CHAT}/a.txt"))
     answered(acall(client, "read_document", {"path": f"{CHAT}/a.txt", "part": None}))
-    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 86}] * 2
+    assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 86, "images": True}] * 2
 
 
 def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store, executor: Scripted) -> None:
@@ -149,7 +166,7 @@ def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store,
     answer = answered(read(client, f"{CHAT}/orders.json"))
     (req,) = executor.requests
     assert req.input_files == ["orders.json"]
-    assert req.args == {"path": "orders.json", "part": None, "budget_s": 86}
+    assert req.args == {"path": "orders.json", "part": None, "budget_s": 86, "images": True}
     assert answer["kind"] == "json"
     assert answer["parts"] == [{"label": "lines 1-4", "text": '{\n  "order": "A-0001",\n  "qty": 2\n}'}]
 
@@ -187,7 +204,7 @@ def test_a_read_records_query_with_file_ids(
     assert event["target"]["ids"] == [rec.id]
     assert event["target"]["count"] == 1
     assert event["target"]["container"] == "chat:chat-1"
-    assert event["criteria"] == {"caller": "ghostwriter", "paged": True}
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": True, "images": 0}
     raw = json.dumps(audit_lines())
     for secret in ("salary-review", "paragraph 4", "synthetic body text", "docx"):
         assert secret not in raw
@@ -296,20 +313,19 @@ def test_an_unreadable_job_answer_is_a_fixed_error(
     assert refusal(read(client, f"{CHAT}/a.docx")) == ("refused", "the tool returned an answer that could not be read")
 
 
-def test_pages_without_text_and_the_ocr_hint_pass_through(client: TestClient, store: Store, executor: Scripted) -> None:
-    """The runner's hint is the model's; the pages are listed, and never in ``parts``."""
-    put(store, "scan.pdf", p=PG)
+def test_pages_without_text_and_the_runners_hint_pass_through(
+    client: TestClient, store: Store, executor: Scripted
+) -> None:
+    """The runner's hint is the model's; the slides are listed, and never in ``parts``."""
+    put(store, "slides.pptx", p=PG)
     executor.payload = reading(
-        "x",
-        ("page 1", "text"),
-        kind="pdf",
-        pages_without_text=[2],
-        hint="page 2 of those looked at have no text layer.",
+        "x", ("slide 1", "text"), kind="pptx", pages_without_text=[2], hint="slide 2 hold no text (pictures only?)."
     )
-    body = answered(read(client, f"{CHAT}/scan.pdf"))
+    body = answered(read(client, f"{CHAT}/slides.pptx"))
     assert body["pages_without_text"] == [2]
-    assert [p["label"] for p in body["parts"]] == ["page 1"]
-    assert body["hint"] == "page 2 of those looked at have no text layer."
+    assert [p["label"] for p in body["parts"]] == ["slide 1"]
+    assert body["shown"] == []
+    assert body["hint"] == "slide 2 hold no text (pictures only?)."
 
 
 def test_a_cut_answer_says_how_to_go_on(client: TestClient, store: Store, executor: Scripted) -> None:
@@ -755,3 +771,827 @@ def test_every_other_answer_that_reached_the_api_is_recorded_as_an_error(
     (event,) = tool_events(audit_lines, "read_document")
     assert (event["outcome"], event["target"]["ids"]) == ("error", [rec.id])
     assert event["criteria"] == {"caller": "ghostwriter", "paged": False}
+
+
+# --- read_document: pages without text, and pictures, as images ---------------------------------------------------
+
+SHOWN_KEYS = {"label", "n", "width", "height", "mime"}
+#: What the model is told when the pictures of a PDF's pages without text cannot be made now, but may be later.
+UNSHOWN = "The pages without text could not be shown now; view_file shows them."
+#: What it is told when they cannot be made at all, by the cause: view_file is not promised.
+AT_LIMIT = "The pages without text cannot be shown: the renders of this file are at their limit."
+OVER_QUOTA = "The pages without text cannot be shown: the workspace quota is exceeded."
+FULL = "The pages without text cannot be shown: storage is full."
+UNDRAWABLE = "The pages without text cannot be shown: the file cannot be drawn."
+SCANNED = ["Harbour figures 2026", None, "Quay list"]
+
+
+class Picky(Local):
+    """The in-process executor, but the jobs of a tool a test names get another status, or a scripted answer.
+
+    Attributes:
+        statuses: The status a job of a tool is answered with instead of running, by the tool's name.
+        scripted: The runner's answer a job of a tool gets instead of the real runner's, by the tool's name.
+    """
+
+    def __init__(self, data_dir: Path, jobs: Path) -> None:
+        """Run every tool for real until told otherwise."""
+        super().__init__(data_dir, jobs)
+        self.statuses: dict[str, str] = {}
+        self.scripted: dict[str, dict[str, Any]] = {}
+
+    @override
+    async def run(self, req: JobRequest, timeout_s: float) -> JobResult:
+        """Answer as the test chose for the job's tool, else as :class:`Local` does."""
+        if req.tool in self.scripted:
+            base = await FakeClient.run(self, req, timeout_s)
+            return base.model_copy(update={"result": self.scripted[req.tool]})
+        if req.tool not in self.statuses:
+            return await super().run(req, timeout_s)
+        self.status = self.statuses[req.tool]
+        try:
+            return await super().run(req, timeout_s)
+        finally:
+            self.status = "ok"
+
+    def tools(self) -> list[str]:
+        """The tools of the jobs it was given, in order."""
+        return [req.tool for req in self.requests]
+
+
+@pytest.fixture
+def local(settings: Settings, tmp_path: Path) -> Picky:
+    """The in-process executor."""
+    return Picky(settings.data_dir, tmp_path / "jobs")
+
+
+@pytest.fixture
+def built(tmp_path: Path) -> Path:
+    """Where files are built before they are uploaded."""
+    folder = tmp_path / "built"
+    folder.mkdir()
+    return folder
+
+
+def served(settings: Settings, store: Store, audit: AuditLog, local: Picky) -> Iterator[TestClient]:
+    """A client on an app whose jobs run the real runners in this process, with ``settings``."""
+    queue = JobQueue(settings, local, store, Metrics(settings.data_dir))
+    with TestClient(create_app(settings, store=store, audit=audit, jobs=queue)) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def seeing(settings: Settings, store: Store, audit: AuditLog, local: Picky) -> Iterator[TestClient]:
+    """A client on that app."""
+    yield from served(settings, store, audit, local)
+
+
+@pytest.fixture
+def seeing_small(settings: Settings, store: Store, audit: AuditLog, local: Picky) -> Iterator[TestClient]:
+    """A client on that app whose answers may be 1 KB."""
+    yield from served(dataclasses.replace(settings, result_max_kb=1), store, audit, local)
+
+
+def read_events(audit_lines: AuditLines) -> list[dict[str, Any]]:
+    """The ``read_document`` events written so far."""
+    return tool_events(audit_lines, "read_document")
+
+
+def test_a_scanned_page_comes_back_as_an_image_in_the_same_answer(
+    seeing: TestClient, local: Picky, store: Store, built: Path, settings: Settings
+) -> None:
+    """One call: the text of the pages that have it, and the page that has none as an image, with no round between."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["total_parts"], structured["pages_without_text"]) == ("pdf", 3, [2])
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    (item,) = structured["shown"]
+    assert set(item) == SHOWN_KEYS
+    assert (item["label"], item["n"], item["mime"]) == ("page 2", 2, "image/jpeg")
+    (block,) = images(answer)
+    assert (block["mimeType"], block["annotations"]) == ("image/jpeg", {"audience": ["assistant"]})
+    assert raw(block) == file_of(settings, whole_renders(store, source)[2]).read_bytes()
+    assert Image.open(io.BytesIO(raw(block))).size == (item["width"], item["height"])
+    assert "have no text layer" in structured["hint"]
+    assert structured["hint"].endswith(" Page 2 comes with this answer as an image.")
+    assert json.loads(answer["content"][0]["text"]) == structured
+    assert local.tools() == ["read_document", "prepare_file"]
+
+
+def test_the_window_ends_before_a_page_whose_image_does_not_fit(seeing: TestClient, store: Store, built: Path) -> None:
+    """Four images at most: the fifth page is where the answer stops, and ``next_part`` names it."""
+    source = pdf(store, built, "harbour-scans.pdf", [None] * 6)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [item["n"] for item in structured["shown"]] == [1, 2, 3, 4]
+    assert len(images(answer)) == 4
+    assert structured["parts"] == []
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 5")
+    assert structured["hint"].endswith(
+        " The answer is cut before page 5 to keep its images within the limit."
+        ' Call read_document again with part="page 5" to continue.'
+        " Pages 1, 2, 3, 4 come with this answer as images."
+    )
+    assert "result limit" not in structured["hint"]
+    # The pages the call reads on to are not listed: the model must not take them for pages it was not shown.
+    assert structured["pages_without_text"] == [1, 2, 3, 4]
+
+
+def test_the_text_after_the_cut_goes_with_the_next_part(seeing: TestClient, store: Store, built: Path) -> None:
+    """The window ends where the images stop: the text of the pages after it is read again from ``next_part``."""
+    source = pdf(store, built, "harbour-mixed.pdf", [None, "A", None, None, None, "B", None, "C"])
+    structured = seen(read(seeing, source.virtual_path))["structuredContent"]
+
+    assert [item["n"] for item in structured["shown"]] == [1, 3, 4, 5]
+    assert [part["label"] for part in structured["parts"]] == ["page 2", "page 6"]
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 7")
+    assert 'part="page 7"' in structured["hint"]
+    rest = seen(read(seeing, source.virtual_path, structured["next_part"]))["structuredContent"]
+    assert [item["n"] for item in rest["shown"]] == [7]
+    assert [part["label"] for part in rest["parts"]] == ["page 8"]
+    assert rest["truncated"] is False
+
+
+@pytest.mark.parametrize("strips", [1, 2, 3])
+def test_paging_always_moves_on(seeing: TestClient, store: Store, built: Path, strips: int) -> None:
+    """Whatever the strips, each call shows at least one page and its ``next_part`` leads to the others."""
+    source = pdf(store, built, "harbour-scans.pdf", [None, None, None])
+    seen_pages: list[int] = []
+    part: str | None = None
+    for _ in range(3):
+        structured = seen(read(seeing, source.virtual_path, part, strips=strips))["structuredContent"]
+        assert structured["shown"], "a call that shows no page would not move on"
+        seen_pages += sorted({item["n"] for item in structured["shown"]})
+        if not structured["truncated"]:
+            break
+        part = structured["next_part"]
+    assert seen_pages == [1, 2, 3]
+
+
+def test_three_strips_show_one_page_a_call(seeing: TestClient, store: Store, built: Path) -> None:
+    """Three images a page leave room for one page in four images: the calls follow ``next_part`` page by page."""
+    source = pdf(store, built, "harbour-scans.pdf", [None, None, None])
+    firsts = [
+        seen(read(seeing, source.virtual_path, part, strips=3))["structuredContent"]
+        for part in (None, "page 2", "page 3")
+    ]
+    assert [[item["label"] for item in call["shown"]] for call in firsts] == [
+        [f"page {n}, strip {i} of 3" for i in (1, 2, 3)] for n in (1, 2, 3)
+    ]
+    assert [(call["truncated"], call["next_part"]) for call in firsts] == [
+        (True, "page 2"),
+        (True, "page 3"),
+        (False, None),
+    ]
+
+
+def test_the_blocks_follow_shown_in_order(seeing: TestClient, store: Store, built: Path, settings: Settings) -> None:
+    """Block ``i`` is the render ``shown[i]`` names: page by page, each page's strips in order."""
+    source = pdf(store, built, "harbour-mixed.pdf", [None, "A", None])
+    answer = seen(read(seeing, source.virtual_path, strips=2))
+
+    structured = answer["structuredContent"]
+    assert [item["label"] for item in structured["shown"]] == [
+        "page 1, strip 1 of 2",
+        "page 1, strip 2 of 2",
+        "page 3, strip 1 of 2",
+        "page 3, strip 2 of 2",
+    ]
+    cut = {(rec.ordinal, rec.strip): rec for rec in store.derived_of(source) if rec.strips == 2}
+    for item, block in zip(structured["shown"], images(answer), strict=True):
+        rec = cut[(item["n"], int(item["label"].split("strip ")[1][0]))]
+        assert raw(block) == file_of(settings, rec).read_bytes()
+        assert (rec.width, rec.height, rec.mime) == (item["width"], item["height"], item["mime"])
+        assert block["mimeType"] == item["mime"]
+
+
+def test_an_image_file_is_read_as_its_image(
+    seeing: TestClient, local: Picky, store: Store, built: Path, settings: Settings
+) -> None:
+    """A picture has no text to read: no read job, and the answer says what it is, with the image."""
+    source = photo(store, built)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["total_parts"], structured["pages_without_text"]) == ("image", 1, [1])
+    assert (structured["parts"], structured["truncated"], structured["next_part"]) == ([], False, None)
+    assert structured["hint"] == "This is a picture: it comes with this answer for you to see."
+    (item,) = structured["shown"]
+    assert (item["label"], item["n"], item["mime"]) == ("image", 1, "image/jpeg")
+    (block,) = images(answer)
+    assert raw(block) == file_of(settings, whole_renders(store, source)[1]).read_bytes()
+    assert local.tools() == ["prepare_file"]
+
+
+def test_a_picture_can_be_cut_into_strips(seeing: TestClient, store: Store, built: Path) -> None:
+    """Strips are images of the one picture, in order, all with the same page number."""
+    source = photo(store, built)
+    answer = seen(read(seeing, source.virtual_path, strips=2))
+
+    shown = answer["structuredContent"]["shown"]
+    assert [(item["label"], item["n"]) for item in shown] == [("image, strip 1 of 2", 1), ("image, strip 2 of 2", 1)]
+    assert len(images(answer)) == 2
+
+
+def test_a_picture_with_several_frames_says_only_the_first_is_shown(
+    seeing: TestClient, store: Store, built: Path
+) -> None:
+    """Two sentences, each whole, joined by a space."""
+    source = put(store, "harbour-cranes.gif", mi.make_gif(built / "harbour-cranes.gif", frames=2).read_bytes(), p=PG)
+    hint = seen(read(seeing, source.virtual_path))["structuredContent"]["hint"]
+    assert hint == "This is a picture: it comes with this answer for you to see. Only the first of 2 frames is shown."
+
+
+def test_a_text_pdf_reads_as_before(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """No page lacks text: no image block, no render job, and the event names the file alone with no image."""
+    source = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026", "Quay list"])
+    answer = seen(read(seeing, source.virtual_path))
+
+    assert len(answer["content"]) == 1
+    structured = answer["structuredContent"]
+    assert (structured["shown"], structured["pages_without_text"], structured["hint"]) == ([], [], None)
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 2"]
+    assert local.tools() == ["read_document"]
+    (event,) = read_events(audit_lines)
+    assert event["target"]["ids"] == [source.id]
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_an_encrypted_pdf_reads_as_before(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """Review Focus 3: the same refusal and the same ``error`` event as ever; no prepare, no render row."""
+    source = pdf(store, built, "sealed-report.pdf", ["Harbour figures 2026"], password="synthetic-password")
+    assert refusal(read(seeing, source.virtual_path)) == (
+        "refused",
+        "unreadable_file: the PDF is password-protected (encrypted)",
+    )
+    assert local.tools() == ["read_document"]
+    assert store.derived_of(source) == []
+    (event,) = read_events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [source.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "refused": "unreadable_file"}
+
+
+def test_a_pptx_attaches_nothing_yet(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """Stage 1 shows pictures and PDFs only: a slide without text is listed, with no image and no render job."""
+    deck: Any = Presentation()
+    deck.slides.add_slide(deck.slide_layouts[6])
+    deck.save(str(built / "harbour-deck.pptx"))
+    source = put(store, "harbour-deck.pptx", (built / "harbour-deck.pptx").read_bytes(), p=PG)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["pages_without_text"], structured["shown"]) == ("pptx", [1], [])
+    assert structured["hint"] == "slide 1 holds no text (pictures only?) and cannot be shown yet; tell the user."
+    assert len(answer["content"]) == 1
+    assert local.tools() == ["read_document"]
+    (event,) = read_events(audit_lines)
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+@pytest.mark.parametrize("strips", [None, 2])
+def test_a_scanned_pdf_read_without_images_is_read_as_in_0_6(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines, strips: int | None
+) -> None:
+    """Final review I1: a call without ``X-Accept-Images`` gets no image, no note of one and 0.6's hint; no render job.
+
+    ``strips`` is ignored.
+    """
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    answer = seen(read(seeing, source.virtual_path, headers=HG_TEXT, strips=strips))
+
+    assert len(answer["content"]) == 1
+    structured = answer["structuredContent"]
+    assert (structured["pages_without_text"], structured["shown"]) == ([2], [])
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert structured["hint"] == TEXT_ONLY_PAGE_HINT
+    assert "comes with this answer" not in answer["content"][0]["text"]
+    assert local.tools() == ["read_document"]
+    assert local.requests[0].args["images"] is False
+    assert store.derived_of(source) == []
+    (event,) = read_events(audit_lines)
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_picture_read_without_images_is_refused_as_in_0_6(
+    seeing: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """A picture is read by the reader, which refuses it as it did in 0.6: no prepare, no render row."""
+    source = photo(store, built)
+    reason, text = refusal(read(seeing, source.virtual_path, headers=HG_TEXT))
+
+    assert reason == "refused"
+    assert text.startswith("unsupported_format: .jpg cannot be read here")
+    assert local.tools() == ["read_document"]
+    assert store.derived_of(source) == []
+
+
+def test_the_images_are_recorded_with_the_read(
+    seeing: TestClient, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """One ``query`` event names the file, then each render shown; no name or text of the file is in any line."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    seen(read(seeing, source.virtual_path, "pages 1-3"))
+
+    (event,) = read_events(audit_lines)
+    render = whole_renders(store, source)[2]
+    assert (event["action"], event["operation"], event["outcome"]) == ("query", "tool.read_document", "ok")
+    assert event["target"]["ids"] == [source.id, render.id]
+    assert event["target"]["container"] == "chat:chat-1"
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": True, "images": 1}
+    raw_lines = json.dumps(audit_lines())
+    for secret in ("harbour-report", "Harbour figures", "Quay list"):
+        assert secret not in raw_lines
+
+
+def test_a_picture_is_recorded_with_its_image(
+    seeing: TestClient, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """The file, then its render, and the call's strips of a picture are counted as images."""
+    source = photo(store, built)
+    seen(read(seeing, source.virtual_path, strips=2))
+
+    (event,) = read_events(audit_lines)
+    strips = [rec for rec in store.derived_of(source) if rec.strips == 2]
+    assert event["target"]["ids"] == [source.id, *(rec.id for rec in sorted(strips, key=lambda rec: rec.strip))]
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 2}
+
+
+def test_no_image_leaves_when_the_read_cannot_be_recorded(
+    seeing: TestClient,
+    store: Store,
+    built: Path,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed: with the chain broken the call fails, and nothing of the pages goes out."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    seen(read(seeing, source.virtual_path))
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    monkeypatch.setattr(audit_stream, "write", refuse)
+    r = read(seeing, source.virtual_path)
+    unavailable(r)
+    assert "image" not in r.text
+
+
+# --- read_document: when the images cannot be made ----------------------------------------------------------------
+
+
+def test_a_busy_render_still_answers_the_text(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """The text was read: a render job the executor has no room for does not take it back."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    local.statuses["prepare_file"] = "busy"
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert (structured["shown"], structured["pages_without_text"]) == ([], [2])
+    assert len(answer["content"]) == 1
+    assert structured["hint"].endswith(f" {UNSHOWN}")
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    (event,) = read_events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("ok", [source.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+    del local.statuses["prepare_file"]  # the next call has room, and shows the page
+    assert [item["n"] for item in seen(read(seeing, source.virtual_path))["structuredContent"]["shown"]] == [2]
+
+
+def test_a_head_the_store_cannot_keep_still_answers_the_text(
+    seeing: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The source's cap of renders is spent before the first one: the prepare is refused, the text still goes."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    capped(store, monkeypatch, 1)
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert structured["shown"] == []
+    assert structured["hint"].endswith(f" {AT_LIMIT}")
+
+
+def test_a_quota_that_refuses_the_strips_still_answers_the_text(
+    seeing: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user's quota, on the strips a call asks for after the prepare: the text goes, with no image."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    seen(read(seeing, source.virtual_path))
+
+    def refuse(*_: Any, **__: Any) -> None:
+        raise QuotaExceeded("workspace quota exceeded")
+
+    monkeypatch.setattr(store, "register_derived", refuse)
+    answer = seen(read(seeing, source.virtual_path, strips=2))
+
+    structured = answer["structuredContent"]
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert (structured["shown"], len(answer["content"])) == ([], 1)
+    assert structured["hint"].endswith(f" {OVER_QUOTA}")
+
+
+@pytest.mark.parametrize(
+    ("raised", "told"),
+    [
+        (Busy("executor_busy"), UNSHOWN),
+        (Busy("wait_timeout"), UNSHOWN),
+        (HTTPException(status_code=500, detail=NOT_KEPT), UNSHOWN),
+        (
+            HTTPException(status_code=422, detail="the file could not be processed: the job ran past its wall time"),
+            UNSHOWN,
+        ),
+        (HTTPException(status_code=503, detail="hidden_memory: memory outside any job's count"), UNSHOWN),
+        (RendersFull("the renders of this file are at their limit"), AT_LIMIT),
+        (QuotaExceeded("workspace quota exceeded"), OVER_QUOTA),
+        (StorageFull("storage is full"), FULL),
+        (HTTPException(status_code=507, detail="storage_full: storage is full"), FULL),
+        (HTTPException(status_code=422, detail="unreadable_file: the PDF cannot be opened"), UNDRAWABLE),
+        # Final review M3: a runner that ran out of time may not next time, so view_file is promised.
+        (HTTPException(status_code=422, detail="read_timeout: reading the file took longer than 90 s"), UNSHOWN),
+        (HTTPException(status_code=404, detail="file_not_found: the file is not in the workspace"), UNDRAWABLE),
+    ],
+    ids=[
+        "busy",
+        "wait",
+        "not-kept",
+        "job-timeout",
+        "hidden-memory",
+        "renders-full",
+        "quota",
+        "storage",
+        "runner-storage",
+        "unreadable",
+        "read-timeout",
+        "not-found",
+    ],
+)
+def test_the_pictures_of_a_pdf_never_fail_its_read(
+    seeing: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch, raised: Exception, told: str
+) -> None:
+    """Every way the renders can be refused or lost answers the text, with ``shown`` empty and a whole sentence.
+
+    A cause that may pass sends the model to ``view_file``; one that will not names the cause and promises nothing.
+    """
+
+    async def refuse(*_: Any, **__: Any) -> None:
+        raise raised
+
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    monkeypatch.setattr(tools_views, "prepared", refuse)
+    structured = answered(read(seeing, source.virtual_path))
+    assert [part["label"] for part in structured["parts"]] == ["page 1", "page 3"]
+    assert structured["shown"] == []
+    assert structured["hint"].endswith(f" {told}")
+    assert structured["hint"].count("The pages without text") == 1
+
+
+def test_a_render_job_that_fails_in_an_unexpected_way_still_fails_the_read(
+    seeing: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch, audit_lines: AuditLines
+) -> None:
+    """Only the refusals and the losses above are the pictures' own: any other failure is the call's.
+
+    The read job's answer reached the api, so the trail has it: an ``error`` event naming the file, with no image.
+    """
+
+    async def fail(*_: Any, **__: Any) -> None:
+        raise HTTPException(status_code=500, detail="the tool failed")
+
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    monkeypatch.setattr(tools_views, "prepared", fail)
+    assert refusal(read(seeing, source.virtual_path)) == ("refused", "the tool failed")
+    (event,) = read_events(audit_lines)
+    assert (event["action"], event["outcome"], event["target"]["ids"]) == ("query", "error", [source.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_purpose_the_renders_need_and_the_read_did_not_is_recorded_too(
+    settings: Settings, store: Store, audit: AuditLog, local: Picky, built: Path, audit_lines: AuditLines
+) -> None:
+    """With ``modify`` required and ``query`` not, the read runs and its renders are refused: both are in the trail."""
+    required = dataclasses.replace(settings, require_purpose=frozenset({"modify"}))
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    queue = JobQueue(required, local, store, Metrics(settings.data_dir))
+    with TestClient(create_app(required, store=store, audit=audit, jobs=queue)) as client:
+        assert refusal(read(client, source.virtual_path))[0] == "purpose_required"
+        trail = [e for e in audit_lines() if e["operation"] in {"file.prepare", "tool.read_document"}]
+        assert [(e["operation"], e["outcome"]) for e in trail] == [
+            ("file.prepare", "denied"),
+            ("tool.read_document", "error"),
+        ]
+        assert trail[1]["target"]["ids"] == [source.id]
+
+
+def test_a_cancelled_call_records_its_read_and_stays_cancelled(
+    seeing: TestClient,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    local: Picky,
+    built: Path,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A call cancelled while it waits for its renders writes the ``error`` event and is still cancelled."""
+
+    async def cancelled(*_: Any, **__: Any) -> None:
+        raise asyncio.CancelledError
+
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    monkeypatch.setattr(tools_views, "prepared", cancelled)
+    jobs = CallJobs(JobQueue(settings, local, store, Metrics(settings.data_dir)), CallLimits(120, 60))
+    body = ReadDocumentRequest(path=source.virtual_path)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tools_views.read_document(body, PG, settings, store, audit, jobs, images=True))
+    (event,) = read_events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [source.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_trail_that_cannot_take_the_error_does_not_hide_the_failure_it_records(
+    seeing: TestClient,
+    store: Store,
+    built: Path,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed write of that event is the call's failure (audit unavailable), as every unwritable event is."""
+
+    async def fail(*_: Any, **__: Any) -> None:
+        raise HTTPException(status_code=500, detail="the tool failed")
+
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    monkeypatch.setattr(tools_views, "prepared", fail)
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    monkeypatch.setattr(audit_stream, "write", refuse)
+    unavailable(read(seeing, source.virtual_path))
+
+
+def test_a_picture_has_no_text_to_fall_back_on(seeing: TestClient, local: Picky, store: Store, built: Path) -> None:
+    """A picture whose render cannot be made fails the call, as ``view_file`` does."""
+    source = photo(store, built)
+    local.statuses["prepare_file"] = "busy"
+    assert refusal(read(seeing, source.virtual_path)) == ("executor_busy", "busy, retry later")
+
+
+def test_a_picture_that_cannot_be_read_back_is_answered_as_not_shown(
+    seeing: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines
+) -> None:
+    """A render that is not what its row says is never sent: the answer says so, with no image, and is recorded so."""
+    source = photo(store, built)
+    seen(read(seeing, source.virtual_path))
+    file_of(settings, whole_renders(store, source)[1]).write_bytes(b"not a picture, whatever its row says")
+
+    answer = seen(read(seeing, source.virtual_path))
+    structured = answer["structuredContent"]
+    assert (structured["shown"], len(answer["content"])) == ([], 1)
+    assert structured["hint"] == "This picture could not be shown."
+    *_, event = read_events(audit_lines)
+    assert (event["target"]["ids"], event["criteria"]["images"]) == ([source.id], 0)
+
+
+def test_a_file_that_is_not_a_picture_named_as_one_is_refused(seeing: TestClient, store: Store) -> None:
+    """Review Focus 2: a text file named ``.png`` is ``unreadable_file``, with nothing stored."""
+    source = put(store, "harbour-notes.png", b"these are notes, not a picture", p=PG)
+    reason, text = refusal(read(seeing, source.virtual_path))
+    assert (reason, text.partition(":")[0]) == ("refused", "unreadable_file")
+    assert store.derived_of(source) == []
+
+
+def test_a_page_that_cannot_be_read_back_is_named_and_the_others_still_go(
+    seeing: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines
+) -> None:
+    """A render that is not what its row says is left out of the answer and named; the rest is shown."""
+    source = pdf(store, built, "harbour-scans.pdf", [None, None, "Quay list"])
+    seen(read(seeing, source.virtual_path))
+    renders = whole_renders(store, source)
+    file_of(settings, renders[1]).write_bytes(b"not a picture, whatever its row says")
+
+    answer = seen(read(seeing, source.virtual_path))
+    structured = answer["structuredContent"]
+    assert [item["n"] for item in structured["shown"]] == [2]
+    assert len(images(answer)) == 1
+    assert "Page 2 comes with this answer as an image. Page 1 could not be shown." in structured["hint"]
+    _, second = read_events(audit_lines)
+    assert second["target"]["ids"] == [source.id, renders[2].id]
+    assert "not a picture" not in json.dumps(audit_lines())
+
+
+def test_when_every_page_of_the_window_fails_the_rest_is_still_offered(
+    seeing: TestClient, store: Store, built: Path, settings: Settings
+) -> None:
+    """No page of the first four can be read back: the call says so and names where to go on, not nothing."""
+    source = pdf(store, built, "harbour-scans.pdf", [None] * 6)
+    seen(read(seeing, source.virtual_path))
+    for n, rec in whole_renders(store, source).items():
+        if n <= 4:
+            file_of(settings, rec).write_bytes(b"not a picture")
+
+    answer = seen(read(seeing, source.virtual_path))
+    structured = answer["structuredContent"]
+    assert (structured["shown"], len(answer["content"])) == ([], 1)
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 5")
+    assert "Pages 1, 2, 3, 4 could not be shown." in structured["hint"]
+    assert [item["n"] for item in seen(read(seeing, source.virtual_path, "page 5"))["structuredContent"]["shown"]] == [
+        5,
+        6,
+    ]
+
+
+# --- read_document: which pages the images are of -----------------------------------------------------------------
+
+
+def test_a_page_past_where_the_text_stops_has_no_image_yet(
+    seeing: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """The text stops before page 6: the scan there is shown by the call that reads on, not by this one."""
+    source = pdf(store, built, "harbour-mixed.pdf", ["A", None, "B", "C", "D", None, "E", "F"])
+    local.scripted["read_document"] = reading(
+        "x",
+        ("page 1", "a"),
+        ("page 3", "b"),
+        kind="pdf",
+        total_parts=8,
+        pages_without_text=[2, 6],
+        truncated=True,
+        next_part="page 4",
+    )
+    answer = seen(read(seeing, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert [item["n"] for item in structured["shown"]] == [2]
+    assert len(images(answer)) == 1
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 4")
+    assert structured["hint"].count('part="page 4"') == 1
+    assert "result limit" in structured["hint"]  # the text's own cut keeps its own sentence
+    assert structured["pages_without_text"] == [2]
+
+
+def test_the_images_the_results_own_cut_leaves_out_are_left_out_too(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """The answer is cut to the result limit after the images are chosen: pages past that cut wait for the next call."""
+    source = pdf(store, built, "harbour-mixed.pdf", ["A", None, "B", "C", None, "D"])
+    text = "harbour " * 50
+    local.scripted["read_document"] = reading(
+        "x",
+        ("page 1", text),
+        ("page 3", text),
+        ("page 4", text),
+        ("page 6", text),
+        kind="pdf",
+        total_parts=6,
+        pages_without_text=[2, 5],
+    )
+    answer = seen(read(seeing_small, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 3")
+    assert [item["n"] for item in structured["shown"]] == [2]
+    assert len(images(answer)) == 1
+    assert sent_size(structured) <= 1024
+    assert structured["hint"].endswith(" Page 2 comes with this answer as an image.")
+    assert "Pages 2, 5" not in structured["hint"]
+    assert structured["pages_without_text"] == [2]
+
+
+def scripted_text(local: Picky, pad: int, scans: list[int], *pages: int) -> None:
+    """Have the read give long parts for ``pages``, ``pad`` characters longer, and ``scans`` as pages without text."""
+    local.scripted["read_document"] = reading(
+        "x",
+        *((f"page {n}", "w" * (250 + pad)) for n in pages),
+        kind="pdf",
+        total_parts=max([*pages, *scans]),
+        pages_without_text=scans,
+    )
+
+
+def test_the_note_of_an_unshown_page_is_whole_however_full_the_text_is(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Room is kept for the hint before the text is cut: no slack left over by a part may shorten it."""
+
+    async def busy(*_: Any, **__: Any) -> None:
+        raise Busy("executor_busy")
+
+    source = pdf(store, built, "harbour-mixed.pdf", ["A", None, "B", "C", "D"])
+    monkeypatch.setattr(tools_views, "prepared", busy)
+    for pad in range(80):  # the bytes a part leaves over change with its length, so every slack is met
+        scripted_text(local, pad, [2], 1, 3, 4, 5)
+        structured = answered(read(seeing_small, source.virtual_path))
+        assert structured["hint"].endswith(f" {UNSHOWN}"), pad
+        assert (structured["truncated"], structured["shown"]) == (True, []), pad
+        assert sent_size(structured) <= 1024, pad
+
+
+def test_the_note_of_the_images_is_whole_however_full_the_text_is(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """The same for the sentence that names the pages that come as images, and for a page that could not be shown."""
+    source = pdf(store, built, "harbour-mixed.pdf", ["A", None, "B", "C", "D", "E"])
+    for pad in range(120):
+        scripted_text(local, pad, [2], 1, 3, 4, 5, 6)
+        structured = answered(read(seeing_small, source.virtual_path))
+        assert structured["hint"].endswith(" Page 2 comes with this answer as an image."), pad
+        assert [item["n"] for item in structured["shown"]] == [2], pad
+        assert sent_size(structured) <= 1024, pad
+
+
+def test_a_cut_of_the_text_before_the_images_end_keeps_its_own_reason(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """The images would end the answer at page 7, but the text is cut at the result limit at page 3: that is told."""
+    source = pdf(store, built, "harbour-mixed.pdf", ["A", None, "B", None, None, None, None, None, "C"])
+    scripted_text(local, 100, [2, 4, 5, 6, 7, 8], 1, 3, 9)
+    answer = seen(read(seeing_small, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert (structured["truncated"], structured["next_part"]) == (True, "page 3")
+    assert [item["n"] for item in structured["shown"]] == [2]
+    assert structured["pages_without_text"] == [2]
+    assert "The answer is cut at the result limit (1 KB). Call read_document again" in structured["hint"]
+    assert "images within the limit" not in structured["hint"]
+
+
+def test_paging_moves_on_at_the_lowest_result_limit_however_long_the_notes(
+    seeing_small: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """Task 10 minor a: at 1 KB, the room kept for the notes of four images never leaves the answer without text.
+
+    Text on pages 1 and 3, scans on 2, 4, 5 and 6, the read cut at page 7, the runner's own hint and paths of many
+    lengths: the first part is kept, cut if it must be, so that ``next_part`` is never the page the call began at; the
+    notes may then be shortened. Without the guard, names of about 100 to 150 characters stalled on page 1. (Past
+    that, the path, the hint and four ``shown`` entries alone fill 1 KB, whatever room the notes are given.)
+    """
+    for length in range(20, 152, 3):
+        name = f"harbour-{'q' * length}.pdf"
+        source = pdf(store, built, name, ["A", None, "B", None, None, None, "C", "D"])
+        local.scripted["read_document"] = reading(
+            "x",
+            ("page 1", "w" * 400),
+            ("page 3", "w" * 400),
+            kind="pdf",
+            total_parts=8,
+            pages_without_text=[2, 4, 5, 6],
+            truncated=True,
+            next_part="page 7",
+            hint=(
+                "pages 2, 4, 5, 6 of those looked at have no text layer (scans or pictures); do not treat them as "
+                "blank. page 3 is longer than the result limit and is cut; its rest cannot be read by paging."
+            ),
+        )
+        structured = answered(read(seeing_small, source.virtual_path))
+        assert structured["parts"], length
+        assert structured["next_part"] != "page 1", length
+        assert sent_size(structured) <= 1024, length
+
+
+# --- read_document: what the model is told ------------------------------------------------------------------------
+
+
+def test_the_model_is_told_where_the_images_of_a_read_are(client: TestClient) -> None:
+    """The description names the pictures it reads, the pages that come as images, and view_file; no OCR."""
+    tools = listed(client)
+    text = tools["read_document"]["description"]
+    assert "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image" in text
+    assert (
+        "pages_without_text lists pages or slides with no text layer (scans, pictures); never treat them as blank. "
+        "Such PDF pages come back as images in the same answer (shown names them): read them from the images. "
+        "To look at any page, use view_file."
+    ) in text
+    assert "OCR" not in text
+    assert "pillow, pypdfium2" in tools["run_python"]["description"]
+
+
+def test_strips_are_one_to_three_and_hidden_from_the_model_by_its_text(client: TestClient) -> None:
+    """The schema lets Ghostwriter set ``strips``; its description tells the model to leave it out."""
+    schema = listed(client)["read_document"]["inputSchema"]
+    strips = schema["properties"]["strips"]
+    assert (strips["type"], strips["description"]) == ("integer", "Leave it out.")
+    assert strips["anyOf"] == [{"type": "integer", "minimum": 1, "maximum": 3}, {"type": "null"}]
+    assert schema["required"] == ["path"]
+
+
+@pytest.mark.parametrize("strips", [0, 4])
+def test_strips_outside_one_to_three_are_invalid_arguments(
+    seeing: TestClient, store: Store, built: Path, strips: int
+) -> None:
+    """The same bounds as ``view_file``'s."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    assert refusal(read(seeing, source.virtual_path, strips=strips))[0] == "invalid_arguments"
