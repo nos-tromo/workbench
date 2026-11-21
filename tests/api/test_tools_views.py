@@ -28,6 +28,7 @@ from tests.api.test_tools_templates import Local
 from tests.conftest import FakeOffice
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_templates as mt
 from workbench.api import tools_views
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import JobQueue
@@ -503,6 +504,23 @@ def test_view_file_refuses_a_page_of_a_deck(
         "refused",
         "no_such_part: this document has 3 slides",
     )
+
+
+def test_view_file_passes_on_the_refusal_of_a_deck_without_slides(
+    client: TestClient, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """Review Focus 4: a slide master with layouts and no slides is refused in the conversion's own words.
+
+    ``view_file`` passes the 422 on, with nothing converted and nothing kept, whichever part is asked for.
+    """
+    master = mt.as_potx(mt.make_master(built / "harbour-master.pptx", examples=0), built / "harbour-master.potx")
+    source = put(store, "harbour-master.potx", master.read_bytes(), p=PG)
+    words = "unsupported_format: the deck has no slides; inspect_template lists the layouts of a slide master"
+
+    assert refusal(view(client, source.virtual_path)) == ("refused", words)
+    assert refusal(view(client, source.virtual_path, "slide 1")) == ("refused", words)
+    assert store.derived_of(source) == []
+    assert fake_office.calls == 0
 
 
 def test_view_file_shows_a_word_file_as_pages(

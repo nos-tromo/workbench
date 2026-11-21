@@ -28,6 +28,7 @@ from tests.api.test_tools_templates import Local
 from tests.conftest import FakeOffice, scaled
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_templates as mt
 from workbench.api import renders as api_renders
 from workbench.api.audit import AuditLog, PurposeRequired
 from workbench.api.errors import describe
@@ -65,7 +66,7 @@ from workbench.api.store import (
 from workbench.api.tools import ShownImage
 from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
-from workbench.models import DerivedRecord, DerivedSpec, FileRecord
+from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
 from workbench.renders import PAGE_LONG_SIDE, RENDER_MAX_BYTES, RENDERS_PER_JOB
 from workbench.utils.audit_event import AuditWriteError, verify_chain
@@ -904,6 +905,61 @@ async def test_two_prepares_of_a_deck_convert_once(world: World, fake_office: Fa
     assert fake_office.calls == 1
     assert sorted(row.role for row in slow.store.derived_of(source)) == ["page", "page", "page", "pdf"]
     assert [event["outcome"] for event in slow.events()] == ["ok", "ok"]
+
+
+async def test_the_source_lock_is_taken_before_the_turn(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every path takes the source's lock first and a turn of its gate second: the reverse order can deadlock.
+
+    When the prepare of a deck and the on-demand render of its 21st slide each take their turn, the source's lock is
+    already held (one source tracked), and both are let go afterwards.
+    """
+    held_at_turn: list[int] = []
+    real_turn = world.queue.turn
+
+    def turn(p: Principal, **limits: Any) -> contextlib.AbstractAsyncContextManager[Turn]:
+        held_at_turn.append(world.queue.tracked_sources)
+        return real_turn(p, **limits)
+
+    monkeypatch.setattr(world.queue, "turn", turn)
+    source = world.deck(22)
+
+    manifest = await world.prepare(source)
+    drawn = await world.renders(source, manifest, [21])
+
+    assert [rec.ordinal for rec in drawn] == [21]
+    assert held_at_turn == [1, 1]
+    assert world.queue.tracked_sources == 0
+
+
+async def test_a_turn_is_let_go_after_a_refused_conversion(world: World, fake_office: FakeOffice) -> None:
+    """A prepare whose conversion is refused lets its turn and its lock go: the next prepare of a deck runs at once.
+
+    One deck is refused for its pictures (every page came to the ceiling), a slide master for having no slides; a
+    turn that stayed held would keep the caller's prepare gate, and the third prepare would wait for it.
+    """
+    fake_office.ceiling = 0
+    crowded = world.deck(2, name="harbour-crowded.pptx")
+    master = mt.as_potx(mt.make_master(world.built / "harbour-master.pptx", examples=0), world.built / "master.potx")
+    empty = put(world.store, "harbour-master.potx", master.read_bytes(), p=PG)
+
+    refusals: list[str] = []
+    for source in (crowded, empty):
+        with pytest.raises(HTTPException) as refused:
+            await world.prepare(source)
+        assert refused.value.status_code == 422
+        refusals.append(str(refused.value.detail))
+    fake_office.ceiling = None
+
+    assert (
+        refusals[0]
+        == "unreadable_file: the file holds more or larger pictures than can be drawn within the memory limit"
+    )
+    assert refusals[1].startswith("unsupported_format: the deck has no slides")
+    assert world.queue.tracked_sources == 0
+    manifest = await asyncio.wait_for(world.prepare(world.deck(3)), scaled(5))
+    assert (manifest.kind, manifest.total) == ("office", 3)
 
 
 async def test_an_encrypted_deck_is_422_with_nothing_kept(world: World, fake_office: FakeOffice) -> None:
