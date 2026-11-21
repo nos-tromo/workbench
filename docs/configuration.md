@@ -72,7 +72,15 @@ The executor has no network.
 | `WORKBENCH_JOBS_PER_USER` | 1 | Jobs one user may have **running** at once. Their further calls wait, and hold no slot while they wait. |
 | `WORKBENCH_JOB_WALL_S` | 120 | Wall-clock seconds a job may run; also its CPU-time limit. |
 | `WORKBENCH_JOB_MEMORY_MB` | 1536 | Address space one job may map, in MB. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots times this. |
-| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. |
+| `WORKBENCH_RESULT_MAX_KB` | 16 | Largest answer a tool returns to the model, in KB: 1 to 256. Longer answers are cut and say how to go on. It bounds the text only: the images of `view_file` and `read_document` come on top (below). |
+
+An answer that shows images is larger than `WORKBENCH_RESULT_MAX_KB`: its
+images are at most 2.5 MiB raw (`MAX_SHOWN_BYTES`), about 3.3 MiB as base64,
+and its text goes twice (the text block and `structuredContent`), each up to
+`WORKBENCH_RESULT_MAX_KB`, JSON-escaped. All of it must stay under the caller's
+cap on an answer, Ghostwriter's 4 MiB. At the default of 16 KB the margin is
+wide; at the most, 256 KB, it is about 150 KB, so raise the setting that far
+only with a caller whose cap leaves the room.
 
 How the queue decides (`workbench/api/jobs.py:JobQueue`); a refused call gets
 an `isError` result whose `reason` says why:
