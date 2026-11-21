@@ -599,7 +599,7 @@ def _within[M: BaseModel](answer: M, limit: int, *, keep_none: bool = False) -> 
     return best
 
 
-def _fit_read(answer: DocumentRead, limit_kb: int) -> DocumentRead:
+def _fit_read(answer: DocumentRead, limit_kb: int, *, reserve: int = 0) -> DocumentRead:
     """Cut a read to the result limit, with whole parts: the first that does not fit is ``next_part``.
 
     The first part is never left out: if it alone is too long its text is cut and marked, so that
@@ -608,11 +608,13 @@ def _fit_read(answer: DocumentRead, limit_kb: int) -> DocumentRead:
     Args:
         answer: The validated answer.
         limit_kb: The result limit in kilobytes.
+        reserve: Bytes of the limit to keep free for what the caller adds to the answer afterwards (the notes of the
+            images that come with it), so that the parts are cut to leave room for it and it is never cut itself.
 
     Returns:
-        The answer, within the limit as sent, with the sentence that says how to go on if it is cut.
+        The answer, within the limit less ``reserve`` as sent, with the sentence that says how to go on if it is cut.
     """
-    limit = limit_kb * 1024
+    limit = max(1, limit_kb * 1024 - reserve)
     whole = _with_paging(answer, limit_kb)
     if _json_size(whole) <= limit:
         return whole

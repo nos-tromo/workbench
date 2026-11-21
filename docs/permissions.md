@@ -188,9 +188,14 @@ things, the limits that matter to users:
   shows any page or picture, at most 8 images. A read whose images cannot be
   made (the executor has no room, the render is refused, the user's quota or
   the file's cap of renders is spent) still answers the text, with `shown`
-  empty and a hint that `view_file` shows the pages; a page that cannot be
-  read back is named in the hint. A picture file has no text to fall back on,
-  so its read fails with the render.
+  empty and a hint: for a cause that may pass (no room now, a job that ran
+  out of time) that `view_file` shows the pages, and for one that will not
+  (the file's cap of renders, the quota, a full volume, a file that cannot be
+  drawn) the cause, with no promise of `view_file`; a page that cannot be
+  read back is named in the hint. When the images end the answer early, the
+  hint says so and `pages_without_text` lists only the pages before
+  `next_part`. A picture file has no text to fall back on, so its read fails
+  with the render.
 - A Word table holds at most 63 columns. `write_document` refuses a wider
   Markdown table (`refused`), with a text that points to `write_table`.
 - A deck holds 1 to 30 slides and at most 6 blocks a slide, one for each place

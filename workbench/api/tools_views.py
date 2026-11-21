@@ -51,6 +51,7 @@ from workbench.api.renders import (
 )
 from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
 from workbench.api.tools import (
+    _RUNNER_ERRORS,
     MAX_HINT,
     DocumentRead,
     ReadDocumentRequest,
@@ -58,6 +59,7 @@ from workbench.api.tools import (
     _capped,
     _fit_read,
     _join,
+    _json_size,
     _parse,
     _payload,
     _readable,
@@ -67,6 +69,7 @@ from workbench.api.tools import (
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
 from workbench.renders import kind_of
+from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
     from workbench.api.tools_mcp import CallJobs
@@ -81,8 +84,13 @@ _INTEGER: Final[JsonDict] = {"type": "integer"}
 PICTURE: Final = "This is a picture: it comes with this answer for you to see."
 #: What it says when the picture could not be read back.
 NO_PICTURE: Final = "This picture could not be shown."
-#: What a read of a PDF says when the pictures of its pages without text could not be made now.
+#: What a read of a PDF says when the pictures of its pages without text could not be made now, and may be later.
 UNSHOWN: Final = "The pages without text could not be shown now; view_file shows them."
+#: What it says when they cannot be made at all: the cause is named, and view_file is not promised.
+AT_LIMIT: Final = "The pages without text cannot be shown: the renders of this file are at their limit."
+OVER_QUOTA: Final = "The pages without text cannot be shown: the workspace quota is exceeded."
+FULL: Final = "The pages without text cannot be shown: storage is full."
+UNDRAWABLE: Final = "The pages without text cannot be shown: the file cannot be drawn."
 
 #: A page as the PDF reader labels it.
 _PAGE: Final = re.compile(r"page (\d{1,9})")
@@ -362,13 +370,14 @@ class _Attached:
         left_out: The pages asked for whose renders could not be made or read back.
         cut: The first page that did not fit, or that one answer may not take, where the answer ends and ``next_part``
             begins; ``None`` when every page of the window was taken.
-        unshown: Whether the renders could not be made at all, so that the text goes with no image.
+        unshown: What to tell the model when the renders could not be made at all, so that the text goes with no
+            image; ``None`` when they could.
     """
 
     shown: list[tuple[DerivedRecord, bytes]] = dataclasses.field(default_factory=list)
     left_out: list[int] = dataclasses.field(default_factory=list)
     cut: int | None = None
-    unshown: bool = False
+    unshown: str | None = None
 
 
 def _page_of(label: str | None) -> int | None:
@@ -396,13 +405,53 @@ def _pages(numbers: Sequence[int]) -> str:
     return f"Page {numbers[0]}" if len(numbers) == 1 else f"Pages {', '.join(str(n) for n in numbers)}"
 
 
-def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: bool) -> list[str]:
+def _cut_note(cut: int) -> str:
+    """Say that the images, not the text, ended the answer, and where to go on.
+
+    Args:
+        cut: The first page that did not come with this answer.
+
+    Returns:
+        A whole sentence, which the text's own cut at the result limit does not use.
+    """
+    return (
+        f"The answer is cut before page {cut} to keep its images within the limit. "
+        f'Call read_document again with part="page {cut}" to continue.'
+    )
+
+
+def _unshown_because(lost: Exception) -> str:
+    """Tell the model why the pictures of a read could not be made, and whether view_file can show them later.
+
+    Args:
+        lost: What stopped the renders: the executor having no room, a refusal of the render job, or a cap of the store.
+
+    Returns:
+        A whole sentence. ``UNSHOWN`` for a cause that may pass (no room now, a job that ran out of time or memory, a
+        render the store could not keep); one that names the cause, and promises nothing, for a cause that will not
+        (the source's cap of renders, the user's quota, a full volume, a file the renderer refuses).
+    """
+    if isinstance(lost, RendersFull):
+        return AT_LIMIT
+    if isinstance(lost, QuotaExceeded):
+        return OVER_QUOTA
+    if isinstance(lost, StorageFull):
+        return FULL
+    if isinstance(lost, HTTPException):
+        if lost.status_code == 507:
+            return FULL
+        refused = lost.status_code in (404, 422) and str(lost.detail).partition(": ")[0] in _RUNNER_ERRORS
+        return UNDRAWABLE if refused else UNSHOWN
+    return UNSHOWN
+
+
+def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: str | None) -> list[str]:
     """Say what a read attached, each note a whole sentence.
 
     Args:
         shown: The renders that come with the answer.
         left_out: The pages asked for that could not be shown.
-        unshown: Whether the renders could not be made at all.
+        unshown: Why the renders could not be made at all (:func:`_unshown_because`), or ``None``.
 
     Returns:
         The notes, in the order they are told: the pages that come as images, then those that could not be shown.
@@ -415,12 +464,18 @@ def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: 
     if left_out:
         notes.append(f"{_pages(left_out)} could not be shown.")
     if unshown:
-        notes.append(UNSHOWN)
+        notes.append(unshown)
     return notes
 
 
 def _record_read(
-    audit: AuditLog, p: Principal, source: FileRecord, shown: Sequence[DerivedRecord], *, paged: bool
+    audit: AuditLog,
+    p: Principal,
+    source: FileRecord,
+    shown: Sequence[DerivedRecord],
+    *,
+    paged: bool,
+    outcome: str = "ok",
 ) -> None:
     """Record a read, naming the source and each render shown.
 
@@ -430,6 +485,7 @@ def _record_read(
         source: The file.
         shown: The renders that go out with the answer, in order.
         paged: Whether the call named a part.
+        outcome: ``ok``, or ``error`` for a read that was answered by the job and then failed.
 
     Raises:
         AuditWriteError: The event could not be written; nothing may go out.
@@ -438,8 +494,35 @@ def _record_read(
         "read_document",
         p,
         file_ids=[source.id, *(rec.id for rec in shown)],
+        outcome=outcome,
         criteria={"paged": paged, "images": len(shown)},
     )
+
+
+def _record_aborted(audit: AuditLog, p: Principal, source: FileRecord, failed: BaseException, *, paged: bool) -> None:
+    """Record, as an ``error``, a read whose job answered and whose pictures then failed the call.
+
+    It is a plain call, not a thread's: a call that is being cancelled cannot wait for one, and it must not be held up
+    by a failure of its own trail either, so a cancellation goes on as one whatever the event does.
+
+    Args:
+        audit: The audit log, bound to the call.
+        p: The caller, user and chat of the source.
+        source: The file.
+        failed: What stopped the call; an :class:`AuditWriteError` is the trail's own failure and is not written about.
+        paged: Whether the call named a part.
+
+    Raises:
+        AuditWriteError: The event could not be written, and ``failed`` is an ordinary exception: the trail is what
+            the call fails with.
+    """
+    if isinstance(failed, AuditWriteError):
+        return
+    try:
+        _record_read(audit, p, source, [], paged=paged, outcome="error")
+    except Exception:
+        if isinstance(failed, Exception):
+            raise
 
 
 async def _attach_pages(
@@ -474,7 +557,7 @@ async def _attach_pages(
     Returns:
         The images, the pages left out and where the answer ends. When the renders cannot be made (the executor has no
         room, the render job is refused, or the user's quota, the volume or the source's cap of renders stops them), no
-        image and ``unshown`` set: the read is not failed over its pictures.
+        image and ``unshown`` saying why: the read is not failed over its pictures.
 
     Raises:
         PurposeRequired: The call had to state a purpose for ``modify`` (the prepare) and did not.
@@ -491,12 +574,12 @@ async def _attach_pages(
         made = await renders_for(
             p, source, manifest, wanted, strips, settings=settings, store=store, audit=audit, jobs=jobs
         )
-    except (Busy, RendersFull, QuotaExceeded, StorageFull):
-        return _Attached(unshown=True)
+    except (Busy, RendersFull, QuotaExceeded, StorageFull) as lost:
+        return _Attached(unshown=_unshown_because(lost))
     except HTTPException as lost:
         if lost.status_code == 500 and lost.detail != NOT_KEPT:
             raise  # a refusal of the runner is the pictures' own; a failure of the tool is the call's
-        return _Attached(unshown=True)
+        return _Attached(unshown=_unshown_because(lost))
     by_page: dict[int, list[DerivedRecord]] = {}
     for rec in made:
         by_page.setdefault(rec.ordinal, []).append(rec)
@@ -533,9 +616,11 @@ async def _read_pdf(
     """Answer a read of a PDF that was read, with the images of its pages without text.
 
     The text is cut to the result limit as it is for any file. The images are chosen first for the window the executor
-    read; the answer then ends before the first page they did not take, the cut to the result limit may end it earlier,
-    and the images of a page the text no longer reaches wait for the call that reads on. The read is recorded once, when
-    the images are settled.
+    read; the answer then ends before the first page they did not take (and says it was the images), the cut to the
+    result limit may end it earlier, and the images of a page the text no longer reaches wait for the call that reads
+    on, as do the pages named in ``pages_without_text`` from where it ends. The notes about the images are added after
+    the text is cut, and room is kept for them first, so that they are never cut themselves. The read is recorded once,
+    when the images are settled; when the pictures fail the call it is recorded as an ``error`` first.
 
     Args:
         body: The path, the part and the strips.
@@ -555,29 +640,57 @@ async def _read_pdf(
             refusal or a loss of the renders (500).
         PurposeRequired: The call had to state a purpose for the renders it makes and did not.
         AuditWriteError: An event could not be written; no image goes out.
+        BaseException: What stopped the pictures, as it was, after the read is recorded as an ``error``.
     """
     read = _parse(DocumentRead, payload)
-    attached = (
-        await _attach_pages(read, source, body.strips or 1, p=p, settings=settings, store=store, audit=audit, jobs=jobs)
-        if read.pages_without_text
-        else _Attached()
-    )
-    answer = read
-    if attached.cut is not None:
-        cut = attached.cut
+    paged = body.part is not None
+    try:
+        attached = (
+            await _attach_pages(
+                read, source, body.strips or 1, p=p, settings=settings, store=store, audit=audit, jobs=jobs
+            )
+            if read.pages_without_text
+            else _Attached()
+        )
+    except BaseException as failed:
+        _record_aborted(audit, p, source, failed, paged=paged)  # the job answered: the trail says the call failed
+        raise
+    cut = attached.cut
+    base = read
+    if cut is not None:
         kept = [part for part in read.parts if (page := _page_of(part.label)) is None or page < cut]
-        answer = read.model_copy(update={"parts": kept, "truncated": True, "next_part": f"page {cut}"})
-    answer = answer.model_copy(update={"shown": [shown_image("pdf", rec) for rec, _ in attached.shown]})
-    answer = _fit_read(answer, settings.result_max_kb)
+        # What the executor said of its own cut no longer holds: the text ends before the images do. It is told again.
+        base = read.model_copy(update={"parts": kept, "truncated": False, "next_part": None})
+    base = base.model_copy(update={"shown": [shown_image("pdf", rec) for rec, _ in attached.shown]})
+    # The notes come after the text is cut, whole: room is kept for the longest they can be, which is all of them.
+    full = base.model_copy(
+        update={
+            "truncated": base.truncated or cut is not None,
+            "next_part": base.next_part if cut is None else f"page {cut}",
+            "hint": _join(
+                base.hint,
+                None if cut is None else _cut_note(cut),
+                *_notes([rec for rec, _ in attached.shown], attached.left_out, unshown=attached.unshown),
+            ),
+        }
+    )
+    answer = _fit_read(base, settings.result_max_kb, reserve=_json_size(full) - _json_size(base))
+    ended_by_images = cut is not None and (not answer.truncated or answer.next_part is None)
+    if ended_by_images:
+        answer = answer.model_copy(update={"truncated": True, "next_part": f"page {cut}"})
     stop = _page_of(answer.next_part) if answer.truncated else None
     kept_images = [(rec, one) for rec, one in attached.shown if stop is None or rec.ordinal < stop]
     shown = [rec for rec, _ in kept_images]
     notes = _notes(shown, [n for n in attached.left_out if stop is None or n < stop], unshown=attached.unshown)
     answer = answer.model_copy(
-        update={"shown": [shown_image("pdf", rec) for rec in shown], "hint": _join(answer.hint, *notes)}
+        update={
+            "shown": [shown_image("pdf", rec) for rec in shown],
+            "pages_without_text": [n for n in answer.pages_without_text if stop is None or n < stop],
+            "hint": _join(answer.hint, _cut_note(cut) if ended_by_images and cut is not None else None, *notes),
+        }
     )
     answer = _within(answer, settings.result_max_kb * 1024)
-    await run_in_threadpool(_record_read, audit, p, source, shown, paged=body.part is not None)
+    await run_in_threadpool(_record_read, audit, p, source, shown, paged=paged)
     blocks = [image_block(rec.mime, one) for rec, one in kept_images]
     return WithBlocks(answer, blocks) if blocks else answer
 
@@ -683,7 +796,8 @@ async def read_document(
     payload = {**result.result, "path": source.virtual_path} if isinstance(result.result, dict) else None
     if kind == "pdf" and result.status == "ok" and payload is not None and _readable(DocumentRead, payload):
         return await _read_pdf(body, source, payload, p=p, settings=settings, store=store, audit=audit, jobs=jobs)
-    criteria = {"paged": body.part is not None}
+    usable = result.status == "ok" and payload is not None and _readable(DocumentRead, payload)
+    criteria: dict[str, object] = {"paged": body.part is not None, **({"images": 0} if usable else {})}
     await run_in_threadpool(
         record_answer, audit, "read_document", p, [source.id], criteria, result, DocumentRead, payload
     )
