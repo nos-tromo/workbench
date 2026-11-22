@@ -133,11 +133,13 @@ in `tests/api/golden/`). The ten: `list_files`, `read_document`,
 `X-Accept-Images: 1` (`workbench/api/auth.py:accepts_images`; Ghostwriter 0.3.0
 sends it) is told and shown what 0.6 was: no `view_file` (its row is
 `images_only`), `read_document` told its row's `text_description` (0.6's words)
-and read as text alone, the read job's hint in 0.6's words (`images` in its
-arguments), the 0.6 server instructions (`mcp_wire.WORKSPACE_TEXT_INSTRUCTIONS`),
-no image block. The schemas are the same both ways. The goldens hold the listing
-with the header; `tests/api/test_tools_golden.py` derives the one without. The
-header selects what the model is told and shown, never what a caller may reach.
+and read as text alone, `write_presentation` told its row's `text_description`
+(0.8.0's words, which name no `view_file`), the read job's hint in 0.6's words
+(`images` in its arguments), the 0.6 server instructions
+(`mcp_wire.WORKSPACE_TEXT_INSTRUCTIONS`), no image block. The schemas are the
+same both ways. The goldens hold the listing with the header;
+`tests/api/test_tools_golden.py` derives the one without. The header selects
+what the model is told and shown, never what a caller may reach.
 
 - `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
   models of `read_document`, and the helpers the other tool modules share.

@@ -7,7 +7,8 @@ workspace tools are the rows of :data:`~workbench.api.tool_table.WORKSPACE_TABLE
 its own form that its list names (:class:`Registry`), and the api does not start with a list that names any other
 (:func:`allowed_tools`). A call that takes no images (no ``X-Accept-Images: 1``,
 :func:`~workbench.api.auth.accepts_images`) finds none of the tools that only show images, and is told of the others
-what workbench 0.6 told it (:attr:`ToolSpec.text_description`).
+what an earlier workbench told it: ``read_document`` in 0.6's words, ``write_presentation`` in 0.8.0's
+(:attr:`ToolSpec.text_description`).
 
 ``Caller`` is imported for type checking only, since :mod:`workbench.api.auth` imports this module.
 """
@@ -119,7 +120,8 @@ class ToolSpec:
         images_only: Whether it only shows images (``view_file``), and so is listed and called only on a call that
             takes them.
         text_description: What a call that takes no images is told of it instead of ``description``, or ``None`` for
-            the same: ``read_document``'s text of workbench 0.6, which promises no image.
+            the same: ``read_document``'s text of workbench 0.6, which promises no image, and ``write_presentation``'s
+            of 0.8.0, which names no ``view_file``.
     """
 
     name: str

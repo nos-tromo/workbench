@@ -587,6 +587,8 @@ def test_ghostwriter_is_offered_write_presentation(client: TestClient) -> None:
         '"" leaves a place empty',
         "Without path",
         "plain 16:9 master",
+        "View the new deck with view_file",
+        "restyle it in run_python",
     ):
         assert phrase in description, phrase
     schema = tool["inputSchema"]

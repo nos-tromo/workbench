@@ -34,10 +34,9 @@ file routes are not tools, so the model cannot call them.
   send image blocks. A call without it (any other value counts as none), such as
   an older Ghostwriter's, is told and shown what workbench 0.6 told and showed:
   nine tools, `read_document`'s 0.6 description and hints, `write_presentation`
-  without its sentence on `view_file`, the 0.6 server
-  instructions, no image and no render; a picture file is refused as
-  `unsupported_format`, and `view_file` is "unknown tool". The schemas are the
-  same either way. The header is never trusted for access: the key, the tool
+  as 0.8.0 described it (no `view_file`), the 0.6 server instructions, no image
+  and no render; a picture file is refused as `unsupported_format`, and
+  `view_file` is "unknown tool". The schemas are the same either way. The header is never trusted for access: the key, the tool
   list and the chat decide that, and it only chooses what the model is told and
   shown. The file routes need no such header: only a client that knows
   `/files/prepare` and `/files/view?rendition=` calls them.
