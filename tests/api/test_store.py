@@ -2222,3 +2222,99 @@ def test_image_types_are_known() -> None:
     assert store_module._mime("a.TIFF") == "image/tiff"
     assert store_module._mime("a.heic") == "image/heic"
     assert store_module._mime("a.HEIF") == "image/heif"
+
+
+# --- refusals remembered -----------------------------------------------------
+
+#: A refusal as the runner words it: its code, then a fixed text that names no file.
+REFUSED = "unreadable_file: the file holds a picture larger than 120 megapixels"
+
+
+def test_a_refusal_is_remembered_for_its_source_alone(store: Store, alice: Principal, bob: Principal) -> None:
+    """The refusal of a source is answered for that source, never for another file, a copy of it or another user's."""
+    source = put(store, alice, "harbour-deck.pptx")
+    other = put(store, alice, "harbour-notes.docx")
+    theirs = put(store, bob, "harbour-deck.pptx")
+    assert store.refusal_of(source) is None
+    store.remember_refusal(source, REFUSED)
+
+    assert store.refusal_of(source) == REFUSED
+    assert (store.refusal_of(other), store.refusal_of(theirs)) == (None, None)
+    again = put(store, alice, "harbour-deck.pptx")  # the same name again: a new file, with a new id
+    assert again.id != source.id and store.refusal_of(again) is None
+
+
+def test_a_refusal_is_not_inherited_by_a_record_that_is_not_its_files(store: Store, alice: Principal) -> None:
+    """A record of another size under the source's id is another file's: it inherits nothing, and the refusal goes."""
+    source = put(store, alice, "harbour-deck.pptx")
+    store.remember_refusal(source, REFUSED)
+
+    assert store.refusal_of(dataclasses.replace(source, size=source.size + 1)) is None
+    assert store.refusal_of(source) is None
+
+
+def test_refusals_are_bounded_the_least_recently_used_first(
+    store: Store, alice: Principal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past ``REFUSALS_MAX`` (a few thousand) the refusal asked for least recently goes; one asked for again stays."""
+    assert 1000 <= store_module.REFUSALS_MAX <= 10_000
+    monkeypatch.setattr(store_module, "REFUSALS_MAX", 2)
+    first, second, third = (put(store, alice, f"deck-{n}.pptx") for n in (1, 2, 3))
+    store.remember_refusal(first, REFUSED)
+    store.remember_refusal(second, REFUSED)
+    assert store.refusal_of(first) == REFUSED  # asked for: now the most recent
+    store.remember_refusal(third, REFUSED)
+
+    assert [store.refusal_of(rec) for rec in (first, second, third)] == [REFUSED, None, REFUSED]
+
+
+def test_a_refusal_goes_with_its_source(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """Removed (retention) or deleted with its chat, a source's refusal is forgotten; so is every one on a restart."""
+    removed = put(store, alice, "harbour-deck.pptx")
+    deleted = put(store, alice, "harbour-notes.docx")
+    kept = put(store, alice, "quay-deck.pptx")
+    for rec in (removed, deleted, kept):
+        store.remember_refusal(rec, REFUSED)
+
+    store.remove(removed)
+    assert (store.refusal_of(removed), store.refusal_of(kept)) == (None, REFUSED)
+    assert store.delete_chat(alice, unrecorded) == 2
+    assert (store.refusal_of(deleted), store.refusal_of(kept)) == (None, None)
+    assert store._refusals == {}  # nothing is kept of a file that went
+    survivor = put(
+        store, dataclasses.replace(alice, chat_id="chat-2"), "harbour-deck.pptx", directory="/workspace/chat-2"
+    )
+    store.remember_refusal(survivor, REFUSED)
+    restarted = Store(tmp_path / "data" / "workbench.db", Workspaces(tmp_path / "data"))
+    assert restarted.refusal_of(survivor) is None
+
+
+def test_a_refusal_that_may_pass_is_remembered_at_its_second_in_a_row(store: Store, alice: Principal) -> None:
+    """Ruling R22: a refusal no file decides alone is remembered when it comes twice in a row for the same source.
+
+    A success between the two resets the count; so does a record of another size under the same id.
+    """
+    source = put(store, alice, "harbour-deck.pptx")
+    assert store.remember_refusal(source, REFUSED, at_once=False) is False
+    assert store.refusal_of(source) is None
+    assert store.remember_refusal(source, REFUSED, at_once=False) is True
+    assert store.refusal_of(source) == REFUSED
+
+    other = put(store, alice, "harbour-notes.docx")
+    assert store.remember_refusal(other, REFUSED, at_once=False) is False
+    store.forget_refusal(other)  # a success between them
+    assert store.remember_refusal(other, REFUSED, at_once=False) is False
+    assert store.refusal_of(other) is None
+    resized = dataclasses.replace(other, size=other.size + 1)
+    assert store.remember_refusal(resized, REFUSED, at_once=False) is False
+    assert store.remember_refusal(source, REFUSED) is True  # at once, and the first is still remembered
+
+
+def test_no_refusal_is_remembered_of_a_deleted_chat(store: Store, alice: Principal) -> None:
+    """Review M2: a job of a chat deleted while it ran cannot leave a refusal of one of its files in memory."""
+    source = put(store, alice, "harbour-deck.pptx")
+    assert store.delete_chat(alice, unrecorded) == 1
+    assert store.remember_refusal(source, REFUSED) is False
+    assert store.remember_refusal(source, REFUSED, at_once=False) is False
+    assert store.refusal_of(source) is None
+    assert store._refusals == {}

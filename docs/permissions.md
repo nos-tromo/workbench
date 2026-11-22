@@ -13,15 +13,15 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and five file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (2) |
+| `ghostwriter` | mcp, and six file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`. Every such `404` is
   `{"detail": "not found"}`.
-- Ghostwriter's key reaches `/mcp` and five file routes: `/files/upload`,
-  `/files/prepare`, `/files/view`, `/files/list` and `/files/chat`. A purpose
-  it must state and did not is `428` on a file route.
+- Ghostwriter's key reaches `/mcp` and six file routes: `/files/upload`
+  (`POST` and `DELETE`), `/files/prepare`, `/files/view`, `/files/list` and
+  `/files/chat`. A purpose it must state and did not is `428` on a file route.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
@@ -33,10 +33,10 @@ file routes are not tools, so the model cannot call them.
   is `view_file` listed and callable, and do `read_document` and `view_file`
   send image blocks. A call without it (any other value counts as none), such as
   an older Ghostwriter's, is told and shown what workbench 0.6 told and showed:
-  nine tools, `read_document`'s 0.6 description and hints, the 0.6 server
-  instructions, no image and no render; a picture file is refused as
-  `unsupported_format`, and `view_file` is "unknown tool". The schemas are the
-  same either way. The header is never trusted for access: the key, the tool
+  nine tools, `read_document`'s 0.6 description and hints, `write_presentation`
+  as 0.8.0 described it (no `view_file`), the 0.6 server instructions, no image
+  and no render; a picture file is refused as `unsupported_format`, and
+  `view_file` is "unknown tool". The schemas are the same either way. The header is never trusted for access: the key, the tool
   list and the chat decide that, and it only chooses what the model is told and
   shown. The file routes need no such header: only a client that knows
   `/files/prepare` and `/files/view?rendition=` calls them.
@@ -85,8 +85,9 @@ chat.
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
-| prepare, `POST /files/prepare` | a picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`), as a copy in a job of the executor; an Office file is converted once to a PDF, kept as a derived file of it, and then drawn from that PDF, both jobs in one turn of the prepare gate; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF or Office file, or the picture, and an Office file's PDF beside them; with `strips` 2 or 3 (default 1; any other is `422`), also the picture's strips, in a second job on the same prepare gate, while the pages of a PDF or Office file stay to be cut when viewed | `modify` / `file.prepare`, before any render or PDF is visible, one for each job | the renders and the PDF, until the source goes; the answer is their manifest, the same whatever `strips` is |
-| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page, a slide or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn (an Office file with no PDF kept is converted first, in the same turn) | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
+| prepare, `POST /files/prepare` | a picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`), as a copy in a job of the executor; an Office file is converted once to a PDF, kept as a derived file of it, and then drawn from that PDF, both jobs in one turn of the caller's conversion gate (a picture or a PDF waits for its prepare gate, apart from it); a file the executor refused for what it is is refused again, with no job; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF or Office file, or the picture, and an Office file's PDF beside them; with `strips` 2 or 3 (default 1; any other is `422`), also the picture's strips, in a second job on the same prepare gate, while the pages of a PDF or Office file stay to be cut when viewed | `modify` / `file.prepare`, before any render or PDF is visible, one for each job | the renders and the PDF, until the source goes; the answer is their manifest, the same whatever `strips` is |
+| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page, a slide or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn (an Office file with no PDF kept is converted first and drawn, in one turn of the caller's conversion gate) | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
+| `DELETE /files/upload` (since 0.8.1; 0.8.0 answers `405`) | nothing | one upload of the chat, the user's, that Ghostwriter takes back (it does so only for one not yet sent; workbench deletes any upload of the chat), with its renders and their rows; a tool's output, another chat's file or a render is not found (`404`); a job still running on it keeps no render; a refusal remembered for it is forgotten | `delete` / `file.delete`, first | nothing |
 | `DELETE /files/chat` | nothing | the chat's files and renders and their rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
 
@@ -141,8 +142,10 @@ The api calls no model and joins only `workbench-net`.
 ### The agent deletes nothing
 
 No tool deletes or changes a file. Files go only when Ghostwriter deletes a
-chat for its user (`DELETE /files/chat`), or by retention after the period
-(`workbench/api/retention.py:Sweeper`).
+chat for its user (`DELETE /files/chat`) or takes back an upload of the chat
+(`DELETE /files/upload`, never a tool's output; Ghostwriter does so only for one
+its user has not sent), or by retention after
+the period (`workbench/api/retention.py:Sweeper`).
 
 ## Which runs are audited
 
@@ -239,6 +242,16 @@ things, the limits that matter to users:
   (`workbench/decks.py`). Text that may not fit its place is shrunk to 60 % at
   most, and a warning names the slide when that does not do (the answer's
   `warnings`).
+- A deck is read as the model meant it, as models write one by mistake. A
+  block wrapped as `{"role": …, "text": …}`, content given as one block or as a
+  list in a string, a block written as JSON in a string or as `{image: …}`, and
+  line breaks written out before a list's next item are read as the block meant
+  (`workbench/api/tools_presentations.py:_read_as_meant`); every check then runs
+  on that block. A slide that names no layout takes the first layout that has
+  its title, its subtitle and one place a block that takes it, one whose title
+  and subtitle are exactly the slide's first (so a title alone gets a title-only
+  layout); and a title slide's only text block, within a subtitle's 500
+  characters, is its subtitle (`workbench/executor/presentations/deck.py`).
 - A slide master's example slides never reach the new deck. They are removed,
   with the custom shows and sections that name them and the thumbnail and
   `docProps/app.xml` that show or list them; the deck takes the master's theme,

@@ -39,6 +39,7 @@ EXPECTED_OPERATIONS = {
     "write_document": ("collect", "tool.write_document"),
     "write_presentation": ("modify", "tool.write_presentation"),
     "chat_delete": ("delete", "chat.delete"),
+    "file_delete": ("delete", "file.delete"),
     "prepare": ("modify", "file.prepare"),
 }
 
@@ -373,7 +374,9 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         executor.files = {}
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
-        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 10}
+        taken = {"path": f"/workspace/chat-1/{word}-draft.csv"}
+        assert client.delete("/files/upload", params=taken, headers=HG).json() == {"deleted": 1, "renders": 0}
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 9}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

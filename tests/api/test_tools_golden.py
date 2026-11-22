@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from tests.api.conftest import HD, HG, HG_TEXT
 from tests.api.test_mcp import Headers, result, rpc
-from tests.callers import TEXT_ONLY_READ_DOCUMENT
+from tests.callers import TEXT_ONLY_READ_DOCUMENT, TEXT_ONLY_WRITE_PRESENTATION
 from workbench import __version__
 from workbench.api.mcp_wire import LEGACY_DEFAULT, MODERN, SERVER_INFO
 
@@ -55,13 +55,16 @@ def test_tools_list_is_frozen(client: TestClient, caller: str, headers: Headers,
 def test_a_ghostwriter_that_takes_no_images_is_listed_what_0_6_listed(client: TestClient, era: str) -> None:
     """Final review I1: without ``X-Accept-Images`` (a Ghostwriter before 0.3.0), nine tools, read_document as in 0.6.
 
+    write_presentation is told as in 0.8.0, without the view_file sentence.
+
     The schemas stay those of the frozen file, ``shown`` and ``strips`` included: they promise no image.
     """
     version = MODERN if era == "modern" else LEGACY_DEFAULT
     served = json.loads(frozen(result(rpc(client, "tools/list", version=version, headers=HG_TEXT))))
     listed = json.loads((GOLDEN / f"ghostwriter-{era}.json").read_text(encoding="utf-8"))
+    told = {"read_document": TEXT_ONLY_READ_DOCUMENT, "write_presentation": TEXT_ONLY_WRITE_PRESENTATION}
     tools = [
-        {**tool, "description": TEXT_ONLY_READ_DOCUMENT} if tool["name"] == "read_document" else tool
+        {**tool, "description": told[tool["name"]]} if tool["name"] in told else tool
         for tool in listed["tools"]
         if tool["name"] != "view_file"
     ]

@@ -54,6 +54,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "write_document": ("collect", "tool.write_document"),
     "write_presentation": ("modify", "tool.write_presentation"),
     "chat_delete": ("delete", "chat.delete"),
+    "file_delete": ("delete", "file.delete"),
     "prepare": ("modify", "file.prepare"),
 }
 

@@ -1,8 +1,9 @@
-"""Ghostwriter's file routes: list, upload, prepare and view, held to the request's chat, and the chat delete.
+"""Ghostwriter's file routes, held to the request's chat: list, upload, take back, prepare, view, the chat delete.
 
 Any path outside the request's chat is ``404``. The calls state a purpose and a request id,
 which their events carry, and an upload, a prepare or a view that must state a purpose and does not is
-``428``, recorded as denied. ``DELETE /files/chat`` deletes the request's chat.
+``428``, recorded as denied. ``DELETE /files/upload`` deletes one upload of the chat with its renders, as Ghostwriter
+takes back a file its user has not sent (since 0.8.1); ``DELETE /files/chat`` deletes the request's chat.
 
 ``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`), and
 with ``strips`` of 2 or 3 also cuts a picture into that many strips. The view of a file answers the file itself; with
@@ -284,14 +285,15 @@ async def prepare_file(
 
     The first prepare of a file draws its first pages in one job, recorded before any render is visible; every later
     one answers from the renders kept, with no job and no event. An Office file (``kind: office``, counted by ``unit``)
-    is converted once to a PDF first, kept as a derived file of it, in a second job of the same turn of the prepare
-    gate; each of the two is recorded before what it made is visible. A file that is none of these is answered at once
-    as ``kind: none``. The request has no body. It waits at most
-    :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its turn, on the caller's prepare gate, and so never takes the
-    user's own turn from a chat in progress. With ``strips`` of 2 or 3, a picture is also cut into that many strips,
-    in a second job on the same gate (none once they exist), so that a model that sees it in strips pays no job on
-    its turn; a strip that cannot be made fails the prepare as a view of it would. A PDF's pages are cut when they are
-    viewed, whatever ``strips`` says.
+    is converted once to a PDF first, kept as a derived file of it, and drawn in a second job of the same turn, on the
+    caller's conversion gate; each of the two is recorded before what it made is visible. A file that is none of these
+    is answered at once as ``kind: none``; one the executor refused for what it is, with that refusal again, at once
+    and with no job. The request has no body. It waits at most :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its
+    turn, on the caller's prepare gate (a picture's or a PDF's) or conversion gate (an Office file's), and so never
+    takes the user's own turn from a chat in progress, nor does a picture's wait behind a conversion. With ``strips``
+    of 2 or 3, a picture is also cut into that many strips, in a second job on the same gate (none once they exist),
+    so that a model that sees it in strips pays no job on its turn; a strip that cannot be made fails the prepare as a
+    view of it would. A PDF's pages are cut when they are viewed, whatever ``strips`` says.
 
     Args:
         path: The file's virtual path, in the request's chat.
@@ -419,8 +421,11 @@ async def view_file(
     With ``rendition`` the answer is one render of a picture or a PDF instead: page ``rendition``, or the picture for
     1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. A page or the strips of it that do not
     exist yet are made first, in one job on the user's own turn, which waits at most
-    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. ``strips`` of 1 takes no ``strip`` but 1, a greater ``strips`` needs
-    one, from 1 to ``strips``.
+    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. An Office file with no PDF kept is converted on demand first, and
+    drawn, in one turn of the caller's conversion gate, which waits for that gate and then a slot up to
+    :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S`. While another call makes the file's renders, such as its prepare
+    converting it, the view waits for that call up to :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S` too, and answers
+    what it made. ``strips`` of 1 takes no ``strip`` but 1, a greater ``strips`` needs one, from 1 to ``strips``.
 
     Args:
         path: The file's virtual path.
@@ -448,6 +453,38 @@ async def view_file(
     if queue is None:
         raise Busy("executor_busy")
     return await _view_rendition(path, rendition, strips, strip or 1, p, caller, settings, store, audit, queue)
+
+
+@router.delete("/files/upload")
+def delete_upload(path: str, p: FilePrincipalDep, store: StoreDep, audit: CallAuditDep) -> dict[str, int]:
+    """Delete an upload of the request's chat that Ghostwriter takes back for its user, with its renders.
+
+    Only an upload goes: a tool's output, another chat's file or a render is not found. The deletion is recorded by
+    the file's id and its renders' first; one whose event cannot be written deletes nothing. A job still running on the
+    file keeps no render (:meth:`~workbench.api.store.Store.remove_upload`). A refusal remembered for the file is
+    forgotten with it.
+
+    Args:
+        path: The upload's absolute path, ``/workspace/<chat>/<name>``.
+        p: The caller, the user and the chat.
+        store: The file store.
+        audit: The audit log, bound to the call.
+
+    Returns:
+        ``deleted``, 1, and how many ``renders`` went with it.
+
+    Raises:
+        NotFound: No upload of the chat is at the path.
+    """
+    audit.check("file_delete", p)
+    rec = store.get(p, path)
+    if rec.kind != "upload":
+        raise NotFound("file not found")
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        audit.record("file_delete", p, file_ids=ids, outcome=outcome, criteria={"renders": len(ids) - 1})
+
+    return {"deleted": 1, "renders": store.remove_upload(rec, record)}
 
 
 @router.delete(CHAT_PATH)

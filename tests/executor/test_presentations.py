@@ -1099,7 +1099,7 @@ def test_parts_of_one_name_are_refused(job: Job) -> None:
             "content",
         ),
         (
-            {"slides": [{"layout": TITLE_SLIDE, "content": ["Invented"]}]},
+            {"slides": [{"layout": TITLE_SLIDE, "subtitle": "Invented", "content": ["Invented"]}]},
             "invalid_value: slide 1, block 1: text goes into a text or content place; layout 'Title Slide' has: none",
         ),
         (
@@ -1641,6 +1641,52 @@ def test_a_deck_is_built_in_the_plain_master(job: Job) -> None:
         assert PP_PLACEHOLDER.DATE not in found and PP_PLACEHOLDER.FOOTER not in found
     assert {MSO_SHAPE_TYPE.TABLE, MSO_SHAPE_TYPE.CHART} <= {shape.shape_type for shape in deck_.slides[2].shapes}
     assert deck_.slides[3].placeholders[1]._element.tag == qn("p:pic")
+
+
+def test_a_slide_that_names_no_layout_takes_the_first_that_fits(job: Job) -> None:
+    """A model leaves a layout out: the first layout with the slide's title, subtitle and one place a block is used.
+
+    A layout whose title and subtitle are exactly the slide's goes first, so a title alone is a title-only slide.
+    """
+    job.path("figure.png").write_bytes(mk._png(16, 8))
+    slides: list[dict[str, Any]] = [
+        {"title": "Invented harbour review", "subtitle": "A synthetic year"},
+        {"title": "Invented tonnage", "content": ["- North pier"]},
+        {"title": "Invented section"},
+        {"title": "Invented view", "content": [image("figure.png"), "Invented"]},
+    ]
+    assert job.write(slides, path=None) == {"slides": 4, "warnings": []}
+    names = [slide.slide_layout.name for slide in job.deck().slides]
+    assert names == [PLAIN_LAYOUTS[i - 1] for i in (TITLE_SLIDE, TITLE_AND_CONTENT, TITLE_ONLY, TWO_CONTENT)]
+
+
+def test_a_slide_no_layout_takes_is_refused_with_the_layouts(job: Job) -> None:
+    """Naming none, a slide no layout takes is refused, and the model hears the layouts to name one."""
+    error = job.write([{"title": "Invented", "content": ["- a", "- b", "- c", "- d", "- e"]}], path=None)["error"]
+    assert error.startswith(
+        "invalid_value: slide 1: it names no layout, and none takes it as it is; give its layout: 1 Title Slide, "
+        "2 Title and Content, "
+    )
+    assert list(job.ctx.out_dir.iterdir()) == []
+
+
+def test_a_title_slides_only_text_is_its_subtitle(job: Job) -> None:
+    """A model writes a title slide's subtitle as its content: on a layout with a subtitle and no place, it is one.
+
+    Within a subtitle's 500 characters only; a longer block is refused as before.
+    """
+    slides = [{"layout": TITLE_SLIDE, "title": "Invented harbour review", "content": ["A synthetic year"]}]
+    assert job.write(slides, path=None) == {"slides": 1, "warnings": []}
+    found = kinds(job.deck().slides[0])
+    assert found[PP_PLACEHOLDER.SUBTITLE].text_frame.text == "A synthetic year"
+    for refused in (
+        {"layout": TITLE_SLIDE, "subtitle": "Invented", "content": ["A synthetic year"]},
+        {"layout": TITLE_SLIDE, "content": ["Invented", "A synthetic year"]},
+        {"layout": TITLE_SLIDE, "content": [{"table": [["Invented"]]}]},
+        {"layout": TITLE_SLIDE, "content": ["x" * 501]},
+    ):
+        error = job.write([refused], path=None, name="refused.pptx")["error"]
+        assert error.startswith("invalid_value: slide 1, block 1: "), error
 
 
 def test_a_deck_in_the_plain_master_names_no_one(job: Job) -> None:

@@ -50,7 +50,22 @@ def rpc(
     meta: bool | Mapping[str, object] = True,
     name: str | None = None,
 ) -> httpx2.Response:
-    """Send one JSON-RPC message as docint does.
+    """Send one JSON-RPC message as docint does: the body and headers :func:`message` builds."""
+    body, sent = message(method, params, id=id, version=version, headers=headers, meta=meta, name=name)
+    return send(client, body, sent)
+
+
+def message(
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    id: object = 1,
+    version: str | None = MODERN,
+    headers: Headers = HD,
+    meta: bool | Mapping[str, object] = True,
+    name: str | None = None,
+) -> tuple[bytes, Headers]:
+    """Build one JSON-RPC message and its headers as docint sends them.
 
     ``Content-Type``, ``Accept`` and ``MCP-Protocol-Version`` go on every message; on the modern revision also
     ``Mcp-Method``, ``Mcp-Name`` on ``tools/call`` (``name``, else the tool's) and ``params._meta`` with the version
@@ -72,10 +87,10 @@ def rpc(
         protocol["Mcp-Method"] = method
         if method == "tools/call":
             protocol["Mcp-Name"] = name if name is not None else str(sent.get("name"))
-    message: dict[str, object] = {"jsonrpc": "2.0", "method": method, "params": sent}
+    body: dict[str, object] = {"jsonrpc": "2.0", "method": method, "params": sent}
     if id is not NOTIFICATION:
-        message["id"] = id
-    return send(client, json.dumps(message).encode(), {**protocol, **headers})
+        body["id"] = id
+    return json.dumps(body).encode(), {**protocol, **headers}
 
 
 def acall(

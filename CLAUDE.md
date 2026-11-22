@@ -133,11 +133,13 @@ in `tests/api/golden/`). The ten: `list_files`, `read_document`,
 `X-Accept-Images: 1` (`workbench/api/auth.py:accepts_images`; Ghostwriter 0.3.0
 sends it) is told and shown what 0.6 was: no `view_file` (its row is
 `images_only`), `read_document` told its row's `text_description` (0.6's words)
-and read as text alone, the read job's hint in 0.6's words (`images` in its
-arguments), the 0.6 server instructions (`mcp_wire.WORKSPACE_TEXT_INSTRUCTIONS`),
-no image block. The schemas are the same both ways. The goldens hold the listing
-with the header; `tests/api/test_tools_golden.py` derives the one without. The
-header selects what the model is told and shown, never what a caller may reach.
+and read as text alone, `write_presentation` told its row's `text_description`
+(0.8.0's words, which name no `view_file`), the read job's hint in 0.6's words
+(`images` in its arguments), the 0.6 server instructions
+(`mcp_wire.WORKSPACE_TEXT_INSTRUCTIONS`), no image block. The schemas are the
+same both ways. The goldens hold the listing with the header;
+`tests/api/test_tools_golden.py` derives the one without. The header selects
+what the model is told and shown, never what a caller may reach.
 
 - `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
   models of `read_document`, and the helpers the other tool modules share.
@@ -152,22 +154,30 @@ header selects what the model is told and shown, never what a caller may reach.
   (`prepared`, `renders_for`: a file or a page whose renders exist is answered
   from the rows without the source's lock, and no job runs when the source's
   renders leave no room for one more; an Office file with no `pdf` row is
-  converted first, under the source's lock, in the same turn as its drawing,
-  and one whose PDF has gone is converted again) and reads each render back by
+  converted first, under the source's lock, in the same turn as its drawing, a
+  turn of the caller's conversion gate, and one whose PDF has gone is converted
+  again so too; a file the executor refused for what it is is refused again at
+  once, with no job, from `Store.refusal_of`) and reads each render back by
   its row,
   never one that is not what the row says. A render becomes visible only after its `modify` /
   `file.prepare` event, and leaves only after its `disclose` / `file.view`,
   `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
   template and output tools. A new tool gets a module of its own, as
-  `workbench/api/tools_presentations.py` (`write_presentation`) has: it checks the
-  master, the name, every deck bound, each picture and each source before a job,
-  so a refusal names its slide and block and costs no job.
-- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
-  view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
+  `workbench/api/tools_presentations.py` (`write_presentation`) has: it first
+  reads a block in a shape models write by mistake as the block meant
+  (`_read_as_meant`: a place's `role` dropped, a block or list written as JSON in
+  a string, `{image: …}`, line breaks written out before a list's next item),
+  then checks the master, the name, every deck bound, each picture and each
+  source before a job, so a refusal names its slide and block and costs no job.
+  A slide that names no layout is left for the runner, which takes the first
+  layout that takes it (`presentations/deck.py:fitting`), and a title slide's
+  only text block is its subtitle (`subtitle_as_meant`).
+- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
+  an upload not yet sent, prepare, view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
-  the prepare gate; with `strips` 2 or 3 it also cuts a picture into strips, on
+  the conversion gate; with `strips` 2 or 3 it also cuts a picture into strips, on
   the prepare gate) and `GET /files/view?rendition=` serves one render, made first
   on the user's own turn when it does not exist yet.
 - `workbench/executor/runners/`: one runner per tool that needs file content
@@ -186,12 +196,16 @@ header selects what the model is told and shown, never what a caller may reach.
   `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
   its record. A render job (`submit_renders`) keeps its outputs as derived files
   of its source (`Store.register_derived`), never as files of the chat. **The
-  prepare gate:** a prepare, the render job of a file just attached
-  (`gate="prepare"`), waits for its caller's prepare gate in place of its user's
-  turn, so it never takes the user's interactive one: one prepare of a caller runs
-  at a time, over all its users, within the caller's slots, and at most
-  `PREPARE_WAITING_MAX` wait, counted apart from the queue. Renders on the routes
-  and in the tools run on the user's own turn.
+  prepare gate and the conversion gate:** a prepare, the render job of a picture or
+  a PDF just attached (`gate="prepare"`), waits for its caller's prepare gate in
+  place of its user's turn, so it never takes the user's interactive one; an Office
+  file's conversion and its drawing, one turn (`gate="conversion"`), wait for its
+  caller's conversion gate, whether a prepare or a call on demand runs them. Each
+  gate runs one job of a caller at a time, over all its users, within the caller's
+  slots, and at most `PREPARE_WAITING_MAX` wait at each, counted apart from the
+  queue and from each other: a picture is prepared while a deck converts, and a
+  caller never converts two files at once. Other renders on the routes and in the
+  tools run on the user's own turn.
 - `workbench/executor/render/`: what `prepare_file` uses. `images.py` decodes a
   picture (its content decides the format, not its name; at most 120 MP; one HEIF
   decoder thread), brings it to the bounds of a render, to sRGB through its
@@ -257,7 +271,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and five file routes,
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and six file routes,
 workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
@@ -294,7 +308,9 @@ starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
   job, inside a job folder no other slot can pass. A watchdog holds each running
   job to its disk and memory.
 - **The agent deletes nothing.** No tool deletes or overwrites a file; Ghostwriter's
-  chat delete and retention do.
+  chat delete, its taking back of an upload (Ghostwriter calls it only for one
+  its user has not sent; workbench deletes any upload of the chat), and
+  retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error
   answers are short fixed texts (`workbench/api/errors.py`); no handler logs a
   traceback or a cause of a path or store error. An error no handler expected is
@@ -420,6 +436,36 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   child each, halving a range that comes to the ceiling again, joins the parts
   with pdfium, and refuses with `office.TOO_MANY_PICTURES` when a single page
   still does or the budget runs out. `docs/sandbox.md` § Limits has the numbers.
+- **A call waits longer for a source's lock than for its turn.** A view or a
+  tool waits 5 s for its turn (`MCP_QUEUE_WAIT_S`), but up to 120 s for the lock
+  of a source whose renders another call is making (`SOURCE_LOCK_WAIT_S`):
+  Ghostwriter prepares an attachment as it arrives, and a deck's conversion takes
+  13-31 s, so a view of it waits for that prepare rather than answer busy, and
+  converts nothing again. 120 s is one job wall, what the call would have spent
+  converting itself, and short of Ghostwriter's 150 s for a tool call. The wait
+  holds nothing else; every path takes the lock first and a turn second. A call
+  that converts a file on demand waits for the conversion gate and then a slot
+  up to the same 120 s, past its 5 s, since it waits out another file's
+  conversion. The two waits are apart, so the worst case of a view that converts
+  (both waits, then two walls) passes Ghostwriter's 150 s; the usual one does not.
+- **A refusal is remembered, in memory alone.** A file the executor refused at its
+  prepare or its conversion is answered with that refusal by every later prepare
+  or render, with no job, once `Store.refusal_of` holds it (an LRU of
+  `REFUSALS_MAX`, by the source's id, creation time and size), and recorded as
+  the refusal was, with `remembered: true`. A refusal the file decides is
+  remembered at once: every `unsupported_format`, and an `unreadable_file` whose
+  text is in `renders.FILE_DECIDED` (damaged, encrypted, a picture over 120 MP,
+  too many pictures, also when a conversion redone in parts runs out of its time,
+  no pages, a PDF past 32 MB). `FILE_DECIDED` is an allow-list of copies of the
+  runners' texts (the api imports nothing of the executor), pinned to their
+  constants by `tests/api/test_renders.py`. Any other `unreadable_file` (a write
+  that failed in the job's sandbox, a conversion that ended for no reason the file
+  gives, a text added later) is remembered only when it comes twice in a row, a
+  job that went well between them starting the count again; a timeout, a busy
+  executor or a failure never is. It goes with the file (`Store.remove`,
+  `Store.remove_upload`, `Store.delete_chat`; a job of a deleted chat remembers
+  nothing) and with a
+  restart; uploading the file again makes a new file, tried afresh.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in

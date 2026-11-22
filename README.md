@@ -6,13 +6,13 @@ pages of PDFs and the pages and slides of Word, PowerPoint and OpenDocument text
 files (each converted once in the sandbox), fills report templates, builds
 presentations in a slide master (or a plain one) and writes new tables and
 documents, all through workbench's ten typed tools. Every file is opened in a sandbox without network. Uploads, views, tool runs on
-files, new files and chat deletions are recorded in the federation's audit
+files, new files, uploads taken back and chat deletions are recorded in the federation's audit
 trail, by file id; listing files (`list_files` too) is not. Every file is
 deleted 7 days after it was made.
 
 Ghostwriter's backend calls the tools through `/mcp`, with a bearer key, and
-keeps a chat's files on five file routes (list, upload, prepare, view, delete
-the chat).
+keeps a chat's files on six file routes (list, upload, take back an upload,
+prepare, view, delete the chat).
 docint calls `run_python` through `/mcp`, on data each call brings.
 
 ## Architecture

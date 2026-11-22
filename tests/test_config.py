@@ -28,7 +28,7 @@ def test_defaults_match_the_spec() -> None:
     assert (s.docint_tools, s.docint_wall_s, s.docint_slots) == (frozenset({"run_python"}), 60, 2)
     assert s.require_purpose == frozenset()
     assert s.ghostwriter_key == A
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 2)
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 3)
 
 
 def test_every_variable_is_read_by_its_exact_name() -> None:
@@ -273,9 +273,9 @@ def test_the_ghostwriter_key_alone_starts_the_api() -> None:
 
 
 def test_the_ghostwriter_defaults() -> None:
-    """With only Ghostwriter's key set, it may use the nine tools, for 120 seconds, two jobs at once."""
+    """With only Ghostwriter's key set, it may use the ten tools, for 120 seconds, three jobs at once."""
     s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 2)
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 3)
     assert GHOSTWRITER_DEFAULT_TOOLS == GHOSTWRITER_TOOLS
 
 

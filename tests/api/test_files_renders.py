@@ -24,7 +24,7 @@ from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import AuditLog
 from workbench.api.hardening import FILE_HEADERS
-from workbench.api.jobs import JobQueue
+from workbench.api.jobs import SOURCE_LOCK_WAIT_S, JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Conflict, QuotaExceeded, Store
@@ -305,7 +305,7 @@ def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
     fake_office: FakeOffice,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A deck's manifest has the eight keys, ``unit`` after ``kind``; its two jobs run in one turn of the prepare gate.
+    """A deck's manifest has the eight keys, ``unit`` after ``kind``; its two jobs run in one conversion gate's turn.
 
     The conversion and the drawing each have their event, with the call's purpose and request id.
     """
@@ -344,7 +344,7 @@ def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
     assert [req.tool for req in executor.requests] == ["convert_office", "prepare_file"]
     (_, _, turn), _ = sent
     assert turn is not None
-    assert sent == [("convert_office", "prepare", turn), ("prepare_file", "prepare", turn)]
+    assert sent == [("convert_office", "conversion", turn), ("prepare_file", "conversion", turn)]
     events = events_of(audit_lines, "file.prepare")
     assert [(event["action"], event["outcome"]) for event in events] == [("modify", "ok"), ("modify", "ok")]
     assert [event["criteria"].get("converted") for event in events] == [True, None]
@@ -769,22 +769,30 @@ def test_each_route_waits_for_its_own_turn_on_its_own_gate(
 ) -> None:
     """A prepare waits up to 120 s on the prepare gate; a page made for a view waits 5 s on the user's own turn.
 
-    Both are within the caller's wall and slots.
+    Both are within the caller's wall and slots. Each waits for the source's lock up to ``SOURCE_LOCK_WAIT_S``, the
+    view as long as the prepare, whatever its own turn's wait.
     """
     asked: list[tuple[int, int, int | None, str]] = []
-    real = queue.submit_renders
+    locked: list[float] = []
+    real, real_lock = queue.submit_renders, queue.source_lock
 
     async def watched(*args: Any, **more: Any) -> Any:
         call = more["call"]
         asked.append((call.wall_s, call.wait_s, call.slots, more["gate"]))
         return await real(*args, **more)
 
+    def lock(source_id: str, wait_s: float) -> Any:
+        locked.append(wait_s)
+        return real_lock(source_id, wait_s)
+
     monkeypatch.setattr(queue, "submit_renders", watched)
+    monkeypatch.setattr(queue, "source_lock", lock)
     source = pdf(store, built, "quay-list.pdf", quay_pages(21))
     assert prepare(client, source.virtual_path).status_code == 200
     assert rendition(client, source.virtual_path, 21).status_code == 200
 
-    assert asked == [(120, 120, 2, "prepare"), (120, 5, 2, "user")]
+    assert asked == [(120, 120, 3, "prepare"), (120, 5, 3, "user")]
+    assert locked == [SOURCE_LOCK_WAIT_S, SOURCE_LOCK_WAIT_S] == [120, 120]
 
 
 def test_a_callers_wall_bounds_the_runners_budget(

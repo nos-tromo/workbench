@@ -16,7 +16,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, override
 
@@ -30,9 +30,11 @@ from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
 from workbench.api import renders as api_renders
+from workbench.api import tools_mcp
+from workbench.api import tools_views as views
 from workbench.api.audit import AuditLog, PurposeRequired
 from workbench.api.errors import describe
-from workbench.api.jobs import Busy, Gate, JobQueue, Turn
+from workbench.api.jobs import MCP_QUEUE_WAIT_S, Busy, CallLimits, Gate, JobQueue, Turn
 from workbench.api.metrics import Metrics
 from workbench.api.renders import (
     MAX_READ_IMAGES,
@@ -65,6 +67,7 @@ from workbench.api.store import (
 )
 from workbench.api.tools import ShownImage
 from workbench.api.tools_mcp import CallJobs
+from workbench.api.tools_views import ViewedFile, ViewFileRequest
 from workbench.config import Settings
 from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
@@ -751,7 +754,7 @@ async def test_a_deck_is_converted_once_and_drawn(
     assert render.args["office"] == {"unit": "slide", "slides": 3}
     (turn,) = taken
     assert [(tool, held is turn) for tool, held in sent] == [("convert_office", True), ("prepare_file", True)]
-    assert turn.gate == "prepare"
+    assert turn.gate == "conversion"  # an Office file's prepare waits for no picture's, and no picture's for it
     assert fake_office.calls == 1
     converted, drawn = world.events()
     assert (converted["action"], converted["outcome"]) == ("modify", "ok")
@@ -879,7 +882,7 @@ async def test_a_lost_pdf_is_converted_again(
     assert (convert.tool, render.tool, render.input_files) == ("convert_office", "prepare_file", [again.relative_path])
     (turn,) = taken
     assert [(tool, held is turn) for tool, held in sent] == [("convert_office", True), ("prepare_file", True)]
-    assert turn.gate == "user"
+    assert turn.gate == "conversion"  # a conversion on demand waits in the same gate as a prepare's
     assert fake_office.calls == 2
     converted, drawn = world.events()[-2:]
     assert converted["target"]["ids"] == [source.id, again.id]
@@ -931,6 +934,29 @@ async def test_the_source_lock_is_taken_before_the_turn(
     assert [rec.ordinal for rec in drawn] == [21]
     assert held_at_turn == [1, 1]
     assert world.queue.tracked_sources == 0
+
+
+async def test_a_conversion_runs_only_in_a_turn_of_the_conversion_gate(world: World, fake_office: FakeOffice) -> None:
+    """Review M7: a conversion sent in a turn of the user's or the prepare gate is a programming error.
+
+    It is refused before any job or event, so no future caller converts beside another conversion of its caller.
+    """
+    source = world.deck(3)
+    for gate in ("user", "prepare"):
+        jobs = world.jobs(gate)
+        async with jobs.turn(PG) as turn:
+            with pytest.raises(ValueError, match="conversion gate"):
+                await api_renders._convert(
+                    PG,
+                    source,
+                    settings=world.settings,
+                    store=world.store,
+                    audit=world.audit,
+                    jobs=jobs,
+                    turn=turn,
+                    on_demand=False,
+                )
+    assert (world.executor.requests, world.events(), fake_office.calls) == ([], [], 0)
 
 
 async def test_a_turn_is_let_go_after_a_refused_conversion(world: World, fake_office: FakeOffice) -> None:
@@ -1011,6 +1037,480 @@ async def test_a_pdf_past_the_quota_is_507(
     assert world.store.derived_of(source) == []
     assert [req.tool for req in world.executor.requests] == ["convert_office"]
     assert [event["outcome"] for event in world.events()] == ["ok", "error"]  # the PDF, named again
+
+
+# --- the conversion gate and the source's lock -------------------------------------------------------------------
+
+#: Ghostwriter's user B, as its calls name them, and as the store's own calls in a test do.
+PB = Principal("ghostwriter", "user-b", "chat-1", confined=True)
+PB_SETUP = Principal("ghostwriter", "user-b", "chat-1")
+
+
+class HeldConversion(Local):
+    """The in-process executor, whose conversions wait for the test to let them run; every other job runs at once.
+
+    Attributes:
+        converting: Set once a conversion has come and waits.
+        release: Set by the test to let the conversions run.
+        running: Conversions in hand now.
+        peak: The most conversions in hand at once.
+    """
+
+    def __init__(self, data_dir: Path, jobs: Path) -> None:
+        """Run the real runners; hold each conversion until :attr:`release` is set."""
+        super().__init__(data_dir, jobs)
+        self.converting = asyncio.Event()
+        self.release = asyncio.Event()
+        self.running = 0
+        self.peak = 0
+
+    @override
+    async def run(self, req: JobRequest, timeout_s: float) -> JobResult:
+        """Hold a conversion until released, then run the runner; run any other job at once."""
+        if req.tool != "convert_office":
+            return await super().run(req, timeout_s)
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        try:
+            self.converting.set()
+            await self.release.wait()
+            return await super().run(req, timeout_s)
+        finally:
+            self.running -= 1
+
+
+def held_world(world: World, **settings: Any) -> tuple[World, HeldConversion]:
+    """The world over an executor that holds conversions, with a queue of its own over ``settings`` changed."""
+    executor = HeldConversion(world.settings.data_dir, world.built.parent / "held-conversions")
+    changed = dataclasses.replace(world.settings, **settings)
+    queue = JobQueue(changed, executor, world.store, Metrics(changed.data_dir))
+    return dataclasses.replace(world, executor=executor, queue=queue), executor
+
+
+def queue_length(world: World) -> float:
+    """How many calls wait in the world's queue, its gates' lines included."""
+    return world.queue.metrics.registry.get_sample_value("workbench_queue_length", {}) or 0.0
+
+
+async def until(condition: Callable[[], bool], seconds: float = 2.0) -> None:
+    """Let the loop run until ``condition()`` holds."""
+    async with asyncio.timeout(scaled(seconds)):
+        while not condition():
+            await asyncio.sleep(0.005)
+
+
+def a_call(world: World, wait_s: int = MCP_QUEUE_WAIT_S) -> CallJobs:
+    """The queue as one MCP call of Ghostwriter's sees it: its wall, its wait for its turn and its slots."""
+    call = CallLimits(world.settings.ghostwriter_wall_s, wait_s, world.settings.ghostwriter_slots)
+    return CallJobs(world.queue, call)
+
+
+async def view(world: World, source: FileRecord, jobs: CallJobs, p: Principal = PG) -> ViewedFile | WithBlocks:
+    """Call ``view_file`` as the MCP door does, through ``jobs``."""
+    body = ViewFileRequest(path=source.virtual_path)
+    return await views.view_file(body, p, world.settings, world.store, world.audit, jobs)
+
+
+def shown_labels(answer: ViewedFile | WithBlocks) -> list[str]:
+    """The labels of the images a view answered with, one block for each."""
+    assert isinstance(answer, WithBlocks)
+    viewed = answer.answer
+    assert isinstance(viewed, ViewedFile)
+    assert len(answer.blocks) == len(viewed.shown)
+    return [shown.label for shown in viewed.shown]
+
+
+async def test_a_pictures_prepare_runs_while_a_deck_converts(world: World, fake_office: FakeOffice) -> None:
+    """Final review: an Office file's prepare takes the conversion gate, so user B's photo is prepared meanwhile."""
+    held, executor = held_world(world)
+    source = held.deck(3)
+    photo = put(held.store, "quay-photo.jpg", mi.make_photo(held.built / "quay-photo.jpg").read_bytes(), p=PB_SETUP)
+    converting = asyncio.create_task(held.prepare(source))
+    await executor.converting.wait()
+
+    manifest = await asyncio.wait_for(
+        prepared(PB, photo, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare")),
+        scaled(2),
+    )
+    assert (manifest.kind, [r.n for r in manifest.renditions]) == ("image", [1])
+    assert not converting.done()
+    executor.release.set()
+    assert (await converting).total == 3
+    assert fake_office.calls == 1
+
+
+async def test_an_on_demand_conversion_waits_for_a_prepares_in_the_conversion_gate(
+    world: World, fake_office: FakeOffice
+) -> None:
+    """A deck whose PDF went is converted again for a later slide: that waits for user B's conversion, never beside it.
+
+    It waits in the conversion gate's own line, and runs once the prepare's conversion and drawing are through.
+    """
+    held, executor = held_world(world)
+    mine = held.deck(22, chart_on=None)
+    executor.release.set()
+    manifest = await held.prepare(mine)
+    held.store.remove_derived(held.converted(mine))
+    executor.release.clear()
+    executor.converting.clear()
+    theirs = put(held.store, "quay-deck.pptx", mk.make_deck(held.built / "quay-deck.pptx", 3).read_bytes(), p=PB_SETUP)
+    preparing = asyncio.create_task(
+        prepared(PB, theirs, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare"))
+    )
+    await executor.converting.wait()
+    later = asyncio.create_task(held.renders(mine, manifest, [21]))
+    await until(lambda: queue_length(held) == 1)
+    assert executor.running == 1
+
+    executor.release.set()
+    await preparing
+    assert [rec.ordinal for rec in await later] == [21]
+    assert executor.peak == 1
+    assert [(req.user_id, req.tool) for req in executor.requests][2:] == [
+        ("user-b", "convert_office"),
+        ("user-b", "prepare_file"),
+        ("user-a", "convert_office"),
+        ("user-a", "prepare_file"),
+    ]
+
+
+async def test_a_call_waits_for_the_sources_lock_while_its_prepare_converts(
+    world: World, fake_office: FakeOffice
+) -> None:
+    """Final review: a view of a deck whose prepare converts it waits for that prepare, past its own turn's wait.
+
+    Then it answers the slides from the rows, and no second conversion runs. While it waits it holds no slot, no turn
+    of its user and no place in a line: with two slots, one the conversion's, the same user's photo is viewed at once.
+    """
+    held, executor = held_world(world, executor_slots=2)
+    source = held.deck(3)
+    photo = held.photo()
+    preparing = asyncio.create_task(held.prepare(source))
+    await executor.converting.wait()
+    viewing = asyncio.create_task(view(held, source, a_call(held, wait_s=0)))
+    await asyncio.sleep(0.1)
+
+    assert not viewing.done()
+    assert (held.queue.tracked_users, queue_length(held)) == (0, 0)
+    pictured = await asyncio.wait_for(view(held, photo, a_call(held, wait_s=0)), scaled(2))
+    assert shown_labels(pictured) == ["image"]
+    executor.release.set()
+    await preparing
+    assert shown_labels(await viewing) == ["slide 1", "slide 2", "slide 3"]
+    assert fake_office.calls == 1
+    assert [req.tool for req in held.executor.requests].count("convert_office") == 1
+
+
+async def test_a_lock_held_past_its_bound_is_wait_timeout(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call waits for a source's lock ``SOURCE_LOCK_WAIT_S`` at the most (lowered here); then it is refused busy."""
+    monkeypatch.setattr(tools_mcp, "SOURCE_LOCK_WAIT_S", 0.2)
+    held, executor = held_world(world)
+    source = held.deck(3)
+    preparing = asyncio.create_task(held.prepare(source))
+    await executor.converting.wait()
+    async with asyncio.timeout(scaled(2)):
+        with pytest.raises(Busy) as refused:
+            await view(held, source, a_call(held))
+    assert refused.value.reason == "wait_timeout"
+    executor.release.set()
+    await preparing
+
+
+def their_deck(world: World, name: str = "quay-deck.pptx") -> FileRecord:
+    """A deck of three invented slides of user B's chat."""
+    return put(world.store, name, mk.make_deck(world.built / name, 3).read_bytes(), p=PB_SETUP)
+
+
+async def test_a_view_that_converts_waits_out_another_conversion(world: World, fake_office: FakeOffice) -> None:
+    """Ruling R19: a view of a deck no one prepared converts it on demand, and waits out user B's conversion to do so.
+
+    It waits for the conversion gate past its own turn's wait (none here), up to ``SOURCE_LOCK_WAIT_S``, in the gate's
+    own line and not the queue's; then it converts and answers the slides, never ``wait_timeout``.
+    """
+    held, executor = held_world(world)
+    theirs, mine = their_deck(held), held.deck(3)
+    preparing = asyncio.create_task(
+        prepared(PB, theirs, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare"))
+    )
+    await executor.converting.wait()
+    viewing = asyncio.create_task(view(held, mine, a_call(held, wait_s=0)))
+    await until(lambda: queue_length(held) == 1)
+    await asyncio.sleep(0.1)
+
+    assert not viewing.done()
+    line = held.queue._shared_gates["conversion", "ghostwriter"]  # the conversion gate's own count of who waits
+    assert (line.waiting, held.queue._waiting, held.queue.tracked_users) == (1, 0, 0)
+    executor.release.set()
+    await preparing
+    assert shown_labels(await viewing) == ["slide 1", "slide 2", "slide 3"]
+    assert executor.peak == 1
+    assert [(req.user_id, req.tool) for req in held.executor.requests] == [
+        ("user-b", "convert_office"),
+        ("user-b", "prepare_file"),
+        ("user-a", "convert_office"),
+        ("user-a", "prepare_file"),
+    ]
+    assert queue_length(held) == 0
+
+
+async def test_a_view_that_converts_waits_for_the_gate_no_longer_than_its_bound(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past ``SOURCE_LOCK_WAIT_S`` (lowered here) for the conversion gate, a view that would convert is refused busy."""
+    monkeypatch.setattr(tools_mcp, "SOURCE_LOCK_WAIT_S", 0.2)
+    held, executor = held_world(world)
+    theirs, mine = their_deck(held), held.deck(3)
+    preparing = asyncio.create_task(
+        prepared(PB, theirs, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare"))
+    )
+    await executor.converting.wait()
+    async with asyncio.timeout(scaled(2)):
+        with pytest.raises(Busy) as refused:
+            await view(held, mine, a_call(held, wait_s=0))
+    assert refused.value.reason == "wait_timeout"
+    assert queue_length(held) == 0
+    executor.release.set()
+    await preparing
+    assert conversions(held) == 1
+
+
+# --- refusals remembered -----------------------------------------------------------------------------------------
+
+#: The refusal of a deck whose pictures cannot all be drawn within the memory limit, as the runner words it.
+TOO_MANY_PICTURES = "unreadable_file: the file holds more or larger pictures than can be drawn within the memory limit"
+
+
+def conversions(world: World) -> int:
+    """How many conversion jobs reached the executor."""
+    return [req.tool for req in world.executor.requests].count("convert_office")
+
+
+async def refused_with(call: Awaitable[object]) -> tuple[int, str]:
+    """The status and the text a call is refused with."""
+    with pytest.raises(HTTPException) as refused:
+        await call
+    return refused.value.status_code, str(refused.value.detail)
+
+
+async def test_a_refused_deck_is_answered_from_memory(world: World, fake_office: FakeOffice) -> None:
+    """Final review: a deck refused once is refused again at once, by a prepare or a view, with no conversion.
+
+    Each answer from memory is recorded as the refusal was, the file alone named, and says it was remembered.
+    """
+    fake_office.ceiling = 0
+    source = world.deck(2)
+    first = await refused_with(world.prepare(source))
+    calls = fake_office.calls
+    again = await refused_with(world.prepare(source))
+    viewed = await refused_with(view(world, source, a_call(world)))
+
+    assert first == again == viewed == (422, TOO_MANY_PICTURES)
+    assert (conversions(world), fake_office.calls) == (1, calls)
+    assert world.store.derived_of(source) == []
+    converting, *remembered = world.events()
+    assert (converting["outcome"], converting["criteria"]["refused"], converting["criteria"]["converted"]) == (
+        "error",
+        "unreadable_file",
+        True,
+    )
+    assert [(event["outcome"], event["target"]["ids"]) for event in remembered] == [("error", [source.id])] * 2
+    assert [event["criteria"] for event in remembered] == [
+        {
+            "caller": "ghostwriter",
+            "renders": 0,
+            "strips": 1,
+            "on_demand": False,
+            "outputs": 0,
+            "refused": "unreadable_file",
+            "remembered": True,
+        }
+    ] * 2
+
+
+async def test_a_refused_picture_is_answered_from_memory(world: World) -> None:
+    """A text file named ``.png`` is refused once by its prepare's job; later prepares are refused with no job."""
+    source = put(world.store, "quay-photo.png", b"Quay list, not a picture", p=PG)
+    first = await refused_with(world.prepare(source))
+    again = await refused_with(world.prepare(source))
+
+    assert first == again
+    assert first[0] == 422 and first[1].startswith("unreadable_file:")
+    assert len(world.executor.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "raised"),
+    [
+        ("error", {"error": "read_timeout: drawing the file took longer than 86 s"}, HTTPException),
+        ("timeout", {}, HTTPException),
+        ("error", {"error": "hidden_memory: the container held shared memory no job's count showed"}, HTTPException),
+        ("error", {"error": "an error no code names"}, HTTPException),
+        ("busy", {}, Busy),
+    ],
+    ids=["read-timeout", "wall", "hidden-memory", "failed", "busy"],
+)
+async def test_a_refusal_that_may_pass_is_not_remembered(
+    world: World, status: str, payload: dict[str, Any], raised: type[Exception]
+) -> None:
+    """A prepare that ran out of time, failed or found the executor busy is tried again by the next, with a job."""
+    source = world.photo()
+    world.executor.status, world.executor.payload = status, payload
+    for _ in range(2):
+        with pytest.raises(raised):
+            await world.prepare(source)
+    assert len(world.executor.requests) == 2
+    assert world.store.refusal_of(source) is None
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "unreadable_file: the converted file could not be written",
+        "unreadable_file: the renders could not be written",
+        "unreadable_file: the file could not be converted to pages",
+        "unreadable_file: an invented reason no runner gives",
+    ],
+    ids=["conversion-not-written", "renders-not-written", "not-converted", "unknown"],
+)
+async def test_a_refusal_that_may_pass_is_remembered_when_it_comes_twice_in_a_row(world: World, detail: str) -> None:
+    """Ruling R22: an ``unreadable_file`` the file does not decide alone is not remembered once, and is twice in a row.
+
+    Such are a job that could not write inside its sandbox, a conversion that ended for no reason the file gives, and
+    any text the api does not know: the second prepare runs a job again, the third is answered from memory.
+    """
+    source = world.photo()
+    world.executor.status, world.executor.payload = "error", {"error": detail}
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert (len(world.executor.requests), world.store.refusal_of(source)) == (1, None)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert (len(world.executor.requests), world.store.refusal_of(source)) == (2, detail)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert len(world.executor.requests) == 2
+    assert world.events()[-1]["criteria"]["remembered"] is True
+
+
+async def test_a_success_between_two_refusals_that_may_pass_starts_the_count_again(world: World) -> None:
+    """Ruling R22: a prepare that went well between two such refusals resets their count: two more are needed."""
+    source = world.photo()
+    passing = {"error": "unreadable_file: the renders could not be written"}
+    world.executor.status, world.executor.payload = "error", passing
+    await refused_with(world.prepare(source))
+    world.executor.status, world.executor.payload = "ok", None
+    assert (await world.prepare(source)).kind == "image"
+    for row in world.store.derived_of(source):  # its renders went: the next call prepares it again
+        world.store.remove_derived(row)
+    world.executor.status, world.executor.payload = "error", passing
+    await refused_with(world.prepare(source))
+    assert world.store.refusal_of(source) is None
+    await refused_with(world.prepare(source))
+    assert world.store.refusal_of(source) == passing["error"]
+    assert len(world.executor.requests) == 4
+
+
+@pytest.mark.parametrize("detail", sorted(api_renders.FILE_DECIDED))
+async def test_a_refusal_the_file_decides_is_remembered_at_once(world: World, detail: str) -> None:
+    """Ruling R22: each allow-listed ``unreadable_file`` text, and any ``unsupported_format``, is remembered at once."""
+    source = world.photo()
+    world.executor.status, world.executor.payload = "error", {"error": detail}
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert len(world.executor.requests) == 1
+    other = world.photo("quay-photo-2.jpg")
+    unsupported = "unsupported_format: an invented reason no runner gives"
+    world.executor.payload = {"error": unsupported}
+    assert await refused_with(world.prepare(other)) == (422, unsupported)
+    assert world.store.refusal_of(other) == unsupported
+
+
+def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
+    """The allow-list is the runners' own texts of refusals the file decides, each tied to the constant that says it."""
+    from workbench.executor import readers
+    from workbench.executor.render import encode, images, office, pages
+    from workbench.executor.runners import convert
+
+    said = {
+        readers.DAMAGED,
+        readers.TOO_BIG,
+        readers.PDF_ENCRYPTED,
+        readers._OFFICE_ENCRYPTED,
+        office.TOO_MANY_PICTURES,
+        office._NOT_OPENED,
+        images._TOO_MANY_PIXELS,
+        pages._NO_PAGES,
+        encode._NO_FIT,
+        convert._LOCKED,
+        convert._PICTURE_TOO_LARGE,
+        convert._TOO_LARGE,
+    }
+    assert {f"unreadable_file: {text}" for text in said} == api_renders.FILE_DECIDED
+    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, "the renders could not be written"}
+    assert not {f"unreadable_file: {text}" for text in passing} & api_renders.FILE_DECIDED
+
+
+async def test_a_new_upload_under_the_same_name_is_converted_afresh(world: World, fake_office: FakeOffice) -> None:
+    """A refusal is its file's: the same name uploaded again, beside it or after it went, is a new file, converted."""
+    fake_office.ceiling = 0
+    refused = world.deck(2)
+    await refused_with(world.prepare(refused))
+    fake_office.ceiling = None
+    beside = world.deck(2)
+    world.store.remove(refused)
+    after = world.deck(2)
+
+    assert beside.id != refused.id != after.id and after.name == refused.name
+    assert (await world.prepare(beside)).total == 2
+    assert (await world.prepare(after)).total == 2
+    assert conversions(world) == 3
+
+
+async def test_a_lost_pdf_converted_again_and_refused_is_remembered(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deck whose PDF went and whose conversion again is refused: the next slide asked for is refused at once."""
+    source = world.deck(22, chart_on=None)
+    manifest = await world.prepare(source)
+    world.store.remove_derived(world.converted(source))
+    fake_office.ceiling = 0
+    first = await refused_with(world.renders(source, manifest, [21]))
+    again = await refused_with(world.renders(source, manifest, [22]))
+
+    assert first == again == (422, TOO_MANY_PICTURES)
+    assert conversions(world) == 2
+    assert world.events()[-1]["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 0,
+        "strips": 1,
+        "on_demand": True,
+        "outputs": 0,
+        "refused": "unreadable_file",
+        "remembered": True,
+    }
+
+
+async def test_a_remembered_refusal_is_recorded_before_it_goes_out(
+    world: World, audit_stream: io.StringIO, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an answer from memory whose event cannot be written is the audit's failure, never the refusal.
+
+    A call that must state a purpose and states none is denied first, as for a job.
+    """
+    source = put(world.store, "quay-photo.png", b"Quay list, not a picture", p=PG)
+    await refused_with(world.prepare(source))
+    bound = world.audit.bound(None, "req-2", required=frozenset({"modify"}))
+    with pytest.raises(PurposeRequired):
+        await world.prepare(source, audit=bound)
+    assert world.events()[-1]["outcome"] == "denied"
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(audit_stream, "write", refuse)
+        with pytest.raises(AuditWriteError):
+            await world.prepare(source)
+    assert len(world.executor.requests) == 1
 
 
 # --- reading back ------------------------------------------------------------------------------------------------

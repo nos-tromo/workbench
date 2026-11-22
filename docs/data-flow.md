@@ -121,13 +121,30 @@ The database has three tables (`workbench/api/store.py`):
 name a person or a case, and the user id identifies a user to its caller. Both are
 in the database and in the folder names on the volume.
 
-Two more places hold data for a short time:
+Three more places hold data for a short time:
 
 - the api's `/tmp`, a tmpfs in memory, where uploads are spooled while they
   arrive (at most the upload limit plus 1 MiB each);
 - the database's `-wal` file, which can hold earlier versions of deleted rows
   until a checkpoint copies over them (see
-  [retention.md](retention.md#after-a-sweep)).
+  [retention.md](retention.md#after-a-sweep));
+- the api's memory, which remembers the refusal of a file the executor could
+  not convert or draw. A refusal the file decides is remembered at once: one
+  that is damaged or not what its name says, password-protected, a deck with no
+  slides, a macro-enabled deck or a slide show, one with a picture over 120
+  megapixels or more pictures than can be drawn within the memory limit (also
+  when a conversion redone in parts runs out of its time), or one whose PDF
+  would pass 32 MB. Any other `unreadable_file` (a job that could not write
+  inside its sandbox, a conversion that ended for no reason the file gives) is
+  remembered only when it comes twice in a row for the file, a prepare that
+  went well between them starting the count again; a timeout or a busy
+  executor never is. It keeps the file's id, its creation time and size, the
+  refusal's fixed text, which names no file, and how many came in a row
+  (`workbench/api/store.py:Store.remember_refusal`). Every later prepare, view
+  or read of the file's pages is answered with a remembered refusal at once,
+  with no job, and recorded as the refusal was
+  ([audit.md](audit.md#what-is-recorded), `remembered`). It is never written to
+  the volume. Uploading the file again makes a new file, which is tried afresh.
 
 workbench encrypts nothing at rest. Encryption of the host's disk is the
 operator's.
@@ -139,6 +156,7 @@ operator's.
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
 | Renders, and an Office file's converted PDF | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render or PDF with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
+| A refusal remembered or counted, in the api's memory | until its file goes (retention, the upload taken back, or its chat's delete), the api restarts, or 4096 refusals asked for since push it out (`REFUSALS_MAX`); a new upload under the same name is a new file and inherits nothing. A job of a chat deleted while it ran leaves none. One of a file that retention removes, or that is taken back, while its job runs can stay until it is pushed out, never answered: no file of that id comes back | `Store.remove`, `Store.remove_upload`, `Store.delete_chat`, `Store.remember_refusal` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
 | Empty folders, empty chat folders and empty user roots | one hour after they were last changed | `workbench/api/store.py:Store.sweep_user` |
@@ -253,7 +271,8 @@ is a recipient in the legal sense is for the operator to decide.
 `WORKBENCH_RETENTION_DAYS`, 7 days by default, from creation (a render counts
 from its source's). Ghostwriter's chat delete (`DELETE /files/chat`) removes
 the chat's files and their renders at once and leaves an event by file id
-(the renders' among them), nothing else. Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
+(the renders' among them), nothing else; so does its taking back of one upload
+not yet sent (`DELETE /files/upload`), for that file and its renders. Leftovers of interrupted work: one hour. Audit events: obs-plane's audit
 retention (`AUDIT_RETENTION`, one year by default). Copies in Ghostwriter's
 chat database and docint's session database, kept with the chat turn: their own
 retention; workbench keeps neither the data nor the outputs of a docint call.

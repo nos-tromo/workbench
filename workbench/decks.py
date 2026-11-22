@@ -90,7 +90,7 @@ def deck_problem(slides: object) -> str | None:
     counted: what each holds is checked where the sources are read.
 
     Args:
-        slides: The slides, each an object with a ``layout`` (a number from 1 or a name) and, optionally, ``title``,
+        slides: The slides, each an object with, optionally, a ``layout`` (a number from 1 or a name), ``title``,
             ``subtitle``, ``notes``, ``content`` (a list of blocks) and ``sources`` (a list).
 
     Returns:
@@ -121,7 +121,7 @@ def _slide_problem(number: int, slide: object, images: int) -> str | None:
     where = f"slide {number}"
     if not isinstance(slide, dict):
         return f"{where}: a slide is an object"
-    if not _layout_is_valid(slide.get("layout")):
+    if slide.get("layout") is not None and not _layout_is_valid(slide["layout"]):
         return f"{where}: layout is a number from 1, or a name of 1 to {MAX_LAYOUT_NAME} characters"
     for field, limit in _SLIDE_TEXTS:
         if field in slide:

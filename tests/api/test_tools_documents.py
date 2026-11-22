@@ -1220,6 +1220,24 @@ def test_a_busy_conversion_still_answers_the_text(
     ]
 
 
+def test_a_deck_that_cannot_be_converted_is_read_and_not_converted_again(
+    seeing: TestClient, local: Picky, store: Store, built: Path, fake_office: FakeOffice
+) -> None:
+    """Final review: a deck refused by its conversion is still read as text; the next read does not convert it again.
+
+    Each read says its slides without text cannot be drawn; the refusal of the first is remembered for the second.
+    """
+    fake_office.ceiling = 0
+    source = deck(store, built, 3, picture_only=[2])
+    answers = [answered(read(seeing, source.virtual_path)) for _ in range(2)]
+
+    for structured in answers:
+        assert [part["label"] for part in structured["parts"]] == ["slide 1", "slide 3"]
+        assert structured["shown"] == []
+        assert structured["hint"].endswith(" The slides without text cannot be shown: the file cannot be drawn.")
+    assert local.tools() == ["read_document", "convert_office", "read_document"]
+
+
 @pytest.mark.parametrize("strips", [None, 2])
 def test_a_scanned_pdf_read_without_images_is_read_as_in_0_6(
     seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines, strips: int | None
