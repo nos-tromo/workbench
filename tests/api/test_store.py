@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import override
 
@@ -20,13 +20,16 @@ from workbench import renders
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
+    Gone,
     NotFound,
     QuotaExceeded,
     RendersFull,
+    StagedArtifact,
     StorageFull,
     Store,
     StoreError,
     TooLarge,
+    UnreadableArtifact,
     new_file_id,
 )
 from workbench.models import DerivedRecord, DerivedRole, DerivedSpec, DirEntry, FileRecord, Principal
@@ -2213,6 +2216,504 @@ def test_an_existing_database_gains_the_derived_table(store: Store, alice: Princ
     reopened = Store(database, Workspaces(tmp_path / "data"))
     source = reopened.files_in_chat(alice)[0]
     assert derive(reopened, tmp_path, source).source_id == source.id
+
+
+# --- the raw artifacts of a clip, streamed in ------------------------------------------------------------------------
+
+JSONL = b'{"text": "a synthetic sentence"}\n'
+OTHER_JSONL = b'{"text": "another synthetic sentence"}\n'
+ZIP = b"PK\x03\x04 a synthetic archive"
+TRANSCRIPT = b"[00:00] Speaker 1: a synthetic sentence\n"
+JSONL_TYPE = "application/x-ndjson"
+ZIP_TYPE = "application/zip"
+TEXT_TYPE = "text/plain"
+CLIP = b"synthetic clip bytes"  # 20 bytes
+
+
+def media_source(store: Store, p: Principal) -> FileRecord:
+    """Upload ``harbour-tour.mp4`` with invented bytes."""
+    return put(store, p, "harbour-tour.mp4", CLIP)
+
+
+def artifact(role: DerivedRole = "nextext_jsonl") -> DerivedSpec:
+    """The spec of a clip's raw artifact: role ``nextext_jsonl`` or ``nextext_zip``, with no size in pixels."""
+    return DerivedSpec(role, 0, ZIP_TYPE if role == "nextext_zip" else JSONL_TYPE, None, None, {})
+
+
+def accept(_: Path) -> None:
+    """A check that takes every artifact."""
+
+
+class Recorder:
+    """What ``place_derived`` records, call by call."""
+
+    def __init__(self) -> None:
+        """Start with no call."""
+        self.calls: list[tuple[str, int, list[str], str]] = []
+
+    def __call__(self, file_id: str, size: int, replaced: Sequence[str], outcome: str) -> None:
+        """Note one record."""
+        self.calls.append((file_id, size, list(replaced), outcome))
+
+
+def stage_artifact(
+    store: Store,
+    source: FileRecord,
+    data: bytes = JSONL,
+    role: DerivedRole = "nextext_jsonl",
+    *,
+    max_bytes: int = 10**6,
+    quota_bytes: int = 10**6,
+    check: Callable[[Path], None] = accept,
+) -> StagedArtifact:
+    """Stream ``data`` in as an artifact of ``source``, with roomy limits."""
+    return store.stage_derived(
+        source, io.BytesIO(data), artifact(role), max_bytes=max_bytes, quota_bytes=quota_bytes, check=check
+    )
+
+
+def keep_artifact(
+    store: Store,
+    source: FileRecord,
+    data: bytes = JSONL,
+    role: DerivedRole = "nextext_jsonl",
+    *,
+    record: Recorder | None = None,
+    quota_bytes: int = 10**6,
+    cap_bytes: int = renders.DERIVED_MAX_BYTES,
+) -> tuple[DerivedRecord, list[DerivedRecord]]:
+    """Stage an artifact and place it."""
+    ready = stage_artifact(store, source, data, role, quota_bytes=quota_bytes)
+    return store.place_derived(
+        ready, quota_bytes=quota_bytes, record=Recorder() if record is None else record, cap_bytes=cap_bytes
+    )
+
+
+def derive_as(store: Store, tmp_path: Path, source: FileRecord, role: DerivedRole, mime: str) -> DerivedRecord:
+    """Register one file of ``role`` and ``mime`` through the executor's door, ``register_derived``."""
+    return store.register_derived(
+        source,
+        staged(tmp_path, TRANSCRIPT, "made.bin"),
+        DerivedSpec(role, 0, mime, 1280 if role == "frame" else None, 720 if role == "frame" else None, {}),
+        file_id=new_file_id(),
+        quota_bytes=QUOTA,
+    )
+
+
+def clip_folder(workspaces: Workspaces, p: Principal, source: FileRecord) -> Path:
+    """The folder of a clip's derived files."""
+    return workspaces.chat_dir(p) / ".derived" / source.id
+
+
+def test_an_artifact_is_streamed_in_beside_its_clip(
+    store: Store, alice: Principal, workspaces: Workspaces, clock: Clock
+) -> None:
+    """Staged, it is ``<id>.part`` in the clip's folder; placed, ``<id>.jsonl``, recorded before it is visible."""
+    source = media_source(store, alice)
+    clock.now += 500
+    folder = clip_folder(workspaces, alice, source)
+    ready = stage_artifact(store, source)
+    assert (ready.source, ready.spec, ready.size) == (source, artifact(), len(JSONL))
+    assert ready.part == folder / f"{ready.id}.part"
+    assert disk_names(folder) == [f"{ready.id}.part"]
+    assert stat.S_IMODE(ready.part.stat().st_mode) == 0o600
+    assert stat.S_IMODE(folder.stat().st_mode) == stat.S_IMODE(folder.parent.stat().st_mode) == 0o700
+    assert store.derived_of(source) == []
+    seen = Recorder()
+    visible: list[tuple[list[DerivedRecord], list[str]]] = []
+
+    def record(file_id: str, size: int, replaced: Sequence[str], outcome: str) -> None:
+        visible.append((store.derived_of(source), disk_names(folder)))
+        seen(file_id, size, replaced, outcome)
+
+    rec, replaced = store.place_derived(ready, quota_bytes=QUOTA, record=record)
+    assert seen.calls == [(ready.id, len(JSONL), [], "ok")]
+    assert visible == [([], [f"{ready.id}.part"])]  # nothing was visible when the event was written
+    real = folder / f"{ready.id}.jsonl"
+    assert real.read_bytes() == JSONL
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    assert disk_names(folder) == [real.name]
+    assert replaced == []
+    assert rec == DerivedRecord(
+        id=ready.id,
+        source_id=source.id,
+        caller="ghostwriter",
+        user_id="user-a",
+        chat_id="chat-1",
+        role="nextext_jsonl",
+        ordinal=0,
+        name=f"{ready.id}.jsonl",
+        size=len(JSONL),
+        mime=JSONL_TYPE,
+        width=None,
+        height=None,
+        meta={},
+        created_at=source.created_at,
+    )
+    assert rec.created_at != clock.now
+    assert store.derived_of(source) == [rec]
+
+
+def test_an_artifact_counts_in_the_quota(store: Store, alice: Principal) -> None:
+    """Its bytes are the user's like a render's."""
+    source = media_source(store, alice)
+    used = store.usage(alice)
+    keep_artifact(store, source, ZIP, "nextext_zip")
+    assert store.usage(alice) == used + len(ZIP)
+
+
+def test_an_artifact_past_its_bound_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """One byte over ``max_bytes`` stops the transfer: no ``.part``, no empty folder, no row."""
+    source = media_source(store, alice)
+    with pytest.raises(TooLarge):
+        stage_artifact(store, source, b"x" * 11, max_bytes=10)
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+    assert store.derived_of(source) == []
+    assert stage_artifact(store, source, b"x" * 10, max_bytes=10).size == 10  # exactly the bound is taken
+
+
+def test_an_artifact_past_the_quota_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """A transfer that would take the user over the quota stops, and leaves nothing."""
+    source = media_source(store, alice)  # 20 bytes
+    with pytest.raises(QuotaExceeded):
+        stage_artifact(store, source, b"x" * 21, quota_bytes=40)
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+def test_a_failed_check_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """The check is handed the whole ``.part``; what it raises is raised, and nothing is left."""
+    source = media_source(store, alice)
+    seen: list[Path] = []
+
+    def refuse(part: Path) -> None:
+        seen.append(part)
+        assert part.read_bytes() == b"not json"
+        raise UnreadableArtifact("the first line is not a JSON object")
+
+    with pytest.raises(UnreadableArtifact) as raised:
+        stage_artifact(store, source, b"not json", check=refuse)
+    assert str(raised.value) == "unreadable_file: the first line is not a JSON object"
+    assert len(seen) == 1
+    assert seen[0].parent == clip_folder(workspaces, alice, source)
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+    assert store.derived_of(source) == []
+
+
+def test_an_unreadable_artifact_answers_with_its_code() -> None:
+    """The message starts ``unreadable_file: ``, whether the caller wrote the code or not."""
+    assert str(UnreadableArtifact("empty")) == "unreadable_file: empty"
+    assert str(UnreadableArtifact("unreadable_file: empty")) == "unreadable_file: empty"
+    assert isinstance(UnreadableArtifact("empty"), StoreError)
+
+
+def test_a_dropped_stage_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """``drop_staged`` takes the ``.part`` and its empty folders; a second call, or one for a placed file, is fine."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    assert ready.part.is_file()
+    store.drop_staged(ready)
+    assert not ready.part.exists()
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+    store.drop_staged(ready)
+    placed = stage_artifact(store, source)
+    rec, _ = store.place_derived(placed, quota_bytes=QUOTA, record=Recorder())
+    store.drop_staged(placed)
+    assert store.derived_of(source) == [rec]
+    assert (clip_folder(workspaces, alice, source) / rec.name).is_file()
+
+
+def test_a_staged_artifact_is_placed_once(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """Its ``.part`` is gone once placed: a second placing is refused and records nothing."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    rec, _ = store.place_derived(ready, quota_bytes=QUOTA, record=Recorder())
+    seen = Recorder()
+    with pytest.raises(NotFound):
+        store.place_derived(ready, quota_bytes=QUOTA, record=seen)
+    assert seen.calls == []
+    assert store.derived_of(source) == [rec]
+    assert disk_names(clip_folder(workspaces, alice, source)) == [rec.name]
+
+
+def test_a_second_artifact_replaces_the_first_and_what_was_made_from_it(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """The row of its role, the transcript and the frames go with their files; the other artifact stays."""
+    source = media_source(store, alice)
+    first, _ = keep_artifact(store, source)
+    zipped, _ = keep_artifact(store, source, ZIP, "nextext_zip")
+    transcript = derive_as(store, tmp_path, source, "transcript", TEXT_TYPE)
+    frame = derive_as(store, tmp_path, source, "frame", "image/jpeg")
+    folder = clip_folder(workspaces, alice, source)
+    assert len(disk_names(folder)) == 4
+    seen = Recorder()
+    second, replaced = keep_artifact(store, source, OTHER_JSONL, record=seen)
+    assert replaced == [frame, first, transcript]  # by role
+    assert seen.calls == [(second.id, len(OTHER_JSONL), [frame.id, first.id, transcript.id], "ok")]
+    assert store.derived_of(source) == [second, zipped]
+    assert disk_names(folder) == sorted([second.name, zipped.name])
+    assert (folder / zipped.name).read_bytes() == ZIP
+    assert store.usage(alice) == len(CLIP) + len(OTHER_JSONL) + len(ZIP)
+
+
+def test_replacing_counts_the_replaced_bytes(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """The cap is met by the new bytes less the old ones; another role's bytes count, and a refusal leaves nothing."""
+    source = media_source(store, alice)
+    keep_artifact(store, source, b"x" * 12, cap_bytes=20)
+    again, _ = keep_artifact(store, source, b"y" * 12, cap_bytes=20)
+    assert store.derived_of(source) == [again]
+    with pytest.raises(RendersFull):
+        keep_artifact(store, source, b"z" * 12, "nextext_zip", cap_bytes=20)
+    assert store.derived_of(source) == [again]
+    assert disk_names(clip_folder(workspaces, alice, source)) == [again.name]
+
+
+def test_replacing_needs_room_for_the_new_artifact_alone(store: Store, alice: Principal) -> None:
+    """The room is the quota less what is held, plus what is replaced, when it is staged and again when it is placed."""
+    source = media_source(store, alice)
+    first, _ = keep_artifact(store, source, b"x" * 12, quota_bytes=40)  # 20 + 12 held, 8 free
+    second, replaced = keep_artifact(store, source, b"y" * 12, quota_bytes=40)
+    assert replaced == [first]
+    assert store.usage(alice) == 32
+    assert store.derived_of(source) == [second]
+
+
+def test_an_artifact_that_no_longer_fits_is_not_kept(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """Another upload may take the room while the body arrives: the placing checks the quota again."""
+    source = media_source(store, alice)  # 20 bytes
+    ready = stage_artifact(store, source, b"x" * 12, quota_bytes=40)
+    put(store, alice, "harbour-notes.txt", b"y" * 20)
+    seen = Recorder()
+    with pytest.raises(QuotaExceeded):
+        store.place_derived(ready, quota_bytes=40, record=seen)
+    assert seen.calls == []
+    assert store.derived_of(source) == []
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+@pytest.mark.parametrize("how", ["taken back", "chat deleted"])
+def test_an_artifact_needs_its_source_and_its_chat(
+    store: Store, alice: Principal, workspaces: Workspaces, how: str
+) -> None:
+    """A clip taken back (Ghostwriter's take-back) or a chat deleted between the two calls leaves nothing."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    if how == "taken back":
+        assert store.remove_upload(source, lambda ids, outcome: None) == 0
+        assert ready.part.is_file()  # the part is no render: only the placing finds that it is for nothing
+    else:
+        store.delete_chat(alice, lambda ids, outcome: None)
+    seen = Recorder()
+    with pytest.raises(Gone):
+        store.place_derived(ready, quota_bytes=QUOTA, record=seen)
+    assert seen.calls == []
+    root = workspaces.user_root(alice)
+    assert not (root / "chat-1" / ".derived").exists()
+    assert not list(root.rglob("*.part"))
+    assert store.derived_of(source) == []
+
+
+def test_a_chat_deleted_while_its_artifact_is_checked_is_gone(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """The check finds the ``.part`` gone with its chat: the answer is the chat's, not an error of the disk."""
+    source = media_source(store, alice)
+
+    def check(part: Path) -> None:
+        store.delete_chat(alice, lambda ids, outcome: None)
+        part.read_bytes()
+
+    with pytest.raises(Gone):
+        stage_artifact(store, source, check=check)
+    assert not list(workspaces.user_root(alice).rglob("*.part"))
+
+
+def test_a_staged_artifact_is_of_its_sources_own_owner_and_chat(store: Store, alice: Principal) -> None:
+    """A record of another owner finds no source; a chat held as deleted takes no artifact, staged or placed."""
+    source = media_source(store, alice)
+    with pytest.raises(Gone):
+        stage_artifact(store, dataclasses.replace(source, user_id="user-b"))
+    ready = stage_artifact(store, source)
+    store._deleted[(alice.caller, alice.user_id, alice.chat_id)] = store._monotonic() + 100
+    with pytest.raises(Gone):
+        stage_artifact(store, source)
+    seen = Recorder()
+    with pytest.raises(Gone):
+        store.place_derived(ready, quota_bytes=QUOTA, record=seen)
+    assert seen.calls == []
+    assert not ready.part.exists()
+    assert store.derived_of(source) == []
+
+
+def test_an_unrecorded_artifact_is_not_kept(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """A record that cannot be written leaves no row, no file and no ``.part``, and its error goes up."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+
+    def refuse(*_: object) -> None:
+        raise RuntimeError("synthetic audit failure")
+
+    with pytest.raises(RuntimeError, match="synthetic audit failure"):
+        store.place_derived(ready, quota_bytes=QUOTA, record=refuse)
+    assert store.derived_of(source) == []
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+def test_an_artifact_that_fails_after_its_record_is_recorded_again(
+    store: Store, alice: Principal, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that fails takes the file back out and records ``error``; what it was to replace stays, file and row."""
+    source = media_source(store, alice)
+    first, _ = keep_artifact(store, source)
+    ready = stage_artifact(store, source, OTHER_JSONL)
+
+    def refuse(*_: object) -> None:
+        raise sqlite3.OperationalError("synthetic failure")
+
+    monkeypatch.setattr(store, "_insert_derived", refuse)
+    seen = Recorder()
+    with pytest.raises(sqlite3.OperationalError):
+        store.place_derived(ready, quota_bytes=QUOTA, record=seen)
+    assert seen.calls == [
+        (ready.id, len(OTHER_JSONL), [first.id], "ok"),
+        (ready.id, len(OTHER_JSONL), [first.id], "error"),
+    ]
+    assert store.derived_of(source) == [first]
+    folder = clip_folder(workspaces, alice, source)
+    assert disk_names(folder) == [first.name]
+    assert (folder / first.name).read_bytes() == JSONL
+
+
+def test_taking_a_clip_back_takes_its_artifacts_with_it(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """Both artifacts, the transcript and the frames go with the clip: rows, files and folders, all named."""
+    source = media_source(store, alice)
+    jsonl, _ = keep_artifact(store, source)
+    zipped, _ = keep_artifact(store, source, ZIP, "nextext_zip")
+    transcript = derive_as(store, tmp_path, source, "transcript", TEXT_TYPE)
+    frame = derive_as(store, tmp_path, source, "frame", "image/jpeg")
+    events: list[tuple[list[str], str]] = []
+    gone = store.remove_upload(source, lambda ids, outcome: events.append((list(ids), outcome)))
+    assert gone == 4
+    assert [outcome for _, outcome in events] == ["ok"]
+    assert events[0][0][0] == source.id
+    assert sorted(events[0][0][1:]) == sorted(each.id for each in (jsonl, zipped, transcript, frame))
+    assert every_derived(store) == []
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+    assert disk_names(workspaces.chat_dir(alice)) == []
+    assert store.usage(alice) == 0
+
+
+@pytest.mark.parametrize(
+    ("role", "mime"),
+    [
+        ("transcript", "text/plain"),
+        ("frame", "image/jpeg"),
+        ("page", "image/jpeg"),
+        ("image", "image/png"),
+        ("pdf", "application/pdf"),
+        ("nextext_jsonl", ZIP_TYPE),
+        ("nextext_zip", JSONL_TYPE),
+        ("nextext_zip", "text/plain"),
+    ],
+)
+def test_only_the_two_artifacts_are_streamed_in(
+    store: Store, alice: Principal, workspaces: Workspaces, role: DerivedRole, mime: str
+) -> None:
+    """Another role, or an artifact with another type, is no stage: nothing is made."""
+    source = media_source(store, alice)
+    with pytest.raises(PathError):
+        store.stage_derived(
+            source,
+            io.BytesIO(JSONL),
+            DerivedSpec(role, 0, mime, None, None, {}),
+            max_bytes=10**6,
+            quota_bytes=10**6,
+            check=accept,
+        )
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+def test_the_orphan_sweep_names_parts_and_artifacts_by_id(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """A ``.part`` or an artifact or transcript with no row, in a clip's folder, is named by its id and removed."""
+    source = media_source(store, alice)
+    kept, _ = keep_artifact(store, source)
+    folder = clip_folder(workspaces, alice, source)
+    lost = {suffix: new_file_id() for suffix in ("part", "zip", "jsonl", "txt")}
+    for suffix, file_id in lost.items():
+        (folder / f"{file_id}.{suffix}").write_bytes(b"x")
+    seen: list[tuple[str, list[str], int, str]] = []
+    outcome = store.sweep_user(
+        "ghostwriter",
+        "user-a",
+        untouched_before=time.time() + 3600,
+        device=os.stat(tmp_path / "data").st_dev,
+        record=lambda chat_id, ids, count, outcome: seen.append((chat_id, sorted(ids), count, outcome)),
+    )
+    assert outcome == (4, 0)
+    assert seen == [("chat-1", sorted(lost.values()), 4, "ok")]
+    assert disk_names(folder) == [kept.name]
+    assert store.derived_of(source) == [kept]
+
+
+def test_a_transcript_is_a_derived_text_file(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path
+) -> None:
+    """The executor's transcript is ``.derived/<source id>/<id>.txt``, private, with no size in pixels."""
+    source = media_source(store, alice)
+    file_id = new_file_id()
+    rec = store.register_derived(
+        source,
+        staged(tmp_path, TRANSCRIPT, "transcript.txt"),
+        DerivedSpec("transcript", 0, TEXT_TYPE, None, None, {}),
+        file_id=file_id,
+        quota_bytes=QUOTA,
+    )
+    real = clip_folder(workspaces, alice, source) / f"{file_id}.txt"
+    assert real.read_bytes() == TRANSCRIPT
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    assert (rec.role, rec.name, rec.mime, rec.width, rec.height, rec.size) == (
+        "transcript",
+        f"{file_id}.txt",
+        TEXT_TYPE,
+        None,
+        None,
+        len(TRANSCRIPT),
+    )
+    assert store.derived_of(source) == [rec]
+    assert store.open_derived(rec).read() == TRANSCRIPT
+
+
+@pytest.mark.parametrize(
+    ("role", "mime", "width"),
+    [
+        ("transcript", "image/jpeg", None),
+        ("nextext_zip", JSONL_TYPE, None),
+        ("nextext_jsonl", ZIP_TYPE, None),
+        ("frame", "image/png", 5),
+        ("page", "text/plain", None),
+        ("image", ZIP_TYPE, None),
+        ("pdf", "text/plain", None),
+        ("transcript", "text/plain", 5),
+        ("nextext_zip", ZIP_TYPE, 5),
+        ("page", "application/octet-stream", None),
+    ],
+)
+def test_media_roles_need_their_types(
+    store: Store, alice: Principal, tmp_path: Path, role: DerivedRole, mime: str, width: int | None
+) -> None:
+    """A role takes its own types alone, and only a picture has a size in pixels; the staged file stays."""
+    source = media_source(store, alice)
+    odd = staged(tmp_path, name="odd.bin")
+    with pytest.raises(PathError):
+        store.register_derived(
+            source, odd, DerivedSpec(role, 0, mime, width, width, {}), file_id=new_file_id(), quota_bytes=QUOTA
+        )
+    assert odd.exists()
+    assert store.derived_of(source) == []
 
 
 def test_image_types_are_known() -> None:

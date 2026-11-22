@@ -45,7 +45,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from workbench.api.audit import PurposeRequired
 from workbench.api.jobs import Busy, RequestTooLarge
-from workbench.api.store import Conflict, NotFound, QuotaExceeded, RendersFull, StorageFull, StoreError, TooLarge
+from workbench.api.store import (
+    Conflict,
+    NotFound,
+    QuotaExceeded,
+    RendersFull,
+    StorageFull,
+    StoreError,
+    TooLarge,
+    UnreadableArtifact,
+)
 from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
 
@@ -85,6 +94,7 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
     (QuotaExceeded, 507, None),
     (StorageFull, 507, None),
     (RendersFull, 507, None),
+    (UnreadableArtifact, 422, None),
     (AuditWriteError, 500, "audit unavailable"),
     (Busy, 503, BUSY),
     (RequestTooLarge, 422, TOO_LARGE),

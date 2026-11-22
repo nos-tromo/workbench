@@ -18,11 +18,14 @@ The store never deletes a file of its own accord; :meth:`Store.remove` is called
 only once its deletion is recorded, and :meth:`Store.delete_chat` and
 :meth:`Store.remove_upload` record a chat's or an upload's deletion themselves before anything of it goes.
 
-A derived file, the render of a picture or of a page of a PDF, or the PDF an Office file was converted to, is kept
-beside its source, in the reserved folder ``<chat>/.derived/<source-id>/``, under its own table. It is bound to its
+A derived file, the render of a picture or of a page of a PDF, the PDF an Office file was converted to, the transcript
+and the frames of a clip, or the two raw artifacts of a clip Nextext made (its JSON Lines and its keyframes zip), is
+kept beside its source, in the reserved folder ``<chat>/.derived/<source-id>/``, under its own table. It is bound to its
 source: it is as old as it, counts in the user's quota, is deleted with it, and is reachable by no path: ``.derived``
 is found by no path of any principal, listed in no folder, and no upload, output or folder is named so. The caller
-records a render before it is registered, as it records an output.
+records a render before it is registered, as it records an output. An artifact is streamed in, not staged by a job:
+:meth:`Store.stage_derived` reads its body into ``<id>.part`` in that folder before the caller waits for the source's
+lock, and :meth:`Store.place_derived` records it and makes it visible under the store's lock.
 
 The store also remembers, in this process alone, how the runner refused a source that cannot be converted or drawn
 (:meth:`Store.remember_refusal`), so that no later call runs that job again; the refusal goes with its source, and with
@@ -84,11 +87,40 @@ _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
 
-#: The name of a derived file: its file id and its extension, a render's or the converted PDF's.
-_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png|pdf)")
+#: The name of a derived file: its file id and its extension, a render's, the converted PDF's, a transcript's or an
+#: artifact's.
+_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png|pdf|txt|jsonl|zip)")
 
-#: The extension of each type of derived file the store keeps: the renders, and the PDF an Office file is converted to.
-_DERIVED_EXTENSIONS: Final = {"image/jpeg": "jpg", "image/png": "png", CONVERTED_MIME: "pdf"}
+#: The extension of each type of derived file the store keeps: the renders, the PDF an Office file is converted to, the
+#: transcript of a clip and the two artifacts Nextext made of it.
+_DERIVED_EXTENSIONS: Final = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    CONVERTED_MIME: "pdf",
+    "text/plain": "txt",
+    "application/x-ndjson": "jsonl",
+    "application/zip": "zip",
+}
+
+#: The types each role of derived file takes: a role takes its own alone.
+_ROLE_TYPES: Final[Mapping[str, frozenset[str]]] = {
+    "image": frozenset({"image/jpeg", "image/png"}),
+    "page": frozenset({"image/jpeg", "image/png"}),
+    "frame": frozenset({"image/jpeg"}),
+    "pdf": frozenset({CONVERTED_MIME}),
+    "transcript": frozenset({"text/plain"}),
+    "nextext_jsonl": frozenset({"application/x-ndjson"}),
+    "nextext_zip": frozenset({"application/zip"}),
+}
+
+#: The roles that are pictures: the only ones with a size in pixels.
+_PICTURE_ROLES: Final = frozenset({"image", "page", "frame"})
+
+#: The two raw artifacts of a clip, which are streamed in; one row of each role per source.
+_ARTIFACT_ROLES: Final = frozenset({"nextext_jsonl", "nextext_zip"})
+
+#: What is made from an artifact in the executor, and goes when an artifact is replaced.
+_MADE_FROM_ARTIFACTS: Final = frozenset({"transcript", "frame"})
 
 #: Most source ids one query of ``derived`` names, under the oldest SQLite's limit of 999 variables.
 _IN_CHUNK: Final = 500
@@ -114,6 +146,11 @@ UploadRecord = Callable[[str, str, str], object]
 #: Records a chat's deletion: called with the file ids of the chat's files and the outcome, ``ok`` before anything goes
 #: or ``error`` when the deletion failed after that. It raises when the record cannot be written.
 ChatRecord = Callable[[Sequence[str], str], object]
+
+#: Records an artifact of a clip: called with its new id, its size, the ids of the rows it replaces and the outcome,
+#: ``ok`` before it becomes visible or ``error`` when it could not be kept after all. It raises when the record cannot
+#: be written.
+ArtifactRecord = Callable[[str, int, Sequence[str], str], object]
 
 _EXTRA_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -233,6 +270,44 @@ class RendersFull(StoreError):
     """A source file already holds as many bytes of renders as it may."""
 
 
+class UnreadableArtifact(StoreError):
+    """The first bytes of an artifact are not what its role says; the message is the caller's answer.
+
+    Its message starts ``unreadable_file: ``, as the runner's refusals do: a reason given without the code gets it.
+    """
+
+    CODE: Final = "unreadable_file"
+
+    def __init__(self, reason: str) -> None:
+        """Say why the artifact cannot be read.
+
+        Args:
+            reason: A short fixed text that names no file and quotes no byte of the artifact; it may start with the
+                code already.
+        """
+        prefix = f"{self.CODE}: "
+        super().__init__(reason if reason.startswith(prefix) else prefix + reason)
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedArtifact:
+    """An artifact of a clip read in whole into its ``.part``, checked, and not yet visible.
+
+    Attributes:
+        source: The clip it is an artifact of.
+        spec: What it is: role ``nextext_jsonl`` or ``nextext_zip``, with that role's type.
+        id: Its file id, chosen at the stage and named by the event that records it.
+        part: Its ``.part`` in the clip's folder of derived files.
+        size: Its size in bytes.
+    """
+
+    source: FileRecord
+    spec: DerivedSpec
+    id: str
+    part: Path
+    size: int
+
+
 def _write_all(fd: int, data: bytes) -> None:
     """Write all of ``data`` to ``fd``.
 
@@ -292,8 +367,8 @@ def _orphan_ids(paths: Sequence[Path]) -> list[str]:
         paths: The orphans.
 
     Returns:
-        The id of each ``<id>.part``, and of each ``<id>.jpg``, ``<id>.png`` or ``<id>.pdf`` in a folder
-        ``.derived/<source-id>``; the others carry none.
+        The id of each ``<id>.part``, and of each ``<id>.jpg``, ``<id>.png``, ``<id>.pdf``, ``<id>.txt``,
+        ``<id>.jsonl`` or ``<id>.zip`` in a folder ``.derived/<source-id>``; the others carry none.
     """
     ids: list[str] = []
     for path in paths:
@@ -547,6 +622,42 @@ def _order(rec: DerivedRecord) -> tuple[str, int, int, int, str]:
         Its sort key.
     """
     return rec.role, rec.ordinal, rec.strips, rec.strip, rec.id
+
+
+def _replaced_by(role: str, held: Iterable[DerivedRecord]) -> list[DerivedRecord]:
+    """Pick the rows a new artifact replaces: those of its own role, and the transcript and frames made from the old.
+
+    Args:
+        role: The new artifact's role.
+        held: The renders of the clip, in the order they are listed.
+
+    Returns:
+        The rows that go, in that order.
+    """
+    return [rec for rec in held if rec.role == role or rec.role in _MADE_FROM_ARTIFACTS]
+
+
+def _extension_of(spec: DerivedSpec) -> str:
+    """Check that a derived file's role and type go together, and say what its file is called.
+
+    Args:
+        spec: What it is.
+
+    Returns:
+        The extension of its file: ``jpg``, ``png``, ``pdf``, ``txt``, ``jsonl`` or ``zip``.
+
+    Raises:
+        PathError: If the type is no type of derived file, the role does not take it, or a file that is no picture
+            has a width or height.
+    """
+    extension = _DERIVED_EXTENSIONS.get(spec.mime)
+    if extension is None:
+        raise PathError("not a type of render")
+    if spec.mime not in _ROLE_TYPES.get(spec.role, frozenset()):
+        raise PathError("a derived file's role and type do not go together")
+    if spec.role not in _PICTURE_ROLES and (spec.width, spec.height) != (None, None):
+        raise PathError("only a picture has a size in pixels")
+    return extension
 
 
 def _owner(rec: DerivedRecord) -> tuple[str, str, str, str]:
@@ -1682,11 +1793,13 @@ class Store:
             Principal(rec.caller, rec.user_id, rec.chat_id), f"{VIRTUAL_ROOT}/{rec.chat_id}/{rec.relative_path}"
         )
 
-    def _insert_derived(self, rec: DerivedRecord) -> None:
-        """Store a new render's record.
+    def _insert_derived(self, rec: DerivedRecord, drop: Sequence[str] = ()) -> None:
+        """Store a new render's record, and in the same transaction delete the rows of those it replaces.
 
         Args:
             rec: The record.
+            drop: The ids of the rows it replaces; the caller holds the store's lock and found them for ``rec``'s own
+                source and owner.
 
         Raises:
             StorageFull: If the database cannot grow.
@@ -1694,6 +1807,7 @@ class Store:
         meta = json.dumps(rec.meta, sort_keys=True, separators=(",", ":"))
         try:
             with self._db() as db:
+                db.executemany("DELETE FROM derived WHERE id = ?", [(each,) for each in drop])
                 db.execute(
                     f"INSERT INTO derived ({_DERIVED_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -1745,8 +1859,10 @@ class Store:
         Args:
             source: The file it is a render of; its row must still be there, for its owner and chat.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
-            spec: What it is. ``spec.mime`` is ``image/jpeg`` or ``image/png``; or ``application/pdf`` for role ``pdf``
-                alone, with no width or height.
+            spec: What it is. Each role takes its own types alone: ``image/jpeg`` or ``image/png`` for ``image`` and
+                ``page``, ``image/jpeg`` for ``frame``, ``application/pdf`` for ``pdf``, ``text/plain`` for
+                ``transcript``, ``application/x-ndjson`` for ``nextext_jsonl`` and ``application/zip`` for
+                ``nextext_zip``; only a picture has a width and height.
             file_id: The render's id, chosen and recorded by the caller: 32 lowercase hex digits.
             quota_bytes: Most bytes the user may hold in all chats together, renders included.
             cap_bytes: Most bytes of renders the source may have.
@@ -1755,8 +1871,8 @@ class Store:
             The new record.
 
         Raises:
-            PathError: If ``spec.mime`` is no type of derived file, ``spec.role`` and ``spec.mime`` are not both a PDF's
-                or both not, a PDF has a width or height, or ``staged`` is not a regular file.
+            PathError: If ``spec.mime`` is no type of derived file, its role does not take it, a file that is no picture
+                has a width or height, or ``staged`` is not a regular file.
             ValueError: If ``file_id`` is not 32 lowercase hex digits.
             NotFound: If ``staged`` does not exist; ``staged`` stays.
             Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`; ``staged``
@@ -1767,12 +1883,7 @@ class Store:
             RendersFull: If it would take the source over ``cap_bytes``; ``staged`` stays.
             StorageFull: If the volume is full.
         """
-        extension = _DERIVED_EXTENSIONS.get(spec.mime)
-        if extension is None:
-            raise PathError("not a type of render")
-        is_pdf = spec.role == "pdf"
-        if is_pdf != (spec.mime == CONVERTED_MIME) or (is_pdf and (spec.width, spec.height) != (None, None)):
-            raise PathError("a converted PDF is role pdf, of its type alone and with no size in pixels")
+        extension = _extension_of(spec)
         meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
         st = _take_staged(staged)
         if _FILE_ID.fullmatch(file_id) is None:
@@ -1813,6 +1924,206 @@ class Store:
             self._make_dirs(folder)
             self._place(staged, folder / rec.name, lambda: self._insert_derived(rec))
         return rec
+
+    def _require_source(self, source: FileRecord) -> None:
+        """Check that a source is still there, for its own owner and chat, and its chat not held as deleted.
+
+        Call it under the store's lock.
+
+        Args:
+            source: The file.
+
+        Raises:
+            Gone: If its row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`.
+        """
+        if not self._has_file(source.id, source.caller, source.user_id, source.chat_id):
+            raise Gone("file not found")
+        self._refuse_deleted(source.caller, source.user_id, source.chat_id)
+
+    def _drop_part(self, part: Path) -> None:
+        """Remove a ``.part`` that will not be placed, and the folders of its source's renders if it left them empty.
+
+        Call it under the store's lock, which a stage holds between making its folder and opening its file. A removal
+        that fails is logged by its type and never raised: the failure that brought the part here is the answer, and
+        retention removes a ``.part`` that stayed, recorded by its id.
+
+        Args:
+            part: The ``.part``, ``.derived/<source-id>/<id>.part`` below a chat folder; gone is fine.
+        """
+        try:
+            _unlink(part)
+            _remove_empty(part.parent)
+            _remove_empty(part.parent.parent)
+        except OSError as exc:
+            _log.warning("could not remove an artifact that was not kept (%s)", type(exc).__name__)
+
+    def stage_derived(
+        self,
+        source: FileRecord,
+        src: BinaryIO,
+        spec: DerivedSpec,
+        *,
+        max_bytes: int,
+        quota_bytes: int,
+        check: Callable[[Path], None],
+    ) -> StagedArtifact:
+        """Stream an artifact of a clip into ``<id>.part`` in the clip's folder of derived files, and check it.
+
+        This is the first of two calls, so that a body is read before the caller waits for the source's lock: a client
+        whose body is not read meanwhile would hit its write timeout. Nothing of it is visible and nothing is recorded
+        until :meth:`place_derived`. Under the store's lock the source's row is found (for its own owner and chat, its
+        chat not held as deleted) and the folders and the ``.part`` are made, private, the file opened new
+        (``O_EXCL``, never through a link); outside it the bytes are streamed in and ``check`` reads the whole
+        ``.part``. The ``.part`` is not counted in the quota until it is placed, which checks the room again.
+
+        Args:
+            source: The clip, as :meth:`get` found it for its owner.
+            src: The artifact's bytes; read in chunks until empty.
+            spec: What it is: role ``nextext_jsonl`` with type ``application/x-ndjson``, or ``nextext_zip`` with
+                ``application/zip``, with no width or height.
+            max_bytes: Largest artifact allowed.
+            quota_bytes: Most bytes the user may hold in all chats together; what an artifact of this role replaces
+                (its row, the transcript, the frames) is counted as free.
+            check: Reads the ``.part`` and raises :class:`UnreadableArtifact` for one that is not what its role says;
+                it is called outside the store's lock.
+
+        Returns:
+            The staged artifact, to pass to :meth:`place_derived` or :meth:`drop_staged`.
+
+        Raises:
+            PathError: If ``spec`` is not an artifact's.
+            Gone: If the clip's row is gone or its chat was deleted, before the stage or while ``check`` read the
+                ``.part``.
+            TooLarge: If the body is over ``max_bytes``.
+            QuotaExceeded: If it is over the room.
+            StorageFull: If the volume is full.
+            UnreadableArtifact: What ``check`` raised, or any other error of it; the ``.part`` is removed.
+        """
+        _extension_of(spec)
+        if spec.role not in _ARTIFACT_ROLES:
+            raise PathError("only a clip's raw artifacts are streamed in")
+        file_id = new_file_id()
+        p = Principal(source.caller, source.user_id, source.chat_id)
+        with self._lock:  # the source, the room and the folders are settled before retention or a delete may look
+            self._require_source(source)
+            freed = sum(each.size for each in _replaced_by(spec.role, self.derived_of(source)))
+            room = quota_bytes - self.usage(p) + freed
+            folder = self._derived_folder(p, source.id)
+            self._ws.chat_dir(p)
+            self._make_dirs(folder)
+            part = folder / f"{file_id}{_PART}"
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
+        try:
+            size = self._write_part(fd, part, src, max_bytes=max_bytes, room=room)
+            try:
+                check(part)
+            except FileNotFoundError as exc:  # the chat was deleted, and its folder with it, while the check read
+                raise Gone("file not found") from exc
+        except BaseException:
+            with self._lock:
+                self._drop_part(part)
+            raise
+        return StagedArtifact(source=source, spec=spec, id=file_id, part=part, size=size)
+
+    def place_derived(
+        self,
+        staged: StagedArtifact,
+        *,
+        quota_bytes: int,
+        record: ArtifactRecord,
+        cap_bytes: int = DERIVED_MAX_BYTES,
+    ) -> tuple[DerivedRecord, list[DerivedRecord]]:
+        """Record a staged artifact, make it visible, and replace what it makes out of date, all under the store's lock.
+
+        The second of two calls. The source and its chat are checked again, as they may have gone while the body came
+        in (taken back, deleted). The artifact replaces the source's row of its role and every ``transcript`` and
+        ``frame`` row, which were made from the old input; the room is what the user and the source hold, less those
+        rows, plus the new size. ``record`` writes the event by the new id and the replaced ids, and only then is the
+        ``.part`` renamed to ``<id>.<ext>`` and one transaction inserts the new row and deletes the replaced ones; their
+        files are deleted after the commit. A record that cannot be written keeps nothing; a rename or commit that
+        fails after it takes the file back out and records ``error``, and the replaced rows and files stay. A replaced
+        file that cannot be deleted after the commit is logged by its type: it has no row, and retention removes and
+        records it. Whatever fails, the ``.part`` or the file is removed.
+
+        Args:
+            staged: What :meth:`stage_derived` returned.
+            quota_bytes: Most bytes the user may hold in all chats together, renders included.
+            record: Writes the event (:data:`ArtifactRecord`), under the store's lock.
+            cap_bytes: Most bytes of derived files the source may have.
+
+        Returns:
+            The new record, and the records it replaced, by role and ordinal.
+
+        Raises:
+            Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`.
+            NotFound: If the ``.part`` is gone, as after it was placed.
+            PathError: If the ``.part`` is not a regular file, or a path now runs through a symlink.
+            QuotaExceeded: If it would take the user over ``quota_bytes``.
+            RendersFull: If it would take the source over ``cap_bytes``.
+            StorageFull: If the volume is full.
+            Exception: What ``record`` raised, with nothing kept; or what the rename or commit raised after it.
+        """
+        source, spec = staged.source, staged.spec
+        extension = _extension_of(spec)
+        meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
+        p = Principal(source.caller, source.user_id, source.chat_id)
+        with self._lock:
+            part = self._derived_folder(p, source.id) / f"{staged.id}{_PART}"
+            try:
+                self._require_source(source)
+                st = _take_staged(part)
+                held = self.derived_of(source)
+                replaced = _replaced_by(spec.role, held)
+                freed = sum(each.size for each in replaced)
+                if self.usage(p) - freed + st.st_size > quota_bytes:
+                    raise QuotaExceeded("workspace quota exceeded")
+                if sum(each.size for each in held) - freed + st.st_size > cap_bytes:
+                    raise RendersFull("the renders of this file are at their limit")
+                rec = DerivedRecord(
+                    id=staged.id,
+                    source_id=source.id,
+                    caller=p.caller,
+                    user_id=p.user_id,
+                    chat_id=p.chat_id,
+                    role=spec.role,
+                    ordinal=spec.ordinal,
+                    name=f"{staged.id}.{extension}",
+                    size=st.st_size,
+                    mime=spec.mime,
+                    width=spec.width,
+                    height=spec.height,
+                    meta=meta,
+                    created_at=source.created_at,
+                )
+                ids = [each.id for each in replaced]
+                doomed = [self._derived_path(each) for each in replaced]
+                record(rec.id, rec.size, list(ids), "ok")
+                self._place(
+                    part,
+                    part.with_name(rec.name),
+                    lambda: self._insert_derived(rec, ids),
+                    again=lambda: record(rec.id, rec.size, list(ids), "error"),
+                )
+            except BaseException:
+                self._drop_part(part)
+                raise
+            for path in doomed:
+                try:
+                    _unlink(path)
+                except OSError as exc:  # the row is gone, so nothing serves it; retention removes the file
+                    _log.warning("could not remove a replaced artifact file (%s)", type(exc).__name__)
+        return rec, replaced
+
+    def drop_staged(self, staged: StagedArtifact) -> None:
+        """Remove the ``.part`` of an artifact that is not placed, and the clip's empty folders of derived files.
+
+        Args:
+            staged: What :meth:`stage_derived` returned; gone, or already placed, is fine.
+        """
+        source = staged.source
+        p = Principal(source.caller, source.user_id, source.chat_id)
+        with self._lock:
+            self._drop_part(self._derived_folder(p, source.id) / f"{staged.id}{_PART}")
 
     def derived_for(self, sources: Sequence[FileRecord]) -> list[DerivedRecord]:
         """List every render of some files, each by its own owner and chat.
