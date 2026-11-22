@@ -102,11 +102,16 @@ REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
 #: damaged or not what its name says, too large to read within the memory limit, password-protected (a PDF, an Office
 #: file or an old binary one), not opened by LibreOffice, more or larger pictures than can be drawn within the memory
 #: limit (also when a conversion redone in parts runs out of its time: ruling R23), a picture over 120 megapixels, a PDF
-#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB. The api imports nothing of
-#: the executor, so these are its copies, which ``tests/api/test_renders.py`` pins to the runners' constants. Any other
-#: text, such as a job that could not write inside its sandbox, a conversion that ended for no reason the file gives,
-#: or a text added to a runner later, is remembered only when it comes twice in a row: a passing failure costs one job
-#: more, and a file that always fails so holds its caller's conversion gate twice, never more.
+#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB.
+#:
+#: These are copies, never imports (ruling R25): the api imports nothing of the executor, whose modules that hold them
+#: load the runners, Pillow or pdfium, none of which the api's image has. A pin test in ``tests/api/test_renders.py``
+#: (``test_the_refusals_remembered_at_once_are_the_runners_own_words``) imports the runners' constants and asserts
+#: this set equals them, so a text changed on either side fails CI.
+#:
+#: Any other text, such as a job that could not write inside its sandbox, a conversion that ended for no reason the
+#: file gives, or a text added to a runner later, is remembered only when it comes twice in a row: a passing failure
+#: costs one job more, and a file that always fails so holds its caller's conversion gate twice, never more.
 FILE_DECIDED: Final = frozenset(
     f"unreadable_file: {text}"
     for text in (
