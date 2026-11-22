@@ -73,7 +73,7 @@ def test_the_workspace_specs_are_the_tables_rows(app: FastAPI) -> None:
         tool.name: tool.text_description or tool.description for tool in WORKSPACE_TABLE if not tool.images_only
     }
     assert [tool.name for tool in WORKSPACE_TABLE if tool.images_only] == ["view_file"]
-    assert [tool.name for tool in WORKSPACE_TABLE if tool.text_description] == ["read_document"]
+    assert [tool.name for tool in WORKSPACE_TABLE if tool.text_description] == ["read_document", "write_presentation"]
 
 
 async def _never(_body: Any, _env: ToolEnv) -> ToolOutcome:

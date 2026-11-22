@@ -28,7 +28,12 @@ from tests.api.test_mcp import call as inline_call
 from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_python import ran
 from tests.api.test_tools_templates import Local
-from tests.callers import GHOSTWRITER_TOOLS, TEXT_ONLY_INSTRUCTIONS, TEXT_ONLY_READ_DOCUMENT
+from tests.callers import (
+    GHOSTWRITER_TOOLS,
+    TEXT_ONLY_INSTRUCTIONS,
+    TEXT_ONLY_READ_DOCUMENT,
+    TEXT_ONLY_WRITE_PRESENTATION,
+)
 from tests.conftest import scaled
 from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
@@ -163,13 +168,16 @@ def test_discover_tells_each_form_its_own_instructions(client: TestClient) -> No
 def test_a_ghostwriter_that_takes_no_images_is_told_what_0_6_told_it(client: TestClient, value: str | None) -> None:
     """Final review I1: only ``X-Accept-Images: 1`` lists view_file; any other call is listed nine tools, as in 0.6.
 
-    read_document's description and the end of the instructions are 0.6's word for word.
+    read_document's description and the end of the instructions are 0.6's word for word, and write_presentation's is
+    0.8.0's, which names no view_file.
     """
     headers = HG_TEXT if value is None else {**HG_TEXT, "X-Accept-Images": value}
     tools = result(rpc(client, "tools/list", headers=headers))["tools"]
     assert [tool["name"] for tool in tools] == sorted(GHOSTWRITER_TOOLS - {"view_file"})
     (read,) = [tool for tool in tools if tool["name"] == "read_document"]
     assert read["description"] == TEXT_ONLY_READ_DOCUMENT
+    (deck,) = [tool for tool in tools if tool["name"] == "write_presentation"]
+    assert deck["description"] == TEXT_ONLY_WRITE_PRESENTATION and "view_file" not in deck["description"]
     assert result(rpc(client, "server/discover", headers=headers))["instructions"] == TEXT_ONLY_INSTRUCTIONS
 
 

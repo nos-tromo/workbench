@@ -33,7 +33,8 @@ file routes are not tools, so the model cannot call them.
   is `view_file` listed and callable, and do `read_document` and `view_file`
   send image blocks. A call without it (any other value counts as none), such as
   an older Ghostwriter's, is told and shown what workbench 0.6 told and showed:
-  nine tools, `read_document`'s 0.6 description and hints, the 0.6 server
+  nine tools, `read_document`'s 0.6 description and hints, `write_presentation`
+  without its sentence on `view_file`, the 0.6 server
   instructions, no image and no render; a picture file is refused as
   `unsupported_format`, and `view_file` is "unknown tool". The schemas are the
   same either way. The header is never trusted for access: the key, the tool

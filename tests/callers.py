@@ -30,6 +30,21 @@ TEXT_ONLY_READ_DOCUMENT = (
     "no text layer (scans, pictures): this tool does no OCR, so tell the user those need OCR elsewhere, and never "
     "treat them as blank. Outlook .msg files cannot be read: ask the user to save them as .eml or PDF."
 )
+#: What workbench 0.8.0 told the model of ``write_presentation``, and still tells a call that takes no images: it
+#: names no view_file.
+TEXT_ONLY_WRITE_PRESENTATION = (
+    "Build a PowerPoint deck into a new .pptx of this conversation, in a slide master (.pptx or .potx) of it. Without "
+    "path, the deck is built in a plain 16:9 master. Call inspect_template on the master first (without path for the "
+    "plain one). Then show the user the outline (each slide's title, layout number and name, key points, figures and "
+    "sources) and call this tool only in a later message, after they agreed. Each content entry fills one place of the "
+    "slide's layout, in the order inspect_template lists its places: Markdown text (bullets with -, up to 3 levels, "
+    "**bold**, *italic*), {table: rows} with the first row the header, {chart: {type, categories, series}}, or "
+    "{image: path} of a PNG, JPEG or GIF of this conversation (make a chart image with run_python, or prefer a native "
+    'chart); "" leaves a place empty. A slide\'s title and subtitle are plain text, not Markdown. At most 30 slides. '
+    "Footers and slide numbers come from the master; the master's own slides are left out. Each slide's sources go "
+    "into its speaker notes. To change a deck, read it with read_document and write it again. The user sees the new "
+    "file as a card in the chat."
+)
 TEXT_ONLY_INSTRUCTIONS = (
     "workbench works on the files of this chat: it lists, reads and searches them, runs Python over them in a sandbox "
     "with no network, fills report templates and writes tables and documents. Every file a tool writes comes back as "
