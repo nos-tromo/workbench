@@ -397,7 +397,7 @@ class OfficeRequest(_Strict):
         slides: The slides the reader counted in a deck, at least 1; ``None`` for a text document.
     """
 
-    unit: Unit
+    unit: PagedUnit
     slides: int | None = Field(default=None, ge=1)
 
 

@@ -333,9 +333,9 @@ def test_an_office_request_takes_a_unit_and_the_slide_count() -> None:
     assert (request.unit, request.slides) == ("slide", 24)
 
 
-@pytest.mark.parametrize("fields", [{"unit": "sheet"}, {"slides": 0}, {"extra": "x"}])
+@pytest.mark.parametrize("fields", [{"unit": "sheet"}, {"unit": "frame"}, {"slides": 0}, {"extra": "x"}])
 def test_an_office_request_refuses_what_is_out_of_bounds(fields: dict[str, Any]) -> None:
-    """A request is refused for another unit, no slide or a stray key."""
+    """A request is refused for another unit (a frame is a clip's), no slide or a stray key."""
     with pytest.raises(ValidationError):
         renders.OfficeRequest.model_validate({"unit": "slide"} | fields)
 
