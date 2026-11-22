@@ -121,13 +121,21 @@ The database has three tables (`workbench/api/store.py`):
 name a person or a case, and the user id identifies a user to its caller. Both are
 in the database and in the folder names on the volume.
 
-Two more places hold data for a short time:
+Three more places hold data for a short time:
 
 - the api's `/tmp`, a tmpfs in memory, where uploads are spooled while they
   arrive (at most the upload limit plus 1 MiB each);
 - the database's `-wal` file, which can hold earlier versions of deleted rows
   until a checkpoint copies over them (see
-  [retention.md](retention.md#after-a-sweep)).
+  [retention.md](retention.md#after-a-sweep));
+- the api's memory, which remembers the refusal of a file the executor could
+  not convert or draw for what it is (`unreadable_file`, `unsupported_format`):
+  the file's id, its creation time and size, and the refusal's fixed text,
+  which names no file (`workbench/api/store.py:Store.remember_refusal`). Every
+  later prepare, view or read of the file's pages is answered with it at once,
+  with no job, and recorded as the refusal was
+  ([audit.md](audit.md#what-is-recorded), `remembered`). It is never written to
+  the volume.
 
 workbench encrypts nothing at rest. Encryption of the host's disk is the
 operator's.
@@ -139,6 +147,7 @@ operator's.
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
 | Renders, and an Office file's converted PDF | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render or PDF with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
+| A refusal remembered, in the api's memory | until its file goes (retention, or its chat's delete), the api restarts, or 4096 refusals asked for since push it out (`REFUSALS_MAX`); a new upload under the same name is a new file and inherits nothing | `Store.remove`, `Store.delete_chat`, `Store.remember_refusal` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
 | Empty folders, empty chat folders and empty user roots | one hour after they were last changed | `workbench/api/store.py:Store.sweep_user` |

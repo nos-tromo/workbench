@@ -33,7 +33,7 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and five file routes. The same rules; unset, Ghostwriter's door is off. |
 | `GHOSTWRITER_WORKBENCH_TOOLS` | the ten workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. Since 0.7.0 the default includes `view_file`; a list set explicitly must add it, or Ghostwriter offers no images. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
-| `GHOSTWRITER_WORKBENCH_SLOTS` | 2 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture, PDF or Office file takes one of them (an Office file's two jobs, one after the other), so at 1 prepares share the caller's one slot with its tool calls: keep 2 or more. There is no variable for prepares of their own. |
+| `GHOSTWRITER_WORKBENCH_SLOTS` | 3 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), and the two run apart, so keep 3 or more: at 3, one is left for the tool calls of all Ghostwriter's users while both run. Below that, prepares and conversions share the caller's slots with its tool calls. There is no variable for prepares or conversions of their own. The executor's memory is its own slots times a job's (below), whatever this is. |
 
 The api needs at least one of the two keys, or it refuses to start; two
 callers with the same key stop the start too.
@@ -90,23 +90,44 @@ an `isError` result whose `reason` says why:
   (4 by default). A user past it is refused at once (`queue_full`), and the
   other users are not affected: one user cannot fill every waiting place.
 - docint's and Ghostwriter's calls wait at most 5 s for their turn
-  (`MCP_QUEUE_WAIT_S`, fixed; then `wait_timeout`), may fill 8 of the 16
-  waiting places by default (`DOCINT_WORKBENCH_SLOTS` or
-  `GHOSTWRITER_WORKBENCH_SLOTS` times that share), and an abandoned call holds its
-  slot and that user's turn until its wall time. Each is held to its own share
-  only, so at the defaults docint and Ghostwriter together can hold all 4 slots
-  and all 16 waiting places.
-- A prepare (`POST /files/prepare`, the render job of a file just attached)
-  waits for its caller's prepare gate in place of its user's turn, up to 120 s
-  (`PREPARE_QUEUE_WAIT_S`, fixed; then `503`, "busy, retry later"): one prepare
-  of a caller runs at a time, over all its users and inside its slots, and at
-  most 32 wait (`PREPARE_WAITING_MAX`), counted apart from
+  (`MCP_QUEUE_WAIT_S`, fixed; then `wait_timeout`), may fill 8 (docint's) and
+  12 (Ghostwriter's) of the 16 waiting places by default
+  (`DOCINT_WORKBENCH_SLOTS` or `GHOSTWRITER_WORKBENCH_SLOTS` times that share),
+  and an abandoned call holds its slot and that user's turn until its wall time.
+  Each is held to its own share only, so at the defaults docint and Ghostwriter
+  together can hold all 4 slots and all 16 waiting places.
+- A prepare (`POST /files/prepare`, the render job of a picture or a PDF just
+  attached) waits for its caller's prepare gate in place of its user's turn, up
+  to 120 s (`PREPARE_QUEUE_WAIT_S`, fixed; then `503`, "busy, retry later"):
+  one prepare of a caller runs at a time, over all its users and inside its
+  slots, and at most 32 wait (`PREPARE_WAITING_MAX`), counted apart from
   `WORKBENCH_QUEUE_MAX` and every share, so prepares never fill the places the
   users' own calls need. A client's timeout for the route should cover the
-  120 s, the job's wall and 30 s; for an Office file, whose prepare runs two jobs
-  (the conversion, then the drawing) in one turn of the gate, the 120 s, two
-  walls and 30 s (390 s at the default wall). The renders a view or a tool makes
-  run on the user's own turn.
+  120 s, the job's wall and 30 s. The renders a view or a tool makes run on the
+  user's own turn.
+- An Office file's conversion and the drawing of its pages after it, two jobs
+  in one turn, wait for the caller's **conversion gate** instead, whether the
+  prepare of an attachment runs them (up to its 120 s) or a view or a tool
+  converts the file on demand (up to its 5 s): one conversion of a caller runs
+  at a time, over all its users, apart from the prepare gate, so a picture
+  attached while a deck converts is prepared at once, and a caller never
+  converts two files at once. At most 32 conversions wait, counted as the
+  prepares are and apart from them. A client's timeout for the prepare of an
+  Office file should cover the 120 s, two walls and 30 s (390 s at the default
+  wall).
+- A view or a tool that needs the renders of a file whose renders another call
+  is making (such as a deck its prepare is converting) waits for that call, up
+  to 120 s (`SOURCE_LOCK_WAIT_S`, fixed; then `wait_timeout`), and then answers
+  from what it made, with no job of its own. 120 s is one job wall at the
+  default: as long as the call would have spent converting the file itself,
+  and short of Ghostwriter's 150 s for a tool call. The wait holds no slot, no
+  turn and no waiting place.
+- A file the executor refused for what it is (`unreadable_file`,
+  `unsupported_format`), at its prepare or its conversion, is refused again at
+  once by every later prepare, view or read of its pages, with no job: the api
+  remembers the refusal of up to 4096 files (`REFUSALS_MAX`), in memory alone,
+  until the file goes or the api restarts ([data-flow.md](data-flow.md#how-long)).
+  A refusal that may pass (out of time, busy) is tried again.
 - A `read_document` call on a PDF or a deck can run the read, a deck's
   conversion to a PDF, the render of its pages or slides without text and, when
   strips are asked for, a strips job one after the other, each as long as a job

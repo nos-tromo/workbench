@@ -152,8 +152,10 @@ header selects what the model is told and shown, never what a caller may reach.
   (`prepared`, `renders_for`: a file or a page whose renders exist is answered
   from the rows without the source's lock, and no job runs when the source's
   renders leave no room for one more; an Office file with no `pdf` row is
-  converted first, under the source's lock, in the same turn as its drawing,
-  and one whose PDF has gone is converted again) and reads each render back by
+  converted first, under the source's lock, in the same turn as its drawing, a
+  turn of the caller's conversion gate, and one whose PDF has gone is converted
+  again so too; a file the executor refused for what it is is refused again at
+  once, with no job, from `Store.refusal_of`) and reads each render back by
   its row,
   never one that is not what the row says. A render becomes visible only after its `modify` /
   `file.prepare` event, and leaves only after its `disclose` / `file.view`,
@@ -167,7 +169,7 @@ header selects what the model is told and shown, never what a caller may reach.
   view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
-  the prepare gate; with `strips` 2 or 3 it also cuts a picture into strips, on
+  the conversion gate; with `strips` 2 or 3 it also cuts a picture into strips, on
   the prepare gate) and `GET /files/view?rendition=` serves one render, made first
   on the user's own turn when it does not exist yet.
 - `workbench/executor/runners/`: one runner per tool that needs file content
@@ -186,12 +188,16 @@ header selects what the model is told and shown, never what a caller may reach.
   `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
   its record. A render job (`submit_renders`) keeps its outputs as derived files
   of its source (`Store.register_derived`), never as files of the chat. **The
-  prepare gate:** a prepare, the render job of a file just attached
-  (`gate="prepare"`), waits for its caller's prepare gate in place of its user's
-  turn, so it never takes the user's interactive one: one prepare of a caller runs
-  at a time, over all its users, within the caller's slots, and at most
-  `PREPARE_WAITING_MAX` wait, counted apart from the queue. Renders on the routes
-  and in the tools run on the user's own turn.
+  prepare gate and the conversion gate:** a prepare, the render job of a picture or
+  a PDF just attached (`gate="prepare"`), waits for its caller's prepare gate in
+  place of its user's turn, so it never takes the user's interactive one; an Office
+  file's conversion and its drawing, one turn (`gate="conversion"`), wait for its
+  caller's conversion gate, whether a prepare or a call on demand runs them. Each
+  gate runs one job of a caller at a time, over all its users, within the caller's
+  slots, and at most `PREPARE_WAITING_MAX` wait at each, counted apart from the
+  queue and from each other: a picture is prepared while a deck converts, and a
+  caller never converts two files at once. Other renders on the routes and in the
+  tools run on the user's own turn.
 - `workbench/executor/render/`: what `prepare_file` uses. `images.py` decodes a
   picture (its content decides the format, not its name; at most 120 MP; one HEIF
   decoder thread), brings it to the bounds of a render, to sRGB through its
@@ -420,6 +426,21 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   child each, halving a range that comes to the ceiling again, joins the parts
   with pdfium, and refuses with `office.TOO_MANY_PICTURES` when a single page
   still does or the budget runs out. `docs/sandbox.md` § Limits has the numbers.
+- **A call waits longer for a source's lock than for its turn.** A view or a
+  tool waits 5 s for its turn (`MCP_QUEUE_WAIT_S`), but up to 120 s for the lock
+  of a source whose renders another call is making (`SOURCE_LOCK_WAIT_S`):
+  Ghostwriter prepares an attachment as it arrives, and a deck's conversion takes
+  13-31 s, so a view of it waits for that prepare rather than answer busy, and
+  converts nothing again. 120 s is one job wall, what the call would have spent
+  converting itself, and short of Ghostwriter's 150 s for a tool call. The wait
+  holds nothing else; every path takes the lock first and a turn second.
+- **A refusal is remembered, in memory alone.** A file the executor refused for
+  what it is (`unreadable_file`, `unsupported_format`), at its prepare or its
+  conversion, is answered with that refusal by every later prepare or render, with
+  no job, from `Store.refusal_of` (an LRU of `REFUSALS_MAX`, by the source's id,
+  creation time and size), and recorded as the refusal was, with
+  `remembered: true`. It goes with the file (`Store.remove`, `Store.delete_chat`)
+  and with a restart. A `read_timeout`, a busy executor or a failure is tried again.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in
