@@ -2287,3 +2287,34 @@ def test_a_refusal_goes_with_its_source(store: Store, alice: Principal, tmp_path
     store.remember_refusal(survivor, REFUSED)
     restarted = Store(tmp_path / "data" / "workbench.db", Workspaces(tmp_path / "data"))
     assert restarted.refusal_of(survivor) is None
+
+
+def test_a_refusal_that_may_pass_is_remembered_at_its_second_in_a_row(store: Store, alice: Principal) -> None:
+    """Ruling R22: a refusal no file decides alone is remembered when it comes twice in a row for the same source.
+
+    A success between the two resets the count; so does a record of another size under the same id.
+    """
+    source = put(store, alice, "harbour-deck.pptx")
+    assert store.remember_refusal(source, REFUSED, at_once=False) is False
+    assert store.refusal_of(source) is None
+    assert store.remember_refusal(source, REFUSED, at_once=False) is True
+    assert store.refusal_of(source) == REFUSED
+
+    other = put(store, alice, "harbour-notes.docx")
+    assert store.remember_refusal(other, REFUSED, at_once=False) is False
+    store.forget_refusal(other)  # a success between them
+    assert store.remember_refusal(other, REFUSED, at_once=False) is False
+    assert store.refusal_of(other) is None
+    resized = dataclasses.replace(other, size=other.size + 1)
+    assert store.remember_refusal(resized, REFUSED, at_once=False) is False
+    assert store.remember_refusal(source, REFUSED) is True  # at once, and the first is still remembered
+
+
+def test_no_refusal_is_remembered_of_a_deleted_chat(store: Store, alice: Principal) -> None:
+    """Review M2: a job of a chat deleted while it ran cannot leave a refusal of one of its files in memory."""
+    source = put(store, alice, "harbour-deck.pptx")
+    assert store.delete_chat(alice, unrecorded) == 1
+    assert store.remember_refusal(source, REFUSED) is False
+    assert store.remember_refusal(source, REFUSED, at_once=False) is False
+    assert store.refusal_of(source) is None
+    assert store._refusals == {}

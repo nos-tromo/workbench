@@ -936,6 +936,29 @@ async def test_the_source_lock_is_taken_before_the_turn(
     assert world.queue.tracked_sources == 0
 
 
+async def test_a_conversion_runs_only_in_a_turn_of_the_conversion_gate(world: World, fake_office: FakeOffice) -> None:
+    """Review M7: a conversion sent in a turn of the user's or the prepare gate is a programming error.
+
+    It is refused before any job or event, so no future caller converts beside another conversion of its caller.
+    """
+    source = world.deck(3)
+    for gate in ("user", "prepare"):
+        jobs = world.jobs(gate)
+        async with jobs.turn(PG) as turn:
+            with pytest.raises(ValueError, match="conversion gate"):
+                await api_renders._convert(
+                    PG,
+                    source,
+                    settings=world.settings,
+                    store=world.store,
+                    audit=world.audit,
+                    jobs=jobs,
+                    turn=turn,
+                    on_demand=False,
+                )
+    assert (world.executor.requests, world.events(), fake_office.calls) == ([], [], 0)
+
+
 async def test_a_turn_is_let_go_after_a_refused_conversion(world: World, fake_office: FakeOffice) -> None:
     """A prepare whose conversion is refused lets its turn and its lock go: the next prepare of a deck runs at once.
 
@@ -1347,37 +1370,83 @@ async def test_a_refusal_that_may_pass_is_not_remembered(
         "unreadable_file: the converted file could not be written",
         "unreadable_file: the renders could not be written",
         "unreadable_file: the file could not be converted to pages",
+        "unreadable_file: an invented reason no runner gives",
     ],
-    ids=["conversion-not-written", "renders-not-written", "not-converted"],
+    ids=["conversion-not-written", "renders-not-written", "not-converted", "unknown"],
 )
-async def test_a_refusal_the_file_does_not_decide_is_not_remembered(world: World, detail: str) -> None:
-    """Ruling R18: a refusal that is no property of the file is not remembered, and the next prepare runs a job again.
+async def test_a_refusal_that_may_pass_is_remembered_when_it_comes_twice_in_a_row(world: World, detail: str) -> None:
+    """Ruling R22: an ``unreadable_file`` the file does not decide alone is not remembered once, and is twice in a row.
 
-    Such are a job that could not write inside its sandbox, and a conversion that ended for no reason the file gives.
+    Such are a job that could not write inside its sandbox, a conversion that ended for no reason the file gives, and
+    any text the api does not know: the second prepare runs a job again, the third is answered from memory.
     """
     source = world.photo()
     world.executor.status, world.executor.payload = "error", {"error": detail}
-    for _ in range(2):
-        assert await refused_with(world.prepare(source)) == (422, detail)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert (len(world.executor.requests), world.store.refusal_of(source)) == (1, None)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert (len(world.executor.requests), world.store.refusal_of(source)) == (2, detail)
+    assert await refused_with(world.prepare(source)) == (422, detail)
     assert len(world.executor.requests) == 2
+    assert world.events()[-1]["criteria"]["remembered"] is True
+
+
+async def test_a_success_between_two_refusals_that_may_pass_starts_the_count_again(world: World) -> None:
+    """Ruling R22: a prepare that went well between two such refusals resets their count: two more are needed."""
+    source = world.photo()
+    passing = {"error": "unreadable_file: the renders could not be written"}
+    world.executor.status, world.executor.payload = "error", passing
+    await refused_with(world.prepare(source))
+    world.executor.status, world.executor.payload = "ok", None
+    assert (await world.prepare(source)).kind == "image"
+    for row in world.store.derived_of(source):  # its renders went: the next call prepares it again
+        world.store.remove_derived(row)
+    world.executor.status, world.executor.payload = "error", passing
+    await refused_with(world.prepare(source))
     assert world.store.refusal_of(source) is None
+    await refused_with(world.prepare(source))
+    assert world.store.refusal_of(source) == passing["error"]
+    assert len(world.executor.requests) == 4
 
 
-def test_the_refusals_not_remembered_are_the_runners_own_words() -> None:
-    """The api names the executor's texts of a write that failed and of a conversion with no reason, word for word.
+@pytest.mark.parametrize("detail", sorted(api_renders.FILE_DECIDED))
+async def test_a_refusal_the_file_decides_is_remembered_at_once(world: World, detail: str) -> None:
+    """Ruling R22: each allow-listed ``unreadable_file`` text, and any ``unsupported_format``, is remembered at once."""
+    source = world.photo()
+    world.executor.status, world.executor.payload = "error", {"error": detail}
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert await refused_with(world.prepare(source)) == (422, detail)
+    assert len(world.executor.requests) == 1
+    other = world.photo("quay-photo-2.jpg")
+    unsupported = "unsupported_format: an invented reason no runner gives"
+    world.executor.payload = {"error": unsupported}
+    assert await refused_with(world.prepare(other)) == (422, unsupported)
+    assert world.store.refusal_of(other) == unsupported
 
-    It imports nothing of the executor, so this pins its copies against the runners' constants and source.
-    """
-    from workbench.executor.render import office
-    from workbench.executor.runners import convert, render
 
-    words = {
-        f"unreadable_file: {convert._NOT_WRITTEN}",
-        f"unreadable_file: {office._NOT_CONVERTED}",
-        f"unreadable_file: {convert._NOT_CONVERTED}",
+def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
+    """The allow-list is the runners' own texts of refusals the file decides, each tied to the constant that says it."""
+    from workbench.executor import readers
+    from workbench.executor.render import encode, images, office, pages
+    from workbench.executor.runners import convert
+
+    said = {
+        readers.DAMAGED,
+        readers.TOO_BIG,
+        readers.PDF_ENCRYPTED,
+        readers._OFFICE_ENCRYPTED,
+        office.TOO_MANY_PICTURES,
+        office._NOT_OPENED,
+        images._TOO_MANY_PIXELS,
+        pages._NO_PAGES,
+        encode._NO_FIT,
+        convert._LOCKED,
+        convert._PICTURE_TOO_LARGE,
+        convert._TOO_LARGE,
     }
-    assert words | {"unreadable_file: the renders could not be written"} == api_renders.NOT_REMEMBERED
-    assert 'error("unreadable_file", "the renders could not be written")' in Path(render.__file__).read_text()
+    assert {f"unreadable_file: {text}" for text in said} == api_renders.FILE_DECIDED
+    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, "the renders could not be written"}
+    assert not {f"unreadable_file: {text}" for text in passing} & api_renders.FILE_DECIDED
 
 
 async def test_a_new_upload_under_the_same_name_is_converted_afresh(world: World, fake_office: FakeOffice) -> None:

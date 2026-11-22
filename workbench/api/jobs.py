@@ -128,11 +128,13 @@ MCP_QUEUE_WAIT_S: Final = 5
 #: an Office file's prepare, converting it and drawing it in one turn (13-31 s for a deck of photos; a conversion that
 #: is refused may run to its budget, 3/4 of the wall), so the call waits as long as it would have spent converting the
 #: file itself had it found the lock free: one job wall, the default of ``WORKBENCH_JOB_WALL_S`` and of Ghostwriter's
-#: own. It stays short of Ghostwriter's 150 s for a tool call, so a call that waits it out is still answered (busy,
-#: ``wait_timeout``) in time. The wait holds no slot, no turn and no place in a line: only the lock is waited for.
-#: A call that converts a file on demand waits for its caller's conversion gate up to the same bound, past its 5 s for
-#: a turn (ruling R19): it waits out another file's conversion, which ends within one job wall too; that wait holds
-#: the file's own lock, and its place in the conversion gate's line, as any wait for a turn does.
+#: own. It stays short of Ghostwriter's 150 s for a tool call, so a call that waits out this one wait is answered
+#: (busy, ``wait_timeout``) before Ghostwriter gives up on it. The wait holds no slot, no turn and no place in a line:
+#: only the lock is waited for. A call that converts a file on demand waits for its caller's conversion gate and then a
+#: slot up to the same bound, past its 5 s for a turn (ruling R19): it waits out another file's conversion, which ends
+#: within one job wall too; that wait holds the file's own lock, and its place in the conversion gate's line, as any
+#: wait for a turn does. The two waits are apart: a view that converts can wait for both and then run two jobs, so its
+#: worst case passes Ghostwriter's 150 s (``docs/configuration.md`` says what a caller's timeout should allow for).
 SOURCE_LOCK_WAIT_S: Final = 120
 
 #: Seconds a prepare waits for its turn at the most. One prepare takes 1-6 s, so 120 s covers a burst of some 20-100

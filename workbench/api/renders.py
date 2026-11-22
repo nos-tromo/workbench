@@ -28,12 +28,12 @@ the source's lock, never the other way round; a turn that converts an Office fil
 whoever runs it, so that a caller converts one file at a time and a picture's prepare never waits behind it. The rows
 are read again after every job: a render whose row is not there is never answered, whatever the job said it made.
 
-A file the runner refuses for what it is (``unreadable_file``, ``unsupported_format``: :data:`REMEMBERED`), at its
-prepare or its conversion, is remembered so by the store (:meth:`~workbench.api.store.Store.remember_refusal`), and
+A file the runner refuses for what it is (``unsupported_format``, or an ``unreadable_file`` of :data:`FILE_DECIDED`), at
+its prepare or its conversion, is remembered so by the store (:meth:`~workbench.api.store.Store.remember_refusal`), and
 every later prepare or render of it is answered with the same refusal at once, with no job, recorded as the refusal
-was. A refusal that is no property of the file (a write that failed in the job's sandbox, a conversion that ended for no
-reason the file gives: :data:`NOT_REMEMBERED`) or that may pass (out of time, a busy executor, a failure) is not
-remembered.
+was. Any other ``unreadable_file`` (a write that failed in the job's sandbox, a conversion that ended for no reason the
+file gives, a text the api does not know) is remembered only when it comes twice in a row, a job that went well between
+starting the count again; out of time, a busy executor or a failure is never remembered.
 """
 
 import base64
@@ -92,21 +92,38 @@ _RENDER_ROLES: Final = frozenset({"image", "page"})
 #: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
 _CONVERTED_ROLE: Final = "pdf"
 
-#: The runner's refusals that the file alone decides, which the api remembers of a refused prepare or conversion: each
-#: later prepare or render of the file is answered with it at once. A ``read_timeout``, a busy executor or a failure
-#: may pass, and is tried again.
+#: The runner's codes whose refusals the api remembers of a prepare or a conversion, so that each later prepare or
+#: render of the file is answered with it at once: every ``unsupported_format`` at once, an ``unreadable_file`` at once
+#: when its text is one of :data:`FILE_DECIDED` and else when it comes twice in a row (ruling R22). A ``read_timeout``,
+#: a busy executor or a failure is never remembered.
 REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
 
-#: The refusals of those codes that are no property of the file, word for word as the runners give them: a job that
-#: could not write its own output inside its sandbox (an ``OSError``), and a conversion that ended for no reason the
-#: file gives (its child ended without a cause, or its PDF could not be joined, written or read back, which can be such
-#: an ``OSError`` too). They are not remembered (ruling R18), and the next call runs the job again.
-NOT_REMEMBERED: Final = frozenset(
-    {
-        "unreadable_file: the converted file could not be written",
-        "unreadable_file: the renders could not be written",
-        "unreadable_file: the file could not be converted to pages",
-    }
+#: The ``unreadable_file`` refusals the file alone decides, word for word as the runners give them, remembered at once:
+#: damaged or not what its name says, too large to read within the memory limit, password-protected (a PDF, an Office
+#: file or an old binary one), not opened by LibreOffice, more or larger pictures than can be drawn within the memory
+#: limit (also when a conversion redone in parts runs out of its time: ruling R23), a picture over 120 megapixels, a PDF
+#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB. The api imports nothing of
+#: the executor, so these are its copies, which ``tests/api/test_renders.py`` pins to the runners' constants. Any other
+#: text, such as a job that could not write inside its sandbox, a conversion that ended for no reason the file gives,
+#: or a text added to a runner later, is remembered only when it comes twice in a row: a passing failure costs one job
+#: more, and a file that always fails so holds its caller's conversion gate twice, never more.
+FILE_DECIDED: Final = frozenset(
+    f"unreadable_file: {text}"
+    for text in (
+        "the file is damaged or truncated, or is not what its extension says",
+        "the file is too large to read within the memory limit",
+        "the PDF is password-protected (encrypted)",
+        "the file is password-protected (encrypted) or in an old binary format: "
+        "remove the password and save it as a current .docx, .xlsx or .pptx",
+        "LibreOffice could not open the file: it is damaged, or not what its extension says",
+        "the file holds more or larger pictures than can be drawn within the memory limit",
+        "the picture is larger than 120 megapixels",
+        "the PDF has no pages",
+        "the picture cannot be made small enough to show",
+        "the file is password-protected (encrypted)",
+        "the file holds a picture larger than 120 megapixels",
+        "the converted file is larger than 32 MB",
+    )
 )
 
 #: The status of a refusal answered from memory: both codes of :data:`REMEMBERED` are ``422``.
@@ -538,7 +555,7 @@ def _lost(message: str) -> Exception:
 
 
 def _settled(store: Store, source: FileRecord, result: JobResult) -> dict[str, Any]:
-    """Take the runner's answer out of a prepare's or a conversion's job, remembering a refusal of the file itself.
+    """Take the runner's answer out of a prepare's or a conversion's job, remembering or counting a refusal of it.
 
     Args:
         store: The store, which remembers the refusal.
@@ -549,16 +566,21 @@ def _settled(store: Store, source: FileRecord, result: JobResult) -> dict[str, A
         The runner's answer, of a job that ran to the end.
 
     Raises:
-        HTTPException: What :func:`~workbench.api.tools._payload` raises; a refusal of :data:`REMEMBERED`, but none of
-            :data:`NOT_REMEMBERED`, is remembered for ``source`` first, in the words it is raised with.
+        HTTPException: What :func:`~workbench.api.tools._payload` raises; a refusal of :data:`REMEMBERED` is remembered
+            for ``source`` first, in the words it is raised with: at once when the file decides it, else counted
+            (:data:`FILE_DECIDED`).
     """
     try:
-        return _payload(result, "file")
+        payload = _payload(result, "file")
     except HTTPException as refused:
         detail = str(refused.detail)
-        if refusal(result) in REMEMBERED and detail not in NOT_REMEMBERED:
-            store.remember_refusal(source, detail)
+        code = refusal(result)
+        if code in REMEMBERED:
+            at_once = code == "unsupported_format" or detail in FILE_DECIDED
+            store.remember_refusal(source, detail, at_once=at_once)
         raise
+    store.forget_refusal(source)  # a job that went well: a count of refusals that may pass starts again
+    return payload
 
 
 def _record_remembered(
@@ -646,6 +668,8 @@ async def _convert(
         The PDF's row, read again after the job.
 
     Raises:
+        ValueError: ``turn`` is not of the conversion gate, so the caller could convert beside another conversion of
+            its own; that is a programming error, raised before any job or event.
         AuditWriteError: The job's event could not be written; no PDF is kept.
         Busy: The executor is busy.
         HTTPException: The runner refused the file (its code's status: 422 ``unreadable_file`` for a damaged,
@@ -673,6 +697,8 @@ async def _convert(
         }
         return keep, outcome, {**criteria, **more}
 
+    if turn.gate != "conversion":
+        raise ValueError("a conversion runs in a turn of the conversion gate")
     keeper = OutputKeeper(audit, p, "prepare", [source.id], decide)
     _, result, _ = await jobs.submit_conversion(p, source, {"budget_s": _budget(settings)}, keeper, turn=turn)
     _parse(ConvertAnswer, _settled(store, source, result))

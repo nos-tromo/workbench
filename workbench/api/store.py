@@ -72,9 +72,11 @@ _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 #: turn or any upload takes to arrive. A deleted chat's id never comes back, so the hold costs nothing.
 DELETED_CHAT_HOLD_S: Final = 3600
 
-#: Most refusals the store remembers, one per source; past it, the one asked for least recently is forgotten. Each is
-#: an id, two numbers and a short fixed text, so a few thousand cost the api well under a megabyte.
+#: Most refusals the store remembers or counts, one per source; past it, the one asked for least recently is forgotten.
+#: Each is an id, three numbers and a short fixed text, so a few thousand cost the api well under a megabyte.
 REFUSALS_MAX: Final = 4096
+#: How many refusals in a row of one source make one that may pass remembered (:meth:`Store.remember_refusal`).
+REFUSALS_IN_A_ROW: Final = 2
 
 #: A file id: 32 lowercase hex digits (``uuid4().hex``).
 _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
@@ -590,8 +592,9 @@ class Store:
         self._monotonic: Callable[[], float] = time.monotonic
         self._deleted: dict[tuple[str, str, str], float] = {}
         self._refusals_lock = threading.Lock()
-        # By source id: the source's creation time and size, and the runner's refusal of it, oldest asked for first.
-        self._refusals: OrderedDict[str, tuple[float, int, str]] = OrderedDict()
+        # By source id: the source's creation time and size, the runner's last refusal of it and how many came in a row
+        # (``REFUSALS_IN_A_ROW`` or more once it is remembered), oldest asked for first.
+        self._refusals: OrderedDict[str, tuple[float, int, str, int]] = OrderedDict()
         db_path.parent.mkdir(mode=_PRIVATE_DIR, parents=True, exist_ok=True)
         fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, _PRIVATE_FILE)
         try:
@@ -1352,24 +1355,48 @@ class Store:
                 raise
         return len(files)
 
-    def remember_refusal(self, source: FileRecord, detail: str) -> None:
+    def remember_refusal(self, source: FileRecord, detail: str, *, at_once: bool = True) -> bool:
         """Remember how the runner refused a source, so that later calls answer it without a job.
 
-        Only a refusal that the file alone decides is remembered (the caller chooses which). It lives in this process,
-        never in the database: a restart forgets it, and so does the source's removal (:meth:`remove`,
-        :meth:`delete_chat`). It is kept by the source's id with its creation time and size, so no other file inherits
-        it: an upload under the same name is a new record with a new id. Past ``REFUSALS_MAX`` the refusal asked for
-        least recently is forgotten, and that file is only tried again.
+        A refusal the file alone decides is remembered at once; one that may pass (the caller says which) only when
+        it comes ``REFUSALS_IN_A_ROW`` times in a row for the source, with no success between (:meth:`forget_refusal`).
+        It lives in this process, never in the database: a restart forgets it, and so does the source's removal
+        (:meth:`remove`, :meth:`delete_chat`); a source of a chat deleted while its job ran is not remembered at all. A
+        source removed by retention while its job runs can be, until it is pushed out: its id never comes back. It is
+        kept by the source's id with its creation time and size, so no other file inherits it: an upload under the same
+        name is a new record with a new id. Past ``REFUSALS_MAX`` the refusal asked for least recently is forgotten,
+        and that file is only tried again.
 
         Args:
             source: The file refused.
             detail: The runner's refusal, its code first, as the caller is told it; it names no file.
+            at_once: Whether the file alone decides the refusal; otherwise it is counted.
+
+        Returns:
+            Whether the refusal is remembered now.
         """
+        deadline = self._deleted.get((source.caller, source.user_id, source.chat_id))
+        deleted = deadline is not None and deadline > self._monotonic()
         with self._refusals_lock:
-            self._refusals[source.id] = (source.created_at, source.size, detail)
+            if deleted:
+                self._refusals.pop(source.id, None)
+                return False
+            held = self._refusals.get(source.id)
+            before = held[3] if held is not None and held[:2] == (source.created_at, source.size) else 0
+            count = REFUSALS_IN_A_ROW if at_once else min(before + 1, REFUSALS_IN_A_ROW)
+            self._refusals[source.id] = (source.created_at, source.size, detail, count)
             self._refusals.move_to_end(source.id)
             while len(self._refusals) > REFUSALS_MAX:
                 self._refusals.popitem(last=False)
+            return count >= REFUSALS_IN_A_ROW
+
+    def forget_refusal(self, source: FileRecord) -> None:
+        """Forget what is counted or remembered of a source's refusals: a job of it just went well.
+
+        Args:
+            source: The file.
+        """
+        self._forget_refusals([source.id])
 
     def refusal_of(self, source: FileRecord) -> str | None:
         """The refusal remembered of a source (:meth:`remember_refusal`), if this very file was refused.
@@ -1378,19 +1405,19 @@ class Store:
             source: The file.
 
         Returns:
-            The refusal as the caller was told it; ``None`` when none is remembered, or the one remembered under its id
-            is of a record of another time or size, which is then forgotten.
+            The refusal as the caller was told it; ``None`` when none is remembered (one that may pass counted once is
+            not), or the one under its id is of a record of another time or size, which is then forgotten.
         """
         with self._refusals_lock:
             held = self._refusals.get(source.id)
             if held is None:
                 return None
-            created_at, size, detail = held
+            created_at, size, detail, count = held
             if (created_at, size) != (source.created_at, source.size):
                 del self._refusals[source.id]
                 return None
             self._refusals.move_to_end(source.id)
-            return detail
+            return detail if count >= REFUSALS_IN_A_ROW else None
 
     def _forget_refusals(self, ids: Iterable[str]) -> None:
         """Forget the refusals of files that went.

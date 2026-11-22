@@ -420,10 +420,11 @@ async def view_file(
     With ``rendition`` the answer is one render of a picture or a PDF instead: page ``rendition``, or the picture for
     1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. A page or the strips of it that do not
     exist yet are made first, in one job on the user's own turn, which waits at most
-    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S` (an Office file converted on demand, on the caller's conversion gate);
-    while another call makes the file's renders, such as its prepare converting it, the view waits for that call up to
-    :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S` and answers what it made. ``strips`` of 1 takes no ``strip`` but 1, a
-    greater ``strips`` needs one, from 1 to ``strips``.
+    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. An Office file with no PDF kept is converted on demand first, and
+    drawn, in one turn of the caller's conversion gate, which waits for that gate and then a slot up to
+    :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S`. While another call makes the file's renders, such as its prepare
+    converting it, the view waits for that call up to :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S` too, and answers
+    what it made. ``strips`` of 1 takes no ``strip`` but 1, a greater ``strips`` needs one, from 1 to ``strips``.
 
     Args:
         path: The file's virtual path.
