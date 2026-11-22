@@ -129,13 +129,18 @@ Three more places hold data for a short time:
   until a checkpoint copies over them (see
   [retention.md](retention.md#after-a-sweep));
 - the api's memory, which remembers the refusal of a file the executor could
-  not convert or draw for what it is (`unreadable_file`, `unsupported_format`):
+  not convert or draw for what it is: one that is damaged or not what its name
+  says, password-protected, a deck with no slides, a macro-enabled deck or a
+  slide show, one with a picture over 120 megapixels or more pictures than can
+  be drawn within the memory limit, or one whose PDF would pass 32 MB. It keeps
   the file's id, its creation time and size, and the refusal's fixed text,
   which names no file (`workbench/api/store.py:Store.remember_refusal`). Every
   later prepare, view or read of the file's pages is answered with it at once,
   with no job, and recorded as the refusal was
   ([audit.md](audit.md#what-is-recorded), `remembered`). It is never written to
-  the volume.
+  the volume. A job that could not write inside its sandbox, a conversion that
+  ended for no reason the file gives, one out of time and a busy executor are
+  never remembered.
 
 workbench encrypts nothing at rest. Encryption of the host's disk is the
 operator's.

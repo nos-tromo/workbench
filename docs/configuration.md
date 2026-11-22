@@ -108,7 +108,9 @@ an `isError` result whose `reason` says why:
 - An Office file's conversion and the drawing of its pages after it, two jobs
   in one turn, wait for the caller's **conversion gate** instead, whether the
   prepare of an attachment runs them (up to its 120 s) or a view or a tool
-  converts the file on demand (up to its 5 s): one conversion of a caller runs
+  converts the file on demand (up to 120 s too, `SOURCE_LOCK_WAIT_S`, past its
+  5 s for a turn: it waits out another file's conversion, which ends within one
+  job wall, as for a file's lock below): one conversion of a caller runs
   at a time, over all its users, apart from the prepare gate, so a picture
   attached while a deck converts is prepared at once, and a caller never
   converts two files at once. At most 32 conversions wait, counted as the
@@ -122,12 +124,18 @@ an `isError` result whose `reason` says why:
   default: as long as the call would have spent converting the file itself,
   and short of Ghostwriter's 150 s for a tool call. The wait holds no slot, no
   turn and no waiting place.
-- A file the executor refused for what it is (`unreadable_file`,
-  `unsupported_format`), at its prepare or its conversion, is refused again at
-  once by every later prepare, view or read of its pages, with no job: the api
-  remembers the refusal of up to 4096 files (`REFUSALS_MAX`), in memory alone,
-  until the file goes or the api restarts ([data-flow.md](data-flow.md#how-long)).
-  A refusal that may pass (out of time, busy) is tried again.
+- A file the executor refused for what it is, at its prepare or its
+  conversion, is refused again at once by every later prepare, view or read of
+  its pages, with no job. Those refusals are of a file that is damaged or not
+  what its name says, password-protected, a deck with no slides, a
+  macro-enabled deck or a slide show, one with a picture over 120 megapixels or
+  more pictures than can be drawn within the memory limit, or one whose PDF
+  would pass 32 MB. The api remembers the refusal of up to 4096 files
+  (`REFUSALS_MAX`), in memory alone, until the file goes or the api restarts
+  ([data-flow.md](data-flow.md#how-long)). A refusal that is no property of the
+  file (a job that could not write inside its sandbox, a conversion that ended
+  for no reason the file gives) or that may pass (out of time, busy) is tried
+  again.
 - A `read_document` call on a PDF or a deck can run the read, a deck's
   conversion to a PDF, the render of its pages or slides without text and, when
   strips are asked for, a strips job one after the other, each as long as a job

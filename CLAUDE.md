@@ -433,14 +433,20 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   13-31 s, so a view of it waits for that prepare rather than answer busy, and
   converts nothing again. 120 s is one job wall, what the call would have spent
   converting itself, and short of Ghostwriter's 150 s for a tool call. The wait
-  holds nothing else; every path takes the lock first and a turn second.
+  holds nothing else; every path takes the lock first and a turn second. A call
+  that converts a file on demand waits for the conversion gate up to the same
+  120 s, past its 5 s, since it waits out another file's conversion.
 - **A refusal is remembered, in memory alone.** A file the executor refused for
-  what it is (`unreadable_file`, `unsupported_format`), at its prepare or its
-  conversion, is answered with that refusal by every later prepare or render, with
-  no job, from `Store.refusal_of` (an LRU of `REFUSALS_MAX`, by the source's id,
-  creation time and size), and recorded as the refusal was, with
+  what it is (`unreadable_file`, `unsupported_format`: damaged, encrypted, no
+  slides, a picture over 120 MP, too many pictures, a PDF past 32 MB), at its
+  prepare or its conversion, is answered with that refusal by every later prepare
+  or render, with no job, from `Store.refusal_of` (an LRU of `REFUSALS_MAX`, by the
+  source's id, creation time and size), and recorded as the refusal was, with
   `remembered: true`. It goes with the file (`Store.remove`, `Store.delete_chat`)
-  and with a restart. A `read_timeout`, a busy executor or a failure is tried again.
+  and with a restart. The texts of `renders.NOT_REMEMBERED` (a write that failed in
+  the job's sandbox, a conversion that ended for no reason the file gives) carry
+  the same code and are not remembered; nor is a `read_timeout`, a busy executor or
+  a failure.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in
