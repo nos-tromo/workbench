@@ -1195,6 +1195,64 @@ async def test_a_lock_held_past_its_bound_is_wait_timeout(
     await preparing
 
 
+def their_deck(world: World, name: str = "quay-deck.pptx") -> FileRecord:
+    """A deck of three invented slides of user B's chat."""
+    return put(world.store, name, mk.make_deck(world.built / name, 3).read_bytes(), p=PB_SETUP)
+
+
+async def test_a_view_that_converts_waits_out_another_conversion(world: World, fake_office: FakeOffice) -> None:
+    """Ruling R19: a view of a deck no one prepared converts it on demand, and waits out user B's conversion to do so.
+
+    It waits for the conversion gate past its own turn's wait (none here), up to ``SOURCE_LOCK_WAIT_S``, in the gate's
+    own line and not the queue's; then it converts and answers the slides, never ``wait_timeout``.
+    """
+    held, executor = held_world(world)
+    theirs, mine = their_deck(held), held.deck(3)
+    preparing = asyncio.create_task(
+        prepared(PB, theirs, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare"))
+    )
+    await executor.converting.wait()
+    viewing = asyncio.create_task(view(held, mine, a_call(held, wait_s=0)))
+    await until(lambda: queue_length(held) == 1)
+    await asyncio.sleep(0.1)
+
+    assert not viewing.done()
+    line = held.queue._shared_gates["conversion", "ghostwriter"]  # the conversion gate's own count of who waits
+    assert (line.waiting, held.queue._waiting, held.queue.tracked_users) == (1, 0, 0)
+    executor.release.set()
+    await preparing
+    assert shown_labels(await viewing) == ["slide 1", "slide 2", "slide 3"]
+    assert executor.peak == 1
+    assert [(req.user_id, req.tool) for req in held.executor.requests] == [
+        ("user-b", "convert_office"),
+        ("user-b", "prepare_file"),
+        ("user-a", "convert_office"),
+        ("user-a", "prepare_file"),
+    ]
+    assert queue_length(held) == 0
+
+
+async def test_a_view_that_converts_waits_for_the_gate_no_longer_than_its_bound(
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past ``SOURCE_LOCK_WAIT_S`` (lowered here) for the conversion gate, a view that would convert is refused busy."""
+    monkeypatch.setattr(tools_mcp, "SOURCE_LOCK_WAIT_S", 0.2)
+    held, executor = held_world(world)
+    theirs, mine = their_deck(held), held.deck(3)
+    preparing = asyncio.create_task(
+        prepared(PB, theirs, settings=held.settings, store=held.store, audit=held.audit, jobs=held.jobs("prepare"))
+    )
+    await executor.converting.wait()
+    async with asyncio.timeout(scaled(2)):
+        with pytest.raises(Busy) as refused:
+            await view(held, mine, a_call(held, wait_s=0))
+    assert refused.value.reason == "wait_timeout"
+    assert queue_length(held) == 0
+    executor.release.set()
+    await preparing
+    assert conversions(held) == 1
+
+
 # --- refusals remembered -----------------------------------------------------------------------------------------
 
 #: The refusal of a deck whose pictures cannot all be drawn within the memory limit, as the runner words it.
@@ -1281,6 +1339,45 @@ async def test_a_refusal_that_may_pass_is_not_remembered(
             await world.prepare(source)
     assert len(world.executor.requests) == 2
     assert world.store.refusal_of(source) is None
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "unreadable_file: the converted file could not be written",
+        "unreadable_file: the renders could not be written",
+        "unreadable_file: the file could not be converted to pages",
+    ],
+    ids=["conversion-not-written", "renders-not-written", "not-converted"],
+)
+async def test_a_refusal_the_file_does_not_decide_is_not_remembered(world: World, detail: str) -> None:
+    """Ruling R18: a refusal that is no property of the file is not remembered, and the next prepare runs a job again.
+
+    Such are a job that could not write inside its sandbox, and a conversion that ended for no reason the file gives.
+    """
+    source = world.photo()
+    world.executor.status, world.executor.payload = "error", {"error": detail}
+    for _ in range(2):
+        assert await refused_with(world.prepare(source)) == (422, detail)
+    assert len(world.executor.requests) == 2
+    assert world.store.refusal_of(source) is None
+
+
+def test_the_refusals_not_remembered_are_the_runners_own_words() -> None:
+    """The api names the executor's texts of a write that failed and of a conversion with no reason, word for word.
+
+    It imports nothing of the executor, so this pins its copies against the runners' constants and source.
+    """
+    from workbench.executor.render import office
+    from workbench.executor.runners import convert, render
+
+    words = {
+        f"unreadable_file: {convert._NOT_WRITTEN}",
+        f"unreadable_file: {office._NOT_CONVERTED}",
+        f"unreadable_file: {convert._NOT_CONVERTED}",
+    }
+    assert words | {"unreadable_file: the renders could not be written"} == api_renders.NOT_REMEMBERED
+    assert 'error("unreadable_file", "the renders could not be written")' in Path(render.__file__).read_text()
 
 
 async def test_a_new_upload_under_the_same_name_is_converted_afresh(world: World, fake_office: FakeOffice) -> None:

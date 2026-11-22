@@ -31,7 +31,9 @@ are read again after every job: a render whose row is not there is never answere
 A file the runner refuses for what it is (``unreadable_file``, ``unsupported_format``: :data:`REMEMBERED`), at its
 prepare or its conversion, is remembered so by the store (:meth:`~workbench.api.store.Store.remember_refusal`), and
 every later prepare or render of it is answered with the same refusal at once, with no job, recorded as the refusal
-was. A refusal that may pass (out of time, a busy executor, a failure) is not remembered.
+was. A refusal that is no property of the file (a write that failed in the job's sandbox, a conversion that ended for no
+reason the file gives: :data:`NOT_REMEMBERED`) or that may pass (out of time, a busy executor, a failure) is not
+remembered.
 """
 
 import base64
@@ -94,6 +96,18 @@ _CONVERTED_ROLE: Final = "pdf"
 #: later prepare or render of the file is answered with it at once. A ``read_timeout``, a busy executor or a failure
 #: may pass, and is tried again.
 REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
+
+#: The refusals of those codes that are no property of the file, word for word as the runners give them: a job that
+#: could not write its own output inside its sandbox (an ``OSError``), and a conversion that ended for no reason the
+#: file gives (its child ended without a cause, or its PDF could not be joined, written or read back, which can be such
+#: an ``OSError`` too). They are not remembered (ruling R18), and the next call runs the job again.
+NOT_REMEMBERED: Final = frozenset(
+    {
+        "unreadable_file: the converted file could not be written",
+        "unreadable_file: the renders could not be written",
+        "unreadable_file: the file could not be converted to pages",
+    }
+)
 
 #: The status of a refusal answered from memory: both codes of :data:`REMEMBERED` are ``422``.
 _REFUSED_STATUS: Final = 422
@@ -230,7 +244,9 @@ class RenderJobs(Protocol):
         Args:
             p: The caller and user.
             converting: Whether the turn converts an Office file: it is then of the caller's conversion gate, whatever
-                the call's own gate is, and the jobs sent in it run on that gate.
+                the call's own gate is, waited for up to ``SOURCE_LOCK_WAIT_S`` if the call's own wait is shorter (it
+                waits out another file's conversion, which ends within one job wall), and the jobs sent in it run on
+                that gate.
 
         Returns:
             The turn, held while the context runs; entering it raises ``Busy`` as a job's turn does.
@@ -328,12 +344,16 @@ class RouteJobs:
 
         Args:
             p: The caller and user.
-            converting: Whether the turn converts an Office file.
+            converting: Whether the turn converts an Office file. It then waits for the conversion gate up to
+                ``SOURCE_LOCK_WAIT_S``, if the route's own wait is shorter, as for a source's lock.
 
         Returns:
             The turn, held while the context runs.
         """
-        return self.queue.turn(p, call=self.call, gate="conversion" if converting else self.gate)
+        if not converting:
+            return self.queue.turn(p, call=self.call, gate=self.gate)
+        call = dataclasses.replace(self.call, wait_s=max(self.call.wait_s, SOURCE_LOCK_WAIT_S))
+        return self.queue.turn(p, call=call, gate="conversion")
 
     def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the lock of one source's renders, waiting at most ``SOURCE_LOCK_WAIT_S``, whatever the route's wait.
@@ -529,14 +549,15 @@ def _settled(store: Store, source: FileRecord, result: JobResult) -> dict[str, A
         The runner's answer, of a job that ran to the end.
 
     Raises:
-        HTTPException: What :func:`~workbench.api.tools._payload` raises; a refusal of :data:`REMEMBERED` is remembered
-            for ``source`` first, in the words it is raised with.
+        HTTPException: What :func:`~workbench.api.tools._payload` raises; a refusal of :data:`REMEMBERED`, but none of
+            :data:`NOT_REMEMBERED`, is remembered for ``source`` first, in the words it is raised with.
     """
     try:
         return _payload(result, "file")
     except HTTPException as refused:
-        if refusal(result) in REMEMBERED:
-            store.remember_refusal(source, str(refused.detail))
+        detail = str(refused.detail)
+        if refusal(result) in REMEMBERED and detail not in NOT_REMEMBERED:
+            store.remember_refusal(source, detail)
         raise
 
 

@@ -105,7 +105,8 @@ class CallJobs:
 
     Its renders (:meth:`submit_renders`) run on the user's own turn, or with an Office file's conversion on demand in a
     turn of the caller's conversion gate, and are derived files of their source, never files the call wrote:
-    :meth:`outputs` never names them. It waits for a source's lock up to ``SOURCE_LOCK_WAIT_S``, past its turn's wait.
+    :meth:`outputs` never names them. It waits for a source's lock, and for the conversion gate, up to
+    ``SOURCE_LOCK_WAIT_S``, past its turn's wait.
     """
 
     def __init__(self, queue: JobQueue, call: CallLimits) -> None:
@@ -202,12 +203,16 @@ class CallJobs:
         Args:
             p: The caller and user.
             converting: Whether the turn converts an Office file: a turn of the caller's conversion gate, so that the
-                caller converts one file at a time; otherwise the user's own turn.
+                caller converts one file at a time, waited for up to ``SOURCE_LOCK_WAIT_S`` rather than the call's
+                own wait, since it waits out another file's conversion; otherwise the user's own turn.
 
         Returns:
             The turn, held while the context runs; entering it raises ``Busy`` as a job's turn does.
         """
-        return self._queue.turn(p, call=self.call, gate="conversion" if converting else "user")
+        if not converting:
+            return self._queue.turn(p, call=self.call, gate="user")
+        call = dataclasses.replace(self.call, wait_s=max(self.call.wait_s, SOURCE_LOCK_WAIT_S))
+        return self._queue.turn(p, call=call, gate="conversion")
 
     def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
         """Hold the lock of one source's renders, as :meth:`JobQueue.source_lock`; wait ``SOURCE_LOCK_WAIT_S`` at most.

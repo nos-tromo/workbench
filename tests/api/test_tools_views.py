@@ -584,6 +584,8 @@ def test_view_file_shows_a_deck_written_in_the_chat(
 
 #: Ghostwriter's file routes state a purpose and a request id, as its MCP calls may.
 ROUTE_HEADERS = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request-ID": "req-1"}
+#: Ghostwriter's user B and the chat of theirs, as the store's own calls name them.
+THEIRS = ("ghostwriter", "user-b", "chat-1")
 
 
 @pytest.fixture
@@ -674,6 +676,51 @@ async def test_view_file_waits_for_a_sources_lock_no_longer_than_its_bound(
         assert (await preparing).status_code == 200
 
     assert refusal(viewed) == ("wait_timeout", "busy, retry later")
+
+
+@pytest.mark.anyio
+async def test_view_file_of_an_unprepared_deck_waits_out_another_users_conversion(
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    built: Path,
+    fake_office: FakeOffice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ruling R19: a deck no one prepared is converted by its view, after user B's conversion: never busy meanwhile.
+
+    The view waits for the conversion gate past its own turn's wait (lowered here to none), as for a source's lock.
+    """
+    monkeypatch.setattr(tools_mcp, "MCP_QUEUE_WAIT_S", 0)
+    executor = HeldConversion(settings.data_dir, built.parent / "held-conversions")
+    queue = JobQueue(settings, executor, store, Metrics(settings.data_dir))
+    theirs = put(store, "quay-deck.pptx", mk.make_deck(built / "quay-deck.pptx", 3).read_bytes(), p=Principal(*THEIRS))
+    mine = deck(store, built, 3)
+    async with door(settings, store, audit, queue) as http:
+        preparing = asyncio.create_task(
+            http.post(
+                "/files/prepare",
+                params={"path": theirs.virtual_path},
+                headers={**ROUTE_HEADERS, "X-User-Id": THEIRS[1]},
+            )
+        )
+        await executor.converting.wait()
+        viewing = asyncio.create_task(mcp_call(http, "view_file", {"path": mine.virtual_path}))
+        await asyncio.sleep(0.2)
+        assert not viewing.done()
+        executor.release.set()
+        prepared, viewed = await asyncio.gather(preparing, viewing)
+
+    assert prepared.status_code == 200
+    answer = seen(viewed)
+    assert [shown["label"] for shown in answer["structuredContent"]["shown"]] == ["slide 1", "slide 2", "slide 3"]
+    assert [(req.user_id, req.tool) for req in executor.requests] == [
+        ("user-b", "convert_office"),
+        ("user-b", "prepare_file"),
+        ("user-a", "convert_office"),
+        ("user-a", "prepare_file"),
+    ]
+    assert executor.peak == 1
 
 
 def test_view_file_of_a_refused_deck_answers_the_remembered_refusal(
