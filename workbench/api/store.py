@@ -270,23 +270,27 @@ class RendersFull(StoreError):
     """A source file already holds as many bytes of renders as it may."""
 
 
+#: The two reasons an artifact is refused, as the contract words them: fixed literals, the whole of what a caller is
+#: told. No text of a caller, no name and no byte of an artifact is ever part of one.
+ARTIFACT_EMPTY: Final = "unreadable_file: the artifact is empty"
+ARTIFACT_NOT_ITS_ROLE: Final = "unreadable_file: the artifact is not what its role says"
+_ARTIFACT_REASONS: Final = (ARTIFACT_EMPTY, ARTIFACT_NOT_ITS_ROLE)
+
+
 class UnreadableArtifact(StoreError):
     """The first bytes of an artifact are not what its role says; the message is the caller's answer.
 
-    Its message starts ``unreadable_file: ``, as the runner's refusals do: a reason given without the code gets it.
+    The message is :data:`ARTIFACT_EMPTY` or :data:`ARTIFACT_NOT_ITS_ROLE`, and nothing else can be made of it.
     """
 
-    CODE: Final = "unreadable_file"
-
-    def __init__(self, reason: str) -> None:
-        """Say why the artifact cannot be read.
+    def __init__(self, reason: str = ARTIFACT_NOT_ITS_ROLE) -> None:
+        """Say that the artifact cannot be read.
 
         Args:
-            reason: A short fixed text that names no file and quotes no byte of the artifact; it may start with the
-                code already.
+            reason: :data:`ARTIFACT_EMPTY` or :data:`ARTIFACT_NOT_ITS_ROLE`; any other text is replaced by the second,
+                so that no word of a caller and no byte of an artifact reaches an answer.
         """
-        prefix = f"{self.CODE}: "
-        super().__init__(reason if reason.startswith(prefix) else prefix + reason)
+        super().__init__(reason if reason in _ARTIFACT_REASONS else ARTIFACT_NOT_ITS_ROLE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -658,6 +662,58 @@ def _extension_of(spec: DerivedSpec) -> str:
     if spec.role not in _PICTURE_ROLES and (spec.width, spec.height) != (None, None):
         raise PathError("only a picture has a size in pixels")
     return extension
+
+
+def _new_derived(source: FileRecord, spec: DerivedSpec, file_id: str, size: int, extension: str) -> DerivedRecord:
+    """Build the record of a new derived file of ``source``: as old as it, of its owner and chat.
+
+    Args:
+        source: The file it is made from.
+        spec: What it is; its facts are stored as JSON, so what is not JSON raises.
+        file_id: Its id.
+        size: Its size in bytes, taken from the file.
+        extension: Its file's extension, from :func:`_extension_of`.
+
+    Returns:
+        The record.
+    """
+    meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
+    return DerivedRecord(
+        id=file_id,
+        source_id=source.id,
+        caller=source.caller,
+        user_id=source.user_id,
+        chat_id=source.chat_id,
+        role=spec.role,
+        ordinal=spec.ordinal,
+        name=f"{file_id}.{extension}",
+        size=size,
+        mime=spec.mime,
+        width=spec.width,
+        height=spec.height,
+        meta=meta,
+        created_at=source.created_at,
+    )
+
+
+def _open_part(part: Path) -> int:
+    """Create a ``.part`` new and private, never through a link.
+
+    Args:
+        part: Its path.
+
+    Returns:
+        The file, open for writing.
+
+    Raises:
+        StorageFull: If the volume or the user's disk quota is used up.
+    """
+    try:
+        return os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
+    except OSError as exc:
+        if _is_full(exc):
+            raise StorageFull("storage is full") from exc
+        raise
 
 
 def _owner(rec: DerivedRecord) -> tuple[str, str, str, str]:
@@ -1860,9 +1916,9 @@ class Store:
             source: The file it is a render of; its row must still be there, for its owner and chat.
             staged: A regular file, not a symlink; it is moved, so it is gone afterwards.
             spec: What it is. Each role takes its own types alone: ``image/jpeg`` or ``image/png`` for ``image`` and
-                ``page``, ``image/jpeg`` for ``frame``, ``application/pdf`` for ``pdf``, ``text/plain`` for
-                ``transcript``, ``application/x-ndjson`` for ``nextext_jsonl`` and ``application/zip`` for
-                ``nextext_zip``; only a picture has a width and height.
+                ``page``, ``image/jpeg`` for ``frame``, ``application/pdf`` for ``pdf`` and ``text/plain`` for
+                ``transcript``; only a picture has a width and height. Never a clip's raw artifact, which
+                :meth:`stage_derived` and :meth:`place_derived` keep.
             file_id: The render's id, chosen and recorded by the caller: 32 lowercase hex digits.
             quota_bytes: Most bytes the user may hold in all chats together, renders included.
             cap_bytes: Most bytes of renders the source may have.
@@ -1871,8 +1927,8 @@ class Store:
             The new record.
 
         Raises:
-            PathError: If ``spec.mime`` is no type of derived file, its role does not take it, a file that is no picture
-                has a width or height, or ``staged`` is not a regular file.
+            PathError: If ``spec.mime`` is no type of derived file, its role does not take it, the role is a clip's raw
+                artifact, a file that is no picture has a width or height, or ``staged`` is not a regular file.
             ValueError: If ``file_id`` is not 32 lowercase hex digits.
             NotFound: If ``staged`` does not exist; ``staged`` stays.
             Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`; ``staged``
@@ -1884,7 +1940,8 @@ class Store:
             StorageFull: If the volume is full.
         """
         extension = _extension_of(spec)
-        meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
+        if spec.role in _ARTIFACT_ROLES:
+            raise PathError("a clip's raw artifacts are streamed in, never registered")
         st = _take_staged(staged)
         if _FILE_ID.fullmatch(file_id) is None:
             raise ValueError("a file id is 32 lowercase hex digits")
@@ -1893,22 +1950,7 @@ class Store:
             if not self._has_file(source.id, source.caller, source.user_id, source.chat_id):
                 raise Gone("file not found")
             self._refuse_deleted(p.caller, p.user_id, p.chat_id)
-            rec = DerivedRecord(
-                id=file_id,
-                source_id=source.id,
-                caller=p.caller,
-                user_id=p.user_id,
-                chat_id=p.chat_id,
-                role=spec.role,
-                ordinal=spec.ordinal,
-                name=f"{file_id}.{extension}",
-                size=st.st_size,
-                mime=spec.mime,
-                width=spec.width,
-                height=spec.height,
-                meta=meta,
-                created_at=source.created_at,
-            )
+            rec = _new_derived(source, spec, file_id, st.st_size, extension)
             held = self.derived_of(source)
             if self._derived_row(file_id) is not None or any(
                 (each.role, each.ordinal, each.strips, each.strip) == (rec.role, rec.ordinal, rec.strips, rec.strip)
@@ -1957,6 +1999,24 @@ class Store:
         except OSError as exc:
             _log.warning("could not remove an artifact that was not kept (%s)", type(exc).__name__)
 
+    def _discard_staged(self, staged: StagedArtifact) -> None:
+        """Remove the ``.part`` of a staged artifact that is not kept; it never raises, as it runs as an error goes up.
+
+        Call it under the store's lock. The path is made again from the source and the id, never taken from ``staged``.
+        A path that now runs through a link is not followed and is logged by its type: the error that brought the
+        artifact here stays the answer, and retention removes the ``.part``.
+
+        Args:
+            staged: What :meth:`stage_derived` returned; its ``.part``, its folders, or both gone is fine.
+        """
+        source = staged.source
+        try:
+            folder = self._derived_folder(Principal(source.caller, source.user_id, source.chat_id), source.id)
+        except PathError as exc:
+            _log.warning("could not find an artifact that was not kept (%s)", type(exc).__name__)
+            return
+        self._drop_part(folder / f"{staged.id}{_PART}")
+
     def stage_derived(
         self,
         source: FileRecord,
@@ -1992,12 +2052,15 @@ class Store:
 
         Raises:
             PathError: If ``spec`` is not an artifact's.
+            Conflict: If something that is no folder is in the way of the clip's folder.
             Gone: If the clip's row is gone or its chat was deleted, before the stage or while ``check`` read the
-                ``.part``.
+                ``.part`` (a ``FileNotFoundError`` of ``check`` is taken for the second).
             TooLarge: If the body is over ``max_bytes``.
             QuotaExceeded: If it is over the room.
             StorageFull: If the volume is full.
-            UnreadableArtifact: What ``check`` raised, or any other error of it; the ``.part`` is removed.
+            UnreadableArtifact: What ``check`` raises for an artifact that is not what its role says.
+            Exception: Any other error of ``check`` or of the disk, unchanged. Whatever the error, the ``.part`` is
+                removed, and the folders of the clip's derived files if they were left empty.
         """
         _extension_of(spec)
         if spec.role not in _ARTIFACT_ROLES:
@@ -2006,13 +2069,17 @@ class Store:
         p = Principal(source.caller, source.user_id, source.chat_id)
         with self._lock:  # the source, the room and the folders are settled before retention or a delete may look
             self._require_source(source)
-            freed = sum(each.size for each in _replaced_by(spec.role, self.derived_of(source)))
-            room = quota_bytes - self.usage(p) + freed
             folder = self._derived_folder(p, source.id)
-            self._ws.chat_dir(p)
-            self._make_dirs(folder)
             part = folder / f"{file_id}{_PART}"
-            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, _PRIVATE_FILE)
+            try:
+                freed = sum(each.size for each in _replaced_by(spec.role, self.derived_of(source)))
+                room = quota_bytes - self.usage(p) + freed
+                self._ws.chat_dir(p)
+                self._make_dirs(folder)
+                fd = _open_part(part)
+            except BaseException:
+                self._drop_part(part)  # the folders just made, if they are empty
+                raise
         try:
             size = self._write_part(fd, part, src, max_bytes=max_bytes, room=room)
             try:
@@ -2057,19 +2124,19 @@ class Store:
         Raises:
             Gone: If the source's row is gone, or its chat was deleted within :data:`DELETED_CHAT_HOLD_S`.
             NotFound: If the ``.part`` is gone, as after it was placed.
-            PathError: If the ``.part`` is not a regular file, or a path now runs through a symlink.
+            PathError: If ``staged``'s spec is not an artifact's, the ``.part`` is not a regular file, or a path now
+                runs through a symlink.
             QuotaExceeded: If it would take the user over ``quota_bytes``.
             RendersFull: If it would take the source over ``cap_bytes``.
             StorageFull: If the volume is full.
             Exception: What ``record`` raised, with nothing kept; or what the rename or commit raised after it.
         """
         source, spec = staged.source, staged.spec
-        extension = _extension_of(spec)
-        meta: Mapping[str, object] = json.loads(json.dumps(spec.meta, sort_keys=True, separators=(",", ":")))
         p = Principal(source.caller, source.user_id, source.chat_id)
         with self._lock:
-            part = self._derived_folder(p, source.id) / f"{staged.id}{_PART}"
-            try:
+            try:  # nothing is done before it: whatever fails, the .part is removed
+                extension = _extension_of(spec)
+                part = self._derived_folder(p, source.id) / f"{staged.id}{_PART}"
                 self._require_source(source)
                 st = _take_staged(part)
                 held = self.derived_of(source)
@@ -2079,22 +2146,7 @@ class Store:
                     raise QuotaExceeded("workspace quota exceeded")
                 if sum(each.size for each in held) - freed + st.st_size > cap_bytes:
                     raise RendersFull("the renders of this file are at their limit")
-                rec = DerivedRecord(
-                    id=staged.id,
-                    source_id=source.id,
-                    caller=p.caller,
-                    user_id=p.user_id,
-                    chat_id=p.chat_id,
-                    role=spec.role,
-                    ordinal=spec.ordinal,
-                    name=f"{staged.id}.{extension}",
-                    size=st.st_size,
-                    mime=spec.mime,
-                    width=spec.width,
-                    height=spec.height,
-                    meta=meta,
-                    created_at=source.created_at,
-                )
+                rec = _new_derived(source, spec, staged.id, st.st_size, extension)
                 ids = [each.id for each in replaced]
                 doomed = [self._derived_path(each) for each in replaced]
                 record(rec.id, rec.size, list(ids), "ok")
@@ -2105,7 +2157,7 @@ class Store:
                     again=lambda: record(rec.id, rec.size, list(ids), "error"),
                 )
             except BaseException:
-                self._drop_part(part)
+                self._discard_staged(staged)
                 raise
             for path in doomed:
                 try:
@@ -2117,13 +2169,14 @@ class Store:
     def drop_staged(self, staged: StagedArtifact) -> None:
         """Remove the ``.part`` of an artifact that is not placed, and the clip's empty folders of derived files.
 
+        It never raises for a ``.part`` or a folder that is gone, or for a path that now runs through a link (logged by
+        its type), so a caller may use it where an error is going up.
+
         Args:
             staged: What :meth:`stage_derived` returned; gone, or already placed, is fine.
         """
-        source = staged.source
-        p = Principal(source.caller, source.user_id, source.chat_id)
         with self._lock:
-            self._drop_part(self._derived_folder(p, source.id) / f"{staged.id}{_PART}")
+            self._discard_staged(staged)
 
     def derived_for(self, sources: Sequence[FileRecord]) -> list[DerivedRecord]:
         """List every render of some files, each by its own owner and chat.

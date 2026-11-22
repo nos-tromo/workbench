@@ -24,6 +24,8 @@ from workbench.api.registry import (
     allowed_tools,
 )
 from workbench.api.store import (
+    ARTIFACT_EMPTY,
+    ARTIFACT_NOT_ITS_ROLE,
     Conflict,
     NotFound,
     QuotaExceeded,
@@ -176,7 +178,8 @@ def test_the_tools_of_each_form_are_read_only() -> None:
             RendersFull("the renders of this file are at their limit"),
             (507, "the renders of this file are at their limit"),
         ),
-        (UnreadableArtifact("empty"), (422, "unreadable_file: empty")),
+        (UnreadableArtifact(ARTIFACT_EMPTY), (422, ARTIFACT_EMPTY)),
+        (UnreadableArtifact("a word of a caller"), (422, ARTIFACT_NOT_ITS_ROLE)),
         (AuditWriteError("x"), (500, "audit unavailable")),
         (Busy("queue_full"), (503, "busy, retry later")),
         (RequestTooLarge("x"), (422, "request too large")),

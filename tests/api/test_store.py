@@ -19,6 +19,8 @@ from tests.api.conftest import FORMER, PG, PG_SETUP, unrecorded
 from workbench import renders
 from workbench.api import store as store_module
 from workbench.api.store import (
+    ARTIFACT_EMPTY,
+    ARTIFACT_NOT_ITS_ROLE,
     Conflict,
     Gone,
     NotFound,
@@ -2388,22 +2390,45 @@ def test_a_failed_check_leaves_nothing(store: Store, alice: Principal, workspace
     def refuse(part: Path) -> None:
         seen.append(part)
         assert part.read_bytes() == b"not json"
-        raise UnreadableArtifact("the first line is not a JSON object")
+        raise UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE)
 
     with pytest.raises(UnreadableArtifact) as raised:
         stage_artifact(store, source, b"not json", check=refuse)
-    assert str(raised.value) == "unreadable_file: the first line is not a JSON object"
+    assert str(raised.value) == "unreadable_file: the artifact is not what its role says"
     assert len(seen) == 1
     assert seen[0].parent == clip_folder(workspaces, alice, source)
     assert not (workspaces.chat_dir(alice) / ".derived").exists()
     assert store.derived_of(source) == []
 
 
-def test_an_unreadable_artifact_answers_with_its_code() -> None:
-    """The message starts ``unreadable_file: ``, whether the caller wrote the code or not."""
-    assert str(UnreadableArtifact("empty")) == "unreadable_file: empty"
-    assert str(UnreadableArtifact("unreadable_file: empty")) == "unreadable_file: empty"
-    assert isinstance(UnreadableArtifact("empty"), StoreError)
+def test_an_unreadable_artifact_answers_with_one_of_two_literals() -> None:
+    """The message is the contract's own empty or not-its-role text: nothing a caller writes, no byte, can reach it."""
+    assert str(UnreadableArtifact(ARTIFACT_EMPTY)) == "unreadable_file: the artifact is empty"
+    assert str(UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE)) == "unreadable_file: the artifact is not what its role says"
+    assert str(UnreadableArtifact()) == ARTIFACT_NOT_ITS_ROLE
+    for text in (
+        "empty",
+        "unreadable_file: empty",
+        "unreadable_file: 'utf-8' codec can't decode byte 0xff in position 0",
+        "harbour-tour.mp4",
+        "",
+    ):
+        assert str(UnreadableArtifact(text)) == ARTIFACT_NOT_ITS_ROLE
+    assert isinstance(UnreadableArtifact(), StoreError)
+
+
+def test_another_error_of_the_check_goes_up_unchanged_and_leaves_nothing(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """Only a ``FileNotFoundError`` is taken for something else (a chat that went); the ``.part`` goes in any case."""
+    source = media_source(store, alice)
+
+    def broken(_: Path) -> None:
+        raise RuntimeError("synthetic failure of the check")
+
+    with pytest.raises(RuntimeError, match="synthetic failure of the check"):
+        stage_artifact(store, source, check=broken)
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
 
 
 def test_a_dropped_stage_leaves_nothing(store: Store, alice: Principal, workspaces: Workspaces) -> None:
@@ -2420,6 +2445,77 @@ def test_a_dropped_stage_leaves_nothing(store: Store, alice: Principal, workspac
     store.drop_staged(placed)
     assert store.derived_of(source) == [rec]
     assert (clip_folder(workspaces, alice, source) / rec.name).is_file()
+
+
+def test_dropping_a_stage_whose_chat_is_gone_is_fine(store: Store, alice: Principal) -> None:
+    """The chat, its folders and the ``.part`` went with a chat delete: nothing is left to remove, nothing raises."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    store.delete_chat(alice, lambda ids, outcome: None)
+    store.drop_staged(ready)
+    store.drop_staged(ready)
+
+
+def test_dropping_a_stage_never_follows_a_link(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A folder that became a link is left as it is, logged by the type of its error, and nothing raises."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    folder = clip_folder(workspaces, alice, source)
+    shutil.rmtree(folder)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / ready.part.name).write_bytes(b"x")
+    folder.symlink_to(elsewhere, target_is_directory=True)
+    store.drop_staged(ready)
+    assert (elsewhere / ready.part.name).exists()
+    assert folder.is_symlink()
+    assert [entry.getMessage() for entry in caplog.records] == [
+        "could not find an artifact that was not kept (PathError)"
+    ]
+
+
+def test_a_failure_before_the_placing_starts_still_removes_the_part(
+    store: Store, alice: Principal, workspaces: Workspaces
+) -> None:
+    """A spec that cannot be placed is refused with its own error, and the ``.part`` goes all the same."""
+    source = media_source(store, alice)
+    ready = stage_artifact(store, source)
+    forged = dataclasses.replace(ready, spec=DerivedSpec("nextext_jsonl", 0, ZIP_TYPE, None, None, {}))
+    seen = Recorder()
+    with pytest.raises(PathError):
+        store.place_derived(forged, quota_bytes=QUOTA, record=seen)
+    assert seen.calls == []
+    assert not ready.part.exists()
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+def test_a_stage_that_cannot_open_its_part_leaves_no_folder(
+    store: Store, alice: Principal, workspaces: Workspaces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full volume is a ``StorageFull``, as everywhere in the store, and the folders just made are not left."""
+    source = media_source(store, alice)
+    opened = os.open
+
+    def full(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if str(path).endswith(".part"):
+            raise OSError(errno.ENOSPC, "synthetic")
+        return opened(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", full)
+    with pytest.raises(StorageFull):
+        stage_artifact(store, source)
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
+
+
+def test_a_folder_in_the_way_is_a_conflict_and_stays(store: Store, alice: Principal, workspaces: Workspaces) -> None:
+    """Something that is no folder where the clip's folders go is a ``Conflict``; it is never removed."""
+    source = media_source(store, alice)
+    (workspaces.chat_dir(alice) / ".derived").write_bytes(b"x")
+    with pytest.raises(Conflict):
+        stage_artifact(store, source)
+    assert (workspaces.chat_dir(alice) / ".derived").read_bytes() == b"x"
 
 
 def test_a_staged_artifact_is_placed_once(store: Store, alice: Principal, workspaces: Workspaces) -> None:
@@ -2714,6 +2810,22 @@ def test_media_roles_need_their_types(
         )
     assert odd.exists()
     assert store.derived_of(source) == []
+
+
+@pytest.mark.parametrize(("role", "mime"), [("nextext_jsonl", JSONL_TYPE), ("nextext_zip", ZIP_TYPE)])
+def test_an_artifact_enters_only_through_its_stage(
+    store: Store, alice: Principal, workspaces: Workspaces, tmp_path: Path, role: DerivedRole, mime: str
+) -> None:
+    """``register_derived`` is the executor's door; an artifact has one row per role and an event of its own."""
+    source = media_source(store, alice)
+    odd = staged(tmp_path, name="odd.bin")
+    with pytest.raises(PathError):
+        store.register_derived(
+            source, odd, DerivedSpec(role, 0, mime, None, None, {}), file_id=new_file_id(), quota_bytes=QUOTA
+        )
+    assert odd.exists()
+    assert store.derived_of(source) == []
+    assert not (workspaces.chat_dir(alice) / ".derived").exists()
 
 
 def test_image_types_are_known() -> None:
