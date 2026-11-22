@@ -239,6 +239,16 @@ things, the limits that matter to users:
   (`workbench/decks.py`). Text that may not fit its place is shrunk to 60 % at
   most, and a warning names the slide when that does not do (the answer's
   `warnings`).
+- A deck is read as the model meant it, as models write one by mistake. A
+  block wrapped as `{"role": …, "text": …}`, content given as one block or as a
+  list in a string, a block written as JSON in a string or as `{image: …}`, and
+  line breaks written out before a list's next item are read as the block meant
+  (`workbench/api/tools_presentations.py:_read_as_meant`); every check then runs
+  on that block. A slide that names no layout takes the first layout that has
+  its title, its subtitle and one place a block that takes it, one whose title
+  and subtitle are exactly the slide's first (so a title alone gets a title-only
+  layout); and a title slide's only text block, within a subtitle's 500
+  characters, is its subtitle (`workbench/executor/presentations/deck.py`).
 - A slide master's example slides never reach the new deck. They are removed,
   with the custom shows and sections that name them and the thumbnail and
   `docProps/app.xml` that show or list them; the deck takes the master's theme,

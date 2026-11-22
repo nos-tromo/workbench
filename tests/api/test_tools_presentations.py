@@ -34,7 +34,7 @@ from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store, new_file_id
 from workbench.api.tools_mcp import CallJobs
-from workbench.api.tools_presentations import WritePresentationRequest, write_presentation
+from workbench.api.tools_presentations import SlideSpec, TableBlock, WritePresentationRequest, write_presentation
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 
@@ -291,6 +291,10 @@ REFUSED: Final[dict[str, tuple[dict[str, Any], str]]] = {
         deck({"layout": 2, "content": [{"image": "/workspace/chat-2/elsewhere.png"}]}),
         "invalid_value: slide 1, block 1: /workspace/chat-2/elsewhere.png is not a file of this conversation",
     ),
+    "an image of another chat in the old notation": (
+        deck({"layout": 2, "content": ["{image: /workspace/chat-2/elsewhere.png}"]}),
+        "invalid_value: slide 1, block 1: /workspace/chat-2/elsewhere.png is not a file of this conversation",
+    ),
     "a .svg image": (
         deck({"layout": 2, "content": [{"image": f"{CHAT}/drawing.svg"}]}),
         "invalid_value: slide 1, block 1: an image is a PNG, JPEG or GIF file",
@@ -365,6 +369,7 @@ def test_another_users_master_is_not_found(client: TestClient, store: Store, tmp
         {**deck({"layout": 2}), "path": "/" + "x" * 1024 + ".pptx"},
         {**deck({"layout": 2}), "path": ""},
         {"path": f"{CHAT}/master.pptx", "slides": [{"layout": 2}]},
+        deck({"layout": 2, "content": [{"text": "Invented", "table": [["Invented"]]}]}),
     ],
     ids=[
         "unknown slide key",
@@ -382,6 +387,7 @@ def test_another_users_master_is_not_found(client: TestClient, store: Store, tmp
         "a long master path",
         "an empty master path",
         "no name",
+        "text beside a table",
     ],
 )
 def test_arguments_out_of_shape_are_invalid_arguments_and_nothing_runs(
@@ -413,6 +419,7 @@ NOT_BLOCKS: Final[tuple[object, ...]] = (
     {},
     {"table": [["Invented"]], "chart": {"type": "pie"}},
     {"caption": "Invented"},
+    {"text": "Invented", "caption": "Invented"},
 )
 
 
@@ -463,6 +470,108 @@ def test_a_bad_block_is_one_error_at_its_place(
     assert body["detail"] == [wanted]
     assert "more_errors" not in body
     assert fake_executor.requests == []
+
+
+def test_a_slide_without_a_layout_is_left_for_the_runner_to_fit(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
+) -> None:
+    """Content written as one string is read as a list of it, and a slide that names no layout goes to the job so."""
+    stored(store, tmp_path, "master.pptx", mt.make_master)
+    answered(call(client, deck({"title": "Invented harbour review", "content": "- Invented berth count"})))
+    (req,) = fake_executor.requests
+    (slide,) = req.args["slides"]
+    assert "layout" not in slide and slide["content"] == ["- Invented berth count"]
+
+
+@pytest.mark.parametrize(
+    ("content", "meant"),
+    [
+        ({"role": "content", "text": "- Invented berth count"}, ["- Invented berth count"]),
+        ([{"role": "content", "text": "- Invented berth count"}], ["- Invented berth count"]),
+        ([{"text": "- Invented berth count"}], ["- Invented berth count"]),
+        ("- Invented berth count", ["- Invented berth count"]),
+        (["- Invented berth count\\n- Invented quay walls"], ["- Invented berth count\n- Invented quay walls"]),
+        (["1. Invented berth count\\n2. Invented quay walls"], ["1. Invented berth count\n2. Invented quay walls"]),
+        (["- Invented C:\\new\n- Invented quay walls"], ["- Invented C:\\new\n- Invented quay walls"]),
+        (
+            ["Invented share: \\\\nas01\\invented", "Invented C:\\new\\files", "$a \\neq b$", "- Lines end in `\\n`"],
+            ["Invented share: \\\\nas01\\invented", "Invented C:\\new\\files", "$a \\neq b$", "- Lines end in `\\n`"],
+        ),
+        ('["- Invented berth count", "- Invented quay walls"]', ["- Invented berth count", "- Invented quay walls"]),
+        (['{"role": "content", "text": "- Invented berth count"}'], ["- Invented berth count"]),
+        (["{not json}", '{"berths": 1}'], ["{not json}", '{"berths": 1}']),
+    ],
+    ids=[
+        "content as one wrapped block",
+        "text with its place's role",
+        "text alone in an object",
+        "content as a string",
+        "a line break written out",
+        "a numbered list written out",
+        "a backslash beside real breaks",
+        "a backslash-n meant in one line",
+        "a list written in a string",
+        "a wrapped block written in a string",
+        "braces that are no block",
+    ],
+)
+def test_text_written_as_models_write_it_is_read_as_meant(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, content: object, meant: list[str]
+) -> None:
+    """Text wrapped in a role, written bare or as a list in a string, or escaped twice, is read as meant.
+
+    Each is read as the text it means. A written-out break counts only before a list's next item; a text that holds a
+    real break, a path, a formula or a backslash-n in a line keeps its backslashes, and braces that hold no block stay
+    text.
+    """
+    stored(store, tmp_path, "master.pptx", mt.make_master)
+    layout = {1: 2, 2: 4, 4: 5}[len(meant)]  # a layout with a place for each block: Title and Content, Two, Comparison
+    answered(call(client, deck({"layout": layout, "content": content})))
+    (req,) = fake_executor.requests
+    assert req.args["slides"][0]["content"] == meant
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "role-wrapped",
+        "pseudo",
+        "json-string",
+        "role-wrapped-string",
+    ],
+)
+def test_a_picture_written_as_models_write_it_is_a_picture(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines, block: str
+) -> None:
+    """A picture wrapped in its place's role, in the old notation ``{image: path}``, or as JSON in a string."""
+    stored(store, tmp_path, "master.pptx", mt.make_master)
+    picture = png_output(store, tmp_path)
+    given: object = {
+        "role-wrapped": {"role": "picture", "text": {"image": picture.virtual_path}},
+        "pseudo": f"{{image: {picture.virtual_path}}}",
+        "json-string": json.dumps({"image": picture.virtual_path}),
+        "role-wrapped-string": json.dumps({"role": "picture", "text": {"image": picture.virtual_path}}),
+    }[block]
+    answered(call(client, deck({"layout": 9, "content": [given, "Invented caption"]})))
+    (req,) = fake_executor.requests
+    sent = req.args["slides"][0]["content"]
+    assert sent == [{"image": picture.name, "virtual": picture.virtual_path}, "Invented caption"]
+    (event,) = events(audit_lines, "write_presentation")
+    assert event["criteria"]["images"] == 1 and picture.id in event["target"]["ids"]
+
+
+def test_speaker_notes_written_out_get_their_breaks() -> None:
+    """Notes escaped twice before a list's next item are read with breaks, as a text block is."""
+    slide = SlideSpec.model_validate({"layout": 2, "notes": "- Invented berth count\\n- Invented quay walls"})
+    assert slide.notes == "- Invented berth count\n- Invented quay walls"
+
+
+def test_json_a_string_holds_is_read_as_the_request_reader_reads_a_body() -> None:
+    """Nested too deeply to read, it stays text; a lone surrogate in it is replaced, so the job can be sent."""
+    deep = '{"table": ' + "[" * 20000 + "]" * 20000 + "}"
+    assert SlideSpec.model_validate({"layout": 2, "content": [deep]}).content == [deep]
+    (table,) = SlideSpec.model_validate({"layout": 2, "content": ['{"table": [["\\ud800"]]}']}).content
+    assert isinstance(table, TableBlock) and table.table == [["\ufffd"]]
 
 
 def test_blocks_keep_their_kind(client: TestClient, store: Store, fake_executor: Local, tmp_path: Path) -> None:

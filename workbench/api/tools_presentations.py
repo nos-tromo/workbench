@@ -3,7 +3,8 @@
 A deck is built in a slide master of the chat, a ``.pptx`` or ``.potx``, or without one in the plain master the
 executor makes, into one new ``.pptx``: each slide on a layout of the master, its blocks in the layout's places, its
 sources in its speaker notes. The runner (:mod:`workbench.executor.runners.presentations`) builds it in the executor;
-here the api checks what it can before a job is sent, so a refusal names its place and costs no job: that the master
+here the api checks what it can before a job is sent, so a refusal names its place and costs no job. It first reads a
+block in a shape models write by mistake as the block they meant (:func:`_read_as_meant`), then checks that the master
 is a slide master, the new file's name, the deck's bounds (:func:`workbench.decks.deck_problem`, which the runner
 checks again), that each picture is a PNG, JPEG or GIF file of the chat within its bytes, and each source as
 ``fill_template`` checks one. The job is given the master, if there is one, every picture and every file a source
@@ -15,7 +16,9 @@ many sources of each kind; never a slide's text, a layout's name or a file's nam
 is never kept, and a job that refused is recorded by the refusal's code alone: a layout's name can be in its message.
 """
 
+import json
 import posixpath
+import re
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
@@ -32,6 +35,7 @@ from pydantic import (
     StrictInt,
     StringConstraints,
     Tag,
+    model_validator,
 )
 from pydantic.json_schema import JsonDict, JsonValue
 from pydantic_core import PydanticCustomError
@@ -45,7 +49,7 @@ from workbench.config import Settings
 from workbench.decks import IMAGE_TYPES, MAX_IMAGE_BYTES, MAX_IMAGES_BYTES, BlockKind, block_kind, deck_problem
 from workbench.models import FileRecord, Principal
 from workbench.paths import PathError
-from workbench.protocol import MAX_INPUT_FILES, JobResult
+from workbench.protocol import MAX_INPUT_FILES, JobResult, encodable
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
     from workbench.api.tools_mcp import CallJobs
@@ -225,11 +229,106 @@ Block = Annotated[
 ]
 
 
+#: The keys of a block a model wrapped around its content, as inspect_template names a place's role.
+_WRAPPER_KEYS: Final = frozenset({"text", "role"})
+#: A picture written as the old description wrote it, not as JSON: ``{image: /workspace/chat/chart.png}``.
+_PSEUDO_IMAGE: Final = re.compile(r"\{\s*image\s*:\s*(?P<path>[^{}]+?)\s*\}")
+#: A line break a model wrote out (a backslash and an n, escaped twice) where a break belongs: not after another
+#: backslash, and before a list's next item or another such break.
+_WRITTEN_BREAK: Final = re.compile(r"(?<!\\)\\n(?=[ \t]*(?:[-*+][ \t]|\d+[.)][ \t]|\\n))")
+#: Every written-out break not after a backslash, once a text is known to hold them.
+_ANY_WRITTEN_BREAK: Final = re.compile(r"(?<!\\)\\n")
+
+
+def _parsed(text: str) -> object:
+    """Read the JSON value a string holds, as the request reader reads a body.
+
+    Args:
+        text: The string.
+
+    Returns:
+        The value, every lone surrogate in it replaced (:func:`~workbench.protocol.encodable`); ``None`` when the
+        string holds no JSON or a value nested too deeply to read.
+    """
+    try:
+        return encodable(json.loads(text))
+    except (ValueError, RecursionError):
+        return None
+
+
+def _unwrapped(block: object) -> object:
+    """Take an object of ``text`` and, perhaps, ``role`` as what its ``text`` holds; any other block as it came.
+
+    Args:
+        block: A block as it came.
+
+    Returns:
+        The block meant: the role of a place, as inspect_template lists it, is dropped, since a block's order picks
+        its place.
+    """
+    if isinstance(block, dict) and "text" in block and set(block) <= _WRAPPER_KEYS:
+        return block["text"]
+    return block
+
+
+def _with_breaks(text: str) -> str:
+    """Give text whose line breaks a model wrote out real ones; any other text as it came.
+
+    Only text without a real break inside is read so, and only when a written-out break stands where a break
+    belongs: before a list's next item or another one. A Windows path, a formula or a backslash-n in prose stays. Once
+    one break is found, every written-out break not after a backslash is one, so a text that mixes a path with
+    breaks written out loses the path's backslash-n: rare, and the price of reading the common case.
+
+    Args:
+        text: Markdown text, or speaker notes.
+
+    Returns:
+        The text meant.
+    """
+    if "\n" in text.strip() or _WRITTEN_BREAK.search(text) is None:
+        return text
+    return _ANY_WRITTEN_BREAK.sub("\n", text)
+
+
+def _read_as_meant(block: object) -> object:
+    """Take a block in a shape models write by mistake as the block they meant; any other block as it came.
+
+    The shapes, each found in a model's first call:
+
+    - an object of ``text`` and, perhaps, ``role`` (:func:`_unwrapped`): what ``text`` holds, text or a block;
+    - a string that holds such an object or a block as JSON, or ``{image: <path>}``, the old description's notation:
+      that block;
+    - Markdown text with its line breaks written out (:func:`_with_breaks`): the text with line breaks.
+
+    Anything else, an object with a key beside ``text`` and ``role`` too, is left to the block's own check.
+
+    Args:
+        block: One entry of a slide's content, as it came.
+
+    Returns:
+        The block meant.
+    """
+    block = _unwrapped(block)
+    if not isinstance(block, str):
+        return block
+    stripped = block.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        parsed = _unwrapped(_parsed(stripped))
+        if isinstance(parsed, dict) and block_kind(parsed) in ("table", "chart", "image"):
+            return parsed
+        if isinstance(parsed, str):
+            return _with_breaks(parsed)
+        pseudo = _PSEUDO_IMAGE.fullmatch(stripped)
+        if pseudo is not None:
+            return {"image": pseudo.group("path").strip("\"'")}
+    return _with_breaks(block)
+
+
 class SlideSpec(BaseModel):
     """One slide.
 
     Attributes:
-        layout: The layout's number or name.
+        layout: The layout's number or name; ``None`` for the first layout that takes the slide.
         title: The slide's title.
         subtitle: Its subtitle.
         content: Its blocks, one a place of the layout.
@@ -239,8 +338,9 @@ class SlideSpec(BaseModel):
 
     model_config = _REQUEST
 
-    layout: StrictInt | str = Field(
-        description="Its number or name, as inspect_template lists it.",
+    layout: StrictInt | str | None = Field(
+        default=None,
+        description="Its number or name, as inspect_template lists it; left out, the first that takes the slide.",
         json_schema_extra=_shown(type=["integer", "string"]),
     )
     title: str | None = Field(default=None, description="Its title.", json_schema_extra=_STRING)
@@ -250,6 +350,36 @@ class SlideSpec(BaseModel):
     sources: list[Annotated[Source, Field(discriminator="kind")]] = Field(
         default_factory=list, description="Where its content comes from."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _as_meant(cls, data: object) -> object:
+        """Read a slide as the model meant it: its content a list of blocks read as meant, its notes with breaks.
+
+        Content given as one block, or as a list written in a string, is that list; each block is read by
+        :func:`_read_as_meant`, and the notes by :func:`_with_breaks`.
+
+        Args:
+            data: The slide as it came.
+
+        Returns:
+            The slide as meant; anything but an object as it came.
+        """
+        if not isinstance(data, dict):
+            return data
+        slide = dict(data)
+        content = slide.get("content")
+        if isinstance(content, str) and content.strip().startswith("["):
+            listed = _parsed(content.strip())
+            content = listed if isinstance(listed, list) else content
+        if isinstance(content, (str, dict)):
+            content = [content]
+        if isinstance(content, list):
+            slide["content"] = [_read_as_meant(block) for block in content]
+        notes = slide.get("notes")
+        if isinstance(notes, str):
+            slide["notes"] = _with_breaks(notes)
+        return slide
 
 
 class WritePresentationRequest(BaseModel):

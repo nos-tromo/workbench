@@ -92,7 +92,7 @@ def test_a_slide_is_an_object() -> None:
 
 
 def test_a_slide_of_a_layout_alone_passes() -> None:
-    """Only the layout is required."""
+    """A layout alone passes."""
     assert decks.deck_problem([{"layout": 1}]) is None
 
 
@@ -102,7 +102,7 @@ def test_a_layout_is_a_number_or_a_name(layout: object) -> None:
     assert decks.deck_problem([{"layout": layout}]) is None
 
 
-@pytest.mark.parametrize("layout", [0, -3, "", "x" * 101, True, False, 1.0, None, ["Title"]])
+@pytest.mark.parametrize("layout", [0, -3, "", "x" * 101, True, False, 1.0, ["Title"]])
 def test_a_layout_that_is_neither_is_refused(layout: object) -> None:
     """Zero, a negative, an empty or too long name, a bool, a float and the rest are refused."""
     why = decks.deck_problem([{"layout": layout}])
@@ -110,11 +110,10 @@ def test_a_layout_that_is_neither_is_refused(layout: object) -> None:
     assert why.startswith("slide 1: layout ")
 
 
-def test_a_slide_without_a_layout_is_refused() -> None:
-    """The layout is required."""
-    why = decks.deck_problem([{"title": "Hello"}])
-    assert why is not None
-    assert why.startswith("slide 1: layout ")
+def test_a_slide_may_leave_its_layout_out() -> None:
+    """A slide that names no layout, or names none as null, passes: the runner takes the first layout that fits."""
+    assert decks.deck_problem([{"title": "Hello"}]) is None
+    assert decks.deck_problem([{"layout": None, "title": "Hello"}]) is None
 
 
 @pytest.mark.parametrize(

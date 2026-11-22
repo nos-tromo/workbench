@@ -2426,7 +2426,7 @@
             "additionalProperties": false,
             "properties": {
               "layout": {
-                "description": "Its number or name, as inspect_template lists it.",
+                "description": "Its number or name, as inspect_template lists it; left out, the first that takes the slide.",
                 "type": [
                   "integer",
                   "string"
@@ -2485,9 +2485,6 @@
                 "type": "array"
               }
             },
-            "required": [
-              "layout"
-            ],
             "type": "object"
           },
           "TableBlock": {

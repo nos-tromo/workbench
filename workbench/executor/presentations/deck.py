@@ -1,7 +1,9 @@
 """A deck built in a user's slide master: the master's example slides removed, then one slide a layout for each asked.
 
-A slide is made from the layout it names (:func:`resolve`): its title and subtitle, block i of its content in place i of
-the layout (the reading order ``inspect_template`` lists), as :mod:`.blocks` places text, tables, charts and pictures,
+A slide is made from the layout it names (:func:`resolve`), or, naming none, from the first that takes it
+(:func:`fitting`); a title slide's only text block is its subtitle (:func:`subtitle_as_meant`). Its title and subtitle,
+block i of its content in place i of the layout (the reading order ``inspect_template`` lists), as :mod:`.blocks` places
+text, tables, charts and pictures,
 the layout's footer and slide number (:func:`copy_footers`), and its notes with its sources. A place no block fills is
 removed, so that no slide says "Click to add text". The example slides go first, with what in the package still
 describes them (:func:`remove_slides`), and before the deck is written no example slide may be left in it and its part
@@ -214,6 +216,81 @@ def resolve(layouts: Sequence[Layout], wanted: int | str, slide: int) -> Layout:
     raise _unknown(layouts, str(wanted), slide)
 
 
+def _takes(place_role: str, block: object) -> bool:
+    """Tell whether a place takes a block, as :func:`~.blocks.check_places` would: an empty text goes anywhere.
+
+    Args:
+        place_role: The place's role.
+        block: The block.
+
+    Returns:
+        Whether the block may go into the place.
+    """
+    if isinstance(block, str) and not block.strip():
+        return True
+    kind = decks.block_kind(block)
+    return kind is not None and place_role in blocks.ACCEPTS[kind]
+
+
+def fitting(layouts: Sequence[Layout], slide: Mapping[str, Any], number: int) -> Layout:
+    """Find the layout for a slide that names none: the first, in the master's order, that takes it as it is.
+
+    A layout takes a slide when it has a title if the slide has one, a subtitle if it has one, and exactly one place a
+    block, each taking its block. One whose title and subtitle are exactly the slide's goes first, so a slide with a
+    title and nothing else is put on a title-only layout rather than a title slide when the master has one.
+
+    Args:
+        layouts: The master's layouts.
+        slide: The slide, without a layout.
+        number: Its number.
+
+    Returns:
+        The layout.
+
+    Raises:
+        Refusal: No layout takes the slide (``invalid_value``), listing the layouts (:func:`_listed`).
+    """
+    content = slide.get("content", [])
+    title, subtitle = bool(slide.get("title")), bool(slide.get("subtitle"))
+    takes = [
+        layout
+        for layout in layouts
+        if (layout.title or not title)
+        and (layout.subtitle or not subtitle)
+        and len(layout.places) == len(content)
+        and all(_takes(place.role, block) for place, block in zip(layout.places, content, strict=True))
+    ]
+    exact = [layout for layout in takes if (layout.title, layout.subtitle) == (title, subtitle)]
+    if exact or takes:
+        return (exact or takes)[0]
+    said = f"slide {number}: it names no layout, and none takes it as it is"
+    if not layouts:
+        raise Refusal("invalid_value", f"{said}; the master has no layouts")
+    raise Refusal("invalid_value", f"{said}; give its layout: {_listed(layouts)}")
+
+
+def subtitle_as_meant(layout: Layout, slide: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read a title slide's only text block as its subtitle, as a model writes it by mistake; any other slide as asked.
+
+    That is a slide with no subtitle on a layout that has a subtitle and no places, whose content is one text block
+    within a subtitle's bounds (:data:`workbench.decks.MAX_SUBTITLE`); a longer one is refused as before.
+
+    Args:
+        layout: The slide's layout.
+        slide: The slide as asked.
+
+    Returns:
+        The slide meant.
+    """
+    content = slide.get("content", [])
+    if layout.places or not layout.subtitle or slide.get("subtitle") or len(content) != 1:
+        return slide
+    (block,) = content
+    if not isinstance(block, str) or not block.strip() or len(block) > decks.MAX_SUBTITLE:
+        return slide
+    return {**slide, "subtitle": block, "content": []}
+
+
 def _unknown(layouts: Sequence[Layout], said: str, slide: int) -> Refusal:
     """Refuse a layout that is not there, listing those that are.
 
@@ -223,11 +300,23 @@ def _unknown(layouts: Sequence[Layout], said: str, slide: int) -> Refusal:
         slide: The slide's number.
 
     Returns:
-        The refusal: at most :data:`~workbench.executor.runners.templates.LISTED` layouts by number and name, in at
-        most :data:`~workbench.executor.runners.templates.LISTED_ROOM` characters, and how many more there are.
+        The refusal, with the layouts as :func:`_listed` lists them.
     """
     if not layouts:
         return Refusal("invalid_value", f"slide {slide}: no layout {said}; the master has no layouts")
+    return Refusal("invalid_value", f"slide {slide}: no layout {said}; the layouts are {_listed(layouts)}")
+
+
+def _listed(layouts: Sequence[Layout]) -> str:
+    """List a master's layouts for a refusal.
+
+    Args:
+        layouts: The master's layouts, at least one.
+
+    Returns:
+        At most :data:`~workbench.executor.runners.templates.LISTED` layouts by number and name, in at most
+        :data:`~workbench.executor.runners.templates.LISTED_ROOM` characters, and how many more there are.
+    """
     shown: list[str] = []
     used = 0
     for layout in layouts[:LISTED]:
@@ -237,8 +326,7 @@ def _unknown(layouts: Sequence[Layout], said: str, slide: int) -> Refusal:
         shown.append(entry)
         used += len(entry) + 2
     more = len(layouts) - len(shown)
-    listed = ", ".join(shown) + (f" and {more} more" if more else "")
-    return Refusal("invalid_value", f"slide {slide}: no layout {said}; the layouts are {listed}")
+    return ", ".join(shown) + (f" and {more} more" if more else "")
 
 
 def copy_footers(slide: Any, layout: Layout, number: int) -> None:
@@ -326,9 +414,14 @@ def build(prs: Any, args: Mapping[str, Any], ctx: JobContext, warnings: list[str
         readers.UnreadableFile: The master is damaged.
         readers.ReadTimeout: The work ran past the deadline.
     """
-    slides: Sequence[Mapping[str, Any]] = args["slides"]
     found = master.layouts(prs)
-    chosen = [resolve(found, slide["layout"], number) for number, slide in enumerate(slides, 1)]
+    chosen: list[Layout] = []
+    slides: list[Mapping[str, Any]] = []
+    for number, asked in enumerate(args["slides"], 1):
+        named = asked.get("layout")
+        layout = fitting(found, asked, number) if named is None else resolve(found, named, number)
+        chosen.append(layout)
+        slides.append(subtitle_as_meant(layout, asked))
     for number, (slide, layout) in enumerate(zip(slides, chosen, strict=True), 1):
         blocks.check_places(layout, slide.get("content", []), number)
     images = blocks.find_images(slides, ctx)

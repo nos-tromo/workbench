@@ -164,9 +164,15 @@ what the model is told and shown, never what a caller may reach.
   `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
   template and output tools. A new tool gets a module of its own, as
-  `workbench/api/tools_presentations.py` (`write_presentation`) has: it checks the
-  master, the name, every deck bound, each picture and each source before a job,
-  so a refusal names its slide and block and costs no job.
+  `workbench/api/tools_presentations.py` (`write_presentation`) has: it first
+  reads a block in a shape models write by mistake as the block meant
+  (`_read_as_meant`: a place's `role` dropped, a block or list written as JSON in
+  a string, `{image: …}`, line breaks written out before a list's next item),
+  then checks the master, the name, every deck bound, each picture and each
+  source before a job, so a refusal names its slide and block and costs no job.
+  A slide that names no layout is left for the runner, which takes the first
+  layout that takes it (`presentations/deck.py:fitting`), and a title slide's
+  only text block is its subtitle (`subtitle_as_meant`).
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
   view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after

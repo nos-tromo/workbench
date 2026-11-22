@@ -98,7 +98,7 @@ def write_presentation(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     Args:
         args: ``path`` (the master, relative to the chat folder; left out for the plain master,
             :func:`~workbench.executor.presentations.master.plain_master`); ``name`` (the new file's, with ``.pptx``);
-            ``slides`` (each a ``layout`` and, optionally, ``title``, ``subtitle``, ``content``, ``notes`` and
+            ``slides`` (each, optionally, a ``layout``, ``title``, ``subtitle``, ``content``, ``notes`` and
             ``sources``; a file source's ``path`` is relative to the chat folder and ``virtual`` is how the notes
             name it; an image block's ``image`` is relative to the chat folder too, its ``virtual`` left aside);
             ``include_sources``, whether the notes end with the sources; and ``budget_s``, the seconds the work may
