@@ -284,14 +284,15 @@ async def prepare_file(
 
     The first prepare of a file draws its first pages in one job, recorded before any render is visible; every later
     one answers from the renders kept, with no job and no event. An Office file (``kind: office``, counted by ``unit``)
-    is converted once to a PDF first, kept as a derived file of it, in a second job of the same turn of the prepare
-    gate; each of the two is recorded before what it made is visible. A file that is none of these is answered at once
-    as ``kind: none``. The request has no body. It waits at most
-    :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its turn, on the caller's prepare gate, and so never takes the
-    user's own turn from a chat in progress. With ``strips`` of 2 or 3, a picture is also cut into that many strips,
-    in a second job on the same gate (none once they exist), so that a model that sees it in strips pays no job on
-    its turn; a strip that cannot be made fails the prepare as a view of it would. A PDF's pages are cut when they are
-    viewed, whatever ``strips`` says.
+    is converted once to a PDF first, kept as a derived file of it, and drawn in a second job of the same turn, on the
+    caller's conversion gate; each of the two is recorded before what it made is visible. A file that is none of these
+    is answered at once as ``kind: none``; one the executor refused for what it is, with that refusal again, at once
+    and with no job. The request has no body. It waits at most :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its
+    turn, on the caller's prepare gate (a picture's or a PDF's) or conversion gate (an Office file's), and so never
+    takes the user's own turn from a chat in progress, nor does a picture's wait behind a conversion. With ``strips``
+    of 2 or 3, a picture is also cut into that many strips, in a second job on the same gate (none once they exist),
+    so that a model that sees it in strips pays no job on its turn; a strip that cannot be made fails the prepare as a
+    view of it would. A PDF's pages are cut when they are viewed, whatever ``strips`` says.
 
     Args:
         path: The file's virtual path, in the request's chat.
@@ -419,8 +420,10 @@ async def view_file(
     With ``rendition`` the answer is one render of a picture or a PDF instead: page ``rendition``, or the picture for
     1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. A page or the strips of it that do not
     exist yet are made first, in one job on the user's own turn, which waits at most
-    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. ``strips`` of 1 takes no ``strip`` but 1, a greater ``strips`` needs
-    one, from 1 to ``strips``.
+    :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S` (an Office file converted on demand, on the caller's conversion gate);
+    while another call makes the file's renders, such as its prepare converting it, the view waits for that call up to
+    :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S` and answers what it made. ``strips`` of 1 takes no ``strip`` but 1, a
+    greater ``strips`` needs one, from 1 to ``strips``.
 
     Args:
         path: The file's virtual path.

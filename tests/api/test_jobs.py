@@ -19,6 +19,7 @@ import pytest
 
 from tests.api.conftest import CALL, PG_SETUP, put, unrecorded
 from tests.conftest import scaled
+from workbench.api import tools_mcp
 from workbench.api.jobs import (
     IMAGE_MAX,
     MCP_QUEUE_WAIT_S,
@@ -27,6 +28,7 @@ from workbench.api.jobs import (
     PREPARE_WAITING_MAX,
     RETURN_MAX,
     RETURN_TYPES,
+    SOURCE_LOCK_WAIT_S,
     TEXT_MAX,
     Busy,
     CallLimits,
@@ -2591,9 +2593,13 @@ async def test_the_source_lock_serialises_and_times_out(
 
 
 async def test_a_calls_jobs_render_on_the_users_turn_and_name_no_output(
-    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``CallJobs`` renders within its call's limits on the user's own turn; renders are never the call's outputs."""
+    """``CallJobs`` renders within its call's limits on the user's own turn; renders are never the call's outputs.
+
+    It waits for its turn its call's wait, and for a source's lock ``SOURCE_LOCK_WAIT_S`` (lowered here to none).
+    """
+    monkeypatch.setattr(tools_mcp, "SOURCE_LOCK_WAIT_S", 0)
     me = user("user-a")
     source = scan(store)
     queue = queue_for(settings, executor, store, metrics, jobs_per_user=1)
@@ -2922,6 +2928,7 @@ async def test_a_turn_serves_only_its_own_user(
         await refused(b, held)
         await refused(docint, held)
         await refused(a, held, "prepare")
+        await refused(a, held, "conversion")
         await refused(a, Turn("ghostwriter", "user-a", "user"))
     await refused(a, held)
     assert (executor.requests, jobs_recorded(settings), queue.tracked_users) == ([], 0, 0)
@@ -2969,4 +2976,171 @@ async def test_a_calls_jobs_convert_and_render_in_one_turn_of_the_user(
     assert executor.requests[1].input_files == [pdf.relative_path]
     assert [rec.ordinal for rec in kept] == [1]
     assert jobs.outputs() == []
+    assert queue.tracked_users == 0
+
+
+# --- the conversion gate: an Office file's conversion and its drawing, apart from the prepare gate --------------------
+
+#: How long Ghostwriter waits for a tool call (its ``WORKBENCH_TIMEOUT``): a wait for a source's lock ends before it.
+GHOSTWRITER_TOOL_TIMEOUT_S = 150
+
+
+def ghostwriter(settings: Settings, wait_s: int = 60) -> CallLimits:
+    """Ghostwriter's limits as its doors pass them, with its slots as the settings have them."""
+    return CallLimits(wall_s=120, wait_s=wait_s, slots=settings.ghostwriter_slots)
+
+
+async def office_prepare(queue: JobQueue, p: Principal, source: FileRecord, call: CallLimits) -> list[DerivedRecord]:
+    """Prepare an Office file as the prepare route does: its conversion and its renders in one turn of its gate."""
+    async with queue.turn(p, call=call, gate="conversion") as held:
+        _, _, (pdf,) = await convert(queue, p, source, gate="conversion", turn=held)
+        _, _, renders = await queue.submit_renders(
+            p, source, {"pages": None}, KeepAll(), call=call, gate="conversion", turn=held, converted=pdf
+        )
+    return [pdf, *renders]
+
+
+async def turn_only(queue: JobQueue, p: Principal, call: CallLimits, gate: Gate) -> None:
+    """Take a turn of ``gate`` and let it go at once, sending no job."""
+    async with queue.turn(p, call=call, gate=gate):
+        pass
+
+
+def test_a_call_waits_for_a_sources_lock_up_to_a_job_wall() -> None:
+    """The lock's holder may be converting what the call needs: the call waits as long as it would itself have.
+
+    That is the default job wall, longer than a call's 5 s for its own turn and short of Ghostwriter's 150 s for a call.
+    """
+    assert SOURCE_LOCK_WAIT_S == 120
+    assert MCP_QUEUE_WAIT_S < SOURCE_LOCK_WAIT_S < GHOSTWRITER_TOOL_TIMEOUT_S
+
+
+async def test_a_pictures_prepare_runs_while_a_conversion_runs(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The conversion gate is not the prepare gate: user B's prepare runs and ends while user A's conversion runs."""
+    a, b = user("user-a"), Principal("ghostwriter", "user-b", "chat-1")
+    source, picture = deck(store, a), scan(store, b)
+    converts(executor)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    converting = asyncio.create_task(office_prepare(queue, a, source, call))
+    await until(lambda: executor.running == 1)
+
+    _, result, kept = await asyncio.wait_for(prepare(queue, b, picture, call=call), scaled(2))
+    assert (result.status, [rec.ordinal for rec in kept]) == ("ok", [1])
+    assert executor.running == 1  # the conversion still runs
+    executor.gate.set()
+    await converting
+    assert [(req.user_id, req.tool) for req in executor.requests] == [
+        ("user-a", "convert_office"),
+        ("user-b", "prepare_file"),
+        ("user-a", "prepare_file"),
+    ]
+
+
+async def test_one_conversion_of_a_caller_runs_at_a_time_on_demand_or_not(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """User C's conversion waits for user A's; so does user D's on demand, a call's: one gate, over all the users.
+
+    Both wait in the conversion gate's own line, and each runs when the one before it ends.
+    """
+    a, c, d = user("user-a"), user("user-c"), user("user-d")
+    sources = {p: deck(store, p) for p in (a, c, d)}
+    converts(executor)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    first = asyncio.create_task(office_prepare(queue, a, sources[a], call))
+    await until(lambda: executor.running == 1)
+    second = asyncio.create_task(office_prepare(queue, c, sources[c], call))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    jobs = CallJobs(queue, call)
+
+    async def on_demand() -> list[DerivedRecord]:
+        async with jobs.turn(d, converting=True) as held:
+            assert held.gate == "conversion"
+            _, _, (pdf,) = await jobs.submit_conversion(d, sources[d], {}, KeepAll(), turn=held)
+            _, _, renders = await jobs.submit_renders(
+                d, sources[d], {"pages": [1]}, KeepAll(), turn=held, converted=pdf
+            )
+        return [pdf, *renders]
+
+    third = asyncio.create_task(on_demand())
+    await until(lambda: sample(metrics, "workbench_queue_length") == 2)
+    await asyncio.sleep(0.05)
+    assert (executor.running, len(executor.requests)) == (1, 1)
+    executor.gate.set()
+    await asyncio.gather(first, second, third)
+    assert [(req.user_id, req.tool) for req in executor.requests] == [
+        (name, tool) for name in ("user-a", "user-c", "user-d") for tool in ("convert_office", "prepare_file")
+    ]
+    assert executor.peak == 1
+    assert (queue.tracked_users, sample(metrics, "workbench_queue_length")) == (0, 0)
+
+
+async def test_a_tool_call_gets_a_slot_beside_a_conversion_and_a_prepare(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Ghostwriter's default slots, 3: a conversion and a picture's prepare run, and a third user's call still runs.
+
+    They all count within the caller's slots; one more call of Ghostwriter's waits for one of them.
+    """
+    assert settings.ghostwriter_slots == 3
+    a, b = user("user-a"), Principal("ghostwriter", "user-b", "chat-1")
+    source, picture = deck(store, a), scan(store, b)
+    converts(executor)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c", "ghostwriter/user-d"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    converting = asyncio.create_task(office_prepare(queue, a, source, call))
+    preparing = asyncio.create_task(prepare(queue, b, picture, call=call))
+    await until(lambda: executor.running == 2)
+    tool_call = asyncio.create_task(queue.submit(user("user-c"), "run_python", ARGS, [], call=call))
+    await until(lambda: executor.running == 3)
+    one_more = asyncio.create_task(queue.submit(user("user-d"), "run_python", ARGS, [], call=call))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    assert executor.running == 3
+    executor.gate.set()
+    await asyncio.gather(converting, preparing, tool_call, one_more)
+    assert executor.peak == 3
+
+
+async def test_waiting_conversions_are_counted_apart_from_the_queue_and_the_prepares(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """32 conversions and 32 prepares of one user wait, past the queue's 16 places and the user's 4; a 33rd is full.
+
+    Each line is counted on its own: one more of either is refused at once (``queue_full``).
+    """
+    me = user("user-a")
+    source, picture = deck(store, me), scan(store, me)
+    converts(executor)
+    rendered(executor, page(1))
+    executor.hold = {"ghostwriter/user-a"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    converting = asyncio.create_task(office_prepare(queue, me, source, call))
+    preparing = asyncio.create_task(prepare(queue, me, picture, call=call))
+    await until(lambda: executor.running == 2)
+    waiting = [
+        asyncio.create_task(turn_only(queue, me, call, gate))
+        for gate in ("conversion", "prepare")
+        for _ in range(PREPARE_WAITING_MAX)
+    ]
+    await until(lambda: sample(metrics, "workbench_queue_length") == 2 * PREPARE_WAITING_MAX)
+    for gate in ("conversion", "prepare"):
+        async with asyncio.timeout(0.5):
+            with pytest.raises(Busy) as refused:
+                await turn_only(queue, me, call, gate)
+        assert refused.value.reason == "queue_full"
+    assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 2
+    executor.gate.set()
+    await asyncio.gather(converting, preparing, *waiting)
+    assert sample(metrics, "workbench_queue_length") == 0
     assert queue.tracked_users == 0

@@ -23,6 +23,10 @@ beside its source, in the reserved folder ``<chat>/.derived/<source-id>/``, unde
 source: it is as old as it, counts in the user's quota, is deleted with it, and is reachable by no path: ``.derived``
 is found by no path of any principal, listed in no folder, and no upload, output or folder is named so. The caller
 records a render before it is registered, as it records an output.
+
+The store also remembers, in this process alone, how the runner refused a source that cannot be converted or drawn
+(:meth:`Store.remember_refusal`), so that no later call runs that job again; the refusal goes with its source, and with
+a restart.
 """
 
 import dataclasses
@@ -41,7 +45,8 @@ import threading
 import time
 import urllib.parse
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Final, Literal, TypeGuard
@@ -66,6 +71,10 @@ _NOT_EMPTY = frozenset({errno.ENOTEMPTY, errno.EEXIST})
 #: Seconds a deleted chat takes no new job and no upload (:meth:`Store.delete_chat`): longer than any call waits for its
 #: turn or any upload takes to arrive. A deleted chat's id never comes back, so the hold costs nothing.
 DELETED_CHAT_HOLD_S: Final = 3600
+
+#: Most refusals the store remembers, one per source; past it, the one asked for least recently is forgotten. Each is
+#: an id, two numbers and a short fixed text, so a few thousand cost the api well under a megabyte.
+REFUSALS_MAX: Final = 4096
 
 #: A file id: 32 lowercase hex digits (``uuid4().hex``).
 _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
@@ -580,6 +589,9 @@ class Store:
         self._lock = threading.Lock()
         self._monotonic: Callable[[], float] = time.monotonic
         self._deleted: dict[tuple[str, str, str], float] = {}
+        self._refusals_lock = threading.Lock()
+        # By source id: the source's creation time and size, and the runner's refusal of it, oldest asked for first.
+        self._refusals: OrderedDict[str, tuple[float, int, str]] = OrderedDict()
         db_path.parent.mkdir(mode=_PRIVATE_DIR, parents=True, exist_ok=True)
         fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, _PRIVATE_FILE)
         try:
@@ -1272,6 +1284,7 @@ class Store:
                 db.executemany("DELETE FROM derived WHERE id = ?", [(rec_id,) for rec_id in named])
                 if current is not None:
                     db.execute("DELETE FROM files WHERE id = ?", (current.id,))
+            self._forget_refusals([record.id])
             for folder in folders:
                 _remove_empty(folder)
                 _remove_empty(folder.parent)
@@ -1325,6 +1338,7 @@ class Store:
                     db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                     db.execute("DELETE FROM derived WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                     db.execute("DELETE FROM jobs WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
+                self._forget_refusals(files)
                 folder = self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}")
                 try:
                     shutil.rmtree(folder)
@@ -1337,6 +1351,56 @@ class Store:
                     _log.warning("could not record a chat delete that failed (%s)", type(exc).__name__)
                 raise
         return len(files)
+
+    def remember_refusal(self, source: FileRecord, detail: str) -> None:
+        """Remember how the runner refused a source, so that later calls answer it without a job.
+
+        Only a refusal that the file alone decides is remembered (the caller chooses which). It lives in this process,
+        never in the database: a restart forgets it, and so does the source's removal (:meth:`remove`,
+        :meth:`delete_chat`). It is kept by the source's id with its creation time and size, so no other file inherits
+        it: an upload under the same name is a new record with a new id. Past ``REFUSALS_MAX`` the refusal asked for
+        least recently is forgotten, and that file is only tried again.
+
+        Args:
+            source: The file refused.
+            detail: The runner's refusal, its code first, as the caller is told it; it names no file.
+        """
+        with self._refusals_lock:
+            self._refusals[source.id] = (source.created_at, source.size, detail)
+            self._refusals.move_to_end(source.id)
+            while len(self._refusals) > REFUSALS_MAX:
+                self._refusals.popitem(last=False)
+
+    def refusal_of(self, source: FileRecord) -> str | None:
+        """The refusal remembered of a source (:meth:`remember_refusal`), if this very file was refused.
+
+        Args:
+            source: The file.
+
+        Returns:
+            The refusal as the caller was told it; ``None`` when none is remembered, or the one remembered under its id
+            is of a record of another time or size, which is then forgotten.
+        """
+        with self._refusals_lock:
+            held = self._refusals.get(source.id)
+            if held is None:
+                return None
+            created_at, size, detail = held
+            if (created_at, size) != (source.created_at, source.size):
+                del self._refusals[source.id]
+                return None
+            self._refusals.move_to_end(source.id)
+            return detail
+
+    def _forget_refusals(self, ids: Iterable[str]) -> None:
+        """Forget the refusals of files that went.
+
+        Args:
+            ids: Their file ids; an id with no refusal is fine.
+        """
+        with self._refusals_lock:
+            for file_id in ids:
+                self._refusals.pop(file_id, None)
 
     def checkpoint(self) -> bool:
         """Copy the write-ahead log into the database file and empty it.

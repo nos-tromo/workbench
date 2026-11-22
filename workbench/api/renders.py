@@ -21,9 +21,17 @@ nothing of LibreOffice: a render, like the PDF, is checked by its signature and 
 
 Every job is recorded before any file it made is visible (``modify`` / ``file.prepare``, by the source's id and then
 each render's, or the PDF's), and one call at a time makes the renders of a source (:meth:`RenderJobs.source_lock`), so
-two prepares of one file run one job (an Office file's two) and keep one set of renders. The jobs of one call run in
-one turn of its gate (:meth:`RenderJobs.turn`), taken inside the source's lock, never the other way round. The rows are
-read again after every job: a render whose row is not there is never answered, whatever the job said it made.
+two prepares of one file run one job (an Office file's two) and keep one set of renders. A call that finds the lock
+held waits for it up to ``SOURCE_LOCK_WAIT_S``, as long as it would have spent converting the file itself, and then
+finds what the holder made. The jobs of one call run in one turn of its gate (:meth:`RenderJobs.turn`), taken inside
+the source's lock, never the other way round; a turn that converts an Office file is of the caller's conversion gate,
+whoever runs it, so that a caller converts one file at a time and a picture's prepare never waits behind it. The rows
+are read again after every job: a render whose row is not there is never answered, whatever the job said it made.
+
+A file the runner refuses for what it is (``unreadable_file``, ``unsupported_format``: :data:`REMEMBERED`), at its
+prepare or its conversion, is remembered so by the store (:meth:`~workbench.api.store.Store.remember_refusal`), and
+every later prepare or render of it is answered with the same refusal at once, with no job, recorded as the refusal
+was. A refusal that may pass (out of time, a busy executor, a failure) is not remembered.
 """
 
 import base64
@@ -39,9 +47,9 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ValidationError
 
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import CallLimits, Gate, JobQueue, Keeper, Turn
+from workbench.api.jobs import SOURCE_LOCK_WAIT_S, CallLimits, Gate, JobQueue, Keeper, Turn
 from workbench.api.store import NotFound, QuotaExceeded, RendersFull, StorageFull, Store, StoreError
-from workbench.api.tools import OutputKeeper, ShownImage, _parse, _payload, _readable, judged
+from workbench.api.tools import OutputKeeper, ShownImage, _parse, _payload, _readable, judged, refusal
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.paths import PathError
@@ -81,6 +89,14 @@ _RENDER_ROLES: Final = frozenset({"image", "page"})
 
 #: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
 _CONVERTED_ROLE: Final = "pdf"
+
+#: The runner's refusals that the file alone decides, which the api remembers of a refused prepare or conversion: each
+#: later prepare or render of the file is answered with it at once. A ``read_timeout``, a busy executor or a failure
+#: may pass, and is tried again.
+REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
+
+#: The status of a refusal answered from memory: both codes of :data:`REMEMBERED` are ``422``.
+_REFUSED_STATUS: Final = 422
 
 #: What a render shows: a picture, a page of a PDF or document, or a slide of a deck.
 Noun = Literal["image", "page", "slide"]
@@ -208,11 +224,13 @@ class RenderJobs(Protocol):
         """
         ...
 
-    def turn(self, p: Principal) -> AbstractAsyncContextManager[Turn]:
+    def turn(self, p: Principal, *, converting: bool = False) -> AbstractAsyncContextManager[Turn]:
         """Hold one turn of the gate for the jobs of one call, as :meth:`~workbench.api.jobs.JobQueue.turn` does.
 
         Args:
             p: The caller and user.
+            converting: Whether the turn converts an Office file: it is then of the caller's conversion gate, whatever
+                the call's own gate is, and the jobs sent in it run on that gate.
 
         Returns:
             The turn, held while the context runs; entering it raises ``Busy`` as a job's turn does.
@@ -226,9 +244,24 @@ class RenderJobs(Protocol):
             source_id: The source's id.
 
         Returns:
-            The lock, held while the context runs; entering it raises ``Busy("wait_timeout")`` after the call's wait.
+            The lock, held while the context runs; entering it raises ``Busy("wait_timeout")`` after
+            ``SOURCE_LOCK_WAIT_S``.
         """
         ...
+
+
+def gate_for(turn: Turn | None, gate: Gate) -> Gate:
+    """The gate a job of a call runs on: its conversion's turn's, inside one, or else the call's own.
+
+    Args:
+        turn: The turn the job is sent in, or ``None``.
+        gate: The call's own gate.
+
+    Returns:
+        ``conversion`` for a job sent in a turn of the conversion gate; ``gate`` otherwise, which the queue checks
+        against any other turn.
+    """
+    return "conversion" if turn is not None and turn.gate == "conversion" else gate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -269,7 +302,7 @@ class RouteJobs:
             What :meth:`~workbench.api.jobs.JobQueue.submit_renders` returns.
         """
         return await self.queue.submit_renders(
-            p, source, args, keeper, call=self.call, gate=self.gate, turn=turn, converted=converted
+            p, source, args, keeper, call=self.call, gate=gate_for(turn, self.gate), turn=turn, converted=converted
         )
 
     async def submit_conversion(
@@ -287,21 +320,23 @@ class RouteJobs:
         Returns:
             What :meth:`~workbench.api.jobs.JobQueue.submit_conversion` returns.
         """
-        return await self.queue.submit_conversion(p, source, args, keeper, call=self.call, gate=self.gate, turn=turn)
+        gate = gate_for(turn, self.gate)
+        return await self.queue.submit_conversion(p, source, args, keeper, call=self.call, gate=gate, turn=turn)
 
-    def turn(self, p: Principal) -> AbstractAsyncContextManager[Turn]:
-        """Hold one turn of the route's gate, within the call's limits.
+    def turn(self, p: Principal, *, converting: bool = False) -> AbstractAsyncContextManager[Turn]:
+        """Hold one turn of the route's gate, or of the caller's conversion gate, within the call's limits.
 
         Args:
             p: The caller and user.
+            converting: Whether the turn converts an Office file.
 
         Returns:
             The turn, held while the context runs.
         """
-        return self.queue.turn(p, call=self.call, gate=self.gate)
+        return self.queue.turn(p, call=self.call, gate="conversion" if converting else self.gate)
 
     def source_lock(self, source_id: str) -> AbstractAsyncContextManager[None]:
-        """Hold the lock of one source's renders, waiting at most the call's wait.
+        """Hold the lock of one source's renders, waiting at most ``SOURCE_LOCK_WAIT_S``, whatever the route's wait.
 
         Args:
             source_id: The source's id.
@@ -309,7 +344,7 @@ class RouteJobs:
         Returns:
             The lock, held while the context runs.
         """
-        return self.queue.source_lock(source_id, self.call.wait_s)
+        return self.queue.source_lock(source_id, SOURCE_LOCK_WAIT_S)
 
 
 def _is_render(rec: DerivedRecord) -> bool:
@@ -482,6 +517,82 @@ def _lost(message: str) -> Exception:
     return HTTPException(status_code=500, detail=NOT_KEPT)
 
 
+def _settled(store: Store, source: FileRecord, result: JobResult) -> dict[str, Any]:
+    """Take the runner's answer out of a prepare's or a conversion's job, remembering a refusal of the file itself.
+
+    Args:
+        store: The store, which remembers the refusal.
+        source: The file the job was of.
+        result: The executor's answer.
+
+    Returns:
+        The runner's answer, of a job that ran to the end.
+
+    Raises:
+        HTTPException: What :func:`~workbench.api.tools._payload` raises; a refusal of :data:`REMEMBERED` is remembered
+            for ``source`` first, in the words it is raised with.
+    """
+    try:
+        return _payload(result, "file")
+    except HTTPException as refused:
+        if refusal(result) in REMEMBERED:
+            store.remember_refusal(source, str(refused.detail))
+        raise
+
+
+def _record_remembered(
+    audit: AuditLog, p: Principal, source: FileRecord, detail: str, *, strips: int, on_demand: bool
+) -> None:
+    """Record a refusal answered from memory as its job's was: an ``error`` of ``prepare`` naming the file, by its code.
+
+    Args:
+        audit: The audit log, bound to the call.
+        p: The caller, user and chat of the source.
+        source: The file refused.
+        detail: The refusal remembered; its code alone is recorded.
+        strips: Into how many strips the call would have cut each page.
+        on_demand: Whether the call asked for pages after the prepare.
+
+    Raises:
+        AuditWriteError: The event could not be written; the refusal must not go out.
+    """
+    criteria: dict[str, object] = {
+        "renders": 0,
+        "strips": strips,
+        "on_demand": on_demand,
+        "outputs": 0,
+        "refused": detail.partition(": ")[0],
+        "remembered": True,
+    }
+    audit.record("prepare", p, file_ids=[source.id], outcome="error", criteria=criteria)
+
+
+async def _refuse_remembered(
+    p: Principal, source: FileRecord, *, store: Store, audit: AuditLog, strips: int, on_demand: bool
+) -> None:
+    """Answer a file refused before with the same refusal, with no job: recorded first, then raised.
+
+    The caller holds the source's lock and has checked the call's purpose for ``modify``, as before a job.
+
+    Args:
+        p: The caller, user and chat of the source.
+        source: The file.
+        store: The store, which remembers the refusal.
+        audit: The audit log, bound to the call.
+        strips: Into how many strips the call would have cut each page.
+        on_demand: Whether the call asked for pages after the prepare.
+
+    Raises:
+        HTTPException: ``422``, the refusal remembered, word for word.
+        AuditWriteError: Its event could not be written; the refusal does not go out.
+    """
+    detail = store.refusal_of(source)
+    if detail is None:
+        return
+    await run_in_threadpool(_record_remembered, audit, p, source, detail, strips=strips, on_demand=on_demand)
+    raise HTTPException(status_code=_REFUSED_STATUS, detail=detail)
+
+
 async def _convert(
     p: Principal,
     source: FileRecord,
@@ -495,9 +606,10 @@ async def _convert(
 ) -> DerivedRecord:
     """Convert an Office file to a PDF in a turn the caller holds, and answer the PDF's row.
 
-    The caller holds the source's lock and has checked the call's purpose. The job is recorded before the PDF is
-    visible (``modify`` / ``file.prepare``, by the source's id and then the PDF's), with ``converted`` among its
-    criteria and no render.
+    The caller holds the source's lock and a turn of the conversion gate, and has checked the call's purpose and the
+    refusals remembered. The job is recorded before the PDF is visible (``modify`` / ``file.prepare``, by the source's
+    id and then the PDF's), with ``converted`` among its criteria and no render. A refusal of the file itself is
+    remembered (:func:`_settled`).
 
     Args:
         p: The caller, user and chat of the source.
@@ -506,7 +618,7 @@ async def _convert(
         store: The store.
         audit: The audit log, bound to the call.
         jobs: The queue, within the call's limits and on its gate.
-        turn: The turn of that gate the caller holds; the job runs in it.
+        turn: The turn of the conversion gate the caller holds; the job runs in it.
         on_demand: Whether the conversion is for pages a call asked for after the prepare (its PDF went).
 
     Returns:
@@ -516,9 +628,11 @@ async def _convert(
         AuditWriteError: The job's event could not be written; no PDF is kept.
         Busy: The executor is busy.
         HTTPException: The runner refused the file (its code's status: 422 ``unreadable_file`` for a damaged,
-            password-protected or old binary file, one that could not be converted or whose PDF would pass 32 MB;
-            422 ``unsupported_format`` for a deck with no slides), the job ran out of time (422), or failed or answered
-            what cannot be read (500); or the PDF was not kept for a reason that is not one of the three below (500).
+            password-protected or old binary file, one that could not be converted or whose PDF would pass 32 MB, one
+            holding a picture over 120 megapixels or more pictures than can be drawn within the memory limit; 422
+            ``unsupported_format`` for a deck with no slides, a macro-enabled one or a slide show), which is remembered;
+            the job ran out of time (422), or failed or answered what cannot be read (500); or the PDF was not kept for
+            a reason that is not one of the three below (500).
         QuotaExceeded: The PDF would take the user over their quota (507).
         RendersFull: It would take the source over its cap of derived files (507).
         StorageFull: The volume is full (507).
@@ -540,7 +654,7 @@ async def _convert(
 
     keeper = OutputKeeper(audit, p, "prepare", [source.id], decide)
     _, result, _ = await jobs.submit_conversion(p, source, {"budget_s": _budget(settings)}, keeper, turn=turn)
-    _parse(ConvertAnswer, _payload(result, "file"))
+    _parse(ConvertAnswer, _settled(store, source, result))
     pdf = converted_of(await run_in_threadpool(store.derived_of, source))
     if pdf is None:
         raise _lost(result.message)
@@ -577,9 +691,11 @@ async def prepared(
     whose rows hold the manifest is answered from them, with no job, no event and no wait for the source's lock, which a
     job of later pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job,
     which draws the first pages (but those whole pages it has already), finds the facts and is recorded before any
-    render is visible. An Office file takes one turn of the gate inside the lock and has two jobs in it: the conversion
-    to a PDF, unless its PDF is kept already (:func:`_convert`), then the drawing of that PDF. A second call for the
-    same file waits for the lock and then finds the rows.
+    render is visible. An Office file takes one turn inside the lock and has two jobs in it: the conversion to a PDF
+    (:func:`_convert`), then the drawing of that PDF, both on the caller's conversion gate; one whose PDF is kept
+    already is only drawn, on the call's own gate. A second call for the same file waits for the lock (up to
+    ``SOURCE_LOCK_WAIT_S``) and then finds the rows. A file the runner refused for what it is, here or in a
+    conversion, is answered with that refusal at once, with no job (:data:`REMEMBERED`), and so is every later call.
 
     Args:
         p: The caller, user and chat of the source.
@@ -594,12 +710,13 @@ async def prepared(
 
     Raises:
         PurposeRequired: The call had to state a purpose for ``modify`` and did not; no job runs.
-        AuditWriteError: The job's event could not be written; no render is kept.
+        AuditWriteError: The job's event, or that of a refusal remembered, could not be written; no render is kept, and
+            no refusal goes out.
         Busy: The lock or the queue did not come free in time, or the executor is busy.
-        HTTPException: The runner refused the file (its code's status, such as 422 ``unreadable_file``), the job ran
-            out of time (422), or failed or answered what cannot be read (500); or the whole render of page 1, which
-            holds the facts, or an Office file's PDF, was not kept for a reason that is not one of the three below
-            (500).
+        HTTPException: The runner refused the file, now or before (its code's status, such as 422
+            ``unreadable_file``), the job ran out of time (422), or failed or answered what cannot be read (500); or the
+            whole render of page 1, which holds the facts, or an Office file's PDF, was not kept for a reason that is
+            not one of the three below (500).
         QuotaExceeded: That render, or the PDF, would take the user over their quota (507).
         RendersFull: It would take the source over its cap of renders (507).
         StorageFull: The volume is full (507).
@@ -617,19 +734,21 @@ async def prepared(
         if manifest is not None:
             return manifest
         await run_in_threadpool(audit.check, "prepare", p)
+        await _refuse_remembered(p, source, store=store, audit=audit, strips=1, on_demand=False)
         have = sorted({rec.ordinal for rec in rows if _is_render(rec) and rec.strips == 1})
         args: dict[str, Any] = {"pages": None, "strips": 1, "have": have, "budget_s": _budget(settings), "facts": True}
         keeper = _keeper(audit, p, source, strips=1, on_demand=False)
         if kind == "office":
-            async with jobs.turn(p) as turn:
-                pdf = converted_of(rows) or await _convert(
+            kept = converted_of(rows)
+            async with jobs.turn(p, converting=kept is None) as turn:
+                pdf = kept or await _convert(
                     p, source, settings=settings, store=store, audit=audit, jobs=jobs, turn=turn, on_demand=False
                 )
                 args["office"] = _office(source, pdf)
                 _, result, _ = await jobs.submit_renders(p, source, args, keeper, turn=turn, converted=pdf)
         else:
             _, result, _ = await jobs.submit_renders(p, source, args, keeper)
-        _parse(RenderAnswer, _payload(result, "file"))
+        _parse(RenderAnswer, _settled(store, source, result))
         manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
         if manifest is None:
             raise _lost(result.message)
@@ -691,7 +810,8 @@ async def renders_for(
     The rows are read first; when a page lacks a render, the missing pages are made under the source's lock, the rows
     read again inside it, by one job per at most ``RENDERS_PER_JOB // strips`` pages, all in one turn of the gate taken
     inside the lock. The pages of an Office file are drawn from its PDF; when the PDF went, it is converted again first,
-    in the same turn (:func:`_convert`). Each job is recorded before any render it made is visible, and does not look
+    in the same turn, then of the caller's conversion gate (:func:`_convert`), unless the file was refused before: that
+    refusal is answered at once. Each job is recorded before any render it made is visible, and does not look
     for the facts again: the manifest holds them (ruling R4). No job runs
     when the source's renders leave no room for one more (:func:`_no_room`): the missing pages are left out as the cap
     would leave them. A page the job did not make, or whose renders the store could not keep (the user's quota, the
@@ -719,10 +839,10 @@ async def renders_for(
         PurposeRequired: The call had to state a purpose for ``modify`` and did not; no job runs.
         AuditWriteError: A job's event could not be written; none of its renders is kept.
         Busy: The lock or the queue did not come free in time, or the executor is busy.
-        HTTPException: The runner refused the file (its code's status), the job ran out of time (422), or failed or
-            answered what cannot be read (500); an Office file's PDF, converted again, was not kept for a reason that is
-            not one of the three below (500); or no page asked for exists and the loss a job reported is not one of
-            the three below (500).
+        HTTPException: The runner refused the file (its code's status), or refused its conversion now or before (422),
+            the job ran out of time (422), or failed or answered what cannot be read (500); an Office file's PDF,
+            converted again, was not kept for a reason that is not one of the three below (500); or no page asked for
+            exists and the loss a job reported is not one of the three below (500).
         QuotaExceeded: No page asked for exists, and the first loss was the user's quota (507).
         RendersFull: No page asked for exists, and the first loss was the source's cap of renders, or the renders left
             no room for one more (507).
@@ -747,10 +867,14 @@ async def renders_for(
             if missing and not full:
                 await run_in_threadpool(audit.check, "prepare", p)
                 per_job = RENDERS_PER_JOB // strips
-                async with jobs.turn(p) as turn:
-                    pdf = None
-                    if manifest.kind == "office":
-                        pdf = converted_of(rows) or await _convert(
+                kept = converted_of(rows) if manifest.kind == "office" else None
+                converting = manifest.kind == "office" and kept is None
+                if converting:
+                    await _refuse_remembered(p, source, store=store, audit=audit, strips=strips, on_demand=True)
+                async with jobs.turn(p, converting=converting) as turn:
+                    pdf = kept
+                    if converting:
+                        pdf = await _convert(
                             p, source, settings=settings, store=store, audit=audit, jobs=jobs, turn=turn, on_demand=True
                         )
                     for start in range(0, len(missing), per_job):

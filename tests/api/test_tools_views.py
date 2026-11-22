@@ -7,10 +7,13 @@ how many images one answer shows, that block ``i`` is ``shown[i]``, what the mod
 shown, and that the event is written before an image leaves.
 """
 
+import asyncio
 import base64
+import contextlib
 import dataclasses
 import io
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -21,16 +24,17 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tests.api.conftest import HD, HG, PG, AuditLines, put
-from tests.api.mcp_calls import Headers, acall, answered, refusal, result, rpc, unavailable
+from tests.api.mcp_calls import Headers, acall, answered, message, refusal, result, rpc, unavailable
 from tests.api.test_files_renders import deck
-from tests.api.test_renders import capped, quay_pages
+from tests.api.test_renders import HeldConversion, capped, quay_pages
 from tests.api.test_tools_templates import Local
-from tests.conftest import FakeOffice
+from tests.conftest import FakeOffice, scaled
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
 from tests.fixtures import make_templates as mt
-from workbench.api import tools_views
+from workbench.api import tools_mcp, tools_views
 from workbench.api.audit import AuditLog
+from workbench.api.auth import MCP_PATH
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
@@ -574,6 +578,121 @@ def test_view_file_shows_a_deck_written_in_the_chat(
     assert [shown["label"] for shown in structured["shown"]] == ["slide 1", "slide 2"]
     assert len(images(answer)) == 2
     assert fake_office.calls == 1
+
+
+# --- a deck its prepare converts, and a deck refused once ---------------------------------------------------------
+
+#: Ghostwriter's file routes state a purpose and a request id, as its MCP calls may.
+ROUTE_HEADERS = {**HG, "X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request-ID": "req-1"}
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """Run the async tests on asyncio, the loop the api runs on."""
+    return "asyncio"
+
+
+@contextlib.asynccontextmanager
+async def door(settings: Settings, store: Store, audit: AuditLog, queue: JobQueue) -> AsyncIterator[httpx2.AsyncClient]:
+    """The real app over ``queue``, its audit chain open, reached from the test's own loop, so calls can overlap."""
+    app = create_app(settings, store=store, audit=audit, jobs=queue)
+    audit.start({"retention_days": settings.retention_days})
+    try:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://workbench-api") as http:
+            yield http
+    finally:
+        audit.close()
+
+
+async def mcp_call(http: httpx2.AsyncClient, tool: str, arguments: dict[str, Any]) -> httpx2.Response:
+    """Call a tool on the MCP door as Ghostwriter does."""
+    body, headers = message("tools/call", {"name": tool, "arguments": arguments}, headers=HG)
+    sent = {name: value if isinstance(value, str) else value.decode() for name, value in headers.items() if value}
+    return await http.post(MCP_PATH, content=body, headers=sent)
+
+
+async def prepare_route(http: httpx2.AsyncClient, source: FileRecord) -> httpx2.Response:
+    """Prepare a file as Ghostwriter does right after its upload."""
+    return await http.post("/files/prepare", params={"path": source.virtual_path}, headers=ROUTE_HEADERS)
+
+
+@pytest.mark.anyio
+async def test_view_file_waits_for_the_prepare_that_converts_its_deck(
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    built: Path,
+    fake_office: FakeOffice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Final review: the model views a deck while the prepare of its attachment converts it.
+
+    The view waits for that prepare, longer than a call waits for its own turn (lowered here to none), and answers the
+    slides it drew: never busy, and with no second conversion.
+    """
+    monkeypatch.setattr(tools_mcp, "MCP_QUEUE_WAIT_S", 0)
+    executor = HeldConversion(settings.data_dir, built.parent / "held-conversions")
+    queue = JobQueue(settings, executor, store, Metrics(settings.data_dir))
+    source = deck(store, built, 3)
+    async with door(settings, store, audit, queue) as http:
+        preparing = asyncio.create_task(prepare_route(http, source))
+        await executor.converting.wait()
+        viewing = asyncio.create_task(mcp_call(http, "view_file", {"path": source.virtual_path}))
+        await asyncio.sleep(0.2)
+        assert not viewing.done()
+        executor.release.set()
+        prepared, viewed = await asyncio.gather(preparing, viewing)
+
+    assert prepared.status_code == 200
+    answer = seen(viewed)
+    assert [shown["label"] for shown in answer["structuredContent"]["shown"]] == ["slide 1", "slide 2", "slide 3"]
+    assert len(images(answer)) == 3
+    assert fake_office.calls == 1
+    assert [req.tool for req in executor.requests] == ["convert_office", "prepare_file"]
+
+
+@pytest.mark.anyio
+async def test_view_file_waits_for_a_sources_lock_no_longer_than_its_bound(
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    built: Path,
+    fake_office: FakeOffice,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lock held past ``SOURCE_LOCK_WAIT_S`` (lowered here) still answers busy, ``wait_timeout``, as a refusal."""
+    monkeypatch.setattr(tools_mcp, "SOURCE_LOCK_WAIT_S", 0.2)
+    executor = HeldConversion(settings.data_dir, built.parent / "held-conversions")
+    queue = JobQueue(settings, executor, store, Metrics(settings.data_dir))
+    source = deck(store, built, 3)
+    async with door(settings, store, audit, queue) as http:
+        preparing = asyncio.create_task(prepare_route(http, source))
+        await executor.converting.wait()
+        viewed = await asyncio.wait_for(mcp_call(http, "view_file", {"path": source.virtual_path}), scaled(2))
+        executor.release.set()
+        assert (await preparing).status_code == 200
+
+    assert refusal(viewed) == ("wait_timeout", "busy, retry later")
+
+
+def test_view_file_of_a_refused_deck_answers_the_remembered_refusal(
+    client: TestClient, store: Store, built: Path, fake_executor: Local, fake_office: FakeOffice
+) -> None:
+    """Final review: a deck its prepare could not convert is refused by every view after, at once, with no job."""
+    fake_office.ceiling = 0
+    source = deck(store, built, 2)
+    words = "unreadable_file: the file holds more or larger pictures than can be drawn within the memory limit"
+    prepared = client.post("/files/prepare", params={"path": source.virtual_path}, headers=ROUTE_HEADERS)
+    assert (prepared.status_code, prepared.json()) == (422, {"detail": words})
+    calls = fake_office.calls
+
+    assert refusal(view(client, source.virtual_path)) == ("refused", words)
+    assert refusal(view(client, source.virtual_path, "slide 2")) == ("refused", words)
+    again = client.post("/files/prepare", params={"path": source.virtual_path}, headers=ROUTE_HEADERS)
+    assert (again.status_code, again.json()) == (422, {"detail": words})
+    assert [req.tool for req in fake_executor.requests] == ["convert_office"]
+    assert fake_office.calls == calls
 
 
 # --- what is recorded --------------------------------------------------------------------------------------------
