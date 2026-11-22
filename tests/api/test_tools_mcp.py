@@ -422,7 +422,7 @@ async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
 def test_ghostwriters_call_holds_its_limits(
     client: TestClient, app: FastAPI, store: Store, fake_executor: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Its wall, its five-second wait and its two slots; the job keeps the wall, the runner leaves the preview 5 s.
+    """Its wall, its five-second wait and its three slots; the job keeps the wall, the runner leaves the preview 5 s.
 
     The CPU limit is the job's wall, never less, so a preview never meets it before the wall.
     """
@@ -432,7 +432,7 @@ def test_ghostwriters_call_holds_its_limits(
     assert result(acall(client, "run_python", {"code": "print(1)"}))["isError"] is False
     fake_executor.payload = None
     assert result(acall(client, "read_document", {"path": f"{CHAT}/q.csv"}))["isError"] is False
-    assert seen == [{"call": CallLimits(120, 5, 2), "previews": True}] * 2
+    assert seen == [{"call": CallLimits(120, 5, 3), "previews": True}] * 2
     python, read = fake_executor.requests
     for req in (python, read):
         assert (req.limits.wall_s, req.limits.cpu_s, req.previews) == (120, 120, True)
@@ -453,7 +453,7 @@ def test_a_lower_caller_wall_is_the_jobs_wall(
     seen = spy_submit(lowered, monkeypatch)
     with TestClient(lowered) as client:
         assert result(acall(client, "run_python", {"code": "print(1)"}))["isError"] is False
-    assert seen == [{"call": CallLimits(30, 5, 2), "previews": True}]
+    assert seen == [{"call": CallLimits(30, 5, 3), "previews": True}]
     (req,) = executor.requests
     assert (req.limits.wall_s, req.limits.cpu_s) == (30, 30)
     assert req.args["budget_s"] == (30 - PREVIEW_RESERVE_S) * 9 // 10 == 22
@@ -462,38 +462,44 @@ def test_a_lower_caller_wall_is_the_jobs_wall(
 def test_ghostwriters_waiting_calls_are_capped_across_many_users(
     settings: Settings, store: Store, audit: AuditLog
 ) -> None:
-    """Ghostwriter's users are pseudonyms each: 2 run, 8 wait (2 * 16 // 4), the 11th is refused at once.
+    """Ghostwriter's users are pseudonyms each: at its 3 slots, 3 run, 12 wait (3 * 16 // 4), the 16th is refused.
 
-    docint's call still runs meanwhile, on a slot Ghostwriter's cap leaves free.
+    docint's call still runs meanwhile, on the slot of the executor's 4 that Ghostwriter's cap leaves free.
     """
+    slots = settings.ghostwriter_slots
+    waiting = slots * (settings.queue_max // settings.executor_slots)
+    calls_in_hand = slots + waiting
+    assert (slots, waiting) == (3, 12)
     executor = Scripted(settings.data_dir)
     executor.payload = ran()
-    executor.hold = {f"ghostwriter/user-{n}" for n in range(10)}
+    executor.hold = {f"ghostwriter/user-{n}" for n in range(calls_in_hand)}
     queue = JobQueue(settings, executor, store, Metrics(settings.data_dir))
     with TestClient(create_app(settings, store=store, audit=audit, jobs=queue)) as client:
         portal = client.portal
         assert portal is not None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=calls_in_hand) as pool:
             calls = [
                 pool.submit(acall, client, "run_python", {"code": "print(1)"}, headers={**HG, "X-User-Id": f"user-{n}"})
-                for n in range(10)
+                for n in range(calls_in_hand)
             ]
             try:
                 held = partial(
                     until,
-                    lambda: executor.running == 2 and sample(queue.metrics, "workbench_queue_length") == 8,
+                    lambda: executor.running == slots and sample(queue.metrics, "workbench_queue_length") == waiting,
                     seconds=scaled(5),
                 )
                 portal.call(held)
-                eleventh = acall(client, "run_python", {"code": "print(1)"}, headers={**HG, "X-User-Id": "user-10"})
-                assert refused(eleventh) == {"reason": "queue_full"}
+                one_more = {**HG, "X-User-Id": f"user-{calls_in_hand}"}
+                assert refused(acall(client, "run_python", {"code": "print(1)"}, headers=one_more)) == {
+                    "reason": "queue_full"
+                }
                 assert result(inline_call(client))["isError"] is False
-                assert executor.running == 2
+                assert executor.running == slots
             finally:
                 portal.call(executor.gate.set)
             answers = [result(done.result(timeout=scaled(10))) for done in calls]
-    assert [answer["isError"] for answer in answers] == [False] * 10
-    assert sorted(req.caller for req in executor.requests) == ["docint"] + ["ghostwriter"] * 10
+    assert [answer["isError"] for answer in answers] == [False] * calls_in_hand
+    assert sorted(req.caller for req in executor.requests) == ["docint"] + ["ghostwriter"] * calls_in_hand
 
 
 @pytest.mark.parametrize("reason", ["queue_full", "wait_timeout", "executor_busy"])

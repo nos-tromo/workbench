@@ -784,7 +784,7 @@ def test_each_route_waits_for_its_own_turn_on_its_own_gate(
     assert prepare(client, source.virtual_path).status_code == 200
     assert rendition(client, source.virtual_path, 21).status_code == 200
 
-    assert asked == [(120, 120, 2, "prepare"), (120, 5, 2, "user")]
+    assert asked == [(120, 120, 3, "prepare"), (120, 5, 3, "user")]
 
 
 def test_a_callers_wall_bounds_the_runners_budget(

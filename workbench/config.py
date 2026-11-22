@@ -44,7 +44,9 @@ GHOSTWRITER_DEFAULT_TOOLS: Final = frozenset(
     }
 )
 GHOSTWRITER_DEFAULT_WALL_S: Final = 120
-GHOSTWRITER_DEFAULT_SLOTS: Final = 2
+#: Three: a picture's or a PDF's prepare takes one, an Office file's conversion another (their gates run apart), and
+#: one is left for the tool calls of all Ghostwriter's users; still fewer than the executor's default 4.
+GHOSTWRITER_DEFAULT_SLOTS: Final = 3
 
 #: The least wall time Ghostwriter's jobs may be given, so the previews keep their time within it.
 MIN_GHOSTWRITER_WALL_S: Final = 10
