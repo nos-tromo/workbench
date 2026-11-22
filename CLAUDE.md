@@ -173,8 +173,8 @@ what the model is told and shown, never what a caller may reach.
   A slide that names no layout is left for the runner, which takes the first
   layout that takes it (`presentations/deck.py:fitting`), and a title slide's
   only text block is its subtitle (`subtitle_as_meant`).
-- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, prepare,
-  view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
+- `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
+  an upload not yet sent, prepare, view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
   the conversion gate; with `strips` 2 or 3 it also cuts a picture into strips, on
@@ -271,7 +271,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and five file routes,
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and six file routes,
 workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
@@ -308,7 +308,9 @@ starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
   job, inside a job folder no other slot can pass. A watchdog holds each running
   job to its disk and memory.
 - **The agent deletes nothing.** No tool deletes or overwrites a file; Ghostwriter's
-  chat delete and retention do.
+  chat delete, its taking back of an upload (Ghostwriter calls it only for one
+  its user has not sent; workbench deletes any upload of the chat), and
+  retention do.
 - **Never a name in a log or an event.** Audit events name files by id; error
   answers are short fixed texts (`workbench/api/errors.py`); no handler logs a
   traceback or a cause of a path or store error. An error no handler expected is
@@ -461,7 +463,8 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   gives, a text added later) is remembered only when it comes twice in a row, a
   job that went well between them starting the count again; a timeout, a busy
   executor or a failure never is. It goes with the file (`Store.remove`,
-  `Store.delete_chat`; a job of a deleted chat remembers nothing) and with a
+  `Store.remove_upload`, `Store.delete_chat`; a job of a deleted chat remembers
+  nothing) and with a
   restart; uploading the file again makes a new file, tried afresh.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The

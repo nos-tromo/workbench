@@ -15,8 +15,8 @@ ever stored without its record. A job's output is registered under an id the
 caller chose and recorded before it called, for the same reason.
 
 The store never deletes a file of its own accord; :meth:`Store.remove` is called
-only once its deletion is recorded, and :meth:`Store.delete_chat` records a chat's
-deletion itself before anything of it goes.
+only once its deletion is recorded, and :meth:`Store.delete_chat` and
+:meth:`Store.remove_upload` record a chat's or an upload's deletion themselves before anything of it goes.
 
 A derived file, the render of a picture or of a page of a PDF, or the PDF an Office file was converted to, is kept
 beside its source, in the reserved folder ``<chat>/.derived/<source-id>/``, under its own table. It is bound to its
@@ -1263,34 +1263,81 @@ class Store:
             OSError: If the file cannot be deleted; its record stays so a later sweep retries.
         """
         with self._lock:
-            with self._db() as db:
-                row = db.execute(f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?", (record.id,)).fetchone()
-            current = None if row is None else _file(row)
-            held = current or record  # the row's owner counts; a source already gone has only the record's to go by
-            owner = (held.caller, held.user_id, held.chat_id)
-            named: dict[str, DerivedRecord] = {}
-            for each in derived:
-                found = self._current(each)
-                if found is not None and _owner(found) == (record.id, *owner):
-                    named[found.id] = found
-            if current is None and not named:
-                return
-            principal = Principal(*owner)
-            doomed = [self._derived_path(found) for found in named.values()]
-            file_path = None if current is None else self._ws.resolve(principal, current.virtual_path)
-            folders = [self._derived_folder(principal, record.id)] if named else []
-            for path in doomed:
-                _unlink(path)
-            if file_path is not None:
-                _unlink(file_path)
-            with self._db() as db:
-                db.executemany("DELETE FROM derived WHERE id = ?", [(rec_id,) for rec_id in named])
-                if current is not None:
-                    db.execute("DELETE FROM files WHERE id = ?", (current.id,))
-            self._forget_refusals([record.id])
-            for folder in folders:
-                _remove_empty(folder)
-                _remove_empty(folder.parent)
+            self._remove_held(record, derived)
+
+    def _remove_held(self, record: FileRecord, derived: Sequence[DerivedRecord]) -> None:
+        """Delete a file and the renders it names, as :meth:`remove` does, with the store's lock already held.
+
+        Args:
+            record: The file's record.
+            derived: The renders to delete with it.
+        """
+        with self._db() as db:
+            row = db.execute(f"SELECT {_FILE_COLUMNS} FROM files WHERE id = ?", (record.id,)).fetchone()
+        current = None if row is None else _file(row)
+        held = current or record  # the row's owner counts; a source already gone has only the record's to go by
+        owner = (held.caller, held.user_id, held.chat_id)
+        named: dict[str, DerivedRecord] = {}
+        for each in derived:
+            found = self._current(each)
+            if found is not None and _owner(found) == (record.id, *owner):
+                named[found.id] = found
+        if current is None and not named:
+            return
+        principal = Principal(*owner)
+        doomed = [self._derived_path(found) for found in named.values()]
+        file_path = None if current is None else self._ws.resolve(principal, current.virtual_path)
+        folders = [self._derived_folder(principal, record.id)] if named else []
+        for path in doomed:
+            _unlink(path)
+        if file_path is not None:
+            _unlink(file_path)
+        with self._db() as db:
+            db.executemany("DELETE FROM derived WHERE id = ?", [(rec_id,) for rec_id in named])
+            if current is not None:
+                db.execute("DELETE FROM files WHERE id = ?", (current.id,))
+        self._forget_refusals([record.id])
+        for folder in folders:
+            _remove_empty(folder)
+            _remove_empty(folder.parent)
+
+    def remove_upload(self, record: FileRecord, event: ChatRecord) -> int:
+        """Delete an upload Ghostwriter takes back for its user, once its deletion is recorded: renders, bytes, rows.
+
+        The renders are read and the file and they are deleted under one hold of the store's lock, which a render takes
+        on its way in (:meth:`register_derived`): none made meanwhile is left behind. A job still running on the file
+        works on its own copy and keeps no render, as its source is gone. ``event`` writes the deletion by the file's id
+        and its renders' first; a record that cannot be written deletes nothing, and a failure after it is recorded
+        again as ``error`` and raised, as :meth:`delete_chat` does.
+
+        Args:
+            record: The upload's record, as :meth:`get` found it for its owner.
+            event: Writes the deletion's event (:data:`ChatRecord`), under the store's lock.
+
+        Returns:
+            How many renders went with it.
+
+        Raises:
+            NotFound: If the file's row went since it was found (taken back twice at once, its chat deleted, retention);
+                nothing is recorded.
+            PathError: If the file's path, or a render's, now runs through a symlink.
+            Exception: What ``event`` raised, with nothing deleted; or what the deletion raised after the record.
+        """
+        with self._lock:
+            if not self._has_file(record.id, record.caller, record.user_id, record.chat_id):
+                raise NotFound("file not found")  # taken back, or its chat deleted, since it was found: no second event
+            renders = self.derived_of(record)
+            ids = [record.id, *(rec.id for rec in renders)]
+            event(ids, "ok")
+            try:
+                self._remove_held(record, renders)
+            except BaseException:
+                try:
+                    event(ids, "error")
+                except Exception as exc:  # the deletion's error is the answer; this one is only logged
+                    _log.warning("could not record a file delete that failed (%s)", type(exc).__name__)
+                raise
+        return len(renders)
 
     def delete_chat(self, p: Principal, record: ChatRecord) -> int:
         """Delete a chat, once its deletion is recorded: its files' and renders' rows, its job rows, and its folder.
@@ -1361,8 +1408,9 @@ class Store:
         A refusal the file alone decides is remembered at once; one that may pass (the caller says which) only when
         it comes ``REFUSALS_IN_A_ROW`` times in a row for the source, with no success between (:meth:`forget_refusal`).
         It lives in this process, never in the database: a restart forgets it, and so does the source's removal
-        (:meth:`remove`, :meth:`delete_chat`); a source of a chat deleted while its job ran is not remembered at all. A
-        source removed by retention while its job runs can be, until it is pushed out: its id never comes back. It is
+        (:meth:`remove`, :meth:`remove_upload`, :meth:`delete_chat`); a source of a chat deleted while its job ran is
+        not remembered at all. A source removed by retention or taken back while its job runs can be, until it is
+        pushed out: its id never comes back. It is
         kept by the source's id with its creation time and size, so no other file inherits it: an upload under the same
         name is a new record with a new id. Past ``REFUSALS_MAX`` the refusal asked for least recently is forgotten,
         and that file is only tried again.
@@ -1685,7 +1733,8 @@ class Store:
         an Office file was converted to, which is kept as its renders are): the folders are private, the file is
         private, and it is renamed into place and then its row inserted, as :meth:`_place` does for every file. It is
         as old as its source (``created_at``) and counts in the user's quota. All the checks and the placing hold the
-        store's lock, which :meth:`remove` and :meth:`delete_chat` hold: a render is never added to a source that has
+        store's lock, which :meth:`remove`, :meth:`remove_upload` and :meth:`delete_chat` hold: a render is never added
+        to a source that has
         gone, or to a chat that was deleted.
 
         The caller records the render by ``file_id`` before it calls, so that it is never visible without its event,

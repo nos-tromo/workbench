@@ -1,8 +1,9 @@
-"""Ghostwriter's file routes: list, upload, prepare and view, held to the request's chat, and the chat delete.
+"""Ghostwriter's file routes, held to the request's chat: list, upload, take back, prepare, view, the chat delete.
 
 Any path outside the request's chat is ``404``. The calls state a purpose and a request id,
 which their events carry, and an upload, a prepare or a view that must state a purpose and does not is
-``428``, recorded as denied. ``DELETE /files/chat`` deletes the request's chat.
+``428``, recorded as denied. ``DELETE /files/upload`` deletes one upload of the chat with its renders, as Ghostwriter
+takes back a file its user has not sent (since 0.8.1); ``DELETE /files/chat`` deletes the request's chat.
 
 ``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`), and
 with ``strips`` of 2 or 3 also cuts a picture into that many strips. The view of a file answers the file itself; with
@@ -452,6 +453,38 @@ async def view_file(
     if queue is None:
         raise Busy("executor_busy")
     return await _view_rendition(path, rendition, strips, strip or 1, p, caller, settings, store, audit, queue)
+
+
+@router.delete("/files/upload")
+def delete_upload(path: str, p: FilePrincipalDep, store: StoreDep, audit: CallAuditDep) -> dict[str, int]:
+    """Delete an upload of the request's chat that Ghostwriter takes back for its user, with its renders.
+
+    Only an upload goes: a tool's output, another chat's file or a render is not found. The deletion is recorded by
+    the file's id and its renders' first; one whose event cannot be written deletes nothing. A job still running on the
+    file keeps no render (:meth:`~workbench.api.store.Store.remove_upload`). A refusal remembered for the file is
+    forgotten with it.
+
+    Args:
+        path: The upload's absolute path, ``/workspace/<chat>/<name>``.
+        p: The caller, the user and the chat.
+        store: The file store.
+        audit: The audit log, bound to the call.
+
+    Returns:
+        ``deleted``, 1, and how many ``renders`` went with it.
+
+    Raises:
+        NotFound: No upload of the chat is at the path.
+    """
+    audit.check("file_delete", p)
+    rec = store.get(p, path)
+    if rec.kind != "upload":
+        raise NotFound("file not found")
+
+    def record(ids: Sequence[str], outcome: str) -> None:
+        audit.record("file_delete", p, file_ids=ids, outcome=outcome, criteria={"renders": len(ids) - 1})
+
+    return {"deleted": 1, "renders": store.remove_upload(rec, record)}
 
 
 @router.delete(CHAT_PATH)
