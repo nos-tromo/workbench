@@ -77,7 +77,7 @@ from workbench.api.tools import (
 )
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
-from workbench.renders import Unit, kind_of, unit_of
+from workbench.renders import PagedUnit, kind_of, unit_of
 from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
@@ -113,7 +113,7 @@ PAGES_VIEWABLE: Final = "view_file shows its pages as images, as they would prin
 _TRANSIENT: Final = frozenset({"read_timeout"})
 
 #: A page as the PDF reader labels it, and a slide as the deck's reader does.
-_NUMBERED: Final[Mapping[Unit, re.Pattern[str]]] = {
+_NUMBERED: Final[Mapping[PagedUnit, re.Pattern[str]]] = {
     "page": re.compile(r"page (\d{1,9})"),
     "slide": re.compile(r"slide (\d{1,9})"),
 }
@@ -253,7 +253,7 @@ async def _take(store: Store, pages: Mapping[int, list[DerivedRecord]], first: i
     return taken
 
 
-def _part(first: int, last: int, noun: Unit) -> str:
+def _part(first: int, last: int, noun: PagedUnit) -> str:
     """Write the pages (or slides) ``first`` to ``last`` as a ``part`` the tool takes.
 
     Args:
@@ -267,7 +267,7 @@ def _part(first: int, last: int, noun: Unit) -> str:
     return f"{noun} {first}" if first == last else f"{noun}s {first}-{last}"
 
 
-def _not_shown_after(last: int, total: int, noun: Unit) -> str:
+def _not_shown_after(last: int, total: int, noun: PagedUnit) -> str:
     """Say which pages (or slides) after the window a call named no part for are not shown, and how to see them.
 
     Args:
@@ -455,7 +455,7 @@ class _Attached:
     unshown: str | None = None
 
 
-def _page_of(label: str | None, noun: Unit) -> int | None:
+def _page_of(label: str | None, noun: PagedUnit) -> int | None:
     """Read the page a part or a ``next_part`` of a PDF names, or the slide one of a deck names.
 
     Args:
@@ -469,7 +469,7 @@ def _page_of(label: str | None, noun: Unit) -> int | None:
     return None if found is None else int(found.group(1))
 
 
-def _pages(numbers: Sequence[int], noun: Unit) -> str:
+def _pages(numbers: Sequence[int], noun: PagedUnit) -> str:
     """Name pages, or slides, in a sentence.
 
     Args:
@@ -483,7 +483,7 @@ def _pages(numbers: Sequence[int], noun: Unit) -> str:
     return f"{word} {numbers[0]}" if len(numbers) == 1 else f"{word}s {', '.join(str(n) for n in numbers)}"
 
 
-def _cut_note(cut: int, noun: Unit) -> str:
+def _cut_note(cut: int, noun: PagedUnit) -> str:
     """Say that the images, not the text, ended the answer, and where to go on.
 
     Args:
@@ -499,7 +499,7 @@ def _cut_note(cut: int, noun: Unit) -> str:
     )
 
 
-def _unshown_because(lost: Exception, noun: Unit) -> str:
+def _unshown_because(lost: Exception, noun: PagedUnit) -> str:
     """Tell the model why the pictures of a read could not be made, and whether view_file can show them later.
 
     Args:
@@ -528,7 +528,9 @@ def _unshown_because(lost: Exception, noun: Unit) -> str:
     return told.format(units=f"{noun}s")
 
 
-def _notes(shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: str | None, noun: Unit) -> list[str]:
+def _notes(
+    shown: Sequence[DerivedRecord], left_out: Sequence[int], *, unshown: str | None, noun: PagedUnit
+) -> list[str]:
     """Say what a read attached, each note a whole sentence.
 
     Args:
@@ -614,7 +616,7 @@ async def _attach_pages(
     source: FileRecord,
     strips: int,
     *,
-    noun: Unit,
+    noun: PagedUnit,
     p: Principal,
     settings: Settings,
     store: Store,
@@ -699,7 +701,7 @@ async def _read_paged(
     source: FileRecord,
     payload: Mapping[str, Any],
     *,
-    noun: Unit,
+    noun: PagedUnit,
     p: Principal,
     settings: Settings,
     store: Store,

@@ -63,9 +63,9 @@ from workbench.renders import (
     RENDERS_PER_JOB,
     SIGNATURES,
     ConvertAnswer,
+    PagedUnit,
     RenderAnswer,
     RenderFacts,
-    Unit,
     kind_of,
     signature_ok,
     unit_of,
@@ -145,11 +145,11 @@ _LOST: Final = re.compile(r"\d+ outputs? could not be kept \(([a-z ,]+)\)\Z")
 #: What a page or a window of pages may be written as, by the unit of the file: ``page 3``, ``3``, ``pages 2-5`` or
 #: ``2-5`` (for a deck ``slide 3``, ``3``, ``slides 2-5`` or ``2-5``), in any case, with the singular and the plural
 #: taken alike. Nine digits at most, so no number is too long to read.
-_PART: Final[Mapping[Unit, re.Pattern[str]]] = {
+_PART: Final[Mapping[PagedUnit, re.Pattern[str]]] = {
     "page": re.compile(r"(?:pages?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
     "slide": re.compile(r"(?:slides?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
 }
-_GRAMMAR: Final[Mapping[Unit, str]] = {
+_GRAMMAR: Final[Mapping[PagedUnit, str]] = {
     "page": "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'",
     "slide": "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'",
 }
@@ -190,7 +190,7 @@ class Manifest(BaseModel):
 
     path: str
     kind: Literal["image", "pdf", "office", "none"]
-    unit: Unit = "page"
+    unit: PagedUnit = "page"
     total: int
     pages_without_text: list[int]
     renditions: list[Rendition]
@@ -431,14 +431,17 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
 
     Returns:
         The manifest: the facts of the whole render of page 1 and every whole render of its role, by page. ``None``
-        when there is no whole render of page 1 that carries its facts: the file is not prepared yet. The unit is the
-        facts'; a head kept before there were units has none, and reads as ``page``.
+        when there is no whole render of page 1 that carries its facts: the file is not prepared yet, or its facts
+        are a clip's, which a manifest of this kind cannot carry. The unit is the facts'; a head kept before there
+        were units has none, and reads as ``page``.
     """
     whole = [rec for rec in rows if _is_render(rec) and rec.strips == 1]
     head = next((rec for rec in whole if rec.ordinal == 1), None)
     facts = None if head is None else _facts(head)
     if head is None or facts is None:
         return None
+    if facts.kind == "media" or facts.unit == "frame":
+        return None  # a clip's facts: the media branch of prepare answers for them, as a manifest of its own
     renditions = [
         Rendition.model_validate(
             {"n": rec.ordinal, "width": rec.width, "height": rec.height, "mime": rec.mime, "bytes": rec.size}
@@ -775,7 +778,7 @@ async def prepared(
         NotFound: The file went while the job ran, with its chat (404).
     """
     kind = kind_of(source.name)
-    if kind == "none":
+    if kind in ("none", "media"):  # a clip is not shown until its prepare is taught the artifacts
         return not_shown(source)
     manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
     if manifest is not None:
@@ -1052,7 +1055,7 @@ def shown_image(noun: Noun, rec: DerivedRecord) -> ShownImage:
     )
 
 
-def page_window(part: str | None, total: int, *, default_last: int, unit: Unit = "page") -> tuple[int, int]:
+def page_window(part: str | None, total: int, *, default_last: int, unit: PagedUnit = "page") -> tuple[int, int]:
     """Read which pages, or slides of a deck, a call asks to see.
 
     Args:

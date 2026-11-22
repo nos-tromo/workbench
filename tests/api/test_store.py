@@ -16,6 +16,7 @@ from typing import override
 import pytest
 
 from tests.api.conftest import FORMER, PG, PG_SETUP, unrecorded
+from workbench import renders
 from workbench.api import store as store_module
 from workbench.api.store import (
     Conflict,
@@ -2222,6 +2223,13 @@ def test_image_types_are_known() -> None:
     assert store_module._mime("a.TIFF") == "image/tiff"
     assert store_module._mime("a.heic") == "image/heic"
     assert store_module._mime("a.HEIF") == "image/heif"
+
+
+def test_media_types_are_known() -> None:
+    """The types of a clip are the shared table's, whatever the host's ``mime.types`` says."""
+    for suffix, mime in renders.MEDIA_TYPES.items():
+        assert store_module._mime(f"clip{suffix}") == mime
+        assert store_module._mime(f"CLIP{suffix.upper()}") == mime
 
 
 # --- refusals remembered -----------------------------------------------------

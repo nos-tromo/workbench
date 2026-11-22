@@ -1635,6 +1635,45 @@ def test_a_v07_head_reads_as_unit_page() -> None:
     assert (deck.kind, deck.unit, deck.total) == ("office", "slide", 1)
 
 
+def test_a_clip_s_facts_make_no_page_manifest() -> None:
+    """Facts of kind media count frames, which a page manifest cannot carry: no manifest, until the media branch."""
+    owner = {"caller": "ghostwriter", "user_id": "user-a", "chat_id": "chat-1"}
+    source = FileRecord(
+        id="f" * 32,
+        name="harbour-tour.mp4",
+        size=9,
+        mime="video/mp4",
+        kind="upload",
+        created_at=1.0,
+        job_id=None,
+        **owner,
+    )
+    facts: dict[str, object] = {
+        "kind": "media",
+        "unit": "frame",
+        "total": 1,
+        "pages_without_text": [],
+        "frames": None,
+        "hint": None,
+        "duration_s": 4.0,
+    }
+    head = DerivedRecord(
+        id="1" * 32,
+        source_id=source.id,
+        role="page",
+        ordinal=1,
+        name=f"{'1' * 32}.jpg",
+        size=5,
+        mime="image/jpeg",
+        width=9,
+        height=9,
+        meta={"facts": facts},
+        created_at=1.0,
+        **owner,
+    )
+    assert manifest_of(source, [head]) is None
+
+
 # --- the shared rules --------------------------------------------------------------------------------------------
 
 

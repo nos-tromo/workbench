@@ -1698,7 +1698,8 @@ class JobQueue:
             answer = None
         head = None
         if answer is not None and facts:
-            head = RenderFacts.model_validate(answer.model_dump(exclude={"renders"})).model_dump(mode="json")
+            facts_of = answer.model_dump(exclude={"renders", "transcript"})  # a clip's transcript is no fact of it
+            head = RenderFacts.model_validate(facts_of).model_dump(mode="json")
         quota = self._settings.workspace_max_mb * _MIB
 
         def place(staged: Path, output: OutputFile, file_id: str) -> DerivedRecord:

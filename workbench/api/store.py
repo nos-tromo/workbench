@@ -54,7 +54,7 @@ from typing import Any, BinaryIO, Final, Literal, TypeGuard
 from workbench.layout import DERIVED
 from workbench.models import VIRTUAL_ROOT, DerivedRecord, DerivedSpec, DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
-from workbench.renders import CONVERTED_MIME, DERIVED_MAX_BYTES
+from workbench.renders import CONVERTED_MIME, DERIVED_MAX_BYTES, MEDIA_TYPES
 from workbench.utils.audit_event import MAX_IDS
 
 _log = logging.getLogger(__name__)
@@ -136,6 +136,7 @@ _EXTRA_TYPES = {
     ".tiff": "image/tiff",
     ".heic": "image/heic",
     ".heif": "image/heif",
+    **MEDIA_TYPES,
 }
 
 

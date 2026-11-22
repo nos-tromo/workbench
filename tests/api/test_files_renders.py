@@ -224,6 +224,20 @@ def test_prepare_of_a_spreadsheet_is_kind_none_without_a_job(
     assert events_of(audit_lines, "file.prepare") == []
 
 
+def test_prepare_of_a_clip_is_not_shown_yet(
+    client: TestClient, store: Store, executor: Local, audit_lines: AuditLines
+) -> None:
+    """A clip is told as media by its suffix, but nothing draws it until its prepare takes its artifacts: no job."""
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    r = prepare(client, source.virtual_path)
+
+    assert r.status_code == 200
+    assert set(r.json()) == MANIFEST_KEYS
+    assert (r.json()["kind"], r.json()["total"], r.json()["renditions"]) == ("none", 0, [])
+    assert executor.requests == []
+    assert events_of(audit_lines, "file.prepare") == []
+
+
 def test_prepare_of_a_text_file_named_png_is_422_and_stores_nothing(
     client: TestClient, store: Store, audit_lines: AuditLines
 ) -> None:

@@ -184,7 +184,7 @@ def test_a_render_entry_takes_a_whole_entry() -> None:
         {"height": 0},
         {"height": 2049},
         {"mime": "image/gif"},
-        {"role": "frame"},
+        {"role": "strip"},
         {"extra": "x"},
     ],
 )
@@ -371,3 +371,200 @@ def test_the_bounds_are_the_spec_s() -> None:
     assert (renders.MAX_STRIPS, renders.STRIP_OVERLAP) == (3, 0.06)
     assert renders.DERIVED_MAX_BYTES == 64 * 1024 * 1024
     assert renders.PDF_SUFFIX == ".pdf"
+
+
+# --- clips ---------------------------------------------------------------------------------------------------------
+
+
+def _media_facts(**fields: Any) -> dict[str, Any]:
+    """Build the fields of the facts of a clip with no frames, with the given ones on top.
+
+    Args:
+        **fields: What differs from the facts of a clip with neither pictures nor frames.
+
+    Returns:
+        The fields, to pass as keyword arguments to :class:`renders.RenderFacts`.
+    """
+    base: dict[str, Any] = {
+        "kind": "media",
+        "unit": "frame",
+        "total": 0,
+        "pages_without_text": [],
+        "frames": None,
+        "hint": None,
+    }
+    return base | fields
+
+
+def test_clips_are_media() -> None:
+    """A video or audio suffix, in any case, makes a clip; a format workbench does not take stays none."""
+    assert renders.kind_of("Harbour-Tour.MP4") == "media"
+    assert renders.kind_of("voice-memo.opus") == "media"
+    assert renders.kind_of("clip.avi") == "none"
+    assert len(renders.MEDIA_SUFFIXES) == 11
+    assert set(renders.MEDIA_TYPES) == renders.MEDIA_SUFFIXES
+    assert renders.MEDIA_SUFFIXES == renders.VIDEO_SUFFIXES | renders.AUDIO_SUFFIXES
+    assert not renders.VIDEO_SUFFIXES & renders.AUDIO_SUFFIXES
+
+
+def test_the_media_types_are_the_spec_s() -> None:
+    """Each suffix of a clip has the one type the spec gives it."""
+    assert dict(renders.MEDIA_TYPES) == {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".m4v": "video/x-m4v",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".flac": "audio/flac",
+    }
+
+
+def test_the_bounds_of_a_clip_are_the_spec_s() -> None:
+    """The constants of a clip are the numbers of the spec."""
+    assert (renders.FRAME_LONG_SIDE, renders.FRAME_QUALITY) == (1280, 85)
+    assert renders.MEDIA_FRAMES_MAX == renders.RENDERS_PER_JOB - 1 == 19
+    assert renders.JSONL_MAX_BYTES == 8 * 1024 * 1024
+    assert renders.ZIP_MAX_BYTES == 32 * 1024 * 1024
+    assert renders.TRANSCRIPT_MAX_BYTES == 4 * 1024 * 1024
+    assert renders.TRANSCRIPT_NAME == "transcript.txt"
+    assert renders.NOTHING_FOUND == (
+        "Nothing was found in this clip: no speech and no pictures, or it has not been transcribed."
+    )
+    assert renders.NO_SPEECH == "No speech was found in this clip."
+
+
+def test_stamps() -> None:
+    """A time reads as minutes and seconds, with hours from one hour on; a negative time is zero."""
+    assert renders.stamp(84.9) == "01:24"
+    assert renders.stamp(0) == "00:00"
+    assert renders.stamp(3599) == "59:59"
+    assert renders.stamp(3600) == "1:00:00"
+    assert renders.stamp(3723.4) == "1:02:03"
+    assert renders.stamp(-2) == "00:00"
+    assert renders.stamp(math.nan) == "00:00"
+    assert renders.parse_stamp("01:24") == 84
+    assert renders.parse_stamp("1:02:03") == 3723
+    assert renders.parse_stamp("75:00") == 4500
+    assert renders.parse_stamp("00:00") == 0
+    assert renders.parse_stamp("99:59") == 5999
+    assert renders.parse_stamp("100:00") == 6000
+    assert renders.parse_stamp("5999:59") == 5999 * 60 + 59
+    assert renders.parse_stamp("0:01:24") == 84
+    arabic_indic = "\u0660\u0661:\u0662\u0664"  # digits that are not ASCII
+    for text in (
+        "1:60",
+        "1:02:60",
+        "1:60:03",
+        "6000:00",
+        "x",
+        "",
+        "1",
+        "1:2",
+        "-1:00",
+        "1:00:00:00",
+        " 01:24",
+        arabic_indic,
+    ):
+        assert renders.parse_stamp(text) is None, text
+
+
+@pytest.mark.parametrize("seconds", [0, 1, 59, 60, 84, 3599, 3600, 3723, 86399])
+def test_a_stamp_parses_back_to_its_whole_seconds(seconds: int) -> None:
+    """What ``stamp`` writes, ``parse_stamp`` reads, up to a day."""
+    assert renders.parse_stamp(renders.stamp(seconds)) == seconds
+
+
+def test_frame_label() -> None:
+    """A frame is told by its number and, when the zip had times, its time."""
+    assert renders.frame_label(3, 84.0) == "frame 3 (01:24)"
+    assert renders.frame_label(3, None) == "frame 3"
+    assert renders.frame_label(12, 3723.0) == "frame 12 (1:02:03)"
+
+
+def test_media_facts() -> None:
+    """A clip's facts take a total of zero, and no duration; the others refuse one, or a unit of another kind."""
+    facts = renders.RenderFacts(**_media_facts())
+    assert (facts.kind, facts.unit, facts.total, facts.duration_s) == ("media", "frame", 0, None)
+    assert renders.RenderFacts(**_media_facts(total=12, duration_s=134.2)).duration_s == 134.2
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_facts(total=0))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(unit="page"))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_facts(unit="frame"))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(frames=3))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(pages_without_text=[1]))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(duration_s=-1.0))
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(duration_s=math.inf))
+    stage_one = {"kind": "pdf", "total": 24, "pages_without_text": [3], "frames": None, "hint": None}
+    facts = renders.RenderFacts.model_validate(stage_one)
+    assert (facts.unit, facts.duration_s) == ("page", None)
+
+
+def test_a_clip_s_facts_take_a_hint() -> None:
+    """A clip's facts carry the same hint as any others."""
+    facts = renders.RenderFacts(**_media_facts(hint=renders.NOTHING_FOUND))
+    assert facts.hint == renders.NOTHING_FOUND
+
+
+def test_frame_entries_carry_their_time() -> None:
+    """Only a frame has a time, and a frame is never a strip; a transcript and a media request are strict."""
+    name = renders.render_name(1, 1, 1, "image/jpeg")
+    frame = renders.RenderEntry(**_entry(role="frame", name=name, time_s=4.0, width=1280, height=720))
+    assert (frame.role, frame.time_s) == ("frame", 4.0)
+    assert renders.RenderEntry(**_entry(role="frame", name=name)).time_s is None
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="page", time_s=4.0))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="image", time_s=4.0))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="frame", strips=2))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="frame", time_s=-0.5))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="frame", time_s=math.nan))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="frame", name="../p0001.jpg"))
+    assert renders.RenderEntry(**_entry()).time_s is None  # a page's entry is as it was
+
+
+def test_a_transcript_entry_names_only_the_transcript() -> None:
+    """The one file, and at least a line."""
+    assert renders.TranscriptEntry(name="transcript.txt", lines=3).lines == 3
+    for fields in ({"name": "notes.txt"}, {"name": "../transcript.txt"}, {"lines": 0}, {"extra": "x"}):
+        with pytest.raises(ValidationError):
+            renders.TranscriptEntry.model_validate({"name": "transcript.txt", "lines": 1} | fields)
+
+
+def test_a_media_request_takes_the_two_artifacts() -> None:
+    """Neither artifact is required; the clip says whether it is a video; a stray key is refused."""
+    request = renders.MediaRequest(video=True)
+    assert (request.nextext_jsonl, request.nextext_zip, request.video) == (None, None, True)
+    both = renders.MediaRequest(nextext_jsonl=".derived/a/b.jsonl", nextext_zip=".derived/a/c.zip", video=False)
+    assert both.nextext_zip == ".derived/a/c.zip"
+    with pytest.raises(ValidationError):
+        renders.MediaRequest.model_validate({"video": True, "extra": "x"})
+    with pytest.raises(ValidationError):
+        renders.MediaRequest.model_validate({})
+
+
+def test_an_answer_may_carry_a_transcript() -> None:
+    """The answer of a clip lists its frames and, when it has one, its transcript."""
+    name = renders.render_name(1, 1, 1, "image/jpeg")
+    frame = _entry(role="frame", name=name, time_s=0.0, width=1280, height=720)
+    answer = renders.RenderAnswer(
+        **_media_facts(total=1, duration_s=9.0),
+        renders=[frame],
+        transcript=renders.TranscriptEntry(name="transcript.txt", lines=4),
+    )
+    assert answer.transcript is not None and answer.transcript.lines == 4
+    assert renders.RenderAnswer(**_facts(), renders=[_entry()]).transcript is None

@@ -356,7 +356,7 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     kind = kind_of(name)
     if args.get("office") is not None and kind != "pdf":
         raise ValueError("office names what a converted PDF stands for, and the input is not a PDF")
-    if kind == "none":
+    if kind in ("none", "media"):  # a clip's frames come from its artifacts, never from the clip
         return error("unsupported_format", "only pictures and PDFs can be shown")
     if kind == "office":
         return error("unsupported_format", "an Office file is converted first")
