@@ -33,7 +33,7 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and five file routes. The same rules; unset, Ghostwriter's door is off. |
 | `GHOSTWRITER_WORKBENCH_TOOLS` | the ten workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. Since 0.7.0 the default includes `view_file`; a list set explicitly must add it, or Ghostwriter offers no images. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
-| `GHOSTWRITER_WORKBENCH_SLOTS` | 3 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), and the two run apart, so keep 3 or more: at 3, one is left for the tool calls of all Ghostwriter's users while both run. At 2 (an `.env` that pinned the old default), a conversion and a picture's prepare take both, and every Ghostwriter tool call answers `wait_timeout` after 5 s while they run; nothing warns at start. There is no variable for prepares or conversions of their own. Since 0.8.0 a host with `WORKBENCH_EXECUTOR_SLOTS` 3 and this unset refuses to start (3 is not fewer than 3): raise the executor's slots there, or set this to 2 with the cost above. The executor's memory is its own slots times a job's (below), whatever this is. |
+| `GHOSTWRITER_WORKBENCH_SLOTS` | 3 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), and the two run apart, so keep 3 or more: at 3, one is left for the tool calls of all Ghostwriter's users while both run. At 2 (an `.env` that pinned the old default), a conversion and a picture's prepare take both, and every Ghostwriter tool call answers `wait_timeout` after 5 s while they run; nothing warns at start. There is no variable for prepares or conversions of their own. Since 0.8.1 a host with `WORKBENCH_EXECUTOR_SLOTS` 3 and this unset refuses to start (3 is not fewer than 3): raise the executor's slots there, or set this to 2 with the cost above. The executor's memory is its own slots times a job's (below), whatever this is. |
 
 The api needs at least one of the two keys, or it refuses to start; two
 callers with the same key stop the start too.
@@ -95,7 +95,7 @@ an `isError` result whose `reason` says why:
   (`DOCINT_WORKBENCH_SLOTS` or `GHOSTWRITER_WORKBENCH_SLOTS` times that share),
   and an abandoned call holds its slot and that user's turn until its wall time.
   Each is held to its own share only, so at the defaults docint and Ghostwriter
-  together can hold all 4 slots and all 16 waiting places. Since 0.8.0 the two
+  together can hold all 4 slots and all 16 waiting places. Since 0.8.1 the two
   shares overlap (3 + 2 slots of 4, 12 + 8 places of 16): while Ghostwriter
   holds all of its own, docint keeps 1 running slot and 4 waiting places, where
   it had 2 and 8.
