@@ -125,7 +125,8 @@ path answers `404` to a caller with the key, and `401` to anyone without it.
     the last two are given none of its clips, and `inspect_template`,
     `fill_template` and `write_presentation` refuse one named as a template, a
     master or a file source, before any job, as `422 unsupported_format: a clip
-    is read with read_document and view_file`: a clip's bytes enter no job, its
+    is read with read_document`, a word that names no `view_file` to a call
+    without images: a clip's bytes enter no job, its
     own prepare's reading Nextext's artifacts of it, never the clip;
   - `fill_template` and `write_presentation` take file sources only from the
     template's or master's chat (without a master, the request's), and

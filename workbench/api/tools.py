@@ -186,12 +186,13 @@ def is_clip(rec: FileRecord) -> bool:
     return rec.kind == "upload" and kind_of(rec.name) == "media"
 
 
-#: What a tool says of a path or a source that names a clip: no job is given one (:func:`refuse_clip`).
-CLIP_REFUSED: Final = "unsupported_format: a clip is read with read_document and view_file"
+#: What a tool says of a path or a source that names a clip: no job is given one (:func:`refuse_clip`). It names no
+#: ``view_file``, which a call that takes no images does not have.
+CLIP_REFUSED: Final = "unsupported_format: a clip is read with read_document"
 
 
 def refuse_clip(rec: FileRecord) -> FileRecord:
-    """Refuse, before any job, a clip named as a tool's file: a template, a master, a picture or a source.
+    """Refuse, before any job, a clip named as a tool's file: a template, a master or a file source.
 
     The clip's bytes enter no executor job, whatever runs in it: a clip is read as its transcript and looked at as its
     frames. The one check every tool that turns a path into a job's input makes, once it has the file's record.

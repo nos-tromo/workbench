@@ -21,7 +21,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.api.conftest import CALL, CHAT, HG, PG, AuditLines, put, unrecorded
+from tests.api.conftest import CALL, CHAT, HG, HG_TEXT, PG, AuditLines, put, unrecorded
 from tests.api.mcp_calls import (
     Headers,
     acall,
@@ -539,8 +539,8 @@ def test_sources_must_exist(client: TestClient, store: Store, fake_executor: Loc
     answered(fill(client, f"{CHAT}/form.docx", {"customer": job(mine.id)}))
 
 
-#: What a tool says of a clip named as a template, a master, a picture or a source: no job is given one.
-CLIP_REFUSED = "unsupported_format: a clip is read with read_document and view_file"
+#: What a tool says of a clip named as a template, a master or a file source: no job is given one.
+CLIP_REFUSED = "unsupported_format: a clip is read with read_document"
 
 
 @pytest.mark.parametrize("name", ["harbour-tour.mp4", "voice-memo.M4A"])
@@ -553,6 +553,19 @@ def test_a_clip_is_no_template_to_inspect(
     assert refusal(inspect(client, f"{CHAT}/{name}")) == ("refused", CLIP_REFUSED)
     assert fake_executor.requests == []
     assert events(audit_lines, "inspect_template") == []
+
+
+@pytest.mark.parametrize("headers", [HG, HG_TEXT], ids=["with images", "without images"])
+def test_a_clips_refusal_names_no_view_file_to_a_call_that_has_none(
+    client: TestClient, store: Store, fake_executor: Local, headers: Headers
+) -> None:
+    """``view_file`` is not on a blind call's list, so the refusal tells both calls the one tool they share."""
+    put(store, "harbour-tour.mp4", b"x", p=PG)
+    reason, text = refusal(inspect(client, f"{CHAT}/harbour-tour.mp4", headers=headers))
+
+    assert (reason, text) == ("refused", CLIP_REFUSED)
+    assert "view_file" not in text
+    assert fake_executor.requests == []
 
 
 def test_a_clip_is_no_template_to_fill(
