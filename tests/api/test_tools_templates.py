@@ -583,13 +583,16 @@ def test_a_clip_is_no_template_to_fill(
 def test_a_clip_is_no_source_of_a_value(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
 ) -> None:
-    """A file source that is a clip is refused before the job, so the clip's bytes are in none: a PDF still is one."""
+    """A file source that is a clip is refused before the job and names its field: no job has its bytes."""
     stored(store, tmp_path, "form.docx", mt.make_controls_docx)
     stored(store, tmp_path, "q.pdf", lambda path: mk.make_pdf(path, ["one", "two"]))
     put(store, "harbour-tour.mp4", b"x", p=PG)
 
     cited = {"value": "x", "source": {"kind": "file", "path": f"{CHAT}/harbour-tour.mp4"}}
-    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": cited})) == ("refused", CLIP_REFUSED)
+    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": cited})) == (
+        "refused",
+        f"invalid_source: customer: {CLIP_REFUSED}",  # the field is named, as for any source that is refused
+    )
     assert fake_executor.requests == []
     assert events(audit_lines, "fill_template") == []
     pdf = {"value": "x", "source": {"kind": "file", "path": f"{CHAT}/q.pdf", "page": 1}}

@@ -243,11 +243,23 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
   text file's are, after a `query` / `tool.read_document` event that names the
   clip and its transcript; the text itself is in no event. It is what the
   speakers said, with their labels: the same personal data the clip holds. The
-  two raw artifacts leave nowhere, and no job reads the clip's own bytes: its
-  file goes only as any upload does, to its user's download
-  (`GET /files/view` without `rendition`).
+  two raw artifacts leave nowhere, and no job reads the clip's own bytes.
+- **A clip's own bytes go to Ghostwriter, and from it to Nextext.** For each
+  video or audio file a user attaches, Ghostwriter's backend itself fetches the
+  file with `GET /files/view` (no `rendition`), stating its purpose, and
+  streams it into Nextext's `POST /jobs`: a third service, which keeps a copy
+  for the length of that one job. No user downloads anything in that case. The
+  fetch is recorded as any view is, `disclose` / `file.view` naming the clip
+  ([audit.md](audit.md)); the hand-over and the job's deletion are recorded by
+  Ghostwriter and Nextext, not by workbench. It is the one exception deploy ADR
+  0009 (`docs/decisions/0009-ghostwriter-sees-images-and-media.md`) makes to
+  "a copy of a user's file exists outside workbench", and only for media. What
+  Ghostwriter and Nextext keep of the flow is for their own records
+  (Ghostwriter's `docs/data-flow.md`). What comes back is the two artifacts
+  above.
 - **Files go to Ghostwriter**, and from it to the user's browser, when the user
-  views or downloads them (`GET /files/view`). What a user downloads is outside
+  views or downloads them, and to Nextext in the case above (`GET /files/view`).
+  What a user downloads, and what Nextext holds for its job, is outside
   workbench from then on.
 - **Audit events** go to the api container's standard output. obs-plane
   collects them into its audit store (see [audit.md](audit.md)). They name
@@ -307,6 +319,9 @@ the values the model writes.
 - through docint and Ghostwriter, to their models and their own databases: what
   a run returns enters their model context and is kept with the turn; their own
   processing, recorded there;
+- through Ghostwriter, to Nextext: the bytes of each clip Ghostwriter attaches
+  (`GET /files/view`, recorded `disclose` / `file.view`), which Nextext holds
+  for one job (deploy ADR 0009); only the two artifacts above come back;
 - to obs-plane: the audit events (user pseudonym, chat id, file ids, times,
   counts, purpose and request id) into its audit store, and the containers' log
   lines into its log store. Metrics hold no personal data.

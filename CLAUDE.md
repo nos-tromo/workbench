@@ -85,8 +85,9 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
   default 4, run at once), copy-in and copy-out, with limits. The
   readers, the search, the templates, the writers, `run_python`, the renders
-  of pictures and PDF pages and the conversion of Office files to a PDF all run
-  there.
+  of pictures and PDF pages, the conversion of Office files to a PDF and a
+  clip's transcript and frames (made from Nextext's two artifacts, never the
+  clip) all run there.
 - **`volume-permissions`**: a one-shot that lays out `workbench-data`
   (`workbench/executor/prepare_volume.py`) before the other two start.
 - **Networks**: the external `workbench-net`, the federation's fourth seam.
@@ -123,7 +124,8 @@ of a render, `RenderAnswer` and its checks, `kind_of` (which names an Office fil
 converted PDF's name, type and cap, the strip rule and `render_name`, which the
 api checks the executor's answer against, and a clip's rules: `MEDIA_SUFFIXES`
 and `MEDIA_TYPES` (`kind_of` names a clip `media`), `MEDIA_FRAMES_MAX` (19, as one
-job has at most 20 outputs and one is the transcript), `FRAME_LONG_SIDE`,
+job has at most 20 outputs and one is the transcript), `MEDIA_SECONDS_MAX` (100 h, the bound of a
+frame's time and a clip's duration, in the executor and in the answer's checks), `FRAME_LONG_SIDE`,
 `JSONL_MAX_BYTES`, `ZIP_MAX_BYTES`, `TRANSCRIPT_MAX_BYTES`, `ARTIFACTS` (the two
 roles, their types and extensions), `TRANSCRIPT_NAME`, the three hints
 `NOTHING_FOUND`, `NO_SPEECH` and `TRANSCRIPT_UNREADABLE`, `MediaRequest` (the
@@ -132,7 +134,8 @@ artifacts' derived paths, the clip's own never), and the stamps (`stamp`,
 nothing of LibreOffice). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
 a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
-the row of its page 1 render and read back leniently, an unknown one ignored, so
+the row of its page 1 render (a clip's: its transcript's, else its frame 1's)
+and read back leniently, an unknown one ignored, so
 **a field added to `RenderFacts` needs a default**: each version then reads the
 heads the other prepared, and a rollback never leaves a file that always 500s.
 
@@ -185,8 +188,8 @@ what the model is told and shown, never what a caller may reach.
   its one job reading the transcript row alone, never the clip; with no
   transcript row it answers `NO_SPEECH`, or `TRANSCRIPT_UNREADABLE` when a jsonl
   artifact is there, with no job), and `view_file` shows its frames by number,
-  range or time (`frame_window`: `frame 3`, `frames 2-5`, `at 01:24`; none left
-  out, 8 spread over the clip). A clip's frames are never made one by one and
+  range or time (`frame_window`: `frame 3`, `frames 2-5`, `at 01:24`, a frame's own label
+  `frame 3 (01:24)` too; none left out, 8 spread over the clip). A clip's frames are never made one by one and
   never cut into strips: a frame whose row or file is lost is skipped and named in
   the hint (in a rendition view it is a 404), and the set comes back only when
   the head (the transcript row, else frame 1, which holds the clip's facts) is

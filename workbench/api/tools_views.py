@@ -337,6 +337,21 @@ def _sentence(note: str) -> str:
     return text if text.endswith(".") else f"{text}."
 
 
+def _unsaid(told: str | None, hint: str | None) -> str | None:
+    """Take the sentences of a clip's manifest hint that a text does not say already.
+
+    Args:
+        told: What the answer says, or ``None``.
+        hint: The manifest's hint of the clip, which the prepare wrote as whole sentences.
+
+    Returns:
+        The hint's sentences that are not in ``told``, joined; ``None`` when there are none.
+    """
+    if hint is None:
+        return None
+    return _join(*(sentence for sentence in re.split(r"(?<=\.) ", hint) if sentence not in (told or "")))
+
+
 def _record(
     audit: AuditLog, p: Principal, source: FileRecord, shown: list[DerivedRecord], strips: int, *, paged: bool
 ) -> None:
@@ -375,7 +390,8 @@ async def _view_frames(
     frame 1) is gone, which :func:`~workbench.api.renders.prepared` has made good before this runs. A call that names no
     part of a clip of more frames than one answer holds is shown that many, spread over the clip, and told so.
     ``strips`` is ignored: a clip's frames are never cut. A clip without frames answers its hint whatever ``part``
-    says: a part is read only when there are frames to name.
+    says: a part is read only when there are frames to name. The hint then adds the manifest's own words, when the
+    prepare wrote some (the frames could not be read, none were taken, the transcript is cut).
 
     Args:
         body: The call: ``part`` says which frames.
@@ -405,7 +421,10 @@ async def _view_frames(
     await run_in_threadpool(_record, audit, p, source, taken.renders, 1, paged=paged)
     notes: list[str] = []
     if manifest.total == 0:
-        notes.append(NO_PICTURES if manifest.transcript else NOTHING_FOUND)
+        told = NO_PICTURES if manifest.transcript else NOTHING_FOUND
+        notes.append(told)
+        if (more := _unsaid(told, manifest.hint)) is not None:
+            notes.append(more)
     else:
         notes += _notes([], taken.left_out, unshown=None, noun="frame")
         if not paged and manifest.total > MAX_VIEW_IMAGES and taken.renders:
@@ -978,21 +997,20 @@ async def _read_picture(
     return WithBlocks(answer, blocks) if blocks else answer
 
 
-def _without_transcript(total: int, *, spoken: bool, see: str | None) -> str | None:
+def _without_transcript(total: int, *, spoken: bool) -> str:
     """Say why a clip has no transcript to read.
 
     Args:
         total: How many frames the clip has.
         spoken: Whether the clip holds the JSON Lines of its speech: they were there and gave no transcript.
-        see: What a call that takes images is told of the frames, if the clip has any.
 
     Returns:
         That the transcript could not be read, when the speech's artifact is there; else that there was no speech, or
         that nothing was found when the clip has no frames either.
     """
     if spoken:
-        return _join(TRANSCRIPT_UNREADABLE, see)
-    return _join(NO_SPEECH, see) if total > 0 else NOTHING_FOUND
+        return TRANSCRIPT_UNREADABLE
+    return NO_SPEECH if total > 0 else NOTHING_FOUND
 
 
 async def _read_clip(
@@ -1013,8 +1031,9 @@ async def _read_clip(
     the clip's path and the kind ``transcript``; the clip itself is no input of any job, and no path of ``.derived`` is
     said. Without one there is no job: the answer has no part and says there was no speech, that the transcript could
     not be read (the clip holds the JSON Lines of its speech and they gave none), or that nothing was found when the
-    clip has no frames either. A call that takes images is told, after the hint, that ``view_file`` shows the clip's
-    frames, when it has any; no image goes with the answer either way.
+    clip has no frames either. The hint goes on with what the prepare said of the clip that this does not (the
+    transcript is cut, some frames are kept, the frames could not be read). A call that takes images is told, after
+    the hint, that ``view_file`` shows the clip's frames, when it has any; no image goes with the answer either way.
 
     The read is recorded once the job has answered, naming the clip and its transcript, before anything of the answer
     goes out; a refusal of the job is an ``error`` with its code, raised as for any file.
@@ -1052,6 +1071,7 @@ async def _read_clip(
         see = ONE_FRAME if manifest.total == 1 else SEE_FRAMES.format(total=manifest.total)
     paged = body.part is not None
     if transcript is None:
+        told = _without_transcript(manifest.total, spoken=has_speech_artifact(rows))
         answer = DocumentRead(
             path=source.virtual_path,
             kind="transcript",
@@ -1060,7 +1080,7 @@ async def _read_clip(
             pages_without_text=[],
             shown=[],
             truncated=False,
-            hint=_without_transcript(manifest.total, spoken=has_speech_artifact(rows), see=see),
+            hint=_join(told, _unsaid(told, manifest.hint), see),
         )
         await run_in_threadpool(_record_read, audit, p, source, [], paged=paged)
         return answer
@@ -1081,7 +1101,8 @@ async def _read_clip(
     )
     _payload(result, "file")
     read = _parse(DocumentRead, payload)
-    return _fit_read(read.model_copy(update={"hint": _join(read.hint, see)}), settings.result_max_kb)
+    hint = _join(read.hint, _unsaid(read.hint, manifest.hint), see)
+    return _fit_read(read.model_copy(update={"hint": hint}), settings.result_max_kb)
 
 
 async def read_document(

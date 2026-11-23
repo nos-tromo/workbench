@@ -100,6 +100,11 @@ FRAME_LONG_SIDE: Final = 1280
 FRAME_QUALITY: Final = 85
 MEDIA_FRAMES_MAX: Final = RENDERS_PER_JOB - 1
 
+#: The latest a time of a clip may be, in seconds: 100 hours, past what a stamp reads (``parse_stamp`` stops at
+#: 99:59:59). The executor drops a time past it, and a frame's ``time_s`` and a clip's ``duration_s`` are refused past
+#: it, so that no label or hint is longer than a clip's.
+MEDIA_SECONDS_MAX: Final = 100.0 * 3600
+
 #: Most bytes of the two raw artifacts of a clip (Nextext's JSON Lines and its keyframes zip), and of the transcript
 #: made from them. The artifacts count toward ``DERIVED_MAX_BYTES``, as the converted PDF of an Office file does.
 JSONL_MAX_BYTES: Final = 8 * 1024 * 1024
@@ -339,7 +344,7 @@ class RenderEntry(_Strict):
     width: int = Field(ge=1, le=IMAGE_LONG_SIDE)
     height: int = Field(ge=1, le=IMAGE_LONG_SIDE)
     mime: Literal["image/jpeg", "image/png"]
-    time_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    time_s: float | None = Field(default=None, ge=0, le=MEDIA_SECONDS_MAX, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _strip_is_one_of_strips(self) -> Self:
@@ -467,7 +472,7 @@ class RenderFacts(_Strict):
     pages_without_text: list[int] = Field(max_length=PAGES_CHECKED_MAX)
     frames: int | None = Field(ge=2)
     hint: str | None = Field(max_length=300)
-    duration_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    duration_s: float | None = Field(default=None, ge=0, le=MEDIA_SECONDS_MAX, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _only_a_clip_has_no_total(self) -> Self:

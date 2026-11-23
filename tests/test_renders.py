@@ -505,6 +505,9 @@ def test_media_facts() -> None:
         renders.RenderFacts(**_media_facts(duration_s=-1.0))
     with pytest.raises(ValidationError):
         renders.RenderFacts(**_media_facts(duration_s=math.inf))
+    assert renders.RenderFacts(**_media_facts(duration_s=renders.MEDIA_SECONDS_MAX)).duration_s == 360000.0
+    with pytest.raises(ValidationError):
+        renders.RenderFacts(**_media_facts(duration_s=renders.MEDIA_SECONDS_MAX + 1))
     stage_one = {"kind": "pdf", "total": 24, "pages_without_text": [3], "frames": None, "hint": None}
     facts = renders.RenderFacts.model_validate(stage_one)
     assert (facts.unit, facts.duration_s) == ("page", None)
@@ -532,6 +535,11 @@ def test_frame_entries_carry_their_time() -> None:
         renders.RenderEntry(**_entry(role="frame", time_s=-0.5))
     with pytest.raises(ValidationError):
         renders.RenderEntry(**_entry(role="frame", time_s=math.nan))
+    assert renders.RenderEntry(**_entry(role="frame", time_s=renders.MEDIA_SECONDS_MAX)).time_s == 360000.0
+    with pytest.raises(ValidationError):  # 100 hours is the latest a clip's time may be: no label is longer than that
+        renders.RenderEntry(**_entry(role="frame", time_s=renders.MEDIA_SECONDS_MAX + 1))
+    with pytest.raises(ValidationError):
+        renders.RenderEntry(**_entry(role="frame", time_s=1e300))
     with pytest.raises(ValidationError):
         renders.RenderEntry(**_entry(role="frame", name="../p0001.jpg"))
     assert renders.RenderEntry(**_entry()).time_s is None  # a page's entry is as it was

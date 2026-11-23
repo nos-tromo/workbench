@@ -313,7 +313,7 @@ REFUSED: Final[dict[str, tuple[dict[str, Any], str]]] = {
     ),
     "a clip as a source file": (
         deck({"layout": 1, "sources": [{"kind": "file", "path": f"{CHAT}/harbour-tour.mp4"}]}),
-        "unsupported_format: a clip is read with read_document",
+        "invalid_source: slide 1, source 1: unsupported_format: a clip is read with read_document",
     ),
     "a source file of another chat": (
         deck({"layout": 1, "sources": [{"kind": "file", "path": "/workspace/chat-2/elsewhere.pdf"}]}),

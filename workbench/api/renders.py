@@ -173,8 +173,9 @@ _GRAMMAR: Final[Mapping[PagedUnit, str]] = {
 }
 
 #: What a frame or a window of frames of a clip may be written as: ``frame 3``, ``3``, ``frames 2-5`` or ``2-5``, in any
-#: case. Nine digits at most, as a page's.
-_FRAME_PART: Final = re.compile(r"(?:frames?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE)
+#: case, and with the time its label carries after it (``frame 3 (01:24)``, as ``view_file`` showed it, which is not
+#: read). Nine digits at most, as a page's.
+_FRAME_PART: Final = re.compile(r"(?:frames?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?(?:\s*\([0-9:]+\))?", re.IGNORECASE)
 #: What a time of a clip may be written as: ``at 01:24`` or ``at 1:02:03``, which :func:`~workbench.renders.parse_stamp`
 #: reads.
 _FRAME_AT: Final = re.compile(r"at\s+(\S+)", re.IGNORECASE)
@@ -1412,9 +1413,10 @@ def frame_window(part: str | None, total: int, times: Mapping[int, float]) -> li
     """Read which frames of a clip a call asks to see.
 
     Args:
-        part: ``frame N`` or ``N`` for one frame; ``frames N-M`` or ``N-M`` for N to M; ``at mm:ss`` (or ``h:mm:ss``)
-            for the frame whose time is nearest, the earlier one on a tie; ``None`` for all of the frames, or, when
-            there are more than ``MAX_VIEW_IMAGES``, that many spread evenly from the first to the last.
+        part: ``frame N`` or ``N`` for one frame; ``frames N-M`` or ``N-M`` for N to M; either with the time of a label
+            after it (``frame 3 (01:24)`` is ``frame 3``); ``at mm:ss`` (or ``h:mm:ss``) for the frame whose time is
+            nearest, the earlier one on a tie; ``None`` for all of the frames, or, when there are more than
+            ``MAX_VIEW_IMAGES``, that many spread evenly from the first to the last.
         total: How many frames the clip has.
         times: The frames' times in seconds, by number; a frame the zip gave no time is not in it. Only the frames of
             ``1..total`` are considered.

@@ -41,6 +41,7 @@ from workbench.renders import (
     IMAGE_MAX_PIXELS,
     JSONL_MAX_BYTES,
     MEDIA_FRAMES_MAX,
+    MEDIA_SECONDS_MAX,
     NO_SPEECH,
     NOTHING_FOUND,
     SIGNATURES,
@@ -78,9 +79,6 @@ _SPEAKER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}")
 _FRAME_NAME: Final = re.compile(r"frame_([0-9]{3,6})\.jpg")
 _MANIFEST: Final = "manifest.json"
 _MANIFEST_MAX_BYTES: Final = 1024 * 1024
-
-#: The latest a time of a clip may be: 100 hours, past what a stamp reads (``renders.parse_stamp`` stops at 99:59:59).
-_SECONDS_MAX: Final = 100.0 * 3600
 
 #: Pillow's JPEG chroma subsampling for a frame: 4:2:0, as for a page.
 _FRAME_SUBSAMPLING: Final = 2
@@ -136,7 +134,7 @@ def _seconds(value: object) -> float | None:
     Returns:
         The number as a float; ``None`` for a boolean, anything that is not a number, and a number that is not a time
         of a clip: not finite (``NaN``, an infinity, an integer too large for a float), below 0, or past
-        ``_SECONDS_MAX``, so that no stamp in a line or a hint is longer than a clip's.
+        ``MEDIA_SECONDS_MAX``, so that no stamp in a line or a hint is longer than a clip's.
     """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -144,7 +142,7 @@ def _seconds(value: object) -> float | None:
         seconds = float(value)
     except OverflowError:
         return None
-    return seconds if 0 <= seconds <= _SECONDS_MAX else None  # false for NaN
+    return seconds if 0 <= seconds <= MEDIA_SECONDS_MAX else None  # false for NaN
 
 
 def read_transcript(path: Path) -> Transcript:

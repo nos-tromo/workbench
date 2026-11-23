@@ -28,6 +28,7 @@ from pydantic.json_schema import JsonDict
 from workbench.api.audit import AuditLog
 from workbench.api.store import NotFound, Store
 from workbench.api.tools import (
+    CLIP_REFUSED,
     MAX_HINT,
     OutputKeeper,
     _capped,
@@ -38,6 +39,7 @@ from workbench.api.tools import (
     _payload,
     _readable,
     _within,
+    is_clip,
     judged,
     record_answer,
     refuse_clip,
@@ -492,10 +494,9 @@ def _source_spec(
         notes or the appendix), and the file a file source names, or ``None``.
 
     Raises:
-        HTTPException: A file source is not a file of the request's chat, or is a clip (``unsupported_format``: no
-            clip is a job's input), or a job source is not a finished
-            ``run_python`` run of the user in that chat (422, naming ``label`` and never whether a job exists for
-            someone else).
+        HTTPException: A file source is not a file of the request's chat, or is a clip (no clip is a job's input: the
+            text is :data:`~workbench.api.tools.CLIP_REFUSED`), or a job source is not a finished ``run_python`` run of
+            the user in that chat (422, naming ``label`` and never whether a job exists for someone else).
     """
     if isinstance(source, FileSource):
         try:
@@ -504,7 +505,8 @@ def _source_spec(
             rec = None
         if rec is None:
             raise _refused(label, f"{source.path} is not a file of this conversation")
-        refuse_clip(rec)
+        if is_clip(rec):
+            raise _refused(label, CLIP_REFUSED)
         spec: dict[str, Any] = {"kind": "file", "path": rec.name, "virtual": rec.virtual_path}
         spec.update(
             (key, value)

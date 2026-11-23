@@ -8,8 +8,9 @@ from workbench.layout import DERIVED
 
 VIRTUAL_ROOT = "/workspace"
 
-#: What a derived file is of its source: ``image`` and ``page`` are the renders of a picture and of a page of a PDF;
-#: the others are reserved by the table's ``CHECK`` for later stages.
+#: What a derived file is of its source: ``image`` and ``page`` are the renders of a picture and of a page of a PDF,
+#: ``pdf`` the PDF an Office file was converted to, ``frame`` and ``transcript`` what a clip's artifacts were made into,
+#: and ``nextext_jsonl`` and ``nextext_zip`` those two artifacts as Nextext made them. The table's ``CHECK`` has all.
 DerivedRole = Literal["image", "page", "pdf", "frame", "transcript", "nextext_jsonl", "nextext_zip"]
 
 

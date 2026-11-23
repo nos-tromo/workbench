@@ -43,6 +43,7 @@ from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
 from workbench.api.tools import ReadDocumentRequest
 from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
+from workbench.executor.render import media
 from workbench.models import FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
 from workbench.renders import NOTHING_FOUND, TRANSCRIPT_UNREADABLE
@@ -1911,6 +1912,33 @@ def test_a_clip_whose_transcript_could_not_be_read_does_not_say_there_was_no_spe
     assert NO_SPEECH not in json.dumps([sighted, blind])
     assert local.tools() == ["prepare_file"]
     assert [event["target"]["ids"] for event in read_events(audit_lines)] == [[source.id], [source.id]]
+
+
+def test_a_cut_transcript_says_so_in_the_read(
+    seeing: TestClient, local: Picky, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prepare cut the transcript at the length workbench keeps: the read says where, with or without images."""
+    monkeypatch.setattr(media, "TRANSCRIPT_MAX_BYTES", 60)
+    source = tour(seeing, store, built)
+    sighted = seen(read(seeing, source.virtual_path))["structuredContent"]
+    blind = seen(read(seeing, source.virtual_path, headers=HG_TEXT))["structuredContent"]
+
+    cut = "The transcript is cut at 01:24: it is longer than workbench keeps."
+    assert sighted["parts"] == blind["parts"] == [{"label": "line 1", "text": TOUR_TEXT.splitlines()[0]}]
+    assert sighted["hint"] == f"{cut} {SEE_THREE}"
+    assert blind["hint"] == cut
+
+
+def test_a_clip_whose_frames_were_refused_says_so_in_the_read(
+    seeing: TestClient, local: Picky, store: Store, built: Path
+) -> None:
+    """The transcript was kept and the frames were not: the read carries the prepare's own note."""
+    source = tour(seeing, store, built, frames=0)
+    assert artifact(seeing, source.virtual_path, "nextext_zip", b"PK\x03\x04" + bytes(40)).status_code == 200
+    sighted = seen(read(seeing, source.virtual_path))["structuredContent"]
+
+    assert sighted["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert sighted["hint"] == "The frames could not be read."
 
 
 def test_a_clip_with_nothing_found_says_so_with_no_job(

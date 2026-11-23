@@ -8,7 +8,7 @@ and looks at the frames of a video (made in the sandbox from the two artifacts
 Nextext keeps of a clip; workbench decodes no media), fills report templates, builds
 presentations in a slide master (or a plain one) and writes new tables and
 documents, all through workbench's ten typed tools. Every file is opened in a sandbox without network. Uploads, views, tool runs on
-files, new files, uploads taken back and chat deletions are recorded in the federation's audit
+files, new files, the artifacts kept of a clip, uploads taken back and chat deletions are recorded in the federation's audit
 trail, by file id; listing files (`list_files` too) is not. Every file is
 deleted 7 days after it was made.
 

@@ -810,11 +810,20 @@ def test_frame_window_grammar() -> None:
     assert frame_window("at 00:00", 3, times) == [1]
     assert frame_window("at 0:01:26", 3, times) == [3]  # 86 s is nearer 90 than 80
     assert frame_window("at 00:05", 3, {1: 0.0, 2: 10.0, 3: 20.0}) == [1]  # a tie: the earlier frame
+    assert frame_window("frame 3 (01:24)", 19, {}) == [3]  # a label as view_file showed it, sent back
+    assert frame_window("Frame 3(1:02:03)", 19, {}) == [3]
+    assert frame_window("3 (01:24)", 19, {}) == [3]
+    assert frame_window("frames 2-5 (01:24)", 19, {}) == [2, 3, 4, 5]
 
     assert asked_for("at 00:10", 3) == (422, "no_such_part: the frames of this clip carry no times; ask for 'frame N'")
     assert asked_for("page 2", 3) == (422, FRAME_GRAMMAR)
     assert asked_for("at 1:75", 3, times) == (422, FRAME_GRAMMAR)
     assert asked_for("frames 5-2", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (01:24", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 ()", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (soon)", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (01:24) at 01:24", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 20 (01:24)", 19) == (422, "no_such_part: this clip has 19 frames")
     assert asked_for("frame 20", 19) == (422, "no_such_part: this clip has 19 frames")
     assert asked_for("frame 0", 19) == (422, "no_such_part: this clip has 19 frames")
     assert asked_for("frame 2", 1) == (422, "no_such_part: this clip has 1 frame")
@@ -1009,6 +1018,25 @@ def test_view_file_of_a_clip_with_nothing_found_says_so(client: TestClient, stor
         NOTHING_FOUND,
     )
     assert fake_executor.requests == []
+
+
+def test_view_file_of_a_clip_says_what_its_prepare_said_of_the_missing_frames(
+    client: TestClient, store: Store, built: Path, fake_executor: Local
+) -> None:
+    """The frames were refused, or never taken: the model is told that too, not only that the clip has no pictures."""
+    refused = put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    speech(client, refused, built)
+    assert artifact(client, refused.virtual_path, "nextext_zip", b"PK\x03\x04" + bytes(40)).status_code == 200
+    untaken = put(store, "quay-walk.mp4", CLIP_BYTES, p=PG)
+    speech(client, untaken, built)
+
+    for source, said in ((refused, "The frames could not be read."), (untaken, "No frames were taken from this clip.")):
+        structured = seen(view(client, source.virtual_path))["structuredContent"]
+        assert (structured["total"], structured["shown"]) == (0, [])
+        assert structured["hint"] == f"{NO_PICTURES} {said}"
+        assert (
+            seen(view(client, source.virtual_path, "frame 2"))["structuredContent"]["hint"] == f"{NO_PICTURES} {said}"
+        )
 
 
 def test_view_file_of_a_clip_is_recorded_before_the_frames_go(
