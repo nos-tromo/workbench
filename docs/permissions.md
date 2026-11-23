@@ -13,15 +13,16 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and six file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
+| `ghostwriter` | mcp, and seven file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`. Every such `404` is
   `{"detail": "not found"}`.
-- Ghostwriter's key reaches `/mcp` and six file routes: `/files/upload`
-  (`POST` and `DELETE`), `/files/prepare`, `/files/view`, `/files/list` and
-  `/files/chat`. A purpose it must state and did not is `428` on a file route.
+- Ghostwriter's key reaches `/mcp` and seven file routes: `/files/upload`
+  (`POST` and `DELETE`), `/files/derived`, `/files/prepare`, `/files/view`,
+  `/files/list` and `/files/chat`. A purpose it must state and did not is `428`
+  on a file route.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
@@ -85,6 +86,7 @@ chat.
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
+| artifact of a clip, `POST /files/derived?source=<path>&role=nextext_jsonl\|nextext_zip` | the request body, which is the artifact (Nextext's JSON Lines or its keyframes zip, at most 8 MiB or 32 MiB), read whole into a `.part`; the api reads no more of it than the first four bytes of a zip (`PK\x03\x04`) or the first line of a jsonl (at most 64 KiB, a JSON object), and the executor parses everything else, later | one file under the reserved `.derived/` folder of the clip, which no path reaches, beside the clip's other derived files; a clip of the request's chat that is an audio or video upload (any other source is `422 unsupported_format`, another chat's or a `.derived` path `404`); it replaces the clip's artifact of that role and the transcript and frames made from the old one, and a refusal remembered for the clip is forgotten; it counts in the user's quota and the clip's 64 MiB of derived files (`507`); it waits for the clip's lock up to 120 s (`503`) | `modify` / `file.derived`, before the artifact is visible; naming the clip, the new file and each file it replaces | the artifact, until the clip goes (or a second one of its role replaces it); the answer is its `id`, `role`, `bytes` and the `id` it `replaced` |
 | prepare, `POST /files/prepare` | a picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`), as a copy in a job of the executor; an Office file is converted once to a PDF, kept as a derived file of it, and then drawn from that PDF, both jobs in one turn of the caller's conversion gate (a picture or a PDF waits for its prepare gate, apart from it); a file the executor refused for what it is is refused again, with no job; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF or Office file, or the picture, and an Office file's PDF beside them; with `strips` 2 or 3 (default 1; any other is `422`), also the picture's strips, in a second job on the same prepare gate, while the pages of a PDF or Office file stay to be cut when viewed | `modify` / `file.prepare`, before any render or PDF is visible, one for each job | the renders and the PDF, until the source goes; the answer is their manifest, the same whatever `strips` is |
 | view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page, a slide or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn (an Office file with no PDF kept is converted first and drawn, in one turn of the caller's conversion gate) | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
 | `DELETE /files/upload` (since 0.8.1; 0.8.0 answers `405`) | nothing | one upload of the chat, the user's, that Ghostwriter takes back (it does so only for one not yet sent; workbench deletes any upload of the chat), with its renders and their rows; a tool's output, another chat's file or a render is not found (`404`); a job still running on it keeps no render; a refusal remembered for it is forgotten | `delete` / `file.delete`, first | nothing |

@@ -1,9 +1,14 @@
-"""Ghostwriter's file routes, held to the request's chat: list, upload, take back, prepare, view, the chat delete.
+"""Ghostwriter's file routes, held to the request's chat: list, upload, take back, artifacts, prepare, view, delete.
 
 Any path outside the request's chat is ``404``. The calls state a purpose and a request id,
 which their events carry, and an upload, a prepare or a view that must state a purpose and does not is
 ``428``, recorded as denied. ``DELETE /files/upload`` deletes one upload of the chat with its renders, as Ghostwriter
 takes back a file its user has not sent (since 0.8.1); ``DELETE /files/chat`` deletes the request's chat.
+
+``POST /files/derived`` keeps one of Nextext's two raw artifacts of a clip (its JSON Lines, its keyframes zip) as a
+derived file of the clip. The body is the artifact itself, read whole into a ``.part`` and checked by its first bytes
+before the route waits for the clip's lock; under the lock it is recorded, made visible, and replaces the artifact of
+its role and what was made from the old one. The api reads no more of it than its first bytes: the executor parses it.
 
 ``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`), and
 with ``strips`` of 2 or 3 also cuts a picture into that many strips. The view of a file answers the file itself; with
@@ -13,37 +18,57 @@ exist yet, on the user's own turn.
 Every read or change of content is one audit event, by file id and never by name, and it is
 written *before* the content leaves, the file becomes visible or the chat goes: an action that
 cannot be recorded does not happen. An upload is recorded by the id it was given before its first
-byte was written, before the rename makes it a file of the chat. An upload that could not be
-stored after its record is recorded again as ``error``. A prepare is recorded by the renders' own job, before any
-render is visible; a view of a render names the source and the render. Listing touches no content and is not
-recorded (spec section 7).
+byte was written, before the rename makes it a file of the chat; an artifact is recorded by its id before the rename
+makes it a derived file of its clip. An upload or an artifact that could not be stored after its record is recorded
+again as ``error``. A prepare is recorded by the renders' own job, before any render is visible; a view of a render
+names the source and the render. Listing touches no content and is not recorded (spec section 7).
 
 An error answers short fixed text from :mod:`workbench.api.errors`; no answer here carries a
 name, a path or a user id the caller did not just send.
 """
 
 import dataclasses
+import json
 import os
 import posixpath
-from collections.abc import Iterator, Sequence
-from typing import Annotated, BinaryIO, Final
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Annotated, BinaryIO, Final, Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query, Response, UploadFile
+import anyio
+import anyio.from_thread
+from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import CHAT_PATH, PREPARE_PATH, Caller
+from workbench.api.auth import CHAT_PATH, DERIVED_PATH, PREPARE_PATH, Caller
 from workbench.api.deps import CallAuditDep, CallerDep, FilePrincipalDep, JobsDep, MaybeJobsDep, SettingsDep, StoreDep
 from workbench.api.errors import INTERNAL
-from workbench.api.jobs import MCP_QUEUE_WAIT_S, PREPARE_QUEUE_WAIT_S, Busy, CallLimits, Gate, JobQueue
+from workbench.api.jobs import (
+    MCP_QUEUE_WAIT_S,
+    PREPARE_QUEUE_WAIT_S,
+    SOURCE_LOCK_WAIT_S,
+    Busy,
+    CallLimits,
+    Gate,
+    JobQueue,
+)
 from workbench.api.renders import Noun, RouteJobs, noun_of, prepared, read_render, renders_for
 from workbench.api.routing import EncodableRoute
-from workbench.api.store import NotFound, Store
+from workbench.api.store import (
+    ARTIFACT_EMPTY,
+    ARTIFACT_NOT_ITS_ROLE,
+    NotFound,
+    StagedArtifact,
+    Store,
+    UnreadableArtifact,
+)
 from workbench.api.tools_mcp import PREVIEW_RESERVE_S
 from workbench.config import Settings
-from workbench.models import DerivedRecord, FileRecord, Principal
+from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
+from workbench.renders import JSONL_MAX_BYTES, ZIP_MAX_BYTES, kind_of
 
 #: The file routes; none of them is a tool.
 router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
@@ -69,6 +94,23 @@ _PLAIN: Final = "text/plain"
 #: A whole message or web archive: served as itself, but only ever as an attachment, never shown inline.
 _ARCHIVE_TYPES: Final = frozenset({"message/rfc822", "multipart/related"})
 _ARCHIVE_SUFFIXES: Final = (".eml", ".mht", ".mhtml", ".nws")
+
+#: The two roles of a clip's raw artifacts, as the route's ``role`` names them.
+ArtifactRole = Literal["nextext_jsonl", "nextext_zip"]
+
+#: What each artifact of a clip is sent as, and the most bytes it may have. The route does not trust the type a caller
+#: sends: the first bytes decide (:func:`_artifact_check`).
+ROLE_TYPES: Final[Mapping[ArtifactRole, tuple[str, int]]] = {
+    "nextext_jsonl": ("application/x-ndjson", JSONL_MAX_BYTES),
+    "nextext_zip": ("application/zip", ZIP_MAX_BYTES),
+}
+
+#: The answer for a source that is no audio or video upload.
+UNSUPPORTED_SOURCE: Final = "unsupported_format: the source is not an audio or video upload"
+
+#: The first four bytes of a zip, and the most bytes of a jsonl's first line the api parses.
+_ZIP_SIGNATURE: Final = b"PK\x03\x04"
+_FIRST_LINE_MAX: Final = 64 * 1024
 
 
 def _chunks(src: BinaryIO) -> Iterator[bytes]:
@@ -236,6 +278,183 @@ def _view_whole(path: str, p: Principal, store: Store, audit: AuditLog) -> Strea
         "Content-Disposition": _disposition(rec),
     }
     return StreamingResponse(_chunks(src), headers=headers)
+
+
+class _Body:
+    """A request's body as a file a worker thread reads, one chunk of the request in hand at a time.
+
+    The route reads it in a thread (:func:`~fastapi.concurrency.run_in_threadpool`), so that the store may write the
+    ``.part`` as the body comes in, as :meth:`~workbench.api.store.Store.add_upload` does for an upload. ``read`` takes
+    the next chunk from the request through the event loop (:func:`anyio.from_thread.run`) only when the last is used
+    up, so no more than one chunk is held. Whatever the request raises while its body is read (a client that is gone, a
+    body past the bound of :class:`~workbench.api.body_limit.BodyLimit`) goes up through ``read`` unchanged.
+    """
+
+    def __init__(self, request: Request) -> None:
+        """Wrap ``request``; nothing is read yet.
+
+        Args:
+            request: The request whose body is read; its stream is taken once.
+        """
+        self._chunks: AsyncGenerator[bytes, None] = request.stream()
+        self._held = b""
+        self._ended = False
+
+    async def _pull(self) -> bytes | None:
+        """Take the next chunk from the request, on the event loop.
+
+        Returns:
+            The next chunk that holds a byte, or ``None`` once the body has ended.
+        """
+        while True:
+            try:
+                chunk = await anext(self._chunks)
+            except StopAsyncIteration:
+                return None
+            if chunk:
+                return chunk
+
+    def read(self, size: int) -> bytes:
+        """Read at most ``size`` bytes of the body, from a worker thread.
+
+        Args:
+            size: The most bytes to give, at least 1.
+
+        Returns:
+            The next bytes of the body: fewer than ``size`` when the chunk in hand ends first, and ``b""`` at the end.
+        """
+        if not self._held and not self._ended:
+            chunk = anyio.from_thread.run(self._pull)
+            if chunk is None:
+                self._ended = True
+            else:
+                self._held = chunk
+        taken, self._held = self._held[:size], self._held[size:]
+        return taken
+
+
+def _artifact_check(role: ArtifactRole) -> Callable[[Path], None]:
+    """Make the check of an artifact's first bytes, which the store runs on the whole ``.part`` outside its lock.
+
+    A zip must start with its signature. A jsonl must not be empty, and its first line, up to the first line break
+    and at most 64 KiB, must be a JSON object: the one thing of it the api parses. The refusal is one of the store's
+    two fixed texts, never a word of the artifact. A ``.part`` that has gone (the chat was deleted meanwhile) raises
+    ``FileNotFoundError`` out of the check, which the store takes for a clip that is gone.
+
+    Args:
+        role: The artifact's role.
+
+    Returns:
+        The check: it reads the ``.part`` and raises :class:`~workbench.api.store.UnreadableArtifact` for one that is
+        not what its role says.
+    """
+
+    def check_zip(part: Path) -> None:
+        with part.open("rb") as handle:
+            head = handle.read(len(_ZIP_SIGNATURE))
+        if not head:
+            raise UnreadableArtifact(ARTIFACT_EMPTY)
+        if head != _ZIP_SIGNATURE:
+            raise UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE)
+
+    def check_jsonl(part: Path) -> None:
+        with part.open("rb") as handle:
+            head = handle.read(_FIRST_LINE_MAX + 1)
+        if not head:
+            raise UnreadableArtifact(ARTIFACT_EMPTY)
+        line = head.partition(b"\n")[0]
+        if len(line) > _FIRST_LINE_MAX:
+            raise UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE)
+        try:
+            first = json.loads(line)
+        except (ValueError, RecursionError):  # not JSON, not UTF-8, or nested past the parser's depth
+            raise UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE) from None
+        if not isinstance(first, dict):
+            raise UnreadableArtifact(ARTIFACT_NOT_ITS_ROLE)
+
+    return check_zip if role == "nextext_zip" else check_jsonl
+
+
+@router.post(DERIVED_PATH)
+async def store_derived(
+    source: str,
+    role: ArtifactRole,
+    request: Request,
+    p: FilePrincipalDep,
+    settings: SettingsDep,
+    store: StoreDep,
+    audit: CallAuditDep,
+    jobs: JobsDep,
+) -> dict[str, object]:
+    """Keep one of Nextext's raw artifacts of a clip as a derived file of it, replacing the one of its role.
+
+    The request's body is the artifact. It is read whole into a ``.part`` in the clip's folder of derived files first,
+    its first bytes are checked (:func:`_artifact_check`) and its size is held to the role's bound, all before the route
+    waits for anything: a client whose body is not read meanwhile would hit its write timeout. Then it waits for the
+    clip's lock up to :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S`, so that a prepare of the clip that is running (an
+    artifact posted again after a restart) finishes first. Under the lock the artifact is recorded by its id and the
+    ids it replaces, renamed into place and inserted with the deletion of what it replaces: the artifact of its role,
+    and the transcript and frames made from the old one. A refusal remembered for the clip is forgotten, as its input
+    is new. Whatever ends the call before the artifact is placed (a busy clip, a client that is gone, any error)
+    removes the ``.part``.
+
+    Args:
+        source: The clip's virtual path, in the request's chat.
+        role: ``nextext_jsonl`` or ``nextext_zip``.
+        request: The request; its body is the artifact, raw.
+        p: The caller, user and chat.
+        settings: The api's settings; they hold the quota.
+        store: The file store.
+        audit: The audit log, bound to the call.
+        jobs: The job queue, whose lock of the clip the route holds.
+
+    Returns:
+        ``id`` of the new row, its ``role`` and ``bytes``, and ``replaced``: the id of the row of that role it replaced,
+        or ``None``.
+
+    Raises:
+        HTTPException: 422 ``unsupported_format`` for a source that is no audio or video upload. The store's refusals
+            (a missing clip, a body over its bound, the quota, an artifact that is not what its role says) and a busy
+            clip are answered by the app's handlers.
+    """
+    await run_in_threadpool(audit.check, "derived", p)
+    clip = await run_in_threadpool(store.get, p, source)
+    if clip.kind != "upload" or kind_of(clip.name) != "media":
+        raise HTTPException(status_code=422, detail=UNSUPPORTED_SOURCE)
+    mime, max_bytes = ROLE_TYPES[role]
+    quota_bytes = settings.workspace_max_mb * _MIB
+    spec = DerivedSpec(role, 0, mime, None, None, {})
+    body = _Body(request)
+
+    def stage() -> StagedArtifact:
+        return store.stage_derived(
+            clip, body, spec, max_bytes=max_bytes, quota_bytes=quota_bytes, check=_artifact_check(role)
+        )
+
+    staged = await run_in_threadpool(stage)
+
+    def record(file_id: str, size: int, replaced: Sequence[str], outcome: str) -> None:
+        audit.record(
+            "derived",
+            p,
+            file_ids=[clip.id, file_id, *replaced],
+            outcome=outcome,
+            criteria={"role": role, "bytes": size, "replaced": len(replaced)},
+        )
+
+    def place() -> tuple[DerivedRecord, list[DerivedRecord]]:
+        return store.place_derived(staged, quota_bytes=quota_bytes, record=record)
+
+    try:
+        async with jobs.source_lock(clip.id, SOURCE_LOCK_WAIT_S):
+            made, replaced = await run_in_threadpool(place)
+            store.forget_refusal(clip)
+    except BaseException:  # a busy clip, a call that ends, a refusal of the store: the .part goes whatever the reason
+        with anyio.CancelScope(shield=True):
+            await run_in_threadpool(store.drop_staged, staged)
+        raise
+    previous = next((each.id for each in replaced if each.role == role), None)
+    return {"id": made.id, "role": made.role, "bytes": made.size, "replaced": previous}
 
 
 def _wall_of(settings: Settings, caller: Caller) -> tuple[int, Settings]:

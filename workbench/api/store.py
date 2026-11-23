@@ -52,7 +52,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO, Final, Literal, TypeGuard
+from typing import Any, BinaryIO, Final, Literal, Protocol, TypeGuard
 
 from workbench.layout import DERIVED
 from workbench.models import VIRTUAL_ROOT, DerivedRecord, DerivedSpec, DirEntry, FileRecord, JobRecord, Principal
@@ -151,6 +151,22 @@ ChatRecord = Callable[[Sequence[str], str], object]
 #: ``ok`` before it becomes visible or ``error`` when it could not be kept after all. It raises when the record cannot
 #: be written.
 ArtifactRecord = Callable[[str, int, Sequence[str], str], object]
+
+
+class ByteSource(Protocol):
+    """Bytes read in chunks until none come: an open file, or a request's body read from a worker thread."""
+
+    def read(self, size: int, /) -> bytes:
+        """Read up to ``size`` bytes.
+
+        Args:
+            size: The most bytes to give.
+
+        Returns:
+            The next bytes, ``b""`` once there are no more.
+        """
+        ...
+
 
 _EXTRA_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1128,7 +1144,7 @@ class Store:
                     _log.warning("could not record a file that was not stored (%s)", type(exc).__name__)
             raise
 
-    def _write_part(self, fd: int, part: Path, src: BinaryIO, *, max_bytes: int, room: int) -> int:
+    def _write_part(self, fd: int, part: Path, src: ByteSource, *, max_bytes: int, room: int) -> int:
         """Stream ``src`` into a new private file, stopping at the limits; the file goes on any failure.
 
         Args:
@@ -2020,7 +2036,7 @@ class Store:
     def stage_derived(
         self,
         source: FileRecord,
-        src: BinaryIO,
+        src: ByteSource,
         spec: DerivedSpec,
         *,
         max_bytes: int,

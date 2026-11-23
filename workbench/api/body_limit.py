@@ -6,10 +6,12 @@ checks come only after an oversized body is already in memory or on disk. This g
 declared ``Content-Length`` over the bound is answered 413 before any body is read, and a body without one (chunked),
 or one that lies, is counted as it arrives and stopped at the first chunk that passes the bound.
 
-There are two bounds. ``POST /files/upload`` may carry one file of the per-file limit, plus room for the multipart
-framing; the store's own check stays the exact limit (``file too large``). Every other request is a tool call, which the
-executor's protocol line (1 MiB) bounds anyway, or has no body of its own, so it may have at most
-:data:`REQUEST_MAX` (``request too large``). The caller key is checked before this guard runs
+There are three bounds. ``POST /files/upload`` may carry one file of the per-file limit, plus room for the multipart
+framing; the store's own check stays the exact limit (``file too large``). ``POST /files/derived`` carries one
+artifact of a clip as its raw body, so it has the bound of the largest artifact, the zip's (:data:`DERIVED_BODY_MAX`),
+and the same ``file too large``; the route's own bound for a JSON Lines artifact is the smaller one. Every other request
+is a tool call, which the executor's protocol line (1 MiB) bounds anyway, or has no body of its own, so it may have at
+most :data:`REQUEST_MAX` (``request too large``). The caller key is checked before this guard runs
 (:class:`~workbench.api.auth.KeyGate`), so a request without a valid key never has its body read at all. Nothing here
 is logged, so no path, query or name can reach a log through it.
 
@@ -23,12 +25,16 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from workbench.api.auth import MCP_PATH
+from workbench.api.auth import DERIVED_PATH, MCP_PATH
 from workbench.api.mcp_wire import too_large
 from workbench.config import Settings
+from workbench.renders import ZIP_MAX_BYTES
 
-#: The one route that takes a file.
+#: The route that takes a file of the user's, in a multipart body.
 UPLOAD_PATH: Final = "/files/upload"
+
+#: The largest body of ``POST /files/derived``: the larger of the two artifacts of a clip, Nextext's keyframes zip.
+DERIVED_BODY_MAX: Final = ZIP_MAX_BYTES
 
 #: The detail of a 413 for an upload, the same text the store uses for a file over the per-file limit.
 FILE_TOO_LARGE: Final = "file too large"
@@ -108,6 +114,8 @@ class BodyLimit:
             return
         if scope["method"] == "POST" and scope["path"] == UPLOAD_PATH:
             bound, detail = self.upload_max, FILE_TOO_LARGE
+        elif scope["method"] == "POST" and scope["path"] == DERIVED_PATH:
+            bound, detail = DERIVED_BODY_MAX, FILE_TOO_LARGE
         else:
             bound, detail = self.request_max, REQUEST_TOO_LARGE
         declared = _declared_length(scope)

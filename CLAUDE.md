@@ -174,7 +174,8 @@ what the model is told and shown, never what a caller may reach.
   layout that takes it (`presentations/deck.py:fitting`), and a title slide's
   only text block is its subtitle (`subtitle_as_meant`).
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
-  an upload not yet sent, prepare, view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
+  an upload not yet sent, `POST /files/derived` (Nextext's two artifacts of a
+  clip, streamed in as its derived files), prepare, view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
   the conversion gate; with `strips` 2 or 3 it also cuts a picture into strips, on
@@ -271,7 +272,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and six file routes,
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and seven file routes,
 workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.

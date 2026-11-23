@@ -56,8 +56,11 @@ CHAT_PATH: Final = "/files/chat"
 #: The prepare of a picture or a PDF, a confined caller's alone.
 PREPARE_PATH: Final = "/files/prepare"
 
+#: The route that keeps Nextext's artifacts of a clip as derived files of it, a confined caller's alone.
+DERIVED_PATH: Final = "/files/derived"
+
 #: The file routes a confined caller reaches besides the MCP door.
-FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", PREPARE_PATH, CHAT_PATH})
+FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", PREPARE_PATH, CHAT_PATH, DERIVED_PATH})
 
 #: The header a caller sends on the MCP door to say it takes images (:func:`accepts_images`), in lower case.
 ACCEPT_IMAGES: Final = "x-accept-images"
