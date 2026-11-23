@@ -102,6 +102,7 @@ _RENDER_ROLES: Final = frozenset({"image", "page"})
 
 #: The roles of what a clip's prepare job makes of its raw artifacts (:data:`~workbench.renders.ARTIFACT_ROLES`).
 _TRANSCRIPT_ROLE: Final = "transcript"
+_SPEECH_ROLE: Final = "nextext_jsonl"
 _FRAME_ROLE: Final = "frame"
 
 #: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
@@ -540,6 +541,19 @@ def transcript_of(rows: Sequence[DerivedRecord]) -> DerivedRecord | None:
         not made or is gone.
     """
     return next((rec for rec in rows if rec.role == _TRANSCRIPT_ROLE), None)
+
+
+def has_speech_artifact(rows: Sequence[DerivedRecord]) -> bool:
+    """Tell whether a clip holds the JSON Lines of its speech, the raw artifact its transcript is made from.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        Whether a row of role ``nextext_jsonl`` is there. With no transcript beside it, the transcript could not be
+        read; without it, the clip was given no speech.
+    """
+    return any(rec.role == _SPEECH_ROLE for rec in rows)
 
 
 def frame_time(rec: DerivedRecord) -> float | None:

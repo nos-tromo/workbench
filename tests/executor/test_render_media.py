@@ -28,6 +28,7 @@ from workbench.renders import (
     NO_SPEECH,
     NOTHING_FOUND,
     RENDER_MAX_BYTES,
+    TRANSCRIPT_UNREADABLE,
     RenderAnswer,
     signature_ok,
     stamp,
@@ -745,7 +746,8 @@ def test_a_bad_transcript_leaves_the_frames(ctx: JobContext) -> None:
 
     result = RenderAnswer.model_validate(_prepare(ctx))
 
-    assert (result.total, result.transcript, result.hint) == (3, None, "The transcript could not be read.")
+    assert (result.total, result.transcript, result.hint) == (3, None, TRANSCRIPT_UNREADABLE)
+    assert TRANSCRIPT_UNREADABLE == "The transcript could not be read."  # the api's read of the clip says it too
     assert result.duration_s == 8.0  # the frames still say how long it ran
     assert _written(ctx) == ["p0001.jpg", "p0002.jpg", "p0003.jpg"]
 

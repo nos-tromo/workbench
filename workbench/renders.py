@@ -122,6 +122,9 @@ TRANSCRIPT_NAME: Final = "transcript.txt"
 #: pictures), and what a read says of a clip with pictures but no speech.
 NOTHING_FOUND: Final = "Nothing was found in this clip: no speech and no pictures, or it has not been transcribed."
 NO_SPEECH: Final = "No speech was found in this clip."
+#: What a prepare's hint and a read both say of a clip that has the JSON Lines of its speech but no transcript: they
+#: could not be read. The executor's hint and the api's read use this one text, so they never differ.
+TRANSCRIPT_UNREADABLE: Final = "The transcript could not be read."
 
 #: The PDF an Office file is converted to: its name in the job's output, its type, the first bytes the api checks, and
 #: the most bytes it may have (it counts toward ``DERIVED_MAX_BYTES``).

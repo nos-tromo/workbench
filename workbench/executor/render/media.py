@@ -46,6 +46,7 @@ from workbench.renders import (
     SIGNATURES,
     TRANSCRIPT_MAX_BYTES,
     TRANSCRIPT_NAME,
+    TRANSCRIPT_UNREADABLE,
     ZIP_MAX_BYTES,
     MediaRequest,
     RenderAnswer,
@@ -62,8 +63,8 @@ NOT_KEYFRAMES: Final = "the file is not a set of keyframes"
 _NOTHING_USABLE: Final = "nothing in the clip's artifacts could be read"
 _NOT_WRITTEN: Final = "the renders could not be written"
 
-#: What the hint says of each thing that went wrong or was left out, in the order the hint gives them.
-_TRANSCRIPT_UNREADABLE: Final = "The transcript could not be read."
+#: What the hint says of each thing that went wrong or was left out, in the order the hint gives them (the
+#: transcript's, which a read of the clip says too, is ``workbench.renders.TRANSCRIPT_UNREADABLE``).
 _FRAMES_UNREADABLE: Final = "The frames could not be read."
 _NO_FRAMES_TAKEN: Final = "No frames were taken from this clip."
 
@@ -453,7 +454,7 @@ def prepare_media(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
                 try:
                     transcript = read_transcript(_artifact(ctx, request.nextext_jsonl))
                 except UnreadableFile:
-                    unreadable.append(_TRANSCRIPT_UNREADABLE)
+                    unreadable.append(TRANSCRIPT_UNREADABLE)
             if request.nextext_zip is not None:
                 try:
                     frames, held = read_frames(_artifact(ctx, request.nextext_zip), file_mb=ctx.file_mb)

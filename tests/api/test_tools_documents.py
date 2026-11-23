@@ -45,7 +45,7 @@ from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
 from workbench.models import FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
-from workbench.renders import NOTHING_FOUND
+from workbench.renders import NOTHING_FOUND, TRANSCRIPT_UNREADABLE
 
 Payload = dict[str, Any] | Callable[[JobRequest], dict[str, Any]]
 
@@ -1892,6 +1892,25 @@ def test_a_clip_without_speech_says_so(
     assert [event["criteria"] for event in read_events(audit_lines)] == [
         {"caller": "ghostwriter", "paged": False, "images": 0}
     ] * 2
+
+
+def test_a_clip_whose_transcript_could_not_be_read_does_not_say_there_was_no_speech(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """The JSON Lines are there and gave no transcript: the read says so, not that nobody spoke. No job reads."""
+    source = tour(seeing, store, built, records=[])
+    assert artifact(seeing, source.virtual_path, "nextext_jsonl", b'{"note": "no sentence in it"}\n').status_code == 200
+    sighted = seen(read(seeing, source.virtual_path))["structuredContent"]
+    blind = seen(read(seeing, source.virtual_path, headers=HG_TEXT))["structuredContent"]
+
+    for structured in (sighted, blind):
+        assert (structured["kind"], structured["parts"], structured["total_parts"]) == ("transcript", [], 0)
+        assert structured["shown"] == []
+    assert sighted["hint"] == f"{TRANSCRIPT_UNREADABLE} {SEE_THREE}"
+    assert blind["hint"] == TRANSCRIPT_UNREADABLE
+    assert NO_SPEECH not in json.dumps([sighted, blind])
+    assert local.tools() == ["prepare_file"]
+    assert [event["target"]["ids"] for event in read_events(audit_lines)] == [[source.id], [source.id]]
 
 
 def test_a_clip_with_nothing_found_says_so_with_no_job(

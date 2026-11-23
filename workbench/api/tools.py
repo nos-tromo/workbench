@@ -12,7 +12,8 @@ the store knows and what the job answers. Each later tool has a module of its ow
 A clip (a video or audio file the user uploaded) is given to no job of these two tools: its bytes never enter the
 executor, where a sandbox would decode them. A search counts it among the files it could not search, and a run says
 that video and audio are not in the sandbox; a clip is read as its transcript (``read_document``) and looked at as its
-frames (``view_file``).
+frames (``view_file``). Nor does a tool that takes a path into a job: one that names a clip is refused before the job
+(:func:`refuse_clip`).
 
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
@@ -183,6 +184,30 @@ def is_clip(rec: FileRecord) -> bool:
         Whether it is an upload with the suffix of a video or an audio file.
     """
     return rec.kind == "upload" and kind_of(rec.name) == "media"
+
+
+#: What a tool says of a path or a source that names a clip: no job is given one (:func:`refuse_clip`).
+CLIP_REFUSED: Final = "unsupported_format: a clip is read with read_document and view_file"
+
+
+def refuse_clip(rec: FileRecord) -> FileRecord:
+    """Refuse, before any job, a clip named as a tool's file: a template, a master, a picture or a source.
+
+    The clip's bytes enter no executor job, whatever runs in it: a clip is read as its transcript and looked at as its
+    frames. The one check every tool that turns a path into a job's input makes, once it has the file's record.
+
+    Args:
+        rec: The file the model named, as the store has it.
+
+    Returns:
+        ``rec``, which is no clip.
+
+    Raises:
+        HTTPException: It is a clip (422, :data:`CLIP_REFUSED`).
+    """
+    if is_clip(rec):
+        raise HTTPException(status_code=422, detail=CLIP_REFUSED)
+    return rec
 
 
 def _unsearched(clips: int) -> str:

@@ -40,6 +40,7 @@ from workbench.api.tools import (
     _within,
     judged,
     record_answer,
+    refuse_clip,
 )
 from workbench.config import Settings
 from workbench.decks import MAX_LAYOUT_NAME
@@ -491,7 +492,8 @@ def _source_spec(
         notes or the appendix), and the file a file source names, or ``None``.
 
     Raises:
-        HTTPException: A file source is not a file of the request's chat, or a job source is not a finished
+        HTTPException: A file source is not a file of the request's chat, or is a clip (``unsupported_format``: no
+            clip is a job's input), or a job source is not a finished
             ``run_python`` run of the user in that chat (422, naming ``label`` and never whether a job exists for
             someone else).
     """
@@ -502,6 +504,7 @@ def _source_spec(
             rec = None
         if rec is None:
             raise _refused(label, f"{source.path} is not a file of this conversation")
+        refuse_clip(rec)
         spec: dict[str, Any] = {"kind": "file", "path": rec.name, "virtual": rec.virtual_path}
         spec.update(
             (key, value)
@@ -654,7 +657,7 @@ async def inspect_template(
         rec = None
         _, result, _ = await jobs.submit(p, "inspect_template", budget, [])
     else:
-        rec = await run_in_threadpool(store.get, p, body.path)
+        rec = refuse_clip(await run_in_threadpool(store.get, p, body.path))
         _output_extension(rec.name, inspecting=True)
         _, result, _ = await jobs.submit(p, "inspect_template", {"path": rec.name, **budget}, [rec.name])
     used = [] if rec is None else [rec.id]
@@ -698,7 +701,7 @@ async def fill_template(
         HTTPException: The template, the output name or a source is refused (422); the job's answer cannot be read,
             or its file was not kept (500).
     """
-    rec = await run_in_threadpool(store.get, p, body.path)
+    rec = refuse_clip(await run_in_threadpool(store.get, p, body.path))
     ext = _output_extension(rec.name)
     output = _output_name(rec.name, ext, body.output_name)
     values, inputs, source_ids = await run_in_threadpool(_sources, store, p, rec, body.values)

@@ -70,6 +70,7 @@ from workbench.api.renders import (
     frame_time,
     frame_window,
     frames_of,
+    has_speech_artifact,
     image_block,
     noun_of,
     page_window,
@@ -100,7 +101,7 @@ from workbench.api.tools import (
 )
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
-from workbench.renders import NO_SPEECH, NOTHING_FOUND, PagedUnit, Unit, kind_of, unit_of
+from workbench.renders import NO_SPEECH, NOTHING_FOUND, TRANSCRIPT_UNREADABLE, PagedUnit, Unit, kind_of, unit_of
 from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
@@ -977,6 +978,23 @@ async def _read_picture(
     return WithBlocks(answer, blocks) if blocks else answer
 
 
+def _without_transcript(total: int, *, spoken: bool, see: str | None) -> str | None:
+    """Say why a clip has no transcript to read.
+
+    Args:
+        total: How many frames the clip has.
+        spoken: Whether the clip holds the JSON Lines of its speech: they were there and gave no transcript.
+        see: What a call that takes images is told of the frames, if the clip has any.
+
+    Returns:
+        That the transcript could not be read, when the speech's artifact is there; else that there was no speech, or
+        that nothing was found when the clip has no frames either.
+    """
+    if spoken:
+        return _join(TRANSCRIPT_UNREADABLE, see)
+    return _join(NO_SPEECH, see) if total > 0 else NOTHING_FOUND
+
+
 async def _read_clip(
     body: ReadDocumentRequest,
     source: FileRecord,
@@ -993,9 +1011,10 @@ async def _read_clip(
     The clip is prepared first (:func:`~workbench.api.renders.prepared`: from its artifacts, once). With a transcript,
     one read job runs over that derived file alone, at the path its row gives, and its answer is the text file's with
     the clip's path and the kind ``transcript``; the clip itself is no input of any job, and no path of ``.derived`` is
-    said. Without one there is no job: the answer has no part and says there was no speech, or that nothing was found
-    when the clip has no frames either. A call that takes images is told, after the hint, that ``view_file`` shows the
-    clip's frames, when it has any; no image goes with the answer either way.
+    said. Without one there is no job: the answer has no part and says there was no speech, that the transcript could
+    not be read (the clip holds the JSON Lines of its speech and they gave none), or that nothing was found when the
+    clip has no frames either. A call that takes images is told, after the hint, that ``view_file`` shows the clip's
+    frames, when it has any; no image goes with the answer either way.
 
     The read is recorded once the job has answered, naming the clip and its transcript, before anything of the answer
     goes out; a refusal of the job is an ``error`` with its code, raised as for any file.
@@ -1021,11 +1040,13 @@ async def _read_clip(
         Busy: The queue or the executor has no room for the prepare or the read.
     """
     manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
-    transcript = transcript_of(await run_in_threadpool(store.derived_of, source))
+    rows = await run_in_threadpool(store.derived_of, source)
+    transcript = transcript_of(rows)
     if transcript is None and manifest.transcript:
         # It went after the manifest was read (the artifact was posted again): the next prepare makes it anew.
         manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
-        transcript = transcript_of(await run_in_threadpool(store.derived_of, source))
+        rows = await run_in_threadpool(store.derived_of, source)
+        transcript = transcript_of(rows)
     see: str | None = None
     if images and manifest.total > 0:
         see = ONE_FRAME if manifest.total == 1 else SEE_FRAMES.format(total=manifest.total)
@@ -1039,7 +1060,7 @@ async def _read_clip(
             pages_without_text=[],
             shown=[],
             truncated=False,
-            hint=_join(NO_SPEECH, see) if manifest.total > 0 else NOTHING_FOUND,
+            hint=_without_transcript(manifest.total, spoken=has_speech_artifact(rows), see=see),
         )
         await run_in_threadpool(_record_read, audit, p, source, [], paged=paged)
         return answer

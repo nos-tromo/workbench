@@ -122,8 +122,11 @@ path answers `404` to a caller with the key, and `401` to anyone without it.
   Ghostwriter is held to it: a path in another chat answers `404`, as a file
   that does not exist (`workbench/api/store.py:Store._locate`). So:
   - `list_files`, `search_files` and `run_python` see only the request's chat;
-    the last two are given none of its clips (a clip's bytes enter no job but its
-    own prepare's, which reads Nextext's artifacts of it, never the clip);
+    the last two are given none of its clips, and `inspect_template`,
+    `fill_template` and `write_presentation` refuse one named as a template, a
+    master or a file source, before any job, as `422 unsupported_format: a clip
+    is read with read_document and view_file`: a clip's bytes enter no job, its
+    own prepare's reading Nextext's artifacts of it, never the clip;
   - `fill_template` and `write_presentation` take file sources only from the
     template's or master's chat (without a master, the request's), and
     `write_presentation` its pictures too.
@@ -219,8 +222,9 @@ things, the limits that matter to users:
   is told after the hint that `view_file` shows the clip's frames, when it
   has any; a call that takes none is told of no frame. A clip with no speech
   is answered with no part and the hint "No speech was found in this clip.",
-  one nothing was found of with the manifest's own hint. `view_file` shows any page,
-  slide or picture, drawn as it would print, at most 8 images; a deck's are
+  one whose JSON Lines of speech gave no transcript with "The transcript could
+  not be read.", one nothing was found of with the manifest's own hint.
+  `view_file` shows any page, slide or picture, drawn as it would print, at most 8 images; a deck's are
   labelled and paged by slide (`slide 3`, `slides 9-12`), and `unit` says
   which. With no part it shows the first four pages or slides, and its hint
   names those after them and the part that shows the next four. Spreadsheets

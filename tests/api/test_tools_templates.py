@@ -539,6 +539,51 @@ def test_sources_must_exist(client: TestClient, store: Store, fake_executor: Loc
     answered(fill(client, f"{CHAT}/form.docx", {"customer": job(mine.id)}))
 
 
+#: What a tool says of a clip named as a template, a master, a picture or a source: no job is given one.
+CLIP_REFUSED = "unsupported_format: a clip is read with read_document and view_file"
+
+
+@pytest.mark.parametrize("name", ["harbour-tour.mp4", "voice-memo.M4A"])
+def test_a_clip_is_no_template_to_inspect(
+    client: TestClient, store: Store, fake_executor: Local, audit_lines: AuditLines, name: str
+) -> None:
+    """A clip named as the template is refused before any job, saying where it is read; nothing is recorded."""
+    put(store, name, b"x", p=PG)
+
+    assert refusal(inspect(client, f"{CHAT}/{name}")) == ("refused", CLIP_REFUSED)
+    assert fake_executor.requests == []
+    assert events(audit_lines, "inspect_template") == []
+
+
+def test_a_clip_is_no_template_to_fill(
+    client: TestClient, store: Store, fake_executor: Local, audit_lines: AuditLines
+) -> None:
+    """The same for the template of a fill: the clip's word, not that of a file that is no template."""
+    put(store, "harbour-tour.mp4", b"x", p=PG)
+
+    assert refusal(fill(client, f"{CHAT}/harbour-tour.mp4", {"customer": "x"})) == ("refused", CLIP_REFUSED)
+    assert fake_executor.requests == []
+    assert events(audit_lines, "fill_template") == []
+    assert outputs(store) == []
+
+
+def test_a_clip_is_no_source_of_a_value(
+    client: TestClient, store: Store, fake_executor: Local, tmp_path: Path, audit_lines: AuditLines
+) -> None:
+    """A file source that is a clip is refused before the job, so the clip's bytes are in none: a PDF still is one."""
+    stored(store, tmp_path, "form.docx", mt.make_controls_docx)
+    stored(store, tmp_path, "q.pdf", lambda path: mk.make_pdf(path, ["one", "two"]))
+    put(store, "harbour-tour.mp4", b"x", p=PG)
+
+    cited = {"value": "x", "source": {"kind": "file", "path": f"{CHAT}/harbour-tour.mp4"}}
+    assert refusal(fill(client, f"{CHAT}/form.docx", {"customer": cited})) == ("refused", CLIP_REFUSED)
+    assert fake_executor.requests == []
+    assert events(audit_lines, "fill_template") == []
+    pdf = {"value": "x", "source": {"kind": "file", "path": f"{CHAT}/q.pdf", "page": 1}}
+    answered(fill(client, f"{CHAT}/form.docx", {"customer": pdf}))
+    assert fake_executor.requests[0].input_files == ["form.docx", "q.pdf"]
+
+
 def test_the_files_a_fill_names_go_to_the_job_once(
     client: TestClient, store: Store, fake_executor: Local, tmp_path: Path
 ) -> None:
