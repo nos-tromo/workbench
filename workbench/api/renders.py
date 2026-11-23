@@ -529,6 +529,19 @@ def frames_of(rows: Sequence[DerivedRecord]) -> dict[int, DerivedRecord]:
     return {rec.ordinal: rec for rec in rows if _is_frame(rec)}
 
 
+def transcript_of(rows: Sequence[DerivedRecord]) -> DerivedRecord | None:
+    """Find the transcript of a clip among its derived files.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The row of role ``transcript`` (a clip has one at most), or ``None``: it has no speech, or its transcript was
+        not made or is gone.
+    """
+    return next((rec for rec in rows if rec.role == _TRANSCRIPT_ROLE), None)
+
+
 def frame_time(rec: DerivedRecord) -> float | None:
     """Read the time a frame's row keeps, which the zip's manifest gave it.
 

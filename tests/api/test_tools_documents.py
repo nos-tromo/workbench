@@ -23,15 +23,16 @@ from pptx import Presentation
 
 from tests.api.conftest import CHAT, FORMER, HG, HG_B, HG_TEXT, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
-from tests.api.test_files_renders import deck
+from tests.api.test_files_renders import artifact, deck
 from tests.api.test_jobs import FakeClient
 from tests.api.test_renders import capped
 from tests.api.test_tools_templates import Local
-from tests.api.test_tools_views import file_of, images, pdf, photo, raw, seen, whole_renders
+from tests.api.test_tools_views import CLIP_BYTES, file_of, images, pdf, photo, raw, seen, whole_renders
 from tests.callers import TEXT_ONLY_PAGE_HINT
 from tests.conftest import FakeOffice
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_media
 from workbench.api import tools_views
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import Busy, CallLimits, JobQueue
@@ -42,8 +43,9 @@ from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
 from workbench.api.tools import ReadDocumentRequest
 from workbench.api.tools_mcp import CallJobs
 from workbench.config import Settings
-from workbench.models import Principal
+from workbench.models import FileRecord, Principal
 from workbench.protocol import JobRequest, JobResult
+from workbench.renders import NOTHING_FOUND
 
 Payload = dict[str, Any] | Callable[[JobRequest], dict[str, Any]]
 
@@ -1775,3 +1777,246 @@ def test_strips_outside_one_to_three_are_invalid_arguments(
     """The same bounds as ``view_file``'s."""
     source = pdf(store, built, "harbour-report.pdf", SCANNED)
     assert refusal(read(seeing, source.virtual_path, strips=strips))[0] == "invalid_arguments"
+
+
+# --- read_document of a clip: its transcript ---------------------------------------------------------------------
+
+#: What a clip's read says of its frames when it has three and the call takes images.
+SEE_THREE = "Its 3 frames can be looked at with view_file ('frame 3', 'at 01:24')."
+NO_SPEECH = "No speech was found in this clip."
+#: The three sentences of the invented tour, as the transcript's lines: a clip over a minute, a speaker for two of them.
+TOUR_TEXT = "[00:00] Speaker 1: Welcome aboard.\n[01:24] Speaker 2: The quay opens at nine.\n[01:30] Thanks."
+TOUR = [
+    make_media.jsonl_record(0, 3, "Welcome aboard.", speaker="Speaker 1", index=0),
+    make_media.jsonl_record(84, 88, "The quay opens at nine.", speaker="Speaker 2", index=1),
+    make_media.jsonl_record(90, 91, "Thanks.", index=2),
+]
+
+
+def tour(
+    client: TestClient,
+    store: Store,
+    built: Path,
+    *,
+    frames: int = 3,
+    records: list[dict[str, Any]] | None = None,
+    name: str = "harbour-tour.mp4",
+) -> FileRecord:
+    """A clip of Ghostwriter's chat with Nextext's artifacts of an invented tour, posted as Ghostwriter does.
+
+    ``records`` are the JSON Lines (the three sentences of ``TOUR`` unless it says otherwise; none: no transcript
+    artifact); ``frames`` the keyframes zip's frames (none: no zip).
+    """
+    source = put(store, name, CLIP_BYTES, p=PG)
+    sentences = TOUR if records is None else records
+    if sentences:
+        lines = make_media.make_jsonl(built / "tour.jsonl", sentences).read_bytes()
+        assert artifact(client, source.virtual_path, "nextext_jsonl", lines).status_code == 200
+    if frames:
+        zipped = make_media.make_keyframes_zip(built / "tour.zip", frames, times=[30.0 * n for n in range(frames)])
+        assert artifact(client, source.virtual_path, "nextext_zip", zipped.read_bytes()).status_code == 200
+    return source
+
+
+def transcript_row(store: Store, source: FileRecord) -> Any:
+    """The transcript row of a clip that was prepared."""
+    (row,) = [rec for rec in store.derived_of(source) if rec.role == "transcript"]
+    return row
+
+
+def test_a_clip_reads_as_its_transcript(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """One call: the stamped lines as text parts, no image block; the clip itself reaches no job."""
+    source = tour(seeing, store, built)
+    answer = seen(read(seeing, source.virtual_path))
+
+    assert len(answer["content"]) == 1
+    structured = answer["structuredContent"]
+    assert (structured["kind"], structured["path"]) == ("transcript", source.virtual_path)
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert (structured["total_parts"], structured["pages_without_text"], structured["shown"]) == (3, [], [])
+    assert (structured["truncated"], structured["next_part"], structured["hint"]) == (False, None, SEE_THREE)
+    assert ".derived" not in json.dumps(answer)
+    row = transcript_row(store, source)
+    (job,) = [req for req in local.requests if req.tool == "read_document"]
+    assert job.input_files == [row.relative_path]
+    assert (job.args["path"], job.args["images"]) == (row.relative_path, False)
+    assert all(source.name not in req.input_files for req in local.requests)  # the clip is no input of any job
+    (event,) = read_events(audit_lines)
+    assert (event["action"], event["outcome"]) == ("query", "ok")
+    assert event["target"]["ids"] == [source.id, row.id]
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_clip_reads_the_same_without_the_header(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """Review focus 4: a blind caller reads the transcript, as text, and is told of no frame nor of ``view_file``."""
+    source = tour(seeing, store, built)
+    blind = seen(read(seeing, source.virtual_path, headers=HG_TEXT))
+    sighted = seen(read(seeing, source.virtual_path))
+
+    assert len(blind["content"]) == 1
+    structured = blind["structuredContent"]
+    assert structured["parts"] == sighted["structuredContent"]["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert (structured["kind"], structured["shown"], structured["hint"]) == ("transcript", [], None)
+    assert "view_file" not in json.dumps(blind)
+    assert sighted["structuredContent"]["hint"] == SEE_THREE
+    names = [tool["name"] for tool in result(rpc(seeing, "tools/list", headers=HG_TEXT))["tools"]]
+    assert "view_file" not in names
+    assert [req.args["images"] for req in local.requests if req.tool == "read_document"] == [False, False]
+    first, second = read_events(audit_lines)
+    assert first["target"]["ids"] == second["target"]["ids"]
+    assert first["criteria"] == second["criteria"] == {"caller": "ghostwriter", "paged": False, "images": 0}
+
+
+def test_a_clip_without_speech_says_so(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """No transcript, no read job: the hint says there was no speech, and names ``view_file`` only when it can look."""
+    silent = tour(seeing, store, built, records=[])
+    sighted = seen(read(seeing, silent.virtual_path))
+    blind = seen(read(seeing, silent.virtual_path, headers=HG_TEXT))
+
+    for answer in (sighted, blind):
+        assert len(answer["content"]) == 1
+        structured = answer["structuredContent"]
+        assert (structured["kind"], structured["path"]) == ("transcript", silent.virtual_path)
+        assert (structured["parts"], structured["total_parts"], structured["pages_without_text"]) == ([], 0, [])
+        assert (structured["shown"], structured["truncated"], structured["next_part"]) == ([], False, None)
+    assert sighted["structuredContent"]["hint"] == f"{NO_SPEECH} {SEE_THREE}"
+    assert blind["structuredContent"]["hint"] == NO_SPEECH
+    assert local.tools() == ["prepare_file"]  # the prepare of the frames; nothing was read in a job
+    assert [event["target"]["ids"] for event in read_events(audit_lines)] == [[silent.id], [silent.id]]
+    assert [event["criteria"] for event in read_events(audit_lines)] == [
+        {"caller": "ghostwriter", "paged": False, "images": 0}
+    ] * 2
+
+
+def test_a_clip_with_nothing_found_says_so_with_no_job(
+    seeing: TestClient, local: Picky, store: Store, audit_lines: AuditLines
+) -> None:
+    """A clip with no artifact has no speech and no pictures: the manifest's own hint, and not a job ran."""
+    bare = put(store, "quay-walk.mp4", CLIP_BYTES, p=PG)
+    structured = seen(read(seeing, bare.virtual_path))["structuredContent"]
+
+    assert (structured["kind"], structured["parts"], structured["total_parts"]) == ("transcript", [], 0)
+    assert structured["hint"] == NOTHING_FOUND
+    assert local.requests == []
+    (event,) = read_events(audit_lines)
+    assert event["target"]["ids"] == [bare.id]
+
+
+def test_a_clip_of_one_frame_is_told_in_the_singular(seeing: TestClient, store: Store, built: Path) -> None:
+    """One keyframe is "1 frame", never "1 frames", and is asked for by its number."""
+    source = tour(seeing, store, built, frames=1)
+    structured = seen(read(seeing, source.virtual_path))["structuredContent"]
+
+    assert structured["hint"] == "Its 1 frame can be looked at with view_file ('frame 1')."
+
+
+def test_audio_with_speech_reads_without_frames(seeing: TestClient, local: Picky, store: Store, built: Path) -> None:
+    """A recording has no zip: its transcript is read, and the hint names no frame."""
+    memo = tour(seeing, store, built, frames=0, name="voice-memo.m4a")
+    structured = seen(read(seeing, memo.virtual_path))["structuredContent"]
+
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert structured["hint"] is None
+
+
+@pytest.fixture
+def seeing_4kb(settings: Settings, store: Store, audit: AuditLog, local: Picky) -> Iterator[TestClient]:
+    """A client on that app whose answers may be 4 KB: the reader keeps 2 KB of them for its own words."""
+    yield from served(dataclasses.replace(settings, result_max_kb=4), store, audit, local)
+
+
+def test_a_long_transcript_pages_by_lines(
+    seeing_4kb: TestClient, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """Following ``next_part`` reads on, line by line, until the last line: none twice, none left out."""
+    paging = seeing_4kb
+    sentences = [
+        make_media.jsonl_record(2 * n, 2 * n + 1, f"Sentence number {n} of the invented tour.", index=n)
+        for n in range(120)
+    ]
+    source = tour(paging, store, built, frames=0, records=sentences)
+    lines: list[str] = []
+    part: str | None = None
+    calls = 0
+    while True:
+        structured = seen(read(paging, source.virtual_path, part))["structuredContent"]
+        calls += 1
+        assert structured["kind"] == "transcript"
+        for piece in structured["parts"]:
+            lines += piece["text"].split("\n")
+        part = structured["next_part"]
+        if not structured["truncated"]:
+            break
+        assert part is not None
+        assert calls < 20
+    assert calls > 1
+    assert len(lines) == 120
+    assert lines[0] == "[00:00] Sentence number 0 of the invented tour."
+    assert lines[-1] == "[03:58] Sentence number 119 of the invented tour."
+    assert [line[:7] for line in lines] == [f"[{(2 * n) // 60:02d}:{(2 * n) % 60:02d}]" for n in range(120)]
+    assert [event["criteria"]["paged"] for event in read_events(audit_lines)] == [False] + [True] * (calls - 1)
+
+
+def test_a_part_the_transcript_has_not_is_refused_and_recorded_with_the_clip_and_its_transcript(
+    seeing: TestClient, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """The reader's refusal goes on as for any file; the event is an ``error`` of the code alone, naming both files."""
+    source = tour(seeing, store, built)
+    reason, text = refusal(read(seeing, source.virtual_path, "lines 40-50"))
+
+    assert reason == "refused"
+    assert text.startswith("no_such_part: ")
+    assert ".derived" not in text
+    (event,) = read_events(audit_lines)
+    assert (event["action"], event["outcome"]) == ("query", "error")
+    assert event["target"]["ids"] == [source.id, transcript_row(store, source).id]
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": True, "refused": "no_such_part"}
+
+
+def test_a_transcript_the_job_cannot_find_does_not_name_its_path(
+    seeing: TestClient, local: Picky, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """The runner's words name the file as the store keeps it; the model is told the transcript is gone, no path."""
+    source = tour(seeing, store, built)
+    seen(read(seeing, source.virtual_path))  # the first read prepares the clip
+    row = transcript_row(store, source)
+    local.status = "error"
+    local.scripted["read_document"] = {"error": f"file_not_found: {CHAT}/{row.relative_path} is not in this workspace"}
+    reason, text = refusal(read(seeing, source.virtual_path))
+
+    assert (reason, text) == ("refused", "file_not_found: the transcript of this clip is not there now")
+    _, event = read_events(audit_lines)
+    assert (event["outcome"], event["target"]["ids"]) == ("error", [source.id, row.id])
+    assert event["criteria"] == {"caller": "ghostwriter", "paged": False, "refused": "file_not_found"}
+    assert row.relative_path not in json.dumps(audit_lines())
+
+
+def test_a_transcript_that_goes_while_the_clip_is_read_is_made_again(
+    seeing: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The artifact posted again removes the transcript between the manifest and the read: one more prepare makes it."""
+    source = tour(seeing, store, built)
+    real = tools_views.prepared
+    calls: list[int] = []
+
+    async def racing(*args: Any, **kwargs: Any) -> Any:
+        manifest = await real(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 1:  # the first prepare ends, and the artifact is posted again before the read looks
+            for rec in store.derived_of(source):
+                if rec.role in {"transcript", "frame"}:
+                    store.remove_derived(rec)
+        return manifest
+
+    monkeypatch.setattr(tools_views, "prepared", racing)
+    structured = seen(read(seeing, source.virtual_path))["structuredContent"]
+
+    assert len(calls) == 2
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert structured["hint"] == SEE_THREE

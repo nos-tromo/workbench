@@ -258,7 +258,7 @@ class DocumentRead(BaseModel):
     Attributes:
         path: The file's path.
         kind: ``pdf``, ``docx``, ``xlsx``, ``csv``, ``pptx``, ``odt``, ``ods``, ``eml``, ``html``, ``json``,
-            ``text`` or ``image``.
+            ``text``, ``image``, or ``transcript`` for a video or audio clip.
         parts: The text, in order, each piece with its reference.
         total_parts: How many pages, sheets, slides, paragraphs and tables or lines the file has.
         pages_without_text: Pages or slides looked at that have no text.

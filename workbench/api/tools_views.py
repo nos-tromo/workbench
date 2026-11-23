@@ -36,8 +36,16 @@ gone and the next prepare runs. A clip's frames are labelled ``frame 3 (01:24)``
 clip without frames, has none to name: whatever its ``part`` says, the answer is the hint that says to read its
 transcript with ``read_document`` (or that nothing was found), never a refusal.
 
+``read_document`` reads a clip's transcript, with or without images: the transcript is text, so a call that takes none
+reads it as a call that takes them does (:func:`_read_clip`). The clip is prepared first, as ``view_file`` does it, and
+the one read job has the transcript's derived file as its only input, at the path its row gives, never one the model
+names: the clip itself never enters a job. A clip without a transcript is answered with no job, and says so. The answer
+is the text file's (``lines 1-200``), of kind ``transcript``, with no image; a call that takes images is told in the
+hint that ``view_file`` shows the clip's frames.
+
 Every call is recorded as a ``query`` of the source and of each render shown, before any block is returned; a file that
-shows no image is recorded too, with none. If the event cannot be written the call fails and no image leaves.
+shows no image is recorded too, with none; a clip's read names the clip and its transcript. If the event cannot be
+written the call fails and no image leaves.
 """
 
 import dataclasses
@@ -70,6 +78,7 @@ from workbench.api.renders import (
     renders_for,
     shown_frame,
     shown_image,
+    transcript_of,
 )
 from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
 from workbench.api.tools import (
@@ -87,10 +96,11 @@ from workbench.api.tools import (
     _readable,
     _within,
     record_answer,
+    refusal,
 )
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
-from workbench.renders import NOTHING_FOUND, PagedUnit, Unit, kind_of, unit_of
+from workbench.renders import NO_SPEECH, NOTHING_FOUND, PagedUnit, Unit, kind_of, unit_of
 from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
@@ -124,6 +134,12 @@ PAGES_VIEWABLE: Final = "view_file shows its pages as images, as they would prin
 
 #: What a view of a clip without frames says: it has the transcript, which is read as text.
 NO_PICTURES: Final = "This clip has no pictures; read its transcript with read_document."
+#: What a read of a clip tells a call that takes images, when the clip has frames: ``{total}`` is how many. A clip of
+#: one frame is told in :data:`ONE_FRAME`.
+SEE_FRAMES: Final = "Its {total} frames can be looked at with view_file ('frame 3', 'at 01:24')."
+ONE_FRAME: Final = "Its 1 frame can be looked at with view_file ('frame 1')."
+#: What a read of a clip says when the transcript's file is no longer there: the job's own words name its path.
+NO_TRANSCRIPT_FILE: Final = "file_not_found: the transcript of this clip is not there now"
 
 #: The refusals of a runner that may pass on another try: they get ``UNSHOWN``, not ``UNDRAWABLE``.
 _TRANSIENT: Final = frozenset({"read_timeout"})
@@ -961,6 +977,92 @@ async def _read_picture(
     return WithBlocks(answer, blocks) if blocks else answer
 
 
+async def _read_clip(
+    body: ReadDocumentRequest,
+    source: FileRecord,
+    *,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: "CallJobs",
+    images: bool,
+) -> DocumentRead:
+    """Answer a read of a clip with its transcript, which is text, whether or not the call takes images.
+
+    The clip is prepared first (:func:`~workbench.api.renders.prepared`: from its artifacts, once). With a transcript,
+    one read job runs over that derived file alone, at the path its row gives, and its answer is the text file's with
+    the clip's path and the kind ``transcript``; the clip itself is no input of any job, and no path of ``.derived`` is
+    said. Without one there is no job: the answer has no part and says there was no speech, or that nothing was found
+    when the clip has no frames either. A call that takes images is told, after the hint, that ``view_file`` shows the
+    clip's frames, when it has any; no image goes with the answer either way.
+
+    The read is recorded once the job has answered, naming the clip and its transcript, before anything of the answer
+    goes out; a refusal of the job is an ``error`` with its code, raised as for any file.
+
+    Args:
+        body: The path and the part: ``lines 100-200``, as for a text file.
+        source: The clip.
+        p: The caller, user and chat.
+        settings: The api's settings; ``result_max_kb`` caps the answer.
+        store: The file store.
+        audit: The audit log, bound to the call.
+        jobs: The queue, within the call's limits.
+        images: Whether the call takes images (``X-Accept-Images: 1``): it is then told of ``view_file``.
+
+    Returns:
+        The lines read and how to go on; no part for a clip without speech.
+
+    Raises:
+        HTTPException: The clip's prepare was refused (see :func:`~workbench.api.renders.prepared`), or the read job
+            was: a part the transcript has not (422 ``no_such_part``), or a transcript that is gone (404).
+        PurposeRequired: The prepare had to state a purpose for ``modify`` and the call stated none.
+        AuditWriteError: An event could not be written; nothing goes out.
+        Busy: The queue or the executor has no room for the prepare or the read.
+    """
+    manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+    transcript = transcript_of(await run_in_threadpool(store.derived_of, source))
+    if transcript is None and manifest.transcript:
+        # It went after the manifest was read (the artifact was posted again): the next prepare makes it anew.
+        manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+        transcript = transcript_of(await run_in_threadpool(store.derived_of, source))
+    see: str | None = None
+    if images and manifest.total > 0:
+        see = ONE_FRAME if manifest.total == 1 else SEE_FRAMES.format(total=manifest.total)
+    paged = body.part is not None
+    if transcript is None:
+        answer = DocumentRead(
+            path=source.virtual_path,
+            kind="transcript",
+            parts=[],
+            total_parts=0,
+            pages_without_text=[],
+            shown=[],
+            truncated=False,
+            hint=_join(NO_SPEECH, see) if manifest.total > 0 else NOTHING_FOUND,
+        )
+        await run_in_threadpool(_record_read, audit, p, source, [], paged=paged)
+        return answer
+    budget = max(1, settings.job_wall_s * 3 // 4)
+    args = {"path": transcript.relative_path, "part": body.part, "budget_s": budget, "images": False}
+    _, result, _ = await jobs.submit(p, "read_document", args, [transcript.relative_path])
+    if refusal(result) == "file_not_found":  # the job's words name the transcript's path in the store
+        result = result.model_copy(update={"result": {"error": NO_TRANSCRIPT_FILE}})
+    payload = (
+        {**result.result, "path": source.virtual_path, "kind": "transcript"}
+        if isinstance(result.result, dict)
+        else None
+    )
+    usable = result.status == "ok" and payload is not None and _readable(DocumentRead, payload)
+    criteria: dict[str, object] = {"paged": paged, **({"images": 0} if usable else {})}
+    await run_in_threadpool(
+        record_answer, audit, "read_document", p, [source.id, transcript.id], criteria, result, DocumentRead, payload
+    )
+    _payload(result, "file")
+    read = _parse(DocumentRead, payload)
+    return _fit_read(read.model_copy(update={"hint": _join(read.hint, see)}), settings.result_max_kb)
+
+
 async def read_document(
     body: ReadDocumentRequest,
     p: Principal,
@@ -978,10 +1080,11 @@ async def read_document(
     as images, in the same answer; a deck is converted and drawn for them first, as ``view_file`` does it. A Word or
     OpenDocument text file is answered with its text alone; its first read (no ``part``) says that ``view_file`` shows
     its pages. A picture file is not read but shown: it is prepared as ``view_file`` does it, and answered as its image.
-    On a call that takes no images every file is read in the executor and answered with its text alone, ``strips``
-    ignored, as workbench 0.6 did. The read is recorded by the file's id and then each render shown, once the images are
-    settled and before anything of the answer goes out; a refusal of the job is an ``error`` with its code. Neither the
-    name, the part nor the text is recorded.
+    A video or audio clip is read as its transcript (:func:`_read_clip`), on any call: no image, and the clip itself is
+    no input of any job. On a call that takes no images every other file is read in the executor and answered with its
+    text alone, ``strips`` ignored, as workbench 0.6 did. The read is recorded by the file's id and then each render
+    shown (a clip's, by the clip's and its transcript's), once the images are settled and before anything of the answer
+    goes out; a refusal of the job is an ``error`` with its code. Neither the name, the part nor the text is recorded.
 
     Args:
         body: The path, where to start, and into how many strips each image is cut.
@@ -1003,6 +1106,10 @@ async def read_document(
         Busy: The queue or the executor has no room for the read, or for a picture's render.
     """
     source = await run_in_threadpool(store.get, p, body.path)
+    if kind_of(source.name) == "media":  # a clip is read as its transcript, text, whether or not the call takes images
+        return await _read_clip(
+            body, source, p=p, settings=settings, store=store, audit=audit, jobs=jobs, images=images
+        )
     kind = kind_of(source.name) if images else "none"  # a call that takes no images is read as text alone
     if kind == "image":
         return await _read_picture(body, source, p=p, settings=settings, store=store, audit=audit, jobs=jobs)
