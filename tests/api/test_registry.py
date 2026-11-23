@@ -23,7 +23,17 @@ from workbench.api.registry import (
     ToolSpec,
     allowed_tools,
 )
-from workbench.api.store import Conflict, NotFound, QuotaExceeded, RendersFull, StorageFull, StoreError
+from workbench.api.store import (
+    ARTIFACT_EMPTY,
+    ARTIFACT_NOT_ITS_ROLE,
+    Conflict,
+    NotFound,
+    QuotaExceeded,
+    RendersFull,
+    StorageFull,
+    StoreError,
+    UnreadableArtifact,
+)
 from workbench.api.tool_table import WORKSPACE_TABLE
 from workbench.api.tools import FileList, PythonRun, RunPythonRequest
 from workbench.api.tools_mcp import NoArguments, workspace_tools
@@ -168,6 +178,8 @@ def test_the_tools_of_each_form_are_read_only() -> None:
             RendersFull("the renders of this file are at their limit"),
             (507, "the renders of this file are at their limit"),
         ),
+        (UnreadableArtifact(ARTIFACT_EMPTY), (422, ARTIFACT_EMPTY)),
+        (UnreadableArtifact("a word of a caller"), (422, ARTIFACT_NOT_ITS_ROLE)),
         (AuditWriteError("x"), (500, "audit unavailable")),
         (Busy("queue_full"), (503, "busy, retry later")),
         (RequestTooLarge("x"), (422, "request too large")),

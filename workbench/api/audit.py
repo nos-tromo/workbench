@@ -56,6 +56,7 @@ OPERATIONS: Final[dict[str, tuple[str, str]]] = {
     "chat_delete": ("delete", "chat.delete"),
     "file_delete": ("delete", "file.delete"),
     "prepare": ("modify", "file.prepare"),
+    "derived": ("modify", "file.derived"),
 }
 
 _SYSTEM_ACTOR: Final = Actor(user=None, via="system")

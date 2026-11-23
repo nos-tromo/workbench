@@ -42,7 +42,17 @@ from pydantic_core import PydanticCustomError
 
 from workbench.api.audit import AuditLog
 from workbench.api.store import NotFound, Store
-from workbench.api.tools import MAX_HINT, OutputKeeper, _clean, _json_size, _parse, _payload, _readable, judged
+from workbench.api.tools import (
+    MAX_HINT,
+    OutputKeeper,
+    _clean,
+    _json_size,
+    _parse,
+    _payload,
+    _readable,
+    judged,
+    refuse_clip,
+)
 from workbench.api.tools_output import MAX_NAME, _output_name
 from workbench.api.tools_templates import SLIDE_MASTERS, SOURCE_KINDS, Source, _cut_to, _source_spec
 from workbench.config import Settings
@@ -614,7 +624,7 @@ async def write_presentation(
         HTTPException: The master, the name, a bound, a picture or a source is refused (422, before any job); the
             runner refused (its 422); the job's answer cannot be read, or its file was not kept (500).
     """
-    rec = None if body.path is None else await run_in_threadpool(store.get, p, body.path)
+    rec = None if body.path is None else refuse_clip(await run_in_threadpool(store.get, p, body.path))
     if rec is not None:
         _master(rec)
     name = _output_name(body.name, "pptx")

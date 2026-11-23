@@ -13,15 +13,16 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and six file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
+| `ghostwriter` | mcp, and seven file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but
   `/mcp`, `/healthz` and `/metrics`. Every such `404` is
   `{"detail": "not found"}`.
-- Ghostwriter's key reaches `/mcp` and six file routes: `/files/upload`
-  (`POST` and `DELETE`), `/files/prepare`, `/files/view`, `/files/list` and
-  `/files/chat`. A purpose it must state and did not is `428` on a file route.
+- Ghostwriter's key reaches `/mcp` and seven file routes: `/files/upload`
+  (`POST` and `DELETE`), `/files/derived`, `/files/prepare`, `/files/view`,
+  `/files/list` and `/files/chat`. A purpose it must state and did not is `428`
+  on a file route.
 - Every path Ghostwriter names is confined to `X-Session-Id`'s chat, anything
   else being `404`; `default` or no session is `400`. For up to an hour after
   `DELETE /files/chat` (`DELETED_CHAT_HOLD_S`), an upload or a tool call for
@@ -56,10 +57,10 @@ Every tool that runs in the executor also leaves a job record (see
 | Tool | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | `list_files` | names, sizes, dates and kinds of the chat's files, from the database | nothing | not recorded: the user's own metadata | nothing |
-| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer, or a deck (`.pptx`, `.potx`) with slides that have no text, also has the renders of those pages or slides (a deck converted to a PDF first, in a job), which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer | for a picture, or a PDF or a deck with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet, and a deck's PDF; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
-| `search_files` | the chat's newest 1000 files, as copies in a job; the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
-| `view_file` | one picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`) of the chat, as a copy in a job when a page is not rendered yet (an Office file is converted to a PDF first, in the same turn); its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet, and an Office file's PDF; no file of the chat | `query` / `tool.view_file`, naming the file and each render shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
-| `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
+| `read_document` | one file, as a copy in a job; a picture is not read in a job but rendered as `view_file` does, and a PDF with pages that have no text layer, or a deck (`.pptx`, `.potx`) with slides that have no text, also has the renders of those pages or slides (a deck converted to a PDF first, in a job), which the api reads back and sends to the model as image blocks, at most 4 images and 2.5 MiB an answer; a clip (audio or video) is read as its transcript, the text file its prepare made from Nextext's JSON Lines, which is the job's one input, at the path its row gives and never one the model names: the clip's own bytes enter no job, and a clip with no transcript is answered at once with no job | for a picture, or a PDF or a deck with such pages, the renders under the reserved `.derived/` folder, the pages or strips not made yet, and a deck's PDF; for a clip, its transcript and frames when it was not prepared yet; no file of the chat | `query` / `tool.read_document`, naming the file and each render shown, before any image leaves; for a clip the clip and its transcript, and no image; the renders made for the call have their `modify` / `file.prepare` event | a job record, and the renders until the source goes |
+| `search_files` | the chat's newest 1000 files, as copies in a job, but no clip (a video or audio file the user uploaded: its bytes enter no job, it is counted in `unsupported_files` and the hint says so; a chat of clips alone runs no job); the executor never copies a file below the chat's `out/` folder, though the event names it | nothing | `query` / `tool.search_files` | a job record |
+| `view_file` | one picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`) of the chat, as a copy in a job when a page is not rendered yet (an Office file is converted to a PDF first, in the same turn); its renders, which the api reads back and sends to the model as image blocks, at most 8 images and 2.5 MiB an answer; a clip (audio or video) is never read: its frames are the rows its prepare made from Nextext's keyframes zip, read back and sent as image blocks, never decoded in the api, by number, range or time (`frame 3`, `frames 2-5`, `at 01:24`), and a frame whose row or file is gone is named in the hint, not shown (a frame is not made on its own: it comes back only with the whole set, when the clip's transcript, else its frame 1, is gone and the next prepare runs); any other file is answered at once, with no image and no job | the renders of the file under the reserved `.derived/` folder, the pages or strips not made yet, and an Office file's PDF; for a clip, its transcript and frames when it was not prepared yet (the view runs the clip's prepare first, as `read_document`'s row says, and `strips` is ignored); no file of the chat | `query` / `tool.view_file`, naming the file and each render or frame shown, before any image leaves; the renders made for the call have their `modify` / `file.prepare` event | the renders, until the source goes, and a job record when a job ran |
+| `run_python` | every file of the chat, the newest 1000 outside `out/`, as read-only copies in a job, but no clip (a video or audio file the user uploaded: its bytes enter no job, so the sandbox cannot decode it, and the hint says that video and audio are not in it: a clip's transcript is read with `read_document`, its frames looked at with `view_file`, which a call without `X-Accept-Images: 1` is not told of) | the job's `out/`: at most 20 files, which become new files of the chat; and its private `home/` and `tmp/`, removed with the job | `combine` / `tool.run_python` | the new files and a job record |
 | `inspect_template` | one template or slide master, as a copy in a job; no file without a path (the plain slide master) | nothing | `query` / `tool.inspect_template` | a job record |
 | `fill_template` | the template and every file a value's source names, as copies in a job | one new `.docx` or `.xlsx` in the template's chat; the template is not changed | `modify` / `tool.fill_template` | the new file and a job record |
 | `write_table` | nothing of the chat: the values come in the call | one new `.xlsx` or `.csv` in the chat | `collect` / `tool.write_table` | the new file and a job record |
@@ -85,8 +86,9 @@ chat.
 | Route | Reads | Writes | Audit `action` / `operation` | Kept |
 |---|---|---|---|---|
 | upload, `POST /files/upload` | the uploaded bytes | one new file in the chat folder; a taken name gets a number | `collect` / `file.upload`, before the file is visible | the file |
+| artifact of a clip, `POST /files/derived?source=<path>&role=nextext_jsonl\|nextext_zip` | the request body, which is the artifact (Nextext's JSON Lines or its keyframes zip, at most 8 MiB or 32 MiB), read whole into a `.part`; the api reads no more of it than the first four bytes of a zip (`PK\x03\x04`) or the first line of a jsonl (at most 64 KiB, a JSON object), and the executor parses everything else, later | one file under the reserved `.derived/` folder of the clip, which no path reaches, beside the clip's other derived files; a clip of the request's chat that is an audio or video upload (any other source is `422 unsupported_format`, another chat's or a `.derived` path `404`); it replaces the clip's artifact of that role and the transcript and frames made from the old one, and a refusal remembered for the clip is forgotten; it counts in the user's quota and the clip's 64 MiB of derived files (`507`); it waits for the clip's lock up to 120 s (`503`) | `modify` / `file.derived`, before the artifact is visible; naming the clip, the new file and each file it replaces | the artifact, until the clip goes (or a second one of its role replaces it); the answer is its `id`, `role`, `bytes` and the `id` it `replaced` |
 | prepare, `POST /files/prepare` | a picture, PDF or Office file (`.docx`, `.dotx`, `.pptx`, `.potx`, `.odt`), as a copy in a job of the executor; an Office file is converted once to a PDF, kept as a derived file of it, and then drawn from that PDF, both jobs in one turn of the caller's conversion gate (a picture or a PDF waits for its prepare gate, apart from it); a file the executor refused for what it is is refused again, with no job; any other file is answered as `kind: none` without a job | the renders of the file, under the reserved `.derived/` folder of the chat, which no path reaches: the first 20 pages of a PDF or Office file, or the picture, and an Office file's PDF beside them; with `strips` 2 or 3 (default 1; any other is `422`), also the picture's strips, in a second job on the same prepare gate, while the pages of a PDF or Office file stay to be cut when viewed | `modify` / `file.prepare`, before any render or PDF is visible, one for each job | the renders and the PDF, until the source goes; the answer is their manifest, the same whatever `strips` is |
-| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page, a slide or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn (an Office file with no PDF kept is converted first and drawn, in one turn of the caller's conversion gate) | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
+| view and download, `GET /files/view` | one file's bytes, sent to the caller; with `rendition`, one render of it (a page, a slide or a picture, or one strip of it), made first when it does not exist yet, on the user's own turn (an Office file with no PDF kept is converted first and drawn, in one turn of the caller's conversion gate); of a clip, its frame `rendition`, whole, as its prepare kept it (`strips` above 1 is `422`, with or without a `strip`; a number past the last frame, or a frame whose row or file is lost, is `404`, never `500`) | nothing, or the renders of that page, as a prepare keeps them | `disclose` / `file.view`, naming the file, and the render with `rendition`; a render made first has its `modify` / `file.prepare` event too | nothing, or the render |
 | `DELETE /files/upload` (since 0.8.1; 0.8.0 answers `405`) | nothing | one upload of the chat, the user's, that Ghostwriter takes back (it does so only for one not yet sent; workbench deletes any upload of the chat), with its renders and their rows; a tool's output, another chat's file or a render is not found (`404`); a job still running on it keeps no render; a refusal remembered for it is forgotten | `delete` / `file.delete`, first | nothing |
 | `DELETE /files/chat` | nothing | the chat's files and renders and their rows, its job rows and its folder | `delete` / `chat.delete`, first | nothing |
 | list, `GET /files/list` | names, types, sizes and dates of one folder | nothing | not recorded | nothing |
@@ -120,6 +122,12 @@ path answers `404` to a caller with the key, and `401` to anyone without it.
   Ghostwriter is held to it: a path in another chat answers `404`, as a file
   that does not exist (`workbench/api/store.py:Store._locate`). So:
   - `list_files`, `search_files` and `run_python` see only the request's chat;
+    the last two are given none of its clips, and `inspect_template`,
+    `fill_template` and `write_presentation` refuse one named as a template, a
+    master or a file source, before any job, as `422 unsupported_format: a clip
+    is read with read_document`, a word that names no `view_file` to a call
+    without images: a clip's bytes enter no job, its
+    own prepare's reading Nextext's artifacts of it, never the clip;
   - `fill_template` and `write_presentation` take file sources only from the
     template's or master's chat (without a master, the request's), and
     `write_presentation` its pictures too.
@@ -206,15 +214,29 @@ things, the limits that matter to users:
   number may not be its slide's, and the hint says that `view_file` shows the
   slides as drawn. A Word or OpenDocument text file (`.docx`, `.dotx`, `.odt`)
   is read as text alone, and its first read says that `view_file` shows its
-  pages. A picture file is read as its image. `view_file` shows any page,
-  slide or picture, drawn as it would print, at most 8 images; a deck's are
+  pages. A picture file is read as its image. A clip (video or audio) is
+  read as its transcript, whether or not the call takes images, since the
+  transcript is text: `kind` is `transcript`, `parts` are lines as a text
+  file's are (`lines 1-200`), `total_parts` the lines, and `shown` is empty. A
+  line reads `[01:24] Speaker 1: text`, `[1:02:03] text` from one hour on, and
+  has no speaker label when the sentence had none. A call that takes images
+  is told after the hint that `view_file` shows the clip's frames, when it
+  has any; a call that takes none is told of no frame. A clip with no speech
+  is answered with no part and the hint "No speech was found in this clip.",
+  one whose JSON Lines of speech gave no transcript with "The transcript could
+  not be read.", one nothing was found of with the manifest's own hint.
+  `view_file` shows any page, slide or picture, drawn as it would print, at most 8 images; a deck's are
   labelled and paged by slide (`slide 3`, `slides 9-12`), and `unit` says
   which. With no part it shows the first four pages or slides, and its hint
   names those after them and the part that shows the next four. Spreadsheets
   are not shown, and the hint says to read them with `read_document`. A
   picture of several frames is shown as its first, and the hint says so; a
   deck whose drawn pages are fewer than its slides is told so; a page that
-  could not be shown is named in a sentence. A read whose images cannot be
+  could not be shown is named in a sentence. A clip's frames are labelled
+  `frame 3 (01:24)` and asked for as `frame 3`, `frames 2-5` or `at 01:24`
+  (the frame nearest that time); with no part it shows up to 8 frames spread
+  over the clip, and the hint says so. Audio has no frames: the hint says to
+  read its transcript with `read_document`. A read whose images cannot be
   made (the executor has no room, the conversion or the render is refused,
   the user's quota or the file's cap of renders is spent) still answers the
   text, with `shown` empty and a hint: for a cause that may pass (no room now,

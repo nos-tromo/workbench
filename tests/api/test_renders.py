@@ -260,6 +260,8 @@ async def test_a_manifest_names_pages_without_text_and_renditions(world: World) 
         "pages_without_text": [2],
         "frames": None,
         "hint": None,
+        "duration_s": None,
+        "transcript": False,
     }
     assert [r.n for r in manifest.renditions] == [row.ordinal for row in rows] == [1, 2, 3]
     assert [r.bytes for r in manifest.renditions] == [world.file_of(row).stat().st_size for row in rows]
@@ -288,6 +290,8 @@ async def test_a_spreadsheet_is_kind_none_without_a_job(world: World) -> None:
         "renditions": [],
         "frames": None,
         "hint": NOT_SHOWN,
+        "duration_s": None,
+        "transcript": False,
     }
     assert (world.executor.requests, len(world.lines())) == ([], events)
     assert await world.renders(source, manifest, [1]) == []
@@ -1427,7 +1431,7 @@ async def test_a_refusal_the_file_decides_is_remembered_at_once(world: World, de
 def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
     """The allow-list is the runners' own texts of refusals the file decides, each tied to the constant that says it."""
     from workbench.executor import readers
-    from workbench.executor.render import encode, images, office, pages
+    from workbench.executor.render import encode, images, media, office, pages
     from workbench.executor.runners import convert
 
     said = {
@@ -1443,9 +1447,10 @@ def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
         convert._LOCKED,
         convert._PICTURE_TOO_LARGE,
         convert._TOO_LARGE,
+        media._NOTHING_USABLE,
     }
     assert {f"unreadable_file: {text}" for text in said} == api_renders.FILE_DECIDED
-    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, "the renders could not be written"}
+    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, media._NOT_WRITTEN}
     assert not {f"unreadable_file: {text}" for text in passing} & api_renders.FILE_DECIDED
 
 

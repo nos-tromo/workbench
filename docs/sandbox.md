@@ -583,6 +583,43 @@ Each of these is accepted. Each says what it would take.
   only, and a width and a height only within the bounds of a render, so a wrong
   value the executor states costs the model tokens and never access. A
   decoder's time and memory are the job's own limits.
+- **A clip's artifacts, in the executor only.** Since 0.9.0 a video or audio file
+  the user dropped is never decoded: no decoder of audio or video lives in
+  workbench, and the clip itself enters no job. What is read, to give the model a
+  transcript and frames, is what Nextext made of it, kept by the api as derived
+  files of the clip and handed to the one prepare job at their derived paths:
+  a JSON Lines file and a zip of keyframes. Both are hostile input like any file
+  a user brings (the clip is the user's, and so is what Nextext heard and saw in
+  it). What narrows it:
+  - the zip is checked before any member is read, as an Office file's is
+    (`check_zip`: it is a zip, it holds at most `MAX_ZIP_MEMBERS` members, none
+    encrypted, and the sizes its directory declares add up to no more than the
+    expansion limit), and then by its names: `frame_NNN.jpg` and `manifest.json`,
+    each once, nothing else (a folder, a path, `frame_001.jpg.exe` or a name
+    twice refuses the set, and the transcript is kept);
+  - each frame must begin with the JPEG signature, whatever its name says, so
+    that of the formats a picture upload is open to only Pillow's JPEG decoder
+    takes it; its size is read from its header and a picture over 120 megapixels
+    is refused before one pixel is decoded; it is written again as JPEG with
+    none of the source's metadata (EXIF, GPS, ICC, XMP); at most 19 frames are
+    read, and only those;
+  - the manifest is read only when it is at most 1 MiB, as JSON, and is a
+    courtesy: one that does not read, or whose times do not run forward with
+    the frames, is ignored and the frames carry no times;
+  - the JSON Lines is parsed as JSON lines (the file decoded as UTF-8, split on
+    a line feed alone), at most 8 MiB, a line that is not JSON refuses it, and
+    a time outside 0 to 100 hours skips its record; the transcript made of it
+    is at most 4 MiB, cut at the last whole line;
+  - a refusal or a failure is one of the runner's fixed texts: nothing in it
+    names a path, a member or a word of the artifacts, and a permission error
+    in the job is told the same way;
+  - the api reads no more of an artifact than a zip's first four bytes and a
+    JSON Lines' first line (at most 64 KiB), and parses nothing else: it imports
+    neither `PIL` nor `zipfile` for it.
+
+  A flaw in Pillow's JPEG decoder or in the zip reader is a flaw in a job's
+  process, with the reach of the decoders above. What does not narrow it is the
+  same as for them: `run_python` could call the same libraries.
 - **LibreOffice's import filters and PDF export, in the executor only.** Since
   0.8.0 a Word, PowerPoint or OpenDocument text file the user dropped is opened
   by LibreOffice (Debian's `libreoffice-*-nogui` packages) to be drawn as pages.
@@ -673,6 +710,13 @@ names fifteen packages, since 0.7.0 pillow and pypdfium2 among them
 The model's code runs in the job process itself, as a script
 (`workbench/executor/runners/python.py:run_python`). What follows from that:
 
+- **No clip is in the folder.** A video or audio file the user uploaded is given to no job of
+  `run_python` (nor of `search_files`), so the code cannot decode it, though
+  `scipy` reads a `.wav`: a clip's bytes enter no executor job. The answer's
+  hint says that video and audio are not in the sandbox; a clip is read as its
+  transcript with `read_document` and looked at as its frames with `view_file`
+  (`workbench/api/tools.py:is_clip`). A file the code itself wrote is its own,
+  whatever its name.
 - **Only Python-level output is captured.** `print` and writes to `sys.stdout`
   and `sys.stderr` come back. Writes straight to file descriptors 1 and 2 (a C
   extension, `os.system`, a child process) go to `/dev/null`.

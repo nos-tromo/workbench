@@ -41,6 +41,7 @@ EXPECTED_OPERATIONS = {
     "chat_delete": ("delete", "chat.delete"),
     "file_delete": ("delete", "file.delete"),
     "prepare": ("modify", "file.prepare"),
+    "derived": ("modify", "file.derived"),
 }
 
 
@@ -371,12 +372,17 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         assert client.post("/files/prepare", params={"path": scan_path}, headers=HG).status_code == 200
         assert len(store.derived_of(source)) == 1
         assert answered(acall(client, "view_file", {"path": scan_path}))["shown"][0]["label"] == "image"
+        clip = {"file": (f"{word}-tour.mp4", b"clip")}
+        assert client.post("/files/upload", params=where, headers=HG, files=clip).status_code == 200
+        artifact = {"source": f"/workspace/chat-1/{word}-tour.mp4", "role": "nextext_jsonl"}
+        kept = client.post("/files/derived", params=artifact, headers=HG, content=b'{"text": "invented"}\n')
+        assert kept.status_code == 200
         executor.files = {}
         draft = {"file": (f"{word}-draft.csv", b"a,b\n")}
         assert client.post("/files/upload", params=where, headers=HG, files=draft).status_code == 200
         taken = {"path": f"/workspace/chat-1/{word}-draft.csv"}
         assert client.delete("/files/upload", params=taken, headers=HG).json() == {"deleted": 1, "renders": 0}
-        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 9}
+        assert client.delete("/files/chat", headers=HG).json() == {"deleted": 10}
     events = [json.loads(line) for line in audit_stream.getvalue().splitlines()]
     assert {operation for _, operation in OPERATIONS.values()} <= {e["operation"] for e in events}
     assert word not in audit_stream.getvalue()

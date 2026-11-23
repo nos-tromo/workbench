@@ -307,6 +307,14 @@ REFUSED: Final[dict[str, tuple[dict[str, Any], str]]] = {
         deck(*[{"layout": 4, "content": [{"image": f"{CHAT}/nine.png"}, {"image": f"{CHAT}/nine.png"}]}] * 2),
         "invalid_value: slide 2, block 2: the deck's images take more than 30 MB together",
     ),
+    "a clip as master": (
+        deck({"layout": 1}, path=f"{CHAT}/harbour-tour.mp4"),
+        "unsupported_format: a clip is read with read_document",
+    ),
+    "a clip as a source file": (
+        deck({"layout": 1, "sources": [{"kind": "file", "path": f"{CHAT}/harbour-tour.mp4"}]}),
+        "invalid_source: slide 1, source 1: unsupported_format: a clip is read with read_document",
+    ),
     "a source file of another chat": (
         deck({"layout": 1, "sources": [{"kind": "file", "path": "/workspace/chat-2/elsewhere.pdf"}]}),
         "invalid_source: slide 1, source 1: /workspace/chat-2/elsewhere.pdf is not a file of this conversation",
@@ -333,6 +341,7 @@ def test_refusals_cost_no_job(
     put(store, "nine.png", b"\0" * (9 * MIB))
     put(store, "elsewhere.png", directory="/workspace/chat-2", p=OTHER_CHAT)
     put(store, "elsewhere.pdf", directory="/workspace/chat-2", p=OTHER_CHAT)
+    put(store, "harbour-tour.mp4", b"x")
     arguments, wanted = REFUSED[case]
     reason, detail = refusal(call(client, arguments))
     assert reason == "refused"

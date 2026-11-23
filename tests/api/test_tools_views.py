@@ -13,24 +13,25 @@ import contextlib
 import dataclasses
 import io
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import httpx2
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from tests.api.conftest import HD, HG, PG, AuditLines, put
 from tests.api.mcp_calls import Headers, acall, answered, message, refusal, result, rpc, unavailable
-from tests.api.test_files_renders import deck
+from tests.api.test_files_renders import artifact, deck
 from tests.api.test_renders import HeldConversion, capped, quay_pages
 from tests.api.test_tools_templates import Local
 from tests.conftest import FakeOffice, scaled
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_media
 from tests.fixtures import make_templates as mt
 from workbench.api import tools_mcp, tools_views
 from workbench.api.audit import AuditLog
@@ -38,11 +39,12 @@ from workbench.api.auth import MCP_PATH
 from workbench.api.jobs import JobQueue
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
-from workbench.api.renders import MAX_SHOWN_BYTES, NOT_SHOWN
+from workbench.api.renders import FRAME_GRAMMAR, MAX_SHOWN_BYTES, NOT_SHOWN, frame_window, frames_of
 from workbench.api.store import Conflict, QuotaExceeded, Store
 from workbench.config import Settings
 from workbench.executor.runners import RUNNERS
 from workbench.models import DerivedRecord, FileRecord, Principal
+from workbench.renders import NOTHING_FOUND
 
 ANSWER_KEYS = {"path", "kind", "unit", "total", "shown", "truncated", "next_part", "hint", "outputs"}
 SHOWN_KEYS = {"label", "n", "width", "height", "mime"}
@@ -742,6 +744,413 @@ def test_view_file_of_a_refused_deck_answers_the_remembered_refusal(
     assert fake_office.calls == calls
 
 
+# --- a clip's frames ---------------------------------------------------------------------------------------------
+
+#: What a clip's own bytes are: no job ever reads them.
+CLIP_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16
+#: What a view of a clip with a transcript and no pictures says.
+NO_PICTURES = "This clip has no pictures; read its transcript with read_document."
+
+
+def clip(
+    client: TestClient,
+    store: Store,
+    built: Path,
+    frames: int = 3,
+    *,
+    times: Sequence[float] | None = None,
+    timed: bool = True,
+    name: str = "harbour-tour.mp4",
+) -> FileRecord:
+    """A clip of Ghostwriter's chat with a keyframes zip of ``frames`` invented frames, posted as Ghostwriter does.
+
+    The frames are 5 s apart unless ``times`` says otherwise; ``timed`` false gives a zip with no manifest.
+    """
+    source = put(store, name, CLIP_BYTES, p=PG)
+    stamps = None if not timed else times if times is not None else [5.0 * n for n in range(frames)]
+    zipped = make_media.make_keyframes_zip(built / "keyframes.zip", frames, times=stamps)
+    assert artifact(client, source.virtual_path, "nextext_zip", zipped.read_bytes()).status_code == 200
+    return source
+
+
+def speech(client: TestClient, source: FileRecord, built: Path) -> None:
+    """Post the JSON Lines of an invented tour as the clip's transcript artifact."""
+    records = [make_media.jsonl_record(0, 5, "The quay opens at nine.", speaker="Speaker 1", index=0)]
+    lines = make_media.make_jsonl(built / "speech.jsonl", records)
+    assert artifact(client, source.virtual_path, "nextext_jsonl", lines.read_bytes()).status_code == 200
+
+
+def frames_in(store: Store, source: FileRecord) -> dict[int, DerivedRecord]:
+    """The frames of a clip, by their number."""
+    return frames_of(store.derived_of(source))
+
+
+def asked_for(part: str | None, total: int, times: Mapping[int, float] | None = None) -> tuple[int, str]:
+    """The status and the text of the refusal ``frame_window`` raises."""
+    with pytest.raises(HTTPException) as refused:
+        frame_window(part, total, times or {})
+    return refused.value.status_code, str(refused.value.detail)
+
+
+def test_frame_window_grammar() -> None:
+    """The window of frames, each assertion exact: the default spread, a number, a range, a time, and every refusal."""
+    times = {1: 0.0, 2: 80.0, 3: 90.0}
+    assert frame_window(None, 5, {}) == [1, 2, 3, 4, 5]
+    assert frame_window(None, 8, {}) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert frame_window(None, 9, {}) == [1, 2, 3, 4, 6, 7, 8, 9]
+    assert frame_window(None, 19, {}) == [1, 4, 6, 9, 11, 14, 16, 19]
+    assert frame_window(None, 0, {}) == []
+    assert frame_window("frame 3", 19, {}) == [3]
+    assert frame_window("3", 19, {}) == [3]
+    assert frame_window("frames 2-5", 19, {}) == [2, 3, 4, 5]
+    assert frame_window("FRAMES 18-40", 19, {}) == [18, 19]
+    assert frame_window("at 01:24", 3, times) == [2]
+    assert frame_window("AT 1:24", 3, times) == [2]
+    assert frame_window("at 99:00", 3, times) == [3]  # past the end: the last
+    assert frame_window("at 00:00", 3, times) == [1]
+    assert frame_window("at 0:01:26", 3, times) == [3]  # 86 s is nearer 90 than 80
+    assert frame_window("at 00:05", 3, {1: 0.0, 2: 10.0, 3: 20.0}) == [1]  # a tie: the earlier frame
+    assert frame_window("frame 3 (01:24)", 19, {}) == [3]  # a label as view_file showed it, sent back
+    assert frame_window("Frame 3(1:02:03)", 19, {}) == [3]
+    assert frame_window("3 (01:24)", 19, {}) == [3]
+    assert frame_window("frames 2-5 (01:24)", 19, {}) == [2, 3, 4, 5]
+
+    assert asked_for("at 00:10", 3) == (422, "no_such_part: the frames of this clip carry no times; ask for 'frame N'")
+    assert asked_for("page 2", 3) == (422, FRAME_GRAMMAR)
+    assert asked_for("at 1:75", 3, times) == (422, FRAME_GRAMMAR)
+    assert asked_for("frames 5-2", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (01:24", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 ()", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (soon)", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 3 (01:24) at 01:24", 19) == (422, FRAME_GRAMMAR)
+    assert asked_for("frame 20 (01:24)", 19) == (422, "no_such_part: this clip has 19 frames")
+    assert asked_for("frame 20", 19) == (422, "no_such_part: this clip has 19 frames")
+    assert asked_for("frame 0", 19) == (422, "no_such_part: this clip has 19 frames")
+    assert asked_for("frame 2", 1) == (422, "no_such_part: this clip has 1 frame")
+    assert asked_for("frame 1", 0) == (422, "no_such_part: this clip has no frames")
+    assert FRAME_GRAMMAR == "no_such_part: give a frame as 'frame 3', frames as 'frames 2-5', or a time as 'at 01:24'"
+
+
+def test_frame_window_by_time_counts_the_frames_that_have_a_time() -> None:
+    """Ruling R-W12: a frame with no time is not a candidate, nor is a time of a number the clip has not."""
+    assert frame_window("at 00:20", 4, {1: 0.0, 3: 30.0}) == [3]
+    assert frame_window("at 01:00", 2, {1: 0.0, 2: 10.0, 9: 60.0}) == [2]
+    assert asked_for("at 00:10", 2, {9: 60.0}) == (
+        422,
+        "no_such_part: the frames of this clip carry no times; ask for 'frame N'",
+    )
+    assert asked_for("at 00:10", 0, {}) == (422, "no_such_part: this clip has no frames")
+
+
+def test_view_file_shows_eight_frames_spread_over_a_clip(client: TestClient, store: Store, built: Path) -> None:
+    """A part left out of a clip of 19 frames shows 8, spread from the first to the last, and the hint says so."""
+    source = clip(client, store, built, 19)
+    answer = seen(view(client, source.virtual_path))
+
+    structured = answer["structuredContent"]
+    assert len(images(answer)) == 8
+    assert [shown["n"] for shown in structured["shown"]] == [1, 4, 6, 9, 11, 14, 16, 19]
+    assert (structured["kind"], structured["unit"], structured["total"]) == ("media", "frame", 19)
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    assert structured["hint"] == (
+        "8 of the clip's 19 frames are shown, spread over it; ask for 'frames 2-5' or 'at 01:24' to see others."
+    )
+    frames = frames_in(store, source)
+    for shown, block in zip(structured["shown"], images(answer), strict=True):
+        assert set(shown) == SHOWN_KEYS
+        assert raw(block)[:3] == b"\xff\xd8\xff"
+        assert raw(block) == store.open_derived(frames[shown["n"]]).read()
+
+
+def test_a_clip_of_up_to_eight_frames_is_shown_whole(client: TestClient, store: Store, built: Path) -> None:
+    """Eight frames or fewer need no spread: all of them, in order, with no hint."""
+    source = clip(client, store, built, 8)
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+
+    assert [shown["n"] for shown in structured["shown"]] == list(range(1, 9))
+    assert (structured["total"], structured["truncated"], structured["hint"]) == (8, False, None)
+
+
+def test_a_part_shows_the_frames_it_names(client: TestClient, store: Store, built: Path) -> None:
+    """A number, a range cut at the end of the clip, and a time (the frame nearest it) each show what they name."""
+    source = clip(client, store, built, 3, times=[0.0, 80.0, 90.0])
+
+    def shown(part: str) -> list[tuple[int, str]]:
+        found = seen(view(client, source.virtual_path, part))["structuredContent"]
+        assert found["hint"] is None, part
+        return [(item["n"], item["label"]) for item in found["shown"]]
+
+    assert shown("frame 3") == [(3, "frame 3 (01:30)")]
+    assert shown("2") == [(2, "frame 2 (01:20)")]
+    assert shown("frames 2-9") == [(2, "frame 2 (01:20)"), (3, "frame 3 (01:30)")]
+    assert shown("at 01:24") == [(2, "frame 2 (01:20)")]
+    assert shown("at 99:00") == [(3, "frame 3 (01:30)")]
+    assert refusal(view(client, source.virtual_path, "frame 4")) == (
+        "refused",
+        "no_such_part: this clip has 3 frames",
+    )
+    assert refusal(view(client, source.virtual_path, "slide 2")) == ("refused", FRAME_GRAMMAR)
+
+
+def test_a_time_needs_a_zip_that_gave_times(client: TestClient, store: Store, built: Path) -> None:
+    """A zip with no manifest has frames and no times: a time is refused and a number is not."""
+    source = clip(client, store, built, 3, timed=False)
+
+    assert refusal(view(client, source.virtual_path, "at 00:10")) == (
+        "refused",
+        "no_such_part: the frames of this clip carry no times; ask for 'frame N'",
+    )
+    assert [
+        shown["n"] for shown in seen(view(client, source.virtual_path, "frame 2"))["structuredContent"]["shown"]
+    ] == [2]
+
+
+def test_frame_labels_carry_their_time(client: TestClient, store: Store, built: Path) -> None:
+    """``frame 1 (00:00)`` when the zip gave the times; ``frame 1`` when it did not; hours from the first."""
+    timed = clip(client, store, built, 3, times=[0.0, 84.0, 3723.0])
+    bare = clip(client, store, built, 2, timed=False, name="quay-walk.mp4")
+
+    labels = [s["label"] for s in seen(view(client, timed.virtual_path))["structuredContent"]["shown"]]
+    assert labels == ["frame 1 (00:00)", "frame 2 (01:24)", "frame 3 (1:02:03)"]
+    labels = [s["label"] for s in seen(view(client, bare.virtual_path))["structuredContent"]["shown"]]
+    assert labels == ["frame 1", "frame 2"]
+
+
+def test_frames_cap_at_2_5_mib(client: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Frames of about 700 KiB each: three fit in 2.5 MiB, a fourth does not, and it ends the answer."""
+    source = clip(client, store, built, 8)
+    real = tools_views.read_render
+    size = 700 * 1024
+
+    def padded(store: Store, rec: DerivedRecord) -> bytes | None:
+        data = real(store, rec)
+        return None if data is None else data + bytes(size - len(data))
+
+    monkeypatch.setattr(tools_views, "read_render", padded)
+    answer = seen(view(client, source.virtual_path, "frames 1-8"))
+
+    blocks = images(answer)
+    structured = answer["structuredContent"]
+    assert len(blocks) == len(structured["shown"]) == 3
+    assert sum(len(raw(block)) for block in blocks) == 3 * size <= MAX_SHOWN_BYTES
+    assert (structured["truncated"], structured["next_part"]) == (True, "frames 4-8")
+    assert [shown["n"] for shown in structured["shown"]] == [1, 2, 3]
+
+
+def test_a_cut_spread_continues_from_its_first_frame_left(
+    client: TestClient, store: Store, built: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default spread cut for want of room names the rest as a range, and does not call itself spread."""
+    source = clip(client, store, built, 19)
+    real = tools_views.read_render
+
+    def padded(store: Store, rec: DerivedRecord) -> bytes | None:
+        data = real(store, rec)
+        return None if data is None else data + bytes(700 * 1024 - len(data))
+
+    monkeypatch.setattr(tools_views, "read_render", padded)
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+
+    assert [shown["n"] for shown in structured["shown"]] == [1, 4, 6]
+    assert (structured["truncated"], structured["next_part"]) == (True, "frames 9-19")
+    assert (
+        structured["hint"] == "3 of the clip's 19 frames are shown; ask for 'frames 2-5' or 'at 01:24' to see others."
+    )
+
+
+def test_view_file_of_audio_says_read_the_transcript(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines
+) -> None:
+    """A recording has a transcript and no pictures: no image block, the hint says to read it, the call is recorded."""
+    source = put(store, "voice-memo.m4a", CLIP_BYTES, p=PG)
+    speech(client, source, built)
+    r = view(client, source.virtual_path)
+    answer = seen(r)
+
+    assert len(answer["content"]) == 1
+    assert answer["structuredContent"] == {
+        "path": source.virtual_path,
+        "kind": "media",
+        "unit": "frame",
+        "total": 0,
+        "shown": [],
+        "truncated": False,
+        "next_part": None,
+        "hint": NO_PICTURES,
+        "outputs": [],
+    }
+    assert "image" not in {block["type"] for block in answer["content"]}
+    (event,) = events(audit_lines)
+    assert (event["target"]["ids"], event["criteria"]["images"]) == ([source.id], 0)
+    again = seen(view(client, source.virtual_path, "frame 2"))  # a named frame of a clip with none is no error
+    assert again["structuredContent"]["hint"] == NO_PICTURES
+
+
+@pytest.mark.parametrize("part", ["frame 2", "frames 1-3", "at 01:24"])
+def test_a_part_of_a_clip_without_frames_is_answered_with_its_hint_not_refused(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, part: str
+) -> None:
+    """Audio, and a clip nothing was made of, have no frames to name: any part gets the hint, and is recorded."""
+    memo = put(store, "voice-memo.m4a", CLIP_BYTES, p=PG)
+    speech(client, memo, built)
+    bare = put(store, "quay-walk.mp4", CLIP_BYTES, p=PG)
+
+    for source, hint in ((memo, NO_PICTURES), (bare, NOTHING_FOUND)):
+        answer = seen(view(client, source.virtual_path, part))
+        assert len(answer["content"]) == 1
+        structured = answer["structuredContent"]
+        assert (structured["total"], structured["shown"], structured["truncated"]) == (0, [], False)
+        assert (structured["next_part"], structured["hint"]) == (None, hint)
+    first, second = events(audit_lines)
+    assert (first["target"]["ids"], second["target"]["ids"]) == ([memo.id], [bare.id])
+    assert [event["criteria"]["paged"] for event in (first, second)] == [True, True]
+
+
+def test_view_file_of_a_clip_with_nothing_found_says_so(client: TestClient, store: Store, fake_executor: Local) -> None:
+    """A clip nothing was made of has no frames and no transcript: the hint says nothing was found, and no job ran."""
+    source = put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+
+    assert (structured["kind"], structured["total"], structured["shown"], structured["hint"]) == (
+        "media",
+        0,
+        [],
+        NOTHING_FOUND,
+    )
+    assert fake_executor.requests == []
+
+
+def test_view_file_of_a_clip_says_what_its_prepare_said_of_the_missing_frames(
+    client: TestClient, store: Store, built: Path, fake_executor: Local
+) -> None:
+    """The frames were refused, or never taken: the model is told that too, not only that the clip has no pictures."""
+    refused = put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    speech(client, refused, built)
+    assert artifact(client, refused.virtual_path, "nextext_zip", b"PK\x03\x04" + bytes(40)).status_code == 200
+    untaken = put(store, "quay-walk.mp4", CLIP_BYTES, p=PG)
+    speech(client, untaken, built)
+
+    for source, said in ((refused, "The frames could not be read."), (untaken, "No frames were taken from this clip.")):
+        structured = seen(view(client, source.virtual_path))["structuredContent"]
+        assert (structured["total"], structured["shown"]) == (0, [])
+        assert structured["hint"] == f"{NO_PICTURES} {said}"
+        assert (
+            seen(view(client, source.virtual_path, "frame 2"))["structuredContent"]["hint"] == f"{NO_PICTURES} {said}"
+        )
+
+
+def test_view_file_of_a_clip_is_recorded_before_the_frames_go(
+    client: TestClient,
+    store: Store,
+    built: Path,
+    audit_stream: io.StringIO,
+    audit_lines: AuditLines,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The event names the clip and each frame shown, before any image leaves; with the chain broken none does."""
+    source = clip(client, store, built, 19)
+    seen(view(client, source.virtual_path, "frames 1-3"))
+    frames = frames_in(store, source)
+    (event,) = events(audit_lines)
+    assert (event["action"], event["operation"], event["outcome"]) == ("query", "tool.view_file", "ok")
+    assert event["target"]["ids"] == [source.id, *(frames[n].id for n in (1, 2, 3))]
+    assert event["criteria"] == {"caller": "ghostwriter", "images": 3, "strips": 1, "paged": True}
+    seen(view(client, source.virtual_path))
+    assert events(audit_lines)[1]["criteria"]["paged"] is False
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    monkeypatch.setattr(audit_stream, "write", refuse)
+    r = view(client, source.virtual_path, "frames 1-3")
+    unavailable(r)
+    assert "image" not in r.text
+
+
+def test_a_tampered_frame_is_skipped_with_a_hint(
+    client: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines
+) -> None:
+    """A frame that is not what its row says is left out and named; the blocks still follow ``shown``."""
+    source = clip(client, store, built, 4)
+    seen(view(client, source.virtual_path))
+    frames = frames_in(store, source)
+    file_of(settings, frames[2]).write_bytes(b"not a picture, whatever its row says")
+
+    answer = seen(view(client, source.virtual_path))
+    structured = answer["structuredContent"]
+    assert [shown["n"] for shown in structured["shown"]] == [1, 3, 4]
+    assert structured["hint"] == "Frame 2 could not be shown."
+    assert (structured["truncated"], structured["next_part"]) == (False, None)
+    for item, block in zip(structured["shown"], images(answer), strict=True):
+        assert raw(block) == file_of(settings, frames[item["n"]]).read_bytes()
+    _, second = events(audit_lines)
+    assert second["target"]["ids"] == [source.id, frames[1].id, frames[3].id, frames[4].id]
+    assert second["criteria"]["images"] == 3
+    assert "not a picture" not in json.dumps(audit_lines())
+
+
+def test_a_frame_whose_row_is_gone_is_skipped_and_named(
+    client: TestClient, store: Store, built: Path, fake_executor: Local
+) -> None:
+    """Ruling R-W12: a number inside the clip with no row (a clip cannot remake it) is no error, and is named."""
+    source = clip(client, store, built, 9)
+    seen(view(client, source.virtual_path))
+    store.remove_derived(frames_in(store, source)[7])
+    jobs = len(fake_executor.requests)
+
+    structured = seen(view(client, source.virtual_path, "frames 6-9"))["structuredContent"]
+    assert [shown["n"] for shown in structured["shown"]] == [6, 8, 9]
+    assert (structured["total"], structured["hint"]) == (9, "Frame 7 could not be shown.")
+    spread = seen(view(client, source.virtual_path))["structuredContent"]
+    assert 7 not in [shown["n"] for shown in spread["shown"]]
+    assert spread["hint"].startswith("Frame 7 could not be shown. 7 of the clip's 9 frames are shown")
+    assert len(fake_executor.requests) == jobs  # the frame is not made again
+
+
+@pytest.mark.parametrize(("with_speech", "lost"), [(False, "frame"), (True, "transcript")])
+def test_a_clip_whose_head_is_gone_has_its_frames_made_again_with_the_set(
+    client: TestClient, store: Store, built: Path, fake_executor: Local, with_speech: bool, lost: str
+) -> None:
+    """The one way a frame comes back: the row holding the clip's facts (the transcript, else frame 1) is gone.
+
+    The view prepares the clip again, one recorded job, and shows every frame, the lost one too and one lost beside
+    it; with the head there a frame lost on its own stays lost and is named.
+    """
+    source = clip(client, store, built, 3)
+    if with_speech:
+        speech(client, source, built)
+    seen(view(client, source.virtual_path))
+    head = next(
+        rec for rec in store.derived_of(source) if rec.role == lost and (lost == "transcript" or rec.ordinal == 1)
+    )
+    store.remove_derived(frames_in(store, source)[2])
+    named = seen(view(client, source.virtual_path))["structuredContent"]
+    assert ([shown["n"] for shown in named["shown"]], named["hint"]) == ([1, 3], "Frame 2 could not be shown.")
+    jobs = len(fake_executor.requests)
+    store.remove_derived(head)
+
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+    assert ([shown["n"] for shown in structured["shown"]], structured["hint"]) == ([1, 2, 3], None)
+    assert len(fake_executor.requests) == jobs + 1
+    assert sorted(frames_in(store, source)) == [1, 2, 3]
+
+
+def test_strips_are_ignored_on_a_clip(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, fake_executor: Local
+) -> None:
+    """A clip's frames are never cut: ``strips`` changes neither the images nor what is recorded, and no job runs."""
+    source = clip(client, store, built, 3)
+    plain = seen(view(client, source.virtual_path))
+    jobs = len(fake_executor.requests)
+    cut = seen(view(client, source.virtual_path, strips=3))
+
+    assert cut["structuredContent"] == plain["structuredContent"]
+    assert [raw(block) for block in images(cut)] == [raw(block) for block in images(plain)]
+    assert len(fake_executor.requests) == jobs
+    assert [event["criteria"]["strips"] for event in events(audit_lines)] == [1, 1]
+    assert len(frames_in(store, source)) == 3 and len(store.derived_of(source)) == 4  # no strip was made
+
+
 # --- what is recorded --------------------------------------------------------------------------------------------
 
 
@@ -995,7 +1404,7 @@ def test_the_schema_stays_small(client: TestClient) -> None:
     (tool,) = [t for t in tools_of(client, HG) if t["name"] == "view_file"]
 
     assert len(json.dumps(tool["inputSchema"])) + len(tool["description"]) <= 3000
-    assert 600 <= len(tool["description"]) <= 1000
+    assert 600 <= len(tool["description"]) <= 1200
 
 
 def test_a_shown_image_is_described_as_a_page_or_a_slide(client: TestClient) -> None:
@@ -1005,7 +1414,32 @@ def test_a_shown_image_is_described_as_a_page_or_a_slide(client: TestClient) -> 
         shown = tool["outputSchema"]["$defs"]["ShownImage"]
         assert "'slide 3'" in shown["properties"]["label"]["description"], name
         assert shown["properties"]["n"]["description"].startswith("The page or slide"), name
+        assert "frame of a clip" in shown["properties"]["n"]["description"], name
+        assert "'frame 3 (01:24)'" in shown["properties"]["label"]["description"], name
         assert "``slide 3``" in shown["description"], name
+        assert "``frame 3 (01:24)``" in shown["description"], name
+
+
+def test_the_description_names_a_clips_frames(client: TestClient) -> None:
+    """The model is told how to ask for a clip's frames, and that audio has none and its transcript is read."""
+    (tool,) = [t for t in tools_of(client, HG) if t["name"] == "view_file"]
+
+    assert (
+        "Video: a clip's frames, 'frame 3', 'frames 2-5' or 'at 01:24' (the frame nearest that time); "
+        "left out, up to 8 frames spread over the clip. Audio has no pictures: read its transcript with read_document."
+    ) in tool["description"]
+    answer = tool["outputSchema"]["properties"]
+    assert "media" in answer["kind"]["enum"]
+    assert "frame" in answer["unit"]["anyOf"][0]["enum"]
+
+
+def test_the_part_argument_names_a_clips_grammar(client: TestClient) -> None:
+    """The argument's own description tells a clip's grammar beside the pages' and the slides'."""
+    (tool,) = [t for t in tools_of(client, HG) if t["name"] == "view_file"]
+    part = tool["inputSchema"]["properties"]["part"]["description"]
+
+    for phrase in ("'page 3'", "'slide 3'", "'frame 3'", "'frames 2-5'", "'at 01:24'"):
+        assert phrase in part, phrase
 
 
 def test_ghostwriter_is_offered_view_file(client: TestClient) -> None:

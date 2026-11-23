@@ -8,8 +8,9 @@ message of these exceptions is a literal written in ``paths.py`` or ``store.py``
 A failed audit write is a 500 of the same kind: the action is not done, and the cause (the
 output stream) is not logged either.
 
-Only two routes raise ``Busy`` (the queue refused a job): ``POST /files/prepare`` and the view of a rendition, which
-may render first; both answer it as the app's 503 with one fixed text, whatever the reason. No route raises
+Only three routes raise ``Busy`` (the queue refused a job, or a clip's lock was not free in time): ``POST
+/files/prepare``, the view of a rendition, which may render first, and ``POST /files/derived``, which waits for the
+clip's lock; all answer it as the app's 503 with one fixed text, whatever the reason. No route raises
 ``RequestTooLarge`` (a request too large for the executor's protocol): only tools do, and the MCP door answers both as
 an ``isError`` result (:func:`~workbench.api.mcp.call_failure`). The handler of ``RequestTooLarge`` stays as the app's
 fallback, a 422.
@@ -45,7 +46,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from workbench.api.audit import PurposeRequired
 from workbench.api.jobs import Busy, RequestTooLarge
-from workbench.api.store import Conflict, NotFound, QuotaExceeded, RendersFull, StorageFull, StoreError, TooLarge
+from workbench.api.store import (
+    Conflict,
+    NotFound,
+    QuotaExceeded,
+    RendersFull,
+    StorageFull,
+    StoreError,
+    TooLarge,
+    UnreadableArtifact,
+)
 from workbench.paths import PathError
 from workbench.utils.audit_event import AuditWriteError
 
@@ -85,6 +95,7 @@ _ANSWERS: Final[tuple[tuple[type[Exception], int, str | None], ...]] = (
     (QuotaExceeded, 507, None),
     (StorageFull, 507, None),
     (RendersFull, 507, None),
+    (UnreadableArtifact, 422, None),
     (AuditWriteError, 500, "audit unavailable"),
     (Busy, 503, BUSY),
     (RequestTooLarge, 422, TOO_LARGE),

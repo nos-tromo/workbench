@@ -1,4 +1,4 @@
-"""The tools that show pictures, pages and slides to the model as images: ``view_file`` and ``read_document``.
+"""The tools that show pictures, pages, slides and frames to the model as images: ``view_file`` and ``read_document``.
 
 A picture, a PDF or an Office file of the chat is prepared once (:func:`~workbench.api.renders.prepared`): its renders
 are derived files of it, made in the executor, with the metadata removed; an Office file is converted to a PDF first,
@@ -28,13 +28,29 @@ source's cap of renders stops them) the text is answered with ``shown`` empty an
 fall back on, and fails with them as ``view_file`` does. A Word or OpenDocument text file is read as text alone, and
 its first read says that ``view_file`` shows its pages.
 
+``view_file`` shows a clip's frames too, as the frames, by number, range or time (``frame 3``, ``frames 2-5``, ``at
+01:24``), from the rows its prepare made: no job runs for a frame, and a frame whose row or file is gone is named in
+the hint, not shown. It is made again only with the whole set, when the clip's head (the transcript, else frame 1) is
+gone and the next prepare runs. A clip's frames are labelled ``frame 3 (01:24)``; left out, a part shows up to
+``MAX_VIEW_IMAGES`` frames spread over the clip, and the hint says so. ``strips`` is ignored for a clip. Audio, or a
+clip without frames, has none to name: whatever its ``part`` says, the answer is the hint that says to read its
+transcript with ``read_document`` (or that nothing was found), never a refusal.
+
+``read_document`` reads a clip's transcript, with or without images: the transcript is text, so a call that takes none
+reads it as a call that takes them does (:func:`_read_clip`). The clip is prepared first, as ``view_file`` does it, and
+the one read job has the transcript's derived file as its only input, at the path its row gives, never one the model
+names: the clip itself never enters a job. A clip without a transcript is answered with no job, and says so. The answer
+is the text file's (``lines 1-200``), of kind ``transcript``, with no image; a call that takes images is told in the
+hint that ``view_file`` shows the clip's frames.
+
 Every call is recorded as a ``query`` of the source and of each render shown, before any block is returned; a file that
-shows no image is recorded too, with none. If the event cannot be written the call fails and no image leaves.
+shows no image is recorded too, with none; a clip's read names the clip and its transcript. If the event cannot be
+written the call fails and no image leaves.
 """
 
 import dataclasses
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from fastapi import HTTPException
@@ -49,14 +65,21 @@ from workbench.api.renders import (
     MAX_SHOWN_BYTES,
     MAX_VIEW_IMAGES,
     NOT_KEPT,
+    Manifest,
     WithBlocks,
+    frame_time,
+    frame_window,
+    frames_of,
+    has_speech_artifact,
     image_block,
     noun_of,
     page_window,
     prepared,
     read_render,
     renders_for,
+    shown_frame,
     shown_image,
+    transcript_of,
 )
 from workbench.api.store import QuotaExceeded, RendersFull, StorageFull, Store
 from workbench.api.tools import (
@@ -74,10 +97,11 @@ from workbench.api.tools import (
     _readable,
     _within,
     record_answer,
+    refusal,
 )
 from workbench.config import Settings
 from workbench.models import DerivedRecord, FileRecord, Principal
-from workbench.renders import Unit, kind_of, unit_of
+from workbench.renders import NO_SPEECH, NOTHING_FOUND, TRANSCRIPT_UNREADABLE, PagedUnit, Unit, kind_of, unit_of
 from workbench.utils.audit_event import AuditWriteError
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
@@ -109,11 +133,20 @@ MISMATCH: Final = (
 #: What the first read of a Word or OpenDocument text file adds on a call that takes images: its pages are not attached.
 PAGES_VIEWABLE: Final = "view_file shows its pages as images, as they would print."
 
+#: What a view of a clip without frames says: it has the transcript, which is read as text.
+NO_PICTURES: Final = "This clip has no pictures; read its transcript with read_document."
+#: What a read of a clip tells a call that takes images, when the clip has frames: ``{total}`` is how many. A clip of
+#: one frame is told in :data:`ONE_FRAME`.
+SEE_FRAMES: Final = "Its {total} frames can be looked at with view_file ('frame 3', 'at 01:24')."
+ONE_FRAME: Final = "Its 1 frame can be looked at with view_file ('frame 1')."
+#: What a read of a clip says when the transcript's file is no longer there: the job's own words name its path.
+NO_TRANSCRIPT_FILE: Final = "file_not_found: the transcript of this clip is not there now"
+
 #: The refusals of a runner that may pass on another try: they get ``UNSHOWN``, not ``UNDRAWABLE``.
 _TRANSIENT: Final = frozenset({"read_timeout"})
 
 #: A page as the PDF reader labels it, and a slide as the deck's reader does.
-_NUMBERED: Final[Mapping[Unit, re.Pattern[str]]] = {
+_NUMBERED: Final[Mapping[PagedUnit, re.Pattern[str]]] = {
     "page": re.compile(r"page (\d{1,9})"),
     "slide": re.compile(r"slide (\d{1,9})"),
 }
@@ -124,7 +157,7 @@ class ViewFileRequest(BaseModel):
 
     Attributes:
         path: The file's absolute path.
-        part: Which pages or slides to show; left out, the picture or the first four.
+        part: Which pages, slides or frames to show; left out, the picture, the first four, or 8 frames of a clip.
         strips: Into how many strips each page is cut.
     """
 
@@ -136,8 +169,8 @@ class ViewFileRequest(BaseModel):
     part: str | None = Field(
         default=None,
         description=(
-            "Which pages or slides to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5'; "
-            "left out: the picture, or the first four."
+            "Which pages, slides or frames to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5', "
+            "for a clip 'frame 3', 'frames 2-5', 'at 01:24'; left out: the picture, the first four, or 8 frames."
         ),
         json_schema_extra=_STRING,
     )
@@ -149,11 +182,11 @@ class ViewedFile(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``image``, ``pdf``, ``office`` (a Word, OpenDocument text or PowerPoint file), or ``none`` for a file
-            that is not shown as pictures.
-        unit: What ``total`` and the parts count: ``slide`` for a deck, ``page`` for a PDF or a document; ``None`` for
-            a picture or a file not shown.
-        total: How many pages or slides the file has; 1 for a picture, 0 for ``none``.
+        kind: ``image``, ``pdf``, ``office`` (a Word, OpenDocument text or PowerPoint file), ``media`` (a video or audio
+            clip), or ``none`` for a file that is not shown as pictures.
+        unit: What ``total`` and the parts count: ``slide`` for a deck, ``page`` for a PDF or a document, ``frame`` for
+            a clip; ``None`` for a picture or a file not shown.
+        total: How many pages, slides or frames the file has; 1 for a picture, 0 for ``none`` and for audio.
         shown: The images that come with this answer, in order: the first is the first image block after the text.
         truncated: Whether pages were left out of this answer for want of room.
         next_part: Where to continue when it was cut.
@@ -161,16 +194,21 @@ class ViewedFile(BaseModel):
     """
 
     path: str = Field(description="The file's path.")
-    kind: Literal["image", "pdf", "office", "none"] = Field(
+    kind: Literal["image", "pdf", "office", "media", "none"] = Field(
         description=(
-            "image, pdf, office (Word, OpenDocument text, PowerPoint), or none for a file not shown as pictures."
+            "image, pdf, office (Word, OpenDocument text, PowerPoint), media (a video or audio clip), or none for a "
+            "file not shown as pictures."
         )
     )
-    unit: Literal["page", "slide"] | None = Field(
+    unit: Unit | None = Field(
         default=None,
-        description="slide for a deck, page for a PDF or a document; null for a picture or a file not shown.",
+        description=(
+            "slide for a deck, page for a PDF or a document, frame for a clip; null for a picture or a file not shown."
+        ),
     )
-    total: int = Field(description="How many pages or slides the file has; 1 for a picture, 0 for none.")
+    total: int = Field(
+        description="How many pages, slides or frames the file has; 1 for a picture, 0 for none and for audio."
+    )
     shown: list[ShownImage] = Field(
         description="The images that come with this answer, in order: the first is the first image after the text."
     )
@@ -220,23 +258,25 @@ class _Taken:
     cut_at: int | None = None
 
 
-async def _take(store: Store, pages: Mapping[int, list[DerivedRecord]], first: int, last: int, through: int) -> _Taken:
-    """Take whole pages of the window in order, while the images and their bytes stay within what one answer shows.
+async def _take(
+    store: Store, pages: Mapping[int, list[DerivedRecord]], window: Iterable[int], through: int | None = None
+) -> _Taken:
+    """Take whole pages (or frames) of the window in order, within the images and bytes one answer shows.
 
     Args:
         store: The store.
         pages: The renders there are, by page, each page's strips in order.
-        first: The window's first page.
-        last: The window's last page.
-        through: The last page one answer may take (:data:`MAX_VIEW_IMAGES` images, whole pages).
+        window: The pages asked for, in the order they are shown.
+        through: The last page one answer may take (:data:`MAX_VIEW_IMAGES` images, whole pages); ``None`` for a window
+            that only the images and their bytes bound, as a clip's frames are.
 
     Returns:
         The pages taken. The first page that does not fit ends it; a page that cannot be read back is left out.
     """
     taken = _Taken()
     size = 0
-    for n in range(first, last + 1):
-        if n > through:
+    for n in window:
+        if through is not None and n > through:
             taken.cut_at = n
             break
         data = await run_in_threadpool(_read_page, store, pages[n]) if n in pages else None
@@ -259,15 +299,15 @@ def _part(first: int, last: int, noun: Unit) -> str:
     Args:
         first: The first page.
         last: The last page.
-        noun: What the file counts, ``page`` or ``slide``.
+        noun: What the file counts, ``page``, ``slide`` or ``frame``.
 
     Returns:
-        ``page 9`` or ``pages 9-12``; ``slide 9`` or ``slides 9-12``.
+        ``page 9`` or ``pages 9-12``; ``slide 9`` or ``slides 9-12``; ``frame 9`` or ``frames 9-12``.
     """
     return f"{noun} {first}" if first == last else f"{noun}s {first}-{last}"
 
 
-def _not_shown_after(last: int, total: int, noun: Unit) -> str:
+def _not_shown_after(last: int, total: int, noun: PagedUnit) -> str:
     """Say which pages (or slides) after the window a call named no part for are not shown, and how to see them.
 
     Args:
@@ -297,6 +337,21 @@ def _sentence(note: str) -> str:
     return text if text.endswith(".") else f"{text}."
 
 
+def _unsaid(told: str | None, hint: str | None) -> str | None:
+    """Take the sentences of a clip's manifest hint that a text does not say already.
+
+    Args:
+        told: What the answer says, or ``None``.
+        hint: The manifest's hint of the clip, which the prepare wrote as whole sentences.
+
+    Returns:
+        The hint's sentences that are not in ``told``, joined; ``None`` when there are none.
+    """
+    if hint is None:
+        return None
+    return _join(*(sentence for sentence in re.split(r"(?<=\.) ", hint) if sentence not in (told or "")))
+
+
 def _record(
     audit: AuditLog, p: Principal, source: FileRecord, shown: list[DerivedRecord], strips: int, *, paged: bool
 ) -> None:
@@ -317,6 +372,82 @@ def _record(
     audit.record("view_file", p, file_ids=[source.id, *(rec.id for rec in shown)], criteria=criteria)
 
 
+async def _view_frames(
+    body: ViewFileRequest,
+    p: Principal,
+    source: FileRecord,
+    manifest: Manifest,
+    limit: int,
+    store: Store,
+    audit: AuditLog,
+) -> ViewedFile | WithBlocks:
+    """Show frames of a clip, by number, range or time, from the rows its prepare made: no job runs.
+
+    Whole frames are taken in the order of the window while there are at most ``MAX_VIEW_IMAGES`` images and
+    ``MAX_SHOWN_BYTES`` bytes; the first that does not fit ends the answer, and ``next_part`` names where it goes on
+    (``frames 4-8``). A frame whose row is not there or whose file is not what its row says is left out and named: a
+    frame is not made on its own, and comes back only with the whole set when the clip's head (the transcript, else
+    frame 1) is gone, which :func:`~workbench.api.renders.prepared` has made good before this runs. A call that names no
+    part of a clip of more frames than one answer holds is shown that many, spread over the clip, and told so.
+    ``strips`` is ignored: a clip's frames are never cut. A clip without frames answers its hint whatever ``part``
+    says: a part is read only when there are frames to name. The hint then adds the manifest's own words, when the
+    prepare wrote some (the frames could not be read, none were taken, the transcript is cut).
+
+    Args:
+        body: The call: ``part`` says which frames.
+        p: The caller, user and chat.
+        source: The clip.
+        manifest: Its manifest, from :func:`~workbench.api.renders.prepared`.
+        limit: The answer's limit in bytes.
+        store: The file store.
+        audit: The audit log, bound to the call.
+
+    Returns:
+        The answer alone for a clip with no frames; otherwise it with the image blocks that follow its ``shown``.
+
+    Raises:
+        HTTPException: 422 ``no_such_part``: the clip has frames, and ``part`` is none of the grammar's or names a
+            frame or a time it has not.
+        AuditWriteError: The event could not be written; no image goes out.
+    """
+    paged = body.part is not None
+    frames: dict[int, DerivedRecord] = {}
+    window: list[int] = []
+    if manifest.total > 0:
+        frames = frames_of(await run_in_threadpool(store.derived_of, source))
+        times = {n: time_s for n, rec in frames.items() if (time_s := frame_time(rec)) is not None}
+        window = frame_window(body.part, manifest.total, times)
+    taken = await _take(store, {n: [rec] for n, rec in frames.items()}, window)
+    await run_in_threadpool(_record, audit, p, source, taken.renders, 1, paged=paged)
+    notes: list[str] = []
+    if manifest.total == 0:
+        told = NO_PICTURES if manifest.transcript else NOTHING_FOUND
+        notes.append(told)
+        if (more := _unsaid(told, manifest.hint)) is not None:
+            notes.append(more)
+    else:
+        notes += _notes([], taken.left_out, unshown=None, noun="frame")
+        if not paged and manifest.total > MAX_VIEW_IMAGES and taken.renders:
+            spread = ", spread over it" if taken.cut_at is None else ""
+            notes.append(
+                f"{len(taken.renders)} of the clip's {manifest.total} frames are shown{spread}; "
+                "ask for 'frames 2-5' or 'at 01:24' to see others."
+            )
+    rest = None if taken.cut_at is None else _part(taken.cut_at, window[-1], "frame")
+    answer = ViewedFile(
+        path=source.virtual_path,
+        kind="media",
+        unit="frame",
+        total=manifest.total,
+        shown=[shown_frame(rec) for rec in taken.renders],
+        truncated=rest is not None,
+        next_part=rest,
+        hint=_capped(_join(*notes), MAX_HINT),
+    )
+    answer = _within(answer, limit, keep_none=True)
+    return WithBlocks(answer, taken.blocks) if taken.blocks else answer
+
+
 async def view_file(
     body: ViewFileRequest,
     p: Principal,
@@ -325,10 +456,12 @@ async def view_file(
     audit: AuditLog,
     jobs: "CallJobs",
 ) -> ViewedFile | WithBlocks:
-    """Show a picture, or pages of a PDF or an Office file (a deck's slides), of the chat as images.
+    """Show a picture, pages of a PDF or an Office file (a deck's slides), or frames of a clip, of the chat as images.
 
     The file is prepared on its first view (an Office file is converted, then drawn); the pages asked for are made when
     they are not there yet. A deck is counted by slide: ``part``, the labels, ``next_part`` and the hint say slides. A
+    clip is prepared from its artifacts and its frames are shown from the rows that prepare made
+    (:func:`_view_frames`): ``part`` is ``frame 3``, ``frames 2-5`` or ``at 01:24``. A
     window that gives more than eight images (``8 // strips`` pages) is shown in part, and ``next_part`` names where the
     rest begins. A page whose render could not be read back or kept is named in the hint, and a window wholly past the
     source's cap of renders is answered with that said, not as an error. The hint says too, in whole sentences, an
@@ -350,7 +483,7 @@ async def view_file(
 
     Raises:
         HTTPException: The file cannot be converted or rendered (the runner's refusal), or ``part`` is not a page (a
-            slide, of a deck) of it (``no_such_part``).
+            slide, of a deck; a frame or a time, of a clip) of it (``no_such_part``).
         PathError: The path is outside the chat.
         StoreError: The file does not exist, or is not the chat's.
         PurposeRequired: The call had to state a purpose for ``modify`` and did not.
@@ -363,6 +496,8 @@ async def view_file(
     paged = body.part is not None
     kind = manifest.kind
     limit = settings.result_max_kb * 1024
+    if kind == "media":
+        return await _view_frames(body, p, source, manifest, limit, store, audit)
     if kind == "none":
         await run_in_threadpool(_record, audit, p, source, [], strips, paged=paged)
         nothing = ViewedFile(
@@ -377,7 +512,7 @@ async def view_file(
         )
         return _within(nothing, limit, keep_none=True)
 
-    noun = manifest.unit  # what the parts and the sentences count: a picture and a PDF count by page
+    noun: PagedUnit = "slide" if manifest.unit == "slide" else "page"  # what the parts count: a picture counts by page
     first, last = page_window(body.part, manifest.total, default_last=DEFAULT_LAST, unit=noun)
     through = min(last, first + MAX_VIEW_IMAGES // strips - 1)  # the pages one answer may take
     at_limit = False
@@ -405,7 +540,7 @@ async def view_file(
     pages: dict[int, list[DerivedRecord]] = {}
     for rec in rows:
         pages.setdefault(rec.ordinal, []).append(rec)
-    taken = await _take(store, pages, first, last, through)
+    taken = await _take(store, pages, range(first, last + 1), through)
     await run_in_threadpool(_record, audit, p, source, taken.renders, strips, paged=paged)
     # An Office file's own note comes first: a deck whose pictures are fewer than its slides is told so on every view.
     notes = [_sentence(manifest.hint)] if kind == "office" and manifest.hint else []
@@ -455,7 +590,7 @@ class _Attached:
     unshown: str | None = None
 
 
-def _page_of(label: str | None, noun: Unit) -> int | None:
+def _page_of(label: str | None, noun: PagedUnit) -> int | None:
     """Read the page a part or a ``next_part`` of a PDF names, or the slide one of a deck names.
 
     Args:
@@ -474,16 +609,16 @@ def _pages(numbers: Sequence[int], noun: Unit) -> str:
 
     Args:
         numbers: The pages, in order; at least one.
-        noun: What the file counts, ``page`` or ``slide``.
+        noun: What the file counts, ``page``, ``slide`` or ``frame``.
 
     Returns:
-        ``Page 2`` or ``Pages 2, 5``; ``Slide 2`` or ``Slides 2, 5``.
+        ``Page 2`` or ``Pages 2, 5``; ``Slide 2`` or ``Slides 2, 5``; ``Frame 2`` or ``Frames 2, 5``.
     """
     word = noun.capitalize()
     return f"{word} {numbers[0]}" if len(numbers) == 1 else f"{word}s {', '.join(str(n) for n in numbers)}"
 
 
-def _cut_note(cut: int, noun: Unit) -> str:
+def _cut_note(cut: int, noun: PagedUnit) -> str:
     """Say that the images, not the text, ended the answer, and where to go on.
 
     Args:
@@ -499,7 +634,7 @@ def _cut_note(cut: int, noun: Unit) -> str:
     )
 
 
-def _unshown_because(lost: Exception, noun: Unit) -> str:
+def _unshown_because(lost: Exception, noun: PagedUnit) -> str:
     """Tell the model why the pictures of a read could not be made, and whether view_file can show them later.
 
     Args:
@@ -614,7 +749,7 @@ async def _attach_pages(
     source: FileRecord,
     strips: int,
     *,
-    noun: Unit,
+    noun: PagedUnit,
     p: Principal,
     settings: Settings,
     store: Store,
@@ -699,7 +834,7 @@ async def _read_paged(
     source: FileRecord,
     payload: Mapping[str, Any],
     *,
-    noun: Unit,
+    noun: PagedUnit,
     p: Principal,
     settings: Settings,
     store: Store,
@@ -862,6 +997,114 @@ async def _read_picture(
     return WithBlocks(answer, blocks) if blocks else answer
 
 
+def _without_transcript(total: int, *, spoken: bool) -> str:
+    """Say why a clip has no transcript to read.
+
+    Args:
+        total: How many frames the clip has.
+        spoken: Whether the clip holds the JSON Lines of its speech: they were there and gave no transcript.
+
+    Returns:
+        That the transcript could not be read, when the speech's artifact is there; else that there was no speech, or
+        that nothing was found when the clip has no frames either.
+    """
+    if spoken:
+        return TRANSCRIPT_UNREADABLE
+    return NO_SPEECH if total > 0 else NOTHING_FOUND
+
+
+async def _read_clip(
+    body: ReadDocumentRequest,
+    source: FileRecord,
+    *,
+    p: Principal,
+    settings: Settings,
+    store: Store,
+    audit: AuditLog,
+    jobs: "CallJobs",
+    images: bool,
+) -> DocumentRead:
+    """Answer a read of a clip with its transcript, which is text, whether or not the call takes images.
+
+    The clip is prepared first (:func:`~workbench.api.renders.prepared`: from its artifacts, once). With a transcript,
+    one read job runs over that derived file alone, at the path its row gives, and its answer is the text file's with
+    the clip's path and the kind ``transcript``; the clip itself is no input of any job, and no path of ``.derived`` is
+    said. Without one there is no job: the answer has no part and says there was no speech, that the transcript could
+    not be read (the clip holds the JSON Lines of its speech and they gave none), or that nothing was found when the
+    clip has no frames either. The hint goes on with what the prepare said of the clip that this does not (the
+    transcript is cut, some frames are kept, the frames could not be read). A call that takes images is told, after
+    the hint, that ``view_file`` shows the clip's frames, when it has any; no image goes with the answer either way.
+
+    The read is recorded once the job has answered, naming the clip and its transcript, before anything of the answer
+    goes out; a refusal of the job is an ``error`` with its code, raised as for any file.
+
+    Args:
+        body: The path and the part: ``lines 100-200``, as for a text file.
+        source: The clip.
+        p: The caller, user and chat.
+        settings: The api's settings; ``result_max_kb`` caps the answer.
+        store: The file store.
+        audit: The audit log, bound to the call.
+        jobs: The queue, within the call's limits.
+        images: Whether the call takes images (``X-Accept-Images: 1``): it is then told of ``view_file``.
+
+    Returns:
+        The lines read and how to go on; no part for a clip without speech.
+
+    Raises:
+        HTTPException: The clip's prepare was refused (see :func:`~workbench.api.renders.prepared`), or the read job
+            was: a part the transcript has not (422 ``no_such_part``), or a transcript that is gone (404).
+        PurposeRequired: The prepare had to state a purpose for ``modify`` and the call stated none.
+        AuditWriteError: An event could not be written; nothing goes out.
+        Busy: The queue or the executor has no room for the prepare or the read.
+    """
+    manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+    rows = await run_in_threadpool(store.derived_of, source)
+    transcript = transcript_of(rows)
+    if transcript is None and manifest.transcript:
+        # It went after the manifest was read (the artifact was posted again): the next prepare makes it anew.
+        manifest = await prepared(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
+        rows = await run_in_threadpool(store.derived_of, source)
+        transcript = transcript_of(rows)
+    see: str | None = None
+    if images and manifest.total > 0:
+        see = ONE_FRAME if manifest.total == 1 else SEE_FRAMES.format(total=manifest.total)
+    paged = body.part is not None
+    if transcript is None:
+        told = _without_transcript(manifest.total, spoken=has_speech_artifact(rows))
+        answer = DocumentRead(
+            path=source.virtual_path,
+            kind="transcript",
+            parts=[],
+            total_parts=0,
+            pages_without_text=[],
+            shown=[],
+            truncated=False,
+            hint=_join(told, _unsaid(told, manifest.hint), see),
+        )
+        await run_in_threadpool(_record_read, audit, p, source, [], paged=paged)
+        return answer
+    budget = max(1, settings.job_wall_s * 3 // 4)
+    args = {"path": transcript.relative_path, "part": body.part, "budget_s": budget, "images": False}
+    _, result, _ = await jobs.submit(p, "read_document", args, [transcript.relative_path])
+    if refusal(result) == "file_not_found":  # the job's words name the transcript's path in the store
+        result = result.model_copy(update={"result": {"error": NO_TRANSCRIPT_FILE}})
+    payload = (
+        {**result.result, "path": source.virtual_path, "kind": "transcript"}
+        if isinstance(result.result, dict)
+        else None
+    )
+    usable = result.status == "ok" and payload is not None and _readable(DocumentRead, payload)
+    criteria: dict[str, object] = {"paged": paged, **({"images": 0} if usable else {})}
+    await run_in_threadpool(
+        record_answer, audit, "read_document", p, [source.id, transcript.id], criteria, result, DocumentRead, payload
+    )
+    _payload(result, "file")
+    read = _parse(DocumentRead, payload)
+    hint = _join(read.hint, _unsaid(read.hint, manifest.hint), see)
+    return _fit_read(read.model_copy(update={"hint": hint}), settings.result_max_kb)
+
+
 async def read_document(
     body: ReadDocumentRequest,
     p: Principal,
@@ -879,10 +1122,11 @@ async def read_document(
     as images, in the same answer; a deck is converted and drawn for them first, as ``view_file`` does it. A Word or
     OpenDocument text file is answered with its text alone; its first read (no ``part``) says that ``view_file`` shows
     its pages. A picture file is not read but shown: it is prepared as ``view_file`` does it, and answered as its image.
-    On a call that takes no images every file is read in the executor and answered with its text alone, ``strips``
-    ignored, as workbench 0.6 did. The read is recorded by the file's id and then each render shown, once the images are
-    settled and before anything of the answer goes out; a refusal of the job is an ``error`` with its code. Neither the
-    name, the part nor the text is recorded.
+    A video or audio clip is read as its transcript (:func:`_read_clip`), on any call: no image, and the clip itself is
+    no input of any job. On a call that takes no images every other file is read in the executor and answered with its
+    text alone, ``strips`` ignored, as workbench 0.6 did. The read is recorded by the file's id and then each render
+    shown (a clip's, by the clip's and its transcript's), once the images are settled and before anything of the answer
+    goes out; a refusal of the job is an ``error`` with its code. Neither the name, the part nor the text is recorded.
 
     Args:
         body: The path, where to start, and into how many strips each image is cut.
@@ -904,6 +1148,10 @@ async def read_document(
         Busy: The queue or the executor has no room for the read, or for a picture's render.
     """
     source = await run_in_threadpool(store.get, p, body.path)
+    if kind_of(source.name) == "media":  # a clip is read as its transcript, text, whether or not the call takes images
+        return await _read_clip(
+            body, source, p=p, settings=settings, store=store, audit=audit, jobs=jobs, images=images
+        )
     kind = kind_of(source.name) if images else "none"  # a call that takes no images is read as text alone
     if kind == "image":
         return await _read_picture(body, source, p=p, settings=settings, store=store, audit=audit, jobs=jobs)

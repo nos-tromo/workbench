@@ -104,8 +104,10 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         description=(
             "Read one file of this conversation as text, each piece with a reference. Readable: PDF, DOCX, DOTX, XLSX, "
             "XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, NDJSON, TXT and MD, and "
-            "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image. Give the file's path "
-            "from list_files. Reading starts at part (the start if left out) and goes on until the result limit, so "
+            "pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), which come back as the image; video and audio (mp4, "
+            "mov, m4v, webm, mkv, mp3, m4a, wav, ogg, opus, flac): their transcript, one line per sentence, as "
+            "'[01:24] Speaker 1: text'. Give the file's path from list_files. Reading starts at part (the start if "
+            "left out) and goes on until the result limit, so "
             "a long file is read in several calls: when truncated is true, call again with part set to next_part. "
             "Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
             "paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as "
@@ -119,11 +121,14 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
         input_model=tools.ReadDocumentRequest,
         output_model=tools.DocumentRead,
         function=tools_views.read_document,
-        # workbench 0.6's words, for a call that takes no images: they promise none.
+        # workbench 0.6's words, for a call that takes no images: they promise none. A clip's transcript is text, so
+        # the one sentence about it is in both.
         text_description=(
             "Read one file of this conversation as text, each piece with a reference. Readable: PDF (text layer only, "
             "no OCR), DOCX, DOTX, XLSX, XLSM, CSV, TSV, PPTX, POTX, ODT, ODS, EML, HTML, JSON (shown indented), JSONL, "
-            "NDJSON, TXT and MD. Give the file's path from list_files. Reading starts at part (the start if left out) "
+            "NDJSON, TXT and MD; video and audio (mp4, mov, m4v, webm, mkv, mp3, m4a, wav, ogg, opus, flac): their "
+            "transcript, one line per sentence, as '[01:24] Speaker 1: text'. Give the file's path from list_files. "
+            "Reading starts at part (the start if left out) "
             "and goes on until the result limit, so a long file is read in several calls: when truncated is true, "
             "call again with part set to next_part. Parts are pages ('page 3', 'pages 3-9'), slides ('slide 2'), "
             "paragraphs ('paragraph 40'), runs of table rows ('table 2, rows 30-60'; a search location such as "
@@ -179,7 +184,9 @@ WORKSPACE_TABLE: Final[tuple[WorkspaceTool, ...]] = (
             "their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, "
             "Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, "
             "drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or "
-            "'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Use it for what text "
+            "'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Video: a clip's frames, "
+            "'frame 3', 'frames 2-5' or 'at 01:24' (the frame nearest that time); left out, up to 8 frames spread "
+            "over the clip. Audio has no pictures: read its transcript with read_document. Use it for what text "
             "cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture "
             "a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, "
             "call again with part set to next_part. Pages or slides that could not be shown are named in hint. "

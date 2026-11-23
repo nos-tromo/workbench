@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import Final, cast
+from typing import BinaryIO, Final, cast
 
 from PIL import ExifTags, Image, ImageCms
 
@@ -98,11 +98,11 @@ def _bomb_guard() -> Iterator[None]:
         Image.MAX_IMAGE_PIXELS = before
 
 
-def _open(path: Path) -> Image.Image:
+def _open(source: Path | BinaryIO) -> Image.Image:
     """Open a picture by its content, refusing one that declares more pixels than a source may have.
 
     Args:
-        path: The file.
+        source: The file, or a binary file object positioned at its start.
 
     Returns:
         The image, its pixels not yet read.
@@ -111,7 +111,7 @@ def _open(path: Path) -> Image.Image:
         UnreadableFile: The picture declares more pixels than a source may have.
         OSError: Not a picture of a known kind (Pillow's ``UnidentifiedImageError``); the caller makes it unreadable.
     """
-    image = Image.open(path, formats=FORMATS)
+    image = Image.open(source, formats=FORMATS)
     if image.width * image.height > SOURCE_MAX_PIXELS:  # whatever Pillow's own limit is
         image.close()
         raise UnreadableFile(_TOO_MANY_PIXELS)
@@ -252,11 +252,14 @@ def on_white(image: Image.Image) -> Image.Image:
     return image if image.mode == "RGB" else image.convert("RGB")
 
 
-def normalise(path: Path, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int = IMAGE_MAX_PIXELS) -> Normalised:
+def normalise(
+    source: Path | BinaryIO, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int = IMAGE_MAX_PIXELS
+) -> Normalised:
     """Decode a picture and bring it to a size and form a model can look at.
 
     Args:
-        path: The file; its name decides nothing, its content does.
+        source: The file, or a binary file object positioned at its start (a frame read out of a zip); its name decides
+            nothing, its content does. A file object is left open.
         long_side: Most pixels on the longer side of the result.
         max_pixels: Most pixels in the result.
 
@@ -270,28 +273,28 @@ def normalise(path: Path, *, long_side: int = IMAGE_LONG_SIDE, max_pixels: int =
     try:
         _register_heif()
         with _bomb_guard():
-            source = _open(path)
+            opened = _open(source)
             try:
-                frames = getattr(source, "n_frames", 1)
-                source.seek(0)
-                lossless = source.format in LOSSLESS_FORMATS
-                size = target_size(source.width, source.height, long_side=long_side, max_pixels=max_pixels)
-                if source.format in ("JPEG", "MPO"):
-                    source.draft("RGB", size)  # the decoder scales by 1/2, 1/4 or 1/8 while it reads
-                source.load()
+                frames = getattr(opened, "n_frames", 1)
+                opened.seek(0)
+                lossless = opened.format in LOSSLESS_FORMATS
+                size = target_size(opened.width, opened.height, long_side=long_side, max_pixels=max_pixels)
+                if opened.format in ("JPEG", "MPO"):
+                    opened.draft("RGB", size)  # the decoder scales by 1/2, 1/4 or 1/8 while it reads
+                opened.load()
                 # After the load, since a PNG's EXIF block may follow its pixels; the block is not read for more.
-                orientation = _orientation(source)
-                profile = source.info.get("icc_profile") if source.mode in _RGB_MODES else None
-                image = _convert(source)
+                orientation = _orientation(opened)
+                profile = opened.info.get("icc_profile") if opened.mode in _RGB_MODES else None
+                image = _convert(opened)
                 if image.size != size:
                     image = image.resize(size, Image.Resampling.LANCZOS, reducing_gap=3.0)
                 image = on_white(_upright(_to_srgb(image, profile), orientation))
-                if image is source:
+                if image is opened:
                     image = (
-                        source.copy()
+                        opened.copy()
                     )  # closing the source frees its pixels; this one is within the bounds, so small
             finally:
-                source.close()
+                opened.close()
     except UnreadableFile:
         raise
     except MemoryError:

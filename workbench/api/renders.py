@@ -13,11 +13,16 @@ nothing of LibreOffice: a render, like the PDF, is checked by its signature and 
   facts (kind, unit, page count, pages without text), which the whole render of page 1 keeps; an Office file is
   converted first, in the same turn. Every later call answers from the rows, with no job, no event and no wait for the
   source's lock.
+  A clip (a video or an audio file) is never read by a job: its prepare runs one job over the two artifacts Nextext
+  made of it, kept as its derived files, on the caller's prepare gate, and keeps the transcript and the frames that come
+  back (:func:`media_manifest_of`). A clip with no artifact is answered at once, with no job and no event.
 - :func:`renders_for` answers the renders of some pages at a strip count, and makes those that are missing, unless
   the source's renders leave no room for one more.
 - :func:`read_render` reads one back, or nothing when it is not what its row says.
 - :func:`image_block`, :func:`noun_of`, :func:`label`, :func:`shown_image` and :func:`page_window` are what the tools
-  that show images share, with the caps of what one answer shows.
+  that show images share, with the caps of what one answer shows; :func:`frames_of`, :func:`shown_frame` and
+  :func:`frame_window` are a clip's frames: the rows there are, labelled by number and time, and which of them a part
+  asks for. A clip's frames are never made one by one: :func:`renders_for` answers those that exist.
 
 Every job is recorded before any file it made is visible (``modify`` / ``file.prepare``, by the source's id and then
 each render's, or the PDF's), and one call at a time makes the renders of a source (:meth:`RenderJobs.source_lock`), so
@@ -39,10 +44,11 @@ starting the count again; out of time, a busy executor or a failure is never rem
 import base64
 import dataclasses
 import logging
+import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, override
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -57,16 +63,21 @@ from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.paths import PathError
 from workbench.protocol import JobResult
 from workbench.renders import (
+    ARTIFACT_ROLES,
     DERIVED_MAX_BYTES,
     MAX_STRIPS,
+    NOTHING_FOUND,
     RENDER_MAX_BYTES,
     RENDERS_PER_JOB,
     SIGNATURES,
     ConvertAnswer,
+    PagedUnit,
     RenderAnswer,
     RenderFacts,
     Unit,
+    frame_label,
     kind_of,
+    parse_stamp,
     signature_ok,
     unit_of,
 )
@@ -86,8 +97,13 @@ NOT_SHOWN: Final = "This kind of file, such as a spreadsheet, is not shown as pi
 #: The text of the 500 for a render the store lost for a reason it cannot name (:func:`_lost`).
 NOT_KEPT: Final = "the renders of this file could not be kept"
 
-#: The roles of the derived files that are renders.
+#: The roles of the derived files that are renders of a picture, a PDF or an Office file.
 _RENDER_ROLES: Final = frozenset({"image", "page"})
+
+#: The roles of what a clip's prepare job makes of its raw artifacts (:data:`~workbench.renders.ARTIFACT_ROLES`).
+_TRANSCRIPT_ROLE: Final = "transcript"
+_SPEECH_ROLE: Final = "nextext_jsonl"
+_FRAME_ROLE: Final = "frame"
 
 #: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
 _CONVERTED_ROLE: Final = "pdf"
@@ -102,7 +118,8 @@ REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
 #: damaged or not what its name says, too large to read within the memory limit, password-protected (a PDF, an Office
 #: file or an old binary one), not opened by LibreOffice, more or larger pictures than can be drawn within the memory
 #: limit (also when a conversion redone in parts runs out of its time: ruling R23), a picture over 120 megapixels, a PDF
-#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB.
+#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB, a clip none of whose
+#: artifacts could be read (the artifacts decide it, a new one is a new input: the route that keeps it forgets it).
 #:
 #: These are copies, never imports (ruling R25): the api imports nothing of the executor, whose modules that hold them
 #: load the runners, Pillow or pdfium, none of which the api's image has. A pin test in ``tests/api/test_renders.py``
@@ -128,6 +145,7 @@ FILE_DECIDED: Final = frozenset(
         "the file is password-protected (encrypted)",
         "the file holds a picture larger than 120 megapixels",
         "the converted file is larger than 32 MB",
+        "nothing in the clip's artifacts could be read",
     )
 )
 
@@ -145,14 +163,24 @@ _LOST: Final = re.compile(r"\d+ outputs? could not be kept \(([a-z ,]+)\)\Z")
 #: What a page or a window of pages may be written as, by the unit of the file: ``page 3``, ``3``, ``pages 2-5`` or
 #: ``2-5`` (for a deck ``slide 3``, ``3``, ``slides 2-5`` or ``2-5``), in any case, with the singular and the plural
 #: taken alike. Nine digits at most, so no number is too long to read.
-_PART: Final[Mapping[Unit, re.Pattern[str]]] = {
+_PART: Final[Mapping[PagedUnit, re.Pattern[str]]] = {
     "page": re.compile(r"(?:pages?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
     "slide": re.compile(r"(?:slides?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE),
 }
-_GRAMMAR: Final[Mapping[Unit, str]] = {
+_GRAMMAR: Final[Mapping[PagedUnit, str]] = {
     "page": "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'",
     "slide": "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'",
 }
+
+#: What a frame or a window of frames of a clip may be written as: ``frame 3``, ``3``, ``frames 2-5`` or ``2-5``, in any
+#: case, and with the time its label carries after it (``frame 3 (01:24)``, as ``view_file`` showed it, which is not
+#: read). Nine digits at most, as a page's.
+_FRAME_PART: Final = re.compile(r"(?:frames?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?(?:\s*\([0-9:]+\))?", re.IGNORECASE)
+#: What a time of a clip may be written as: ``at 01:24`` or ``at 1:02:03``, which :func:`~workbench.renders.parse_stamp`
+#: reads.
+_FRAME_AT: Final = re.compile(r"at\s+(\S+)", re.IGNORECASE)
+#: What a part that is none of these is told.
+FRAME_GRAMMAR: Final = "no_such_part: give a frame as 'frame 3', frames as 'frames 2-5', or a time as 'at 01:24'"
 
 
 class Rendition(BaseModel):
@@ -178,24 +206,31 @@ class Manifest(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``image``, ``pdf``, ``office`` for a text document or a deck drawn from the PDF it was converted to, or
-            ``none`` for a file that is not shown as pictures.
-        unit: What ``total`` and the pages count: ``slide`` for a deck, ``page`` for every other file, ``none`` too.
-        total: Pages of a PDF or a document, slides of a deck; 1 for a picture, 0 for ``none``.
-        pages_without_text: The pages or slides with no text of their own (scans, pictures).
-        renditions: The whole renders that exist now, by page or slide.
-        frames: The frame count of a picture with several, of which only the first is shown; else ``None``.
+        kind: ``image``, ``pdf``, ``office`` for a text document or a deck drawn from the PDF it was converted to,
+            ``media`` for a clip, or ``none`` for a file that is not shown as pictures.
+        unit: What ``total`` and the pages count: ``slide`` for a deck, ``frame`` for a clip, ``page`` for every other
+            file, ``none`` too.
+        total: Pages of a PDF or a document, slides of a deck, frames of a clip (none for audio, and for a clip with no
+            pictures); 1 for a picture, 0 for ``none``.
+        pages_without_text: The pages or slides with no text of their own (scans, pictures); empty for a clip.
+        renditions: The whole renders that exist now, by page, slide or frame.
+        frames: The frame count of a picture with several, of which only the first is shown; else ``None``, a clip's
+            too (its frames are ``total``).
         hint: A short note, such as which pages were not checked for text; ``None`` for none.
+        duration_s: The length of a clip in seconds, as far as its artifacts say; ``None`` for any other file.
+        transcript: Whether a clip has a transcript to read; ``False`` for any other file.
     """
 
     path: str
-    kind: Literal["image", "pdf", "office", "none"]
+    kind: Literal["image", "pdf", "office", "media", "none"]
     unit: Unit = "page"
     total: int
     pages_without_text: list[int]
     renditions: list[Rendition]
     frames: int | None
     hint: str | None
+    duration_s: float | None = None
+    transcript: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,8 +262,9 @@ class RenderJobs(Protocol):
         *,
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
-        """Render a picture or pages of a PDF, as :meth:`~workbench.api.jobs.JobQueue.submit_renders` does.
+        """Render a picture, pages of a PDF or a clip's frames, as :meth:`~workbench.api.jobs.JobQueue.submit_renders`.
 
         Args:
             p: The caller, user and chat the job runs for: the source's own.
@@ -237,6 +273,7 @@ class RenderJobs(Protocol):
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             turn: The turn of the gate the caller holds (:meth:`turn`), in which the job runs; ``None`` waits for one.
             converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
+            artifacts: A clip's raw artifacts, which the job reads in place of the clip.
 
         Returns:
             The job record, the executor's answer and the renders kept.
@@ -325,6 +362,7 @@ class RouteJobs:
         *,
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render within the call's limits, on the route's gate.
 
@@ -335,12 +373,21 @@ class RouteJobs:
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             turn: The turn of the route's gate the call holds (:meth:`turn`), or ``None`` to wait for one.
             converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
+            artifacts: A clip's raw artifacts, which the job reads in place of the clip.
 
         Returns:
             What :meth:`~workbench.api.jobs.JobQueue.submit_renders` returns.
         """
         return await self.queue.submit_renders(
-            p, source, args, keeper, call=self.call, gate=gate_for(turn, self.gate), turn=turn, converted=converted
+            p,
+            source,
+            args,
+            keeper,
+            call=self.call,
+            gate=gate_for(turn, self.gate),
+            turn=turn,
+            converted=converted,
+            artifacts=artifacts,
         )
 
     async def submit_conversion(
@@ -458,6 +505,114 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
     )
 
 
+def _is_frame(rec: DerivedRecord) -> bool:
+    """Tell whether a derived file is a frame of a clip: a JPEG of its role with its size.
+
+    Args:
+        rec: The derived file.
+
+    Returns:
+        Whether it is.
+    """
+    return rec.role == _FRAME_ROLE and rec.mime in SIGNATURES and rec.width is not None and rec.height is not None
+
+
+def frames_of(rows: Sequence[DerivedRecord]) -> dict[int, DerivedRecord]:
+    """Find the frames of a clip among its derived files.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The frames that exist, by their number (counted from 1 in time order). A number may be missing inside
+        ``1..total``: a frame is not made on its own. It comes back only with the whole set, when the clip's head (the
+        transcript, else frame 1) is gone and the next prepare runs (:func:`_prepared_clip`).
+    """
+    return {rec.ordinal: rec for rec in rows if _is_frame(rec)}
+
+
+def transcript_of(rows: Sequence[DerivedRecord]) -> DerivedRecord | None:
+    """Find the transcript of a clip among its derived files.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The row of role ``transcript`` (a clip has one at most), or ``None``: it has no speech, or its transcript was
+        not made or is gone.
+    """
+    return next((rec for rec in rows if rec.role == _TRANSCRIPT_ROLE), None)
+
+
+def has_speech_artifact(rows: Sequence[DerivedRecord]) -> bool:
+    """Tell whether a clip holds the JSON Lines of its speech, the raw artifact its transcript is made from.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        Whether a row of role ``nextext_jsonl`` is there. With no transcript beside it, the transcript could not be
+        read; without it, the clip was given no speech.
+    """
+    return any(rec.role == _SPEECH_ROLE for rec in rows)
+
+
+def frame_time(rec: DerivedRecord) -> float | None:
+    """Read the time a frame's row keeps, which the zip's manifest gave it.
+
+    Args:
+        rec: The frame.
+
+    Returns:
+        Its time in seconds; ``None`` when the zip gave none (or a row keeps what is no time).
+    """
+    time_s = rec.meta.get("time_s")
+    if isinstance(time_s, bool) or not isinstance(time_s, int | float) or not math.isfinite(time_s) or time_s < 0:
+        return None
+    return float(time_s)
+
+
+def media_manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest | None:
+    """Build a clip's manifest from its rows alone.
+
+    The facts ride on the transcript, else on frame 1 (:meth:`~workbench.api.jobs.JobQueue._render_place`), and are read
+    leniently as a picture's are (:func:`_facts`).
+
+    Args:
+        source: The clip.
+        rows: Its derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The manifest: the frames that exist, by their number, and whether a transcript does. ``None`` when the clip has
+        neither the transcript nor frame 1 with facts of a clip that can be read: it is not prepared yet, or what it
+        was prepared as is gone.
+    """
+    transcript = next((rec for rec in rows if rec.role == _TRANSCRIPT_ROLE), None)
+    frames = sorted((rec for rec in rows if _is_frame(rec)), key=lambda rec: rec.ordinal)
+    head = transcript or next((rec for rec in frames if rec.ordinal == 1), None)
+    facts = None if head is None else _facts(head)
+    if facts is None or facts.kind != "media":
+        return None
+    renditions = [
+        Rendition.model_validate(
+            {"n": rec.ordinal, "width": rec.width, "height": rec.height, "mime": rec.mime, "bytes": rec.size}
+        )
+        for rec in frames
+    ]
+    return Manifest(
+        path=source.virtual_path,
+        kind="media",
+        unit="frame",
+        total=facts.total,
+        pages_without_text=[],
+        renditions=renditions,
+        frames=None,
+        hint=facts.hint,
+        duration_s=facts.duration_s,
+        transcript=transcript is not None,
+    )
+
+
 def converted_of(rows: Sequence[DerivedRecord]) -> DerivedRecord | None:
     """Find the PDF an Office file was converted to among its derived files.
 
@@ -499,6 +654,35 @@ def _budget(settings: Settings) -> int:
     return max(1, settings.job_wall_s * 3 // 4)
 
 
+def _decider(
+    *, strips: int, on_demand: bool
+) -> Callable[[JobResult, Sequence[str]], tuple[list[str], str, dict[str, object]]]:
+    """How a render job is judged: an ``ok`` answer that reads as a render answer keeps every output the job staged.
+
+    Args:
+        strips: Into how many strips each page is cut.
+        on_demand: Whether the job makes pages a call asked for after the prepare.
+
+    Returns:
+        The keeper's ``decide``: given the answer and the ids planned for its outputs, the ids to keep (all or none),
+        the outcome and the criteria of the event.
+    """
+
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        usable = result.status == "ok" and _readable(RenderAnswer, result.result)
+        keep: list[str] = list(planned) if usable else []
+        outcome, more = judged(result, usable)
+        criteria: dict[str, object] = {
+            "renders": len(planned),
+            "strips": strips,
+            "on_demand": on_demand,
+            "outputs": len(keep),
+        }
+        return keep, outcome, {**criteria, **more}
+
+    return decide
+
+
 def _keeper(audit: AuditLog, p: Principal, source: FileRecord, *, strips: int, on_demand: bool) -> OutputKeeper:
     """The keeper of a render job: it records the job by the source and the renders it keeps, before any is visible.
 
@@ -515,20 +699,62 @@ def _keeper(audit: AuditLog, p: Principal, source: FileRecord, *, strips: int, o
     Returns:
         The keeper.
     """
+    return OutputKeeper(audit, p, "prepare", [source.id], _decider(strips=strips, on_demand=on_demand))
 
-    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
-        usable = result.status == "ok" and _readable(RenderAnswer, result.result)
-        keep: list[str] = list(planned) if usable else []
-        outcome, more = judged(result, usable)
-        criteria: dict[str, object] = {
-            "renders": len(planned),
-            "strips": strips,
-            "on_demand": on_demand,
-            "outputs": len(keep),
-        }
-        return keep, outcome, {**criteria, **more}
 
-    return OutputKeeper(audit, p, "prepare", [source.id], decide)
+@dataclasses.dataclass(frozen=True)
+class _RemakingKeeper(OutputKeeper):
+    """The keeper of a clip's prepare that makes again what an earlier prepare left without its facts.
+
+    A transcript or a frame an earlier prepare could not finish (its head was lost to the quota, say) stays beside the
+    clip's artifacts with no manifest. The job makes them all again, so before it keeps anything the keeper replaces
+    what is there, as an artifact posted again does (:meth:`~workbench.api.store.Store.place_derived`): the one event
+    of the prepare names the clip, the new ids and then the ids replaced, with their count as ``replaced``, and only
+    then are the old rows and files deleted. A job that kept nothing replaces nothing.
+
+    Attributes:
+        store: The store, which deletes the rows replaced.
+        stale: The clip's transcript and frame rows found, under its lock, when the job was sent.
+    """
+
+    store: Store
+    stale: Sequence[DerivedRecord]
+
+    @override
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Write the job's event, naming what it keeps and what that replaces, then delete what is replaced.
+
+        Args:
+            result: The executor's answer.
+            planned: The ids the job's outputs will have.
+
+        Returns:
+            The ids to keep.
+
+        Raises:
+            Exception: What the event's write raised, with nothing deleted; or what a deletion raised, after the event,
+                which is recorded again as an ``error`` by the same ids and raised, with nothing kept. A row that was
+                not deleted is replaced by the next prepare.
+        """
+        keep, outcome, criteria = self.decide(result, planned)
+        replacing: list[DerivedRecord] = list(self.stale) if keep else []
+        more: dict[str, object] = {"replaced": len(replacing)} if replacing else {}
+        ids = [*keep, *(rec.id for rec in replacing)]
+        self.audit.record(
+            self.tool, self.p, file_ids=[*self.used, *ids], outcome=outcome, criteria={**criteria, **more}
+        )
+        try:
+            for rec in replacing:
+                self.store.remove_derived(rec)
+        except BaseException:
+            try:
+                self.again(ids)
+            except Exception as exc:  # the deletion's error is the answer; this one is only logged
+                _log.warning(
+                    "could not record a prepare that failed to replace what it remade (%s)", type(exc).__name__
+                )
+            raise
+        return keep
 
 
 def _lost(message: str) -> Exception:
@@ -734,12 +960,103 @@ def not_shown(source: FileRecord) -> Manifest:
     )
 
 
+def nothing_found(source: FileRecord) -> Manifest:
+    """The manifest of a clip that has neither artifact: no frame, no transcript, and the hint that nothing was found.
+
+    Args:
+        source: The clip.
+
+    Returns:
+        The manifest, counted by frame.
+    """
+    return Manifest(
+        path=source.virtual_path,
+        kind="media",
+        unit="frame",
+        total=0,
+        pages_without_text=[],
+        renditions=[],
+        frames=None,
+        hint=NOTHING_FOUND,
+    )
+
+
+async def _prepared_clip(
+    p: Principal, source: FileRecord, *, settings: Settings, store: Store, audit: AuditLog, jobs: RenderJobs
+) -> Manifest:
+    """Answer a clip's manifest, making its transcript and frames from its artifacts the first time.
+
+    The clip itself is no input of any job: the one job reads the artifacts Nextext made of it, which the store keeps as
+    its derived files, and runs on the caller's prepare gate, as a picture's does, never the conversion gate. A
+    transcript or frames an earlier prepare left without their facts (a loss at its keep) are made again by this job and
+    replace what is there, recorded with it (:class:`_RemakingKeeper`), so a retry ends with one set of rows.
+
+    Args:
+        p: The caller, user and chat of the clip.
+        source: The clip.
+        settings: The api's settings; ``job_wall_s`` gives the runner's time.
+        store: The store.
+        audit: The audit log, bound to the call.
+        jobs: The queue, within the call's limits and on its gate.
+
+    Returns:
+        The manifest.
+
+    Raises:
+        PurposeRequired: The call had to state a purpose for ``modify`` and did not; no job runs.
+        AuditWriteError: The job's event, or that of a refusal remembered, could not be written; nothing is kept, and
+            no refusal goes out.
+        Busy: The lock or the queue did not come free in time, or the executor is busy.
+        HTTPException: The runner refused the artifacts (422 ``unreadable_file``: neither gave anything usable, which
+            is remembered), or an earlier prepare did; the job ran out of time (422), or failed or answered what cannot
+            be read (500); or neither the transcript nor frame 1, which holds the facts, was kept for a reason that is
+            not one of the three below (500).
+        QuotaExceeded: The transcript or a frame would take the user over their quota (507).
+        RendersFull: It would take the clip over its cap of derived files (507).
+        StorageFull: The volume is full (507).
+        NotFound: The clip went while the call waited for the lock or the job ran, with its chat (404). A clip whose
+            artifacts went and which is still there is answered at once as one with nothing found.
+    """
+    rows = await run_in_threadpool(store.derived_of, source)
+    manifest = media_manifest_of(source, rows)
+    if manifest is not None:
+        return manifest
+    if not any(rec.role in ARTIFACT_ROLES for rec in rows):
+        return nothing_found(source)
+    async with jobs.source_lock(source.id):
+        rows = await run_in_threadpool(store.derived_of, source)
+        manifest = media_manifest_of(source, rows)
+        if manifest is not None:
+            return manifest
+        held = [rec for rec in rows if rec.role in ARTIFACT_ROLES]
+        if not held:  # while the call waited for the lock, the clip went, or its artifacts did
+            current = await run_in_threadpool(store.get, p, source.virtual_path)  # NotFound: the clip is gone
+            if current.id != source.id:
+                raise NotFound("file not found")  # another file has its path now
+            return nothing_found(source)
+        await run_in_threadpool(audit.check, "prepare", p)
+        await _refuse_remembered(p, source, store=store, audit=audit, strips=1, on_demand=False)
+        args: dict[str, Any] = {"budget_s": _budget(settings), "facts": True}
+        stale = [rec for rec in rows if rec.role in (_TRANSCRIPT_ROLE, _FRAME_ROLE)]  # an earlier prepare's leftovers
+        keeper = _RemakingKeeper(
+            audit, p, "prepare", [source.id], _decider(strips=1, on_demand=False), store=store, stale=stale
+        )
+        _, result, _ = await jobs.submit_renders(p, source, args, keeper, artifacts=held)
+        _parse(RenderAnswer, _settled(store, source, result))
+        manifest = media_manifest_of(source, await run_in_threadpool(store.derived_of, source))
+        if manifest is None:
+            raise _lost(result.message)
+    return manifest
+
+
 async def prepared(
     p: Principal, source: FileRecord, *, settings: Settings, store: Store, audit: AuditLog, jobs: RenderJobs
 ) -> Manifest:
     """Answer a file's manifest, rendering its first pages the first time.
 
-    A file that is neither a picture, a PDF nor an Office file is answered at once, ``kind: none``, with no job. A file
+    A file that is neither a picture, a PDF, an Office file nor a clip is answered at once, ``kind: none``, with no job.
+    A clip is answered by :func:`_prepared_clip`: from its artifacts, in one job on the prepare gate, the first time,
+    and at once, with no job and no event, when it has none. A file
     whose rows hold the manifest is answered from them, with no job, no event and no wait for the source's lock, which a
     job of later pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job,
     which draws the first pages (but those whole pages it has already), finds the facts and is recorded before any
@@ -777,6 +1094,8 @@ async def prepared(
     kind = kind_of(source.name)
     if kind == "none":
         return not_shown(source)
+    if kind == "media":
+        return await _prepared_clip(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
     manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
     if manifest is not None:
         return manifest
@@ -884,7 +1203,8 @@ async def renders_for(
         jobs: The queue, within the call's limits and on its gate.
 
     Returns:
-        The renders, by page and then by strip; every strip of each page, or none of it.
+        The renders, by page and then by strip; every strip of each page, or none of it. A clip's frames are the rows
+        there are, by number, whole whatever ``strips`` says; one that went is left out, and no job runs.
 
     Raises:
         ValueError: ``strips`` is not 1 to ``MAX_STRIPS``; the caller checks it first, so this is a programming error.
@@ -905,6 +1225,9 @@ async def renders_for(
         raise ValueError(f"strips is 1 to {MAX_STRIPS}")
     if manifest.kind == "none":
         return []
+    if manifest.kind == "media":  # a clip's frames are made with its transcript, never one by one: those there are
+        frames = frames_of(await run_in_threadpool(store.derived_of, source))
+        return [frames[n] for n in sorted({n for n in pages if 1 <= n <= manifest.total}) if n in frames]
     role = "image" if manifest.kind == "image" else "page"
     wanted = sorted({n for n in pages if 1 <= n <= manifest.total})
     complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
@@ -1005,12 +1328,13 @@ def noun_of(manifest: Manifest) -> Noun:
 
     Returns:
         ``image`` for a picture, ``page`` for a PDF, the unit of an Office file (``page`` or ``slide``); ``page`` for a
-        file that is not shown, which has no renders.
+        file that is not shown, which has no renders, and for a clip, whose frames are labelled by
+        :func:`~workbench.renders.frame_label`.
     """
     if manifest.kind == "image":
         return "image"
-    if manifest.kind == "office":
-        return manifest.unit
+    if manifest.kind == "office" and manifest.unit == "slide":
+        return "slide"
     return "page"
 
 
@@ -1052,7 +1376,93 @@ def shown_image(noun: Noun, rec: DerivedRecord) -> ShownImage:
     )
 
 
-def page_window(part: str | None, total: int, *, default_last: int, unit: Unit = "page") -> tuple[int, int]:
+def shown_frame(rec: DerivedRecord) -> ShownImage:
+    """Describe a frame of a clip that comes with an answer.
+
+    Args:
+        rec: The frame.
+
+    Returns:
+        Its label (``frame 3 (01:24)``, or ``frame 3`` when the zip gave no time), number, size and type.
+    """
+    return ShownImage.model_validate(
+        {
+            "label": frame_label(rec.ordinal, frame_time(rec)),
+            "n": rec.ordinal,
+            "width": rec.width,
+            "height": rec.height,
+            "mime": rec.mime,
+        }
+    )
+
+
+def _no_such_frame(total: int) -> HTTPException:
+    """Refuse a frame the clip does not have, and say how many it has.
+
+    Args:
+        total: The clip's frames.
+
+    Returns:
+        The 422 ``no_such_part``.
+    """
+    has = "no frames" if total == 0 else "1 frame" if total == 1 else f"{total} frames"
+    return HTTPException(status_code=422, detail=f"no_such_part: this clip has {has}")
+
+
+def frame_window(part: str | None, total: int, times: Mapping[int, float]) -> list[int]:
+    """Read which frames of a clip a call asks to see.
+
+    Args:
+        part: ``frame N`` or ``N`` for one frame; ``frames N-M`` or ``N-M`` for N to M; either with the time of a label
+            after it (``frame 3 (01:24)`` is ``frame 3``); ``at mm:ss`` (or ``h:mm:ss``) for the frame whose time is
+            nearest, the earlier one on a tie; ``None`` for all of the frames, or, when there are more than
+            ``MAX_VIEW_IMAGES``, that many spread evenly from the first to the last.
+        total: How many frames the clip has.
+        times: The frames' times in seconds, by number; a frame the zip gave no time is not in it. Only the frames of
+            ``1..total`` are considered.
+
+    Returns:
+        The frames, by number, in the order they are shown; none for a clip without frames asked for no part.
+
+    Note:
+        ``view_file`` reads a part only for a clip that has frames; a part of one that has none is answered with its
+        hint, so the refusals below for ``total`` 0 are for a caller that asks directly.
+
+    Raises:
+        HTTPException: 422 ``no_such_part: …``: ``part`` is none of the grammar's, its end comes before its start, N is
+            not a frame of the clip, or a time is asked for and no frame has one.
+    """
+    if part is None:
+        if total <= MAX_VIEW_IMAGES:
+            return list(range(1, total + 1))
+        return [1 + round(i * (total - 1) / (MAX_VIEW_IMAGES - 1)) for i in range(MAX_VIEW_IMAGES)]
+    text = part.strip()
+    if (at := _FRAME_AT.fullmatch(text)) is not None:
+        wanted = parse_stamp(at.group(1))
+        if wanted is None:
+            raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+        if total == 0:
+            raise _no_such_frame(total)
+        timed = {n: time_s for n, time_s in times.items() if 1 <= n <= total}
+        if not timed:
+            raise HTTPException(
+                status_code=422,
+                detail="no_such_part: the frames of this clip carry no times; ask for 'frame N'",
+            )
+        return [min(timed, key=lambda n: (abs(timed[n] - wanted), n))]
+    found = _FRAME_PART.fullmatch(text)
+    if found is None:
+        raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+    first = int(found.group(1))
+    last = first if found.group(2) is None else int(found.group(2))
+    if last < first:
+        raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+    if not 1 <= first <= total:
+        raise _no_such_frame(total)
+    return list(range(first, min(last, total) + 1))
+
+
+def page_window(part: str | None, total: int, *, default_last: int, unit: PagedUnit = "page") -> tuple[int, int]:
     """Read which pages, or slides of a deck, a call asks to see.
 
     Args:

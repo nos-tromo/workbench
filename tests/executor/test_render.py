@@ -1006,6 +1006,17 @@ def test_a_file_of_no_kind_is_unsupported(job: Job) -> None:
     assert "sheet" not in json.dumps(answer)
 
 
+@pytest.mark.parametrize("name", ["harbour-tour.mp4", "voice-memo.opus"])
+def test_a_clip_without_its_artifacts_is_unsupported(job: Job, name: str) -> None:
+    """A clip reaches ``prepare_file`` only with its artifacts; without them it is refused, never read as a PDF."""
+    job.path(name).write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+
+    answer = job.prepare(name)
+
+    assert answer == {"error": "unsupported_format: only pictures and PDFs can be shown"}
+    assert name not in json.dumps(answer)
+
+
 def test_an_office_file_is_drawn_only_after_conversion(job: Job) -> None:
     """A Word file or a deck is told to be converted first, in words of their own, and nothing is written."""
     make_fixtures.make_docx(job.path("memo.docx"))
