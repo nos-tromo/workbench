@@ -69,7 +69,7 @@ from workbench.api.store import (
 from workbench.api.tools_mcp import PREVIEW_RESERVE_S
 from workbench.config import Settings
 from workbench.models import DerivedRecord, DerivedSpec, FileRecord, Principal
-from workbench.renders import JSONL_MAX_BYTES, ZIP_MAX_BYTES, kind_of
+from workbench.renders import ARTIFACTS, JSONL_MAX_BYTES, ZIP_MAX_BYTES, kind_of
 
 #: The file routes; none of them is a tool.
 router = APIRouter(include_in_schema=False, route_class=EncodableRoute)
@@ -102,8 +102,8 @@ ArtifactRole = Literal["nextext_jsonl", "nextext_zip"]
 #: What each artifact of a clip is sent as, and the most bytes it may have. The route does not trust the type a caller
 #: sends: the first bytes decide (:func:`_artifact_check`).
 ROLE_TYPES: Final[Mapping[ArtifactRole, tuple[str, int]]] = {
-    "nextext_jsonl": ("application/x-ndjson", JSONL_MAX_BYTES),
-    "nextext_zip": ("application/zip", ZIP_MAX_BYTES),
+    "nextext_jsonl": (ARTIFACTS["nextext_jsonl"][0], JSONL_MAX_BYTES),
+    "nextext_zip": (ARTIFACTS["nextext_zip"][0], ZIP_MAX_BYTES),
 }
 
 #: The answer for a source that is no audio or video upload.

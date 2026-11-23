@@ -106,6 +106,15 @@ JSONL_MAX_BYTES: Final = 8 * 1024 * 1024
 ZIP_MAX_BYTES: Final = 32 * 1024 * 1024
 TRANSCRIPT_MAX_BYTES: Final = 4 * 1024 * 1024
 
+#: The two raw artifacts Nextext made of a clip, which the api keeps as the clip's derived files and only the clip's
+#: prepare job reads: each role's media type and file extension, the JSON Lines first (the order a job reads them in).
+#: The store, the route and the queue all take the roles, types and extensions from here.
+ARTIFACTS: Final[Mapping[str, tuple[str, str]]] = {
+    "nextext_jsonl": ("application/x-ndjson", "jsonl"),
+    "nextext_zip": ("application/zip", "zip"),
+}
+ARTIFACT_ROLES: Final = frozenset(ARTIFACTS)
+
 #: The transcript of a clip: its name in the job's output.
 TRANSCRIPT_NAME: Final = "transcript.txt"
 

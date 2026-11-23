@@ -26,18 +26,24 @@ from tests.api.test_renders import Held, World, held_world
 from tests.api.test_tools_templates import Local
 from tests.conftest import FakeOffice, scaled
 from tests.fixtures import make_media
+from workbench.api import files as files_module
+from workbench.api import store as store_module
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import SOURCE_LOCK_WAIT_S, JobQueue
 from workbench.api.metrics import Metrics
 from workbench.api.renders import Manifest, media_manifest_of
-from workbench.api.store import Store
+from workbench.api.store import NotFound, QuotaExceeded, Store
 from workbench.config import Settings
 from workbench.models import DerivedRecord, DerivedSpec, FileRecord
+from workbench.protocol import JobRequest, JobResult
 from workbench.renders import (
+    ARTIFACT_ROLES,
+    ARTIFACTS,
     DERIVED_MAX_BYTES,
     JSONL_MAX_BYTES,
     NO_SPEECH,
     NOTHING_FOUND,
+    TRANSCRIPT_MAX_BYTES,
     ZIP_MAX_BYTES,
 )
 from workbench.utils.audit_event import verify_chain
@@ -365,6 +371,181 @@ async def test_an_artifact_posted_again_during_a_prepare_waits_for_it(world: Wor
     assert (again.duration_s, again.total, len(executor.requests)) == (200.0, 3, 2)
 
 
+# --- a retry after a lost head ------------------------------------------------------------------------------------
+
+
+async def leave_frames_without_a_head(
+    world: World, source: FileRecord, monkeypatch: pytest.MonkeyPatch
+) -> list[DerivedRecord]:
+    """Prepare a clip whose transcript the quota refuses: 507, and its frames stay, with no head to carry the facts.
+
+    The store is left refusing nothing again, as when the user frees room.
+    """
+    real = world.store.register_derived
+
+    def refuse_the_transcript(owner: FileRecord, staged: Path, spec: DerivedSpec, **more: Any) -> DerivedRecord:
+        if spec.role == "transcript":
+            raise QuotaExceeded("workspace quota exceeded")
+        return real(owner, staged, spec, **more)
+
+    monkeypatch.setattr(world.store, "register_derived", refuse_the_transcript)
+    with pytest.raises(QuotaExceeded):
+        await world.prepare(source)
+    monkeypatch.setattr(world.store, "register_derived", real)
+    left = rows_of(world, source, "frame")
+    assert (len(left), rows_of(world, source, "transcript")) == (3, [])
+    assert [event["outcome"] for event in world.events()] == ["ok", "error"]  # the job, and the transcript named again
+    return left
+
+
+async def test_a_retry_after_a_lost_head_replaces_what_was_left_and_records_no_error(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry makes the frames again: it replaces the old ones, in its own event, and ends with one set of rows."""
+    source = clip(world)
+    add_jsonl(world, source)
+    add_zip(world, source)
+    old = await leave_frames_without_a_head(world, source, monkeypatch)
+
+    manifest = await world.prepare(source)
+    rows = world.store.derived_of(source)
+    new = [rec for rec in rows if rec.role in ("transcript", "frame")]
+
+    assert (manifest.total, manifest.transcript, [r.n for r in manifest.renditions]) == (3, True, [1, 2, 3])
+    assert sorted(rec.role for rec in rows) == ["frame"] * 3 + ["nextext_jsonl", "nextext_zip", "transcript"]
+    assert {rec.id for rec in old}.isdisjoint(rec.id for rec in rows)
+    assert all(not world.file_of(rec).exists() for rec in old)
+    assert all(world.file_of(rec).is_file() for rec in new)
+    assert len(world.executor.requests) == 2
+    outcomes = [event["outcome"] for event in world.events()]
+    assert outcomes == ["ok", "error", "ok"]  # no error event for a frame that was made again
+    retry = world.events()[2]
+    assert retry["target"]["ids"][0] == source.id
+    assert sorted(retry["target"]["ids"][1:5]) == sorted(rec.id for rec in new)
+    assert retry["target"]["ids"][5:] == [rec.id for rec in old]
+    assert retry["criteria"] == {
+        "caller": "ghostwriter",
+        "renders": 4,
+        "strips": 1,
+        "on_demand": False,
+        "outputs": 4,
+        "replaced": 3,
+    }
+    assert await world.prepare(source) == manifest  # and the next is answered from the rows
+    assert len(world.executor.requests) == 2
+
+
+async def test_a_retry_that_cannot_delete_what_it_replaces_keeps_nothing_and_says_so(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The event is written first; a deletion that fails is recorded as an error by the same ids and nothing is kept.
+
+    The old rows stay, so the next prepare replaces them as this one would have.
+    """
+    source = clip(world)
+    add_jsonl(world, source)
+    add_zip(world, source)
+    old = await leave_frames_without_a_head(world, source, monkeypatch)
+    real = world.store.remove_derived
+
+    def cannot(rec: DerivedRecord) -> None:
+        raise OSError("synthetic: read-only file system")
+
+    monkeypatch.setattr(world.store, "remove_derived", cannot)
+    with pytest.raises(OSError):
+        await world.prepare(source)
+
+    assert [rec.id for rec in rows_of(world, source, "frame")] == [rec.id for rec in old]
+    assert rows_of(world, source, "transcript") == []
+    *_, said, failed = world.events()
+    assert (said["outcome"], failed["outcome"]) == ("ok", "error")
+    assert failed["target"]["ids"] == said["target"]["ids"][1:]  # the new ids and the old ones, not the clip
+
+    monkeypatch.setattr(world.store, "remove_derived", real)
+    manifest = await world.prepare(source)
+    assert (manifest.total, manifest.transcript) == (3, True)
+    assert sorted(rec.role for rec in world.store.derived_of(source)) == (
+        ["frame"] * 3 + ["nextext_jsonl", "nextext_zip", "transcript"]
+    )
+
+
+async def test_a_job_that_keeps_nothing_replaces_nothing(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A retry whose job fails leaves the rows an earlier prepare left: nothing is deleted for it."""
+    source = clip(world)
+    add_jsonl(world, source)
+    add_zip(world, source)
+    old = await leave_frames_without_a_head(world, source, monkeypatch)
+    world.executor.status = "error"
+    with pytest.raises(HTTPException):
+        await world.prepare(source)
+
+    assert [rec.id for rec in rows_of(world, source, "frame")] == [rec.id for rec in old]
+    assert "replaced" not in world.events()[-1]["criteria"]
+
+
+# --- a clip gone while its prepare waits --------------------------------------------------------------------------
+
+
+async def test_a_clip_taken_back_while_its_prepare_waits_for_the_lock_is_not_found(world: World) -> None:
+    """The prepare waits for the clip's lock; the clip is taken back meanwhile: 404, like any file that is gone."""
+    source = clip(world)
+    add_jsonl(world, source)
+    add_zip(world, source)
+    async with world.queue.source_lock(source.id, SOURCE_LOCK_WAIT_S):
+        waiting = asyncio.create_task(world.prepare(source))
+        await asyncio.sleep(0.2)
+        assert not waiting.done()
+        world.store.remove_upload(source, lambda ids, outcome: None)
+
+    with pytest.raises(NotFound):
+        await waiting
+    assert world.executor.requests == []
+
+
+async def test_a_clip_whose_artifacts_went_is_answered_as_one_with_nothing_found(world: World) -> None:
+    """The same wait, but only the artifacts go (the clip stays): the answer is the manifest of nothing found."""
+    source = clip(world)
+    held = [add_jsonl(world, source), add_zip(world, source)]
+    async with world.queue.source_lock(source.id, SOURCE_LOCK_WAIT_S):
+        waiting = asyncio.create_task(world.prepare(source))
+        await asyncio.sleep(0.2)
+        for rec in held:
+            world.store.remove_derived(rec)
+
+    manifest = await waiting
+    assert (manifest.total, manifest.hint, manifest.transcript) == (0, NOTHING_FOUND, False)
+    assert world.executor.requests == []
+
+
+async def test_a_clip_replaced_under_its_name_while_its_prepare_waits_is_not_found(world: World) -> None:
+    """Another file has the clip's path when the lock comes free: the clip asked for is gone, so 404."""
+    source = clip(world)
+    add_jsonl(world, source)
+    async with world.queue.source_lock(source.id, SOURCE_LOCK_WAIT_S):
+        waiting = asyncio.create_task(world.prepare(source))
+        await asyncio.sleep(0.2)
+        world.store.remove_upload(source, lambda ids, outcome: None)
+        assert clip(world).id != source.id
+
+    with pytest.raises(NotFound):
+        await waiting
+
+
+# --- one definition of the artifacts' roles ------------------------------------------------------------------------
+
+
+def test_the_artifact_roles_have_one_definition() -> None:
+    """The store, the route and the queue take each role's type and extension from ``workbench.renders``."""
+    assert ARTIFACT_ROLES == frozenset(ARTIFACTS) == {"nextext_jsonl", "nextext_zip"}
+    route_types = {str(role): mime for role, (mime, _) in files_module.ROLE_TYPES.items()}
+    for role, (mime, extension) in ARTIFACTS.items():
+        assert store_module._ROLE_TYPES[role] == frozenset({mime})
+        assert store_module._DERIVED_EXTENSIONS[mime] == extension
+        assert store_module._RENDER_NAME.fullmatch(f"{'a' * 32}.{extension}")
+        assert route_types[role] == mime
+    assert store_module._RENDER_NAME.fullmatch(f"{'a' * 32}.exe") is None
+
+
 # --- the rows, read back ------------------------------------------------------------------------------------------
 
 
@@ -418,13 +599,33 @@ async def test_a_clips_frames_are_never_made_one_by_one(world: World) -> None:
 # --- the gate ------------------------------------------------------------------------------------------------------
 
 
+def gates_while_running(world: World, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, frozenset[tuple[str, str]]]]:
+    """Watch which shared gates the caller holds while each job runs: the tool and the gates' keys, in order.
+
+    A gate exists only while a turn of it is held, so the keys are read from inside the executor, when a job runs.
+    """
+    seen: list[tuple[str, frozenset[tuple[str, str]]]] = []
+    real = world.executor.run
+
+    async def watch(req: JobRequest, timeout_s: float) -> JobResult:
+        seen.append((req.tool, frozenset(world.queue._shared_gates)))
+        return await real(req, timeout_s)
+
+    monkeypatch.setattr(world.executor, "run", watch)
+    return seen
+
+
 async def test_a_clip_is_prepared_on_the_prepare_gate_and_never_the_conversion_gate(
-    world: World, monkeypatch: pytest.MonkeyPatch
+    world: World, fake_office: FakeOffice, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Ruling W3: the job waits for the caller's prepare gate; the conversion gate, which a deck holds, is not taken."""
+    """Ruling W3: while a clip's job runs the caller holds its prepare gate and not its conversion gate.
+
+    The same watch on a deck sees the conversion gate held by both of its jobs, so the observable is a real one.
+    """
     source = clip(world)
     add_jsonl(world, source)
     add_zip(world, source)
+    seen = gates_while_running(world, monkeypatch)
     sent: list[dict[str, Any]] = []
     real = world.queue.submit_renders
 
@@ -432,17 +633,20 @@ async def test_a_clip_is_prepared_on_the_prepare_gate_and_never_the_conversion_g
         sent.append(more)
         return await real(*args, **more)
 
-    async def conversion(*_: Any, **__: Any) -> Any:
-        raise AssertionError("a clip is not converted")
-
     monkeypatch.setattr(world.queue, "submit_renders", watch)
-    monkeypatch.setattr(world.queue, "submit_conversion", conversion)
     manifest = await world.prepare(source)
 
     (call,) = sent
     assert (manifest.total, call["gate"], call["turn"], call.get("converted")) == (3, "prepare", None, None)
     assert [rec.role for rec in call["artifacts"]] == ["nextext_jsonl", "nextext_zip"]
-    assert ("conversion", "ghostwriter") not in world.queue._shared_gates
+    assert seen == [("prepare_file", frozenset({("prepare", "ghostwriter")}))]
+
+    seen.clear()
+    await world.prepare(world.deck(3))
+    assert [(tool, ("conversion", "ghostwriter") in gates) for tool, gates in seen] == [
+        ("convert_office", True),
+        ("prepare_file", True),
+    ]
 
 
 async def test_a_clips_prepare_does_not_wait_for_a_decks_conversion(world: World, fake_office: FakeOffice) -> None:
@@ -484,19 +688,18 @@ def noise_zip(path: Path, frames: int, size: tuple[int, int]) -> Path:
 
 
 async def test_a_4k_clip_fits_its_cap(world: World) -> None:
-    """Review Focus 5: 19 noise frames of 3840 x 2160 and 7 MiB of speech beside them: no ``RendersFull``, under 64 MiB.
+    """Review Focus 5: 19 noise frames of 3840 x 2160 and 7 MiB of long sentences: no ``RendersFull``, under 64 MiB.
 
-    Each frame is 1280 x 720 under its cap, the transcript is cut at its own, and the whole set of the clip's derived
-    files, both artifacts included, is within the source's cap.
+    Each frame is 1280 x 720 under its cap, the transcript is cut at its own (4 MiB, with the hint that says so), and
+    the whole set of the clip's derived files, both artifacts included, is within the source's cap.
     """
     source = clip(world)
     lines: list[str] = []
     size = 0
     while size < 7 * MIB:
         index = len(lines)
-        record = make_media.jsonl_record(
-            index * 2.0, index * 2.0 + 1.5, f"Invented sentence {index}.", speaker="Speaker 1"
-        )
+        words = " ".join(f"quay{index}-{n}" for n in range(60))  # about 600 characters a sentence
+        record = make_media.jsonl_record(index * 2.0, index * 2.0 + 1.5, words, speaker="Speaker 1")
         lines.append(json.dumps(record) + "\n")
         size += len(lines[-1])
     keep(world, source, "".join(lines).encode(), "nextext_jsonl")
@@ -506,6 +709,9 @@ async def test_a_4k_clip_fits_its_cap(world: World) -> None:
 
     assert (manifest.total, manifest.transcript, len(manifest.renditions)) == (19, True, 19)
     assert {(r.width, r.height) for r in manifest.renditions} == {(1280, 720)}
+    (transcript,) = (rec for rec in rows if rec.role == "transcript")
+    assert TRANSCRIPT_MAX_BYTES - 2048 < transcript.size <= TRANSCRIPT_MAX_BYTES  # cut at the last whole line
+    assert manifest.hint is not None and "The transcript is cut at" in manifest.hint
     assert sum(rec.size for rec in rows) < DERIVED_MAX_BYTES
     assert [rec.role for rec in rows].count("frame") == 19
     assert [event["outcome"] for event in world.events()] == ["ok"]

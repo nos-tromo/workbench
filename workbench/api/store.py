@@ -57,7 +57,7 @@ from typing import Any, BinaryIO, Final, Literal, Protocol, TypeGuard
 from workbench.layout import DERIVED
 from workbench.models import VIRTUAL_ROOT, DerivedRecord, DerivedSpec, DirEntry, FileRecord, JobRecord, Principal
 from workbench.paths import DEFAULT_CHAT, PathError, Workspaces, check_filename, check_id
-from workbench.renders import CONVERTED_MIME, DERIVED_MAX_BYTES, MEDIA_TYPES
+from workbench.renders import ARTIFACT_ROLES, ARTIFACTS, CONVERTED_MIME, DERIVED_MAX_BYTES, MEDIA_TYPES
 from workbench.utils.audit_event import MAX_IDS
 
 _log = logging.getLogger(__name__)
@@ -87,20 +87,20 @@ _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
 #: The name of an upload while it is written: its file id, then ``.part``.
 _PART_NAME: Final = re.compile(r"([0-9a-f]{32})\.part")
 
-#: The name of a derived file: its file id and its extension, a render's, the converted PDF's, a transcript's or an
-#: artifact's.
-_RENDER_NAME: Final = re.compile(r"([0-9a-f]{32})\.(?:jpg|png|pdf|txt|jsonl|zip)")
-
 #: The extension of each type of derived file the store keeps: the renders, the PDF an Office file is converted to, the
-#: transcript of a clip and the two artifacts Nextext made of it.
+#: transcript of a clip and the two artifacts Nextext made of it (:data:`~workbench.renders.ARTIFACTS`).
 _DERIVED_EXTENSIONS: Final = {
     "image/jpeg": "jpg",
     "image/png": "png",
     CONVERTED_MIME: "pdf",
     "text/plain": "txt",
-    "application/x-ndjson": "jsonl",
-    "application/zip": "zip",
+    **{mime: extension for mime, extension in ARTIFACTS.values()},
 }
+
+#: The name of a derived file: its file id and its extension, one of those above.
+_RENDER_NAME: Final = re.compile(
+    r"([0-9a-f]{32})\.(?:" + "|".join(re.escape(extension) for extension in _DERIVED_EXTENSIONS.values()) + ")"
+)
 
 #: The types each role of derived file takes: a role takes its own alone.
 _ROLE_TYPES: Final[Mapping[str, frozenset[str]]] = {
@@ -109,15 +109,11 @@ _ROLE_TYPES: Final[Mapping[str, frozenset[str]]] = {
     "frame": frozenset({"image/jpeg"}),
     "pdf": frozenset({CONVERTED_MIME}),
     "transcript": frozenset({"text/plain"}),
-    "nextext_jsonl": frozenset({"application/x-ndjson"}),
-    "nextext_zip": frozenset({"application/zip"}),
+    **{role: frozenset({mime}) for role, (mime, _) in ARTIFACTS.items()},
 }
 
 #: The roles that are pictures: the only ones with a size in pixels.
 _PICTURE_ROLES: Final = frozenset({"image", "page", "frame"})
-
-#: The two raw artifacts of a clip, which are streamed in; one row of each role per source.
-_ARTIFACT_ROLES: Final = frozenset({"nextext_jsonl", "nextext_zip"})
 
 #: What is made from an artifact in the executor, and goes when an artifact is replaced.
 _MADE_FROM_ARTIFACTS: Final = frozenset({"transcript", "frame"})
@@ -1956,7 +1952,7 @@ class Store:
             StorageFull: If the volume is full.
         """
         extension = _extension_of(spec)
-        if spec.role in _ARTIFACT_ROLES:
+        if spec.role in ARTIFACT_ROLES:
             raise PathError("a clip's raw artifacts are streamed in, never registered")
         st = _take_staged(staged)
         if _FILE_ID.fullmatch(file_id) is None:
@@ -2079,7 +2075,7 @@ class Store:
                 removed, and the folders of the clip's derived files if they were left empty.
         """
         _extension_of(spec)
-        if spec.role not in _ARTIFACT_ROLES:
+        if spec.role not in ARTIFACT_ROLES:
             raise PathError("only a clip's raw artifacts are streamed in")
         file_id = new_file_id()
         p = Principal(source.caller, source.user_id, source.chat_id)

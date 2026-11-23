@@ -94,6 +94,7 @@ from workbench.protocol import (
     encode,
 )
 from workbench.renders import (
+    ARTIFACTS,
     CONVERTED_MAX_BYTES,
     CONVERTED_MIME,
     CONVERTED_NAME,
@@ -640,13 +641,6 @@ def _converted_input(source: FileRecord, converted: DerivedRecord) -> str:
     return converted.relative_path
 
 
-#: The extension each artifact role's file has, and the order the job's inputs come in: the JSON Lines first.
-_ARTIFACT_EXTENSIONS: Final = (
-    ("nextext_jsonl", "application/x-ndjson", "jsonl"),
-    ("nextext_zip", "application/zip", "zip"),
-)
-
-
 def _media_request(source: FileRecord, artifacts: Sequence[DerivedRecord]) -> MediaRequest:
     """The ``media`` argument of a render job over a clip: the artifacts' derived paths, taken from their records alone.
 
@@ -664,7 +658,7 @@ def _media_request(source: FileRecord, artifacts: Sequence[DerivedRecord]) -> Me
             programming error.
     """
     paths: dict[str, str | None] = {}
-    for role, mime, extension in _ARTIFACT_EXTENSIONS:
+    for role, (mime, extension) in ARTIFACTS.items():
         found = [rec for rec in artifacts if rec.role == role]
         if len(found) > 1:
             raise ValueError("a clip's job reads at most one of each of its artifacts")
@@ -1771,9 +1765,8 @@ class JobQueue:
         transcript = answer.transcript if clip and answer is not None else None
         head = None
         if answer is not None and facts:
-            facts_of = answer.model_dump(
-                include=set(RenderFacts.model_fields)
-            )  # the facts alone, so no new field leaks in
+            # the facts alone: a field the answer gains later never leaks into what is stored
+            facts_of = answer.model_dump(include=set(RenderFacts.model_fields))
             head = RenderFacts.model_validate(facts_of).model_dump(mode="json")
         quota = self._settings.workspace_max_mb * _MIB
 

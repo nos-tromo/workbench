@@ -43,9 +43,9 @@ import base64
 import dataclasses
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import Any, Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, override
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -60,6 +60,7 @@ from workbench.models import DerivedRecord, FileRecord, JobRecord, Principal
 from workbench.paths import PathError
 from workbench.protocol import JobResult
 from workbench.renders import (
+    ARTIFACT_ROLES,
     DERIVED_MAX_BYTES,
     MAX_STRIPS,
     NOTHING_FOUND,
@@ -94,8 +95,7 @@ NOT_KEPT: Final = "the renders of this file could not be kept"
 #: The roles of the derived files that are renders of a picture, a PDF or an Office file.
 _RENDER_ROLES: Final = frozenset({"image", "page"})
 
-#: The roles of the two raw artifacts of a clip, which only the clip's prepare job reads, and of what it makes of them.
-_ARTIFACT_ROLES: Final = frozenset({"nextext_jsonl", "nextext_zip"})
+#: The roles of what a clip's prepare job makes of its raw artifacts (:data:`~workbench.renders.ARTIFACT_ROLES`).
 _TRANSCRIPT_ROLE: Final = "transcript"
 _FRAME_ROLE: Final = "frame"
 
@@ -583,6 +583,35 @@ def _budget(settings: Settings) -> int:
     return max(1, settings.job_wall_s * 3 // 4)
 
 
+def _decider(
+    *, strips: int, on_demand: bool
+) -> Callable[[JobResult, Sequence[str]], tuple[list[str], str, dict[str, object]]]:
+    """How a render job is judged: an ``ok`` answer that reads as a render answer keeps every output the job staged.
+
+    Args:
+        strips: Into how many strips each page is cut.
+        on_demand: Whether the job makes pages a call asked for after the prepare.
+
+    Returns:
+        The keeper's ``decide``: given the answer and the ids planned for its outputs, the ids to keep (all or none),
+        the outcome and the criteria of the event.
+    """
+
+    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
+        usable = result.status == "ok" and _readable(RenderAnswer, result.result)
+        keep: list[str] = list(planned) if usable else []
+        outcome, more = judged(result, usable)
+        criteria: dict[str, object] = {
+            "renders": len(planned),
+            "strips": strips,
+            "on_demand": on_demand,
+            "outputs": len(keep),
+        }
+        return keep, outcome, {**criteria, **more}
+
+    return decide
+
+
 def _keeper(audit: AuditLog, p: Principal, source: FileRecord, *, strips: int, on_demand: bool) -> OutputKeeper:
     """The keeper of a render job: it records the job by the source and the renders it keeps, before any is visible.
 
@@ -599,20 +628,62 @@ def _keeper(audit: AuditLog, p: Principal, source: FileRecord, *, strips: int, o
     Returns:
         The keeper.
     """
+    return OutputKeeper(audit, p, "prepare", [source.id], _decider(strips=strips, on_demand=on_demand))
 
-    def decide(result: JobResult, planned: Sequence[str]) -> tuple[list[str], str, dict[str, object]]:
-        usable = result.status == "ok" and _readable(RenderAnswer, result.result)
-        keep: list[str] = list(planned) if usable else []
-        outcome, more = judged(result, usable)
-        criteria: dict[str, object] = {
-            "renders": len(planned),
-            "strips": strips,
-            "on_demand": on_demand,
-            "outputs": len(keep),
-        }
-        return keep, outcome, {**criteria, **more}
 
-    return OutputKeeper(audit, p, "prepare", [source.id], decide)
+@dataclasses.dataclass(frozen=True)
+class _RemakingKeeper(OutputKeeper):
+    """The keeper of a clip's prepare that makes again what an earlier prepare left without its facts.
+
+    A transcript or a frame an earlier prepare could not finish (its head was lost to the quota, say) stays beside the
+    clip's artifacts with no manifest. The job makes them all again, so before it keeps anything the keeper replaces
+    what is there, as an artifact posted again does (:meth:`~workbench.api.store.Store.place_derived`): the one event
+    of the prepare names the clip, the new ids and then the ids replaced, with their count as ``replaced``, and only
+    then are the old rows and files deleted. A job that kept nothing replaces nothing.
+
+    Attributes:
+        store: The store, which deletes the rows replaced.
+        stale: The clip's transcript and frame rows found, under its lock, when the job was sent.
+    """
+
+    store: Store
+    stale: Sequence[DerivedRecord]
+
+    @override
+    def record(self, result: JobResult, planned: Sequence[str]) -> Sequence[str]:
+        """Write the job's event, naming what it keeps and what that replaces, then delete what is replaced.
+
+        Args:
+            result: The executor's answer.
+            planned: The ids the job's outputs will have.
+
+        Returns:
+            The ids to keep.
+
+        Raises:
+            Exception: What the event's write raised, with nothing deleted; or what a deletion raised, after the event,
+                which is recorded again as an ``error`` by the same ids and raised, with nothing kept. A row that was
+                not deleted is replaced by the next prepare.
+        """
+        keep, outcome, criteria = self.decide(result, planned)
+        replacing: list[DerivedRecord] = list(self.stale) if keep else []
+        more: dict[str, object] = {"replaced": len(replacing)} if replacing else {}
+        ids = [*keep, *(rec.id for rec in replacing)]
+        self.audit.record(
+            self.tool, self.p, file_ids=[*self.used, *ids], outcome=outcome, criteria={**criteria, **more}
+        )
+        try:
+            for rec in replacing:
+                self.store.remove_derived(rec)
+        except BaseException:
+            try:
+                self.again(ids)
+            except Exception as exc:  # the deletion's error is the answer; this one is only logged
+                _log.warning(
+                    "could not record a prepare that failed to replace what it remade (%s)", type(exc).__name__
+                )
+            raise
+        return keep
 
 
 def _lost(message: str) -> Exception:
@@ -845,7 +916,9 @@ async def _prepared_clip(
     """Answer a clip's manifest, making its transcript and frames from its artifacts the first time.
 
     The clip itself is no input of any job: the one job reads the artifacts Nextext made of it, which the store keeps as
-    its derived files, and runs on the caller's prepare gate, as a picture's does, never the conversion gate.
+    its derived files, and runs on the caller's prepare gate, as a picture's does, never the conversion gate. A
+    transcript or frames an earlier prepare left without their facts (a loss at its keep) are made again by this job and
+    replace what is there, recorded with it (:class:`_RemakingKeeper`), so a retry ends with one set of rows.
 
     Args:
         p: The caller, user and chat of the clip.
@@ -870,26 +943,33 @@ async def _prepared_clip(
         QuotaExceeded: The transcript or a frame would take the user over their quota (507).
         RendersFull: It would take the clip over its cap of derived files (507).
         StorageFull: The volume is full (507).
-        NotFound: The clip went while the job ran, with its chat (404).
+        NotFound: The clip went while the call waited for the lock or the job ran, with its chat (404). A clip whose
+            artifacts went and which is still there is answered at once as one with nothing found.
     """
     rows = await run_in_threadpool(store.derived_of, source)
     manifest = media_manifest_of(source, rows)
     if manifest is not None:
         return manifest
-    if not any(rec.role in _ARTIFACT_ROLES for rec in rows):
+    if not any(rec.role in ARTIFACT_ROLES for rec in rows):
         return nothing_found(source)
     async with jobs.source_lock(source.id):
         rows = await run_in_threadpool(store.derived_of, source)
         manifest = media_manifest_of(source, rows)
         if manifest is not None:
             return manifest
-        held = [rec for rec in rows if rec.role in _ARTIFACT_ROLES]
-        if not held:  # the clip, or its artifacts, went while the call waited for the lock
+        held = [rec for rec in rows if rec.role in ARTIFACT_ROLES]
+        if not held:  # while the call waited for the lock, the clip went, or its artifacts did
+            current = await run_in_threadpool(store.get, p, source.virtual_path)  # NotFound: the clip is gone
+            if current.id != source.id:
+                raise NotFound("file not found")  # another file has its path now
             return nothing_found(source)
         await run_in_threadpool(audit.check, "prepare", p)
         await _refuse_remembered(p, source, store=store, audit=audit, strips=1, on_demand=False)
         args: dict[str, Any] = {"budget_s": _budget(settings), "facts": True}
-        keeper = _keeper(audit, p, source, strips=1, on_demand=False)
+        stale = [rec for rec in rows if rec.role in (_TRANSCRIPT_ROLE, _FRAME_ROLE)]  # an earlier prepare's leftovers
+        keeper = _RemakingKeeper(
+            audit, p, "prepare", [source.id], _decider(strips=1, on_demand=False), store=store, stale=stale
+        )
         _, result, _ = await jobs.submit_renders(p, source, args, keeper, artifacts=held)
         _parse(RenderAnswer, _settled(store, source, result))
         manifest = media_manifest_of(source, await run_in_threadpool(store.derived_of, source))
