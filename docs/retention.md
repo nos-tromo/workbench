@@ -58,6 +58,32 @@ renders): it goes with them, in the same batches, and is counted as a render in
   that has no row (a kill between its rename into place and its row) is
   swept with the orphans below, named by the id its name carries.
 
+### A clip's artifacts
+
+The two raw artifacts Nextext made of a clip (JSON Lines and keyframes zip, roles
+`nextext_jsonl` and `nextext_zip`), the transcript and the frames made of them
+are derived files of the clip, as the renders above are, and follow the same rules:
+
+- **They go with the clip, in its record.** They carry its creation time, so
+  they are due with it; a batch's event names the clip's id and then their ids
+  (counted in `derived`), and Ghostwriter's chat delete and its taking back of
+  the clip name every one of them in their one event too.
+- **A replaced artifact is recorded.** A second `POST /files/derived` of a role
+  replaces the clip's artifact of that role, and with it the transcript and the
+  frames made from the old one (a clip's retention clock is not restarted: the
+  new rows carry the clip's creation time). One `modify` / `file.derived` event
+  names the clip, the new artifact and each row replaced, before the new
+  artifact is visible; the new row is inserted and the replaced rows deleted in
+  one transaction, and the replaced files go just after it. A file that could
+  not be deleted then has no row, and the orphan rule above removes and records
+  it. A clip's prepare that
+  makes again what an earlier prepare left without its facts replaces those rows
+  the same way, in its own `file.prepare` event (`replaced`).
+- **An interrupted artifact is an orphan.** An artifact is first written whole as
+  `<id>.part` in the clip's folder of derived files, before anything is recorded
+  or visible; one that a kill (or a server shutdown in the middle of a transfer)
+  leaves is removed after an hour with the orphans, recorded by its id.
+
 ### No deletion without its record
 
 - A record that cannot be written ends the api process (`os._exit(1)`) before

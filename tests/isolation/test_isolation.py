@@ -26,6 +26,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_media as mm
 from tests.fixtures import make_templates as mt
 from tests.isolation.conftest import (
     docker,
@@ -929,8 +930,19 @@ def test_a_chat_delete_leaves_nothing(api_info: dict[str, Any], executor: str) -
 
 VISION_USER, VISION_CHAT = "user-vision", "chat-vision"
 
-#: The eight keys of every manifest `POST /files/prepare` answers.
-MANIFEST_KEYS = {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
+#: The ten keys of every manifest `POST /files/prepare` answers.
+MANIFEST_KEYS = {
+    "path",
+    "kind",
+    "unit",
+    "total",
+    "pages_without_text",
+    "renditions",
+    "frames",
+    "hint",
+    "duration_s",
+    "transcript",
+}
 
 #: Run in the api: the renders of one Ghostwriter chat in the database and the chat's folder on the volume, read-only.
 RENDERS_OF_THE_CHAT = r"""
@@ -1130,3 +1142,111 @@ def test_a_deck_and_a_document_are_converted_and_shown_in_the_sandbox(api_info: 
     )
     assert (gone.status_code, gone.json()) == NOT_FOUND
     assert left() == {"rows": 0, "pdfs": 0, "derived": 0, "sources": 0, "folder": False}
+
+
+# --- clips: Nextext's artifacts, prepared, read and shown ---------------------------------------------------------
+
+MEDIA_USER, MEDIA_CHAT = "user-media", "chat-media"
+
+#: A clip's own bytes: no job ever reads them, so they need not be a clip.
+CLIP_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16
+
+#: The three sentences of the invented tour and the lines `read_document` makes of them.
+TOUR = [
+    mm.jsonl_record(0, 3, "Welcome aboard.", speaker="Speaker 1", index=0),
+    mm.jsonl_record(4, 7, "The quay opens at nine.", speaker="Speaker 2", index=1),
+    mm.jsonl_record(8, 9, "Thanks.", index=2),
+]
+TOUR_LINES = "[00:00] Speaker 1: Welcome aboard.\n[00:04] Speaker 2: The quay opens at nine.\n[00:08] Thanks."
+
+
+def test_a_clips_artifacts_are_prepared_read_and_viewed_in_the_sandbox(
+    api_info: dict[str, Any], tmp_path: Path
+) -> None:
+    """Nextext's two artifacts of a clip become a transcript and frames in a real job, are read and shown, then go.
+
+    The prepare's one job reads the two artifacts at their derived paths and never the clip, as a slot uid with a
+    read-only root and no network: the JSON Lines becomes the stamped lines, the zip's frames are decoded by Pillow
+    and written again with none of their metadata. ``read_document`` answers the lines and no image;
+    ``view_file`` ``at 00:04`` shows the one frame nearest that time, whose colour tells it is the second of the
+    zip. Deleting the chat takes the artifacts, the transcript and the frames, and leaves nothing to view.
+    """
+    user, chat = MEDIA_USER, MEDIA_CHAT
+    jsonl = mm.make_jsonl(tmp_path / "tour.jsonl", TOUR).read_bytes()
+    keyframes = mm.make_keyframes_zip(tmp_path / "tour.zip", 3, exif=True).read_bytes()
+    assert mm.CAMERA_MODEL.encode() in keyframes  # the frames of the zip do carry their metadata
+    clip = f"/workspace/{chat}/{_upload(api_info, 'harbour-tour.mp4', CLIP_BYTES, user=user, chat=chat)}"
+
+    def keep(role: str, data: bytes) -> dict[str, Any]:
+        answer = ghostwriter(
+            api_info,
+            "POST",
+            "/files/derived",
+            chat=chat,
+            user=user,
+            params={"source": clip, "role": role},
+            content=data,
+        )
+        assert answer.status_code == 200, answer.text
+        body: dict[str, Any] = answer.json()
+        assert (body["role"], body["bytes"], body["replaced"]) == (role, len(data), None)
+        assert len(body["id"]) == 32
+        return body
+
+    keep("nextext_jsonl", jsonl)
+    keep("nextext_zip", keyframes)
+
+    prepared = ghostwriter(api_info, "POST", "/files/prepare", chat=chat, user=user, params={"path": clip})
+    assert prepared.status_code == 200, prepared.text
+    manifest: dict[str, Any] = prepared.json()
+    assert set(manifest) == MANIFEST_KEYS
+    assert (manifest["kind"], manifest["unit"], manifest["total"]) == ("media", "frame", 3)
+    assert (manifest["transcript"], manifest["duration_s"], manifest["frames"], manifest["hint"]) == (
+        True,
+        9.0,
+        None,
+        None,
+    )
+    assert [(item["n"], item["mime"], item["width"], item["height"]) for item in manifest["renditions"]] == [
+        (n, "image/jpeg", 64, 36) for n in (1, 2, 3)
+    ]
+
+    read = mcp_result(ghostwriter_mcp(api_info, "read_document", {"path": clip}, chat=chat, user=user))
+    assert read["isError"] is False, read
+    assert len(read["content"]) == 1  # the transcript is text: no image block
+    body = read["structuredContent"]
+    assert (body["kind"], body["total_parts"], body["pages_without_text"], body["shown"]) == ("transcript", 3, [], [])
+    assert body["parts"] == [{"label": "lines 1-3", "text": TOUR_LINES}]
+    assert mm.CAMERA_MODEL not in json.dumps(read) and "tour.jsonl" not in json.dumps(read)  # nothing of the artifacts
+
+    viewed = mcp_result(
+        ghostwriter_mcp(api_info, "view_file", {"path": clip, "part": "at 00:04"}, chat=chat, user=user)
+    )
+    assert viewed["isError"] is False, viewed
+    structured = viewed["structuredContent"]
+    assert (structured["kind"], structured["unit"], structured["total"]) == ("media", "frame", 3)
+    (frame,) = structured["shown"]
+    assert (frame["label"], frame["n"]) == ("frame 2 (00:04)", 2)
+    (block,) = _image_blocks(viewed)  # one block, and it is shown[0]
+    shown = Image.open(io.BytesIO(block))
+    assert shown.size == (frame["width"], frame["height"]) == (64, 36)
+    centre = shown.convert("RGB").getpixel((32, 18))
+    assert isinstance(centre, tuple)  # the second frame's colour, give or take what JPEG makes of it
+    assert all(abs(got - want) <= 12 for got, want in zip(centre, mm.frame_colour(1), strict=True))
+    assert b"Exif" not in block and mm.CAMERA_MODEL.encode() not in block  # the frame is written again, stripped
+
+    rendition = ghostwriter(api_info, "GET", "/files/view", chat=chat, user=user, params={"path": clip, "rendition": 2})
+    assert rendition.status_code == 200, rendition.text
+    assert (rendition.headers["content-type"], rendition.content) == ("image/jpeg", block)
+    past = ghostwriter(api_info, "GET", "/files/view", chat=chat, user=user, params={"path": clip, "rendition": 4})
+    assert (past.status_code, past.json()) == NOT_FOUND
+
+    def left() -> dict[str, Any]:
+        return json.loads(docker("exec", api_info["Id"], "python", "-I", "-c", RENDERS_OF_THE_CHAT, user, chat))
+
+    assert left() == {"rows": 6, "folder": True}  # the two artifacts, the transcript and three frames
+    deleted = ghostwriter(api_info, "DELETE", "/files/chat", chat=chat, user=user)
+    assert (deleted.status_code, deleted.json()) == (200, {"deleted": 1})
+    gone = ghostwriter(api_info, "GET", "/files/view", chat=chat, user=user, params={"path": clip, "rendition": 1})
+    assert (gone.status_code, gone.json()) == NOT_FOUND
+    assert left() == {"rows": 0, "folder": False}

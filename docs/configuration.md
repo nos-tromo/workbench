@@ -170,16 +170,42 @@ an `isError` result whose `reason` says why:
 | Variable | Default | Meaning |
 |---|---|---|
 | `WORKBENCH_UPLOAD_MAX_MB` | 50 | Largest upload, per file, in MB. A larger one answers `413`. A request whose body passes this plus 1 MiB is refused while it arrives (`workbench/api/body_limit.py`). It also bounds each file a job writes and a job's outputs together. |
-| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads, the files tools made and the renders of pictures, PDFs and Office files (with the PDF an Office file is converted to), in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. It also bounds what a running job may write (see [sandbox.md](sandbox.md#limits)). |
+| `WORKBENCH_WORKSPACE_MAX_MB` | 500 | Largest workspace per user, all chats together, uploads, the files tools made and the renders of pictures, PDFs and Office files (with the PDF an Office file is converted to) and of clips (their two artifacts, transcript and frames, [below](#a-clips-artifacts-and-their-bounds)), in MB. An upload that would pass it answers `507`; a tool's new file that would pass it is not kept, and the answer says so (`quota`). A full disk also answers `507`. It also bounds what a running job may write (see [sandbox.md](sandbox.md#limits)). |
+
+### A clip's artifacts and their bounds
+
+No variable sets these: they are fixed in `workbench/renders.py` and meet the
+quota and the upload cap above.
+
+| What | Bound |
+|---|---|
+| Nextext's JSON Lines (`POST /files/derived`, role `nextext_jsonl`) | at most 8 MiB; the first line at most 64 KiB and a JSON object. A larger one answers `413`, as does a declared `Content-Length` over 32 MiB before any byte |
+| Nextext's keyframes zip (role `nextext_zip`) | at most 32 MiB; it must begin with a zip's signature |
+| The transcript made of the JSON Lines | at most 4 MiB, cut at the last whole line, and the hint says where |
+| The frames | at most 19, each brought to 1280 px on its long side, JPEG, under 768 KiB; a zip of more keeps 19, spread evenly; a source picture over 120 MP is refused |
+| What a clip may hold of derived files | 64 MiB for all of its artifacts, its transcript and its frames together (`507` past it) |
+| `view_file` of a clip | at most 8 frames and 2.5 MiB an answer, by default 8 spread over the clip |
+| The wait of `POST /files/derived` for the clip's lock | `SOURCE_LOCK_WAIT_S`, 120 s, then `503`; Ghostwriter's client timeout for it is the transfer plus 150 s |
+
+A clip of 50 MB with the most of everything (8 MiB of JSON Lines, 32 MiB of zip,
+a 4 MiB transcript and 19 frames of 768 KiB) holds about 108 MiB of the user's
+`WORKBENCH_WORKSPACE_MAX_MB` (500 by default), the clip itself counted: plan
+for up to about 110 MiB for each such clip. Nextext's real artifacts are far
+smaller: 19 frames of 1080p come to about 4 MiB.
 
 ### Request bodies
 
-Every other request is held to 2 MiB of body: a larger one answers `413`
+Every request but an upload and a clip's artifact is held to 2 MiB of body: a
+larger one answers `413`
 `{"detail": "request too large"}` while it arrives and is never parsed
 (`workbench/api/body_limit.py:BodyLimit`). A tool request could not pass the
 executor's 1 MiB line anyway. A request without a valid caller key answers
 `401` before any of its body is read, whatever its path
 (`workbench/api/auth.py:KeyGate`); only `/healthz` and `/metrics` need no key.
+A clip's artifact (`POST /files/derived`) carries its bytes as the raw body, up
+to 32 MiB, the zip's bound (`file too large`; the JSON Lines' own bound, 8 MiB,
+is checked as it is stored), and is streamed to the volume, not held in memory or
+in the api's `/tmp`.
 
 ## The api container
 

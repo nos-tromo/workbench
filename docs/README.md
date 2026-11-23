@@ -6,7 +6,7 @@ the design record for contributors and coding agents.
 
 | Document | What it covers |
 |---|---|
-| [configuration.md](configuration.md) | Every variable of `.env.example` with its default and meaning, the formulas for the executor's limits, the caller keys shared with docint and Ghostwriter, what is not exposed and why |
+| [configuration.md](configuration.md) | Every variable of `.env.example` with its default and meaning, the formulas for the executor's limits, the bounds of a clip's artifacts and the room it takes in the quota, the caller keys shared with docint and Ghostwriter, what is not exposed and why |
 | [permissions.md](permissions.md) | Per tool and per file route: what it reads, writes, records and keeps; the boundaries (the user, the chat as a folder, no network, no deletion by the agent); which runs are audited; what the model is told |
 | [data-flow.md](data-flow.md) | What enters, where it is stored, for how long, and where it goes, the callers' chat history included; the facts for the record of processing and the impact assessment |
 | [audit.md](audit.md) | The data-protection audit log: every event, its target and criteria, what is never recorded, the retention events, the chain, fail closed |

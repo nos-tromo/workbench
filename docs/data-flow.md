@@ -17,6 +17,20 @@ record of processing and the impact assessment.
 - **Uploads.** A user drops a file into a Ghostwriter chat; Ghostwriter's
   backend sends it to `POST /files/upload`. workbench streams it to disk
   (`workbench/api/store.py:Store.add_upload`).
+- **Nextext's artifacts of a clip** (`POST /files/derived`, Ghostwriter's
+  caller only; `workbench/api/files.py:store_derived`). For a video or an audio
+  file a user drops into a chat, Ghostwriter sends workbench the two raw
+  artifacts Nextext keeps of it: a JSON Lines file of the speech
+  (one record per sentence: its start and end, its speaker label when the clip
+  was told apart by speaker, its text, and Nextext's own bookkeeping, the
+  file's name, its hash and the language) and a zip of keyframes (JPEG frames
+  and a manifest of their times). The body is streamed into a `.part` in the
+  clip's folder of derived files and checked (a zip's first four bytes, a JSON
+  Lines' first line), then recorded and made a derived file of the clip
+  (`workbench/api/store.py:Store.stage_derived`, `place_derived`). At most 8 MiB
+  of JSON Lines and 32 MiB of zip; a second artifact of a role replaces the
+  first, and with it the transcript and frames made from it. The clip's own
+  bytes are kept as any upload's are and enter no job.
 - **Tool arguments the model writes** (`workbench/api/tools*.py`). They reach
   the executor in the job's request. What becomes of them:
   - paths, search queries and Python code end with the job: workbench keeps
@@ -76,6 +90,22 @@ record of processing and the impact assessment.
   that cannot be read is dropped unapplied). A render, like the converted PDF,
   is a derived file of its source, not a file of the chat: see
   [Where it is stored](#where-it-is-stored).
+- **The transcript and the frames of a clip** (`workbench/executor/render/media.py`,
+  `POST /files/prepare`). The one job of a clip's prepare reads only the two
+  artifacts, at their derived paths, in the executor (the clip itself is no
+  input), and makes the transcript, `transcript.txt`, and the frames, as derived
+  files of the clip. The transcript has one line a sentence, `[mm:ss] Speaker 1:
+  text` (`[h:mm:ss]` from an hour, no label for a sentence without a speaker, at
+  most 4 MiB); **Nextext's bookkeeping, the file's name, its hash and the
+  language, is dropped**, and a sentence's own line breaks become spaces, so
+  that no sentence can make a line of its own. The frames are at most 19 of the zip's, spread evenly if it
+  holds more, each brought to 1280 px on its long side, as JPEG, under 768 KiB,
+  with none of the source's metadata, numbered from 1 in time order with their
+  time. They are made from the clip's own content: what its speakers said and
+  what its pictures show, faces included. The two raw artifacts stay as derived
+  files beside them, read by that job alone: no route and no tool sends them
+  anywhere. A clip with no artifact has none of this: its manifest says that
+  nothing was found.
 - **docint's data** (`workbench/api/tools_inline.py`). The model's code and up to
   8 texts docint builds from the turn (passages of its documents, keyword
   checks, topic listings), which can hold special categories of data, with the
@@ -96,7 +126,7 @@ Everything lives on the external volume `workbench-data`, mounted at `/data`.
 |---|---|---|
 | `/data/` | root, group of the api, `1771` | the parts below; the api may add the database's journal files here |
 | `workspaces/<caller>/<user-id>/<chat-id>/…` | api, `0700` | the users' files: uploads under the names users chose, tool outputs under the names the model chose, as plain bytes |
-| `workspaces/<caller>/<user-id>/<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`, or `.pdf`) | api, `0700` | the renders of a picture, a PDF or an Office file, and the PDF an Office file was converted to, each named by an id and nothing of the source's name; the folder is reserved, no path of any caller reaches it and no listing shows it |
+| `workspaces/<caller>/<user-id>/<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`, `.pdf`, `.txt`, `.jsonl`, `.zip`) | api, `0700` | the renders of a picture, a PDF or an Office file, and the PDF an Office file was converted to; for a clip, its transcript, its frames and the two raw artifacts they were made from; each named by an id and nothing of the source's name; the folder is reserved, no path of any caller reaches it and no listing shows it |
 | `staging/<job-id>/<name>` | api, `0700` | outputs the executor hands over; each is moved into its chat folder (a render, into its source's `.derived/` folder) within the same request (an inline job's are read back and removed) |
 | `jobs/<job-id>/` | `jobs/` root's, `0711`; each job's folder root's, `0710`, its group the slot's; its `home/` and `out/` the slot's, `0700` | one private folder per running job: copies of its input files, its `out/`, its `home/` with its `tmp/` and its answer (`result.json`), and the request (`spec.json`); removed when the job ends |
 | `workbench.db` | api, `0600` | the SQLite database, in WAL mode with `secure_delete` on |
@@ -107,11 +137,16 @@ The database has three tables (`workbench/api/store.py`):
   chat folder), size, media type, kind (`upload` or `output`), creation time
   and, for an output, the job that made it;
 - `derived`: per render its id, its source's id, caller, user id, chat id, role
-  (`image` or `page`; `pdf` for the PDF an Office file was converted to),
-  place (page number), name (`<id>.jpg`, `<id>.png` or `<id>.pdf`), size, media
-  type, width and height (none for the PDF), a few facts (the strip, and on a
+  (`image` or `page`; `pdf` for the PDF an Office file was converted to;
+  `frame` for a frame of a clip, `transcript` for its transcript, and
+  `nextext_jsonl` and `nextext_zip` for the two raw artifacts of it),
+  place (page number, or frame number), name (`<id>.jpg`, `<id>.png`, `<id>.pdf`,
+  `<id>.txt`, `<id>.jsonl` or `<id>.zip`), size, media
+  type, width and height (none for the PDF, the transcript and the artifacts), a few facts (the strip, and on a
   file's first render what the executor found: kind, unit, page count, the pages
-  without a text layer; on the PDF its pages and, for a deck, its slides) and the
+  without a text layer; on the PDF its pages and, for a deck, its slides; on a
+  clip's transcript, else its first frame, its kind, its frame count, its
+  duration and its hint, and on each frame its time) and the
   creation time **of its source**. It is bound to its source: counted in the
   user's quota, deleted with it, and reachable by no path;
 - `jobs`: per tool run its id, caller, user id, chat id, tool, start time and
@@ -133,8 +168,10 @@ Three more places hold data for a short time:
   that is damaged or not what its name says, password-protected, a deck with no
   slides, a macro-enabled deck or a slide show, one with a picture over 120
   megapixels or more pictures than can be drawn within the memory limit (also
-  when a conversion redone in parts runs out of its time), or one whose PDF
-  would pass 32 MB. Any other `unreadable_file` (a job that could not write
+  when a conversion redone in parts runs out of its time), one whose PDF
+  would pass 32 MB, or a clip none of whose artifacts could be read (a new
+  artifact of the clip, kept by `POST /files/derived`, makes the api forget it,
+  as its input is new). Any other `unreadable_file` (a job that could not write
   inside its sandbox, a conversion that ended for no reason the file gives) is
   remembered only when it comes twice in a row for the file, a prepare that
   went well between them starting the count again; a timeout or a busy
@@ -154,9 +191,9 @@ operator's.
 | What | Kept for | Enforced by |
 |---|---|---|
 | Uploads and outputs | `WORKBENCH_RETENTION_DAYS` (7) days from creation; using a file does not extend it, and there is no extension of any kind | `workbench/api/retention.py:Sweeper` |
-| Renders, and an Office file's converted PDF | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. A render or PDF with no source, or one left when its source went, is swept on its own | `Sweeper._delete`, `Sweeper._sweep_derived` |
+| Renders, an Office file's converted PDF, and a clip's artifacts, transcript and frames | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. One with no source, or one left when its source went, is swept on its own. A clip's artifact that a second one replaces goes at once, in the event that records the second ([retention.md](retention.md#a-clips-artifacts)) | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
-| A refusal remembered or counted, in the api's memory | until its file goes (retention, the upload taken back, or its chat's delete), the api restarts, or 4096 refusals asked for since push it out (`REFUSALS_MAX`); a new upload under the same name is a new file and inherits nothing. A job of a chat deleted while it ran leaves none. One of a file that retention removes, or that is taken back, while its job runs can stay until it is pushed out, never answered: no file of that id comes back | `Store.remove`, `Store.remove_upload`, `Store.delete_chat`, `Store.remember_refusal` |
+| A refusal remembered or counted, in the api's memory | until its file goes (retention, the upload taken back, or its chat's delete), a new artifact of a clip is kept, the api restarts, or 4096 refusals asked for since push it out (`REFUSALS_MAX`); a new upload under the same name is a new file and inherits nothing. A job of a chat deleted while it ran leaves none. One of a file that retention removes, or that is taken back, while its job runs can stay until it is pushed out, never answered: no file of that id comes back | `Store.remove`, `Store.remove_upload`, `Store.delete_chat`, `Store.remember_refusal` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
 | Empty folders, empty chat folders and empty user roots | one hour after they were last changed | `workbench/api/store.py:Store.sweep_user` |
@@ -196,7 +233,19 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
   ids of the source and the render before it leaves ([audit.md](audit.md)).
   Besides the image, the caller gets the manifest's metadata: the kind, the page
   count, the pages without a text layer, and each render's size, type, width and
-  height. A render has none of the source's own image metadata.
+  height. A render has none of the source's own image metadata. A clip's frames
+  go the same ways: `view_file` for the assistant (`frame 3`, `frames 2-5`, `at
+  01:24`, at most 8) and the rendition view for the browser, each frame named in
+  the event, and the manifest adds the clip's duration and whether it has a
+  transcript.
+- **A clip's transcript goes to the caller as text**, in the answer of
+  `read_document` (with or without images: a transcript is text), in lines as a
+  text file's are, after a `query` / `tool.read_document` event that names the
+  clip and its transcript; the text itself is in no event. It is what the
+  speakers said, with their labels: the same personal data the clip holds. The
+  two raw artifacts leave nowhere, and no job reads the clip's own bytes: its
+  file goes only as any upload does, to its user's download
+  (`GET /files/view` without `rendition`).
 - **Files go to Ghostwriter**, and from it to the user's browser, when the user
   views or downloads them (`GET /files/view`). What a user downloads is outside
   workbench from then on.
@@ -267,7 +316,7 @@ model the operator configured behind the inference router; if that is an
 outside provider, they leave the host and the federation. Whether any of these
 is a recipient in the legal sense is for the operator to decide.
 
-**Storage periods.** Files, their renders and job records:
+**Storage periods.** Files, their renders (a clip's artifacts, transcript and frames among them) and job records:
 `WORKBENCH_RETENTION_DAYS`, 7 days by default, from creation (a render counts
 from its source's). Ghostwriter's chat delete (`DELETE /files/chat`) removes
 the chat's files and their renders at once and leaves an event by file id

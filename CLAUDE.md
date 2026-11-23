@@ -26,12 +26,14 @@ of its own ("tool execution is shared, never embedded"; Office files are
 converted to pages in the executor too). Ghostwriter connects
 through the MCP door (`/mcp`). Users drop files into a chat; the model lists,
 reads and searches them, looks at pictures, the pages of PDFs and the pages and
-slides of Word, PowerPoint and OpenDocument text files as images, runs
+slides of Word, PowerPoint and OpenDocument text files as images, reads the
+transcript of a recording and looks at the frames of a video (from the two
+artifacts Nextext made of it: workbench decodes no media), runs
 Python over them, inspects and fills report templates, builds presentations in a
 slide master (or a plain one), and writes tables and documents, through ten typed
 tools. Every file is recorded in the audit trail by id and deleted
 `WORKBENCH_RETENTION_DAYS` (7) days after it was made, the renders made of it
-with it.
+(a clip's artifacts, transcript and frames too) with it.
 docint, the second caller, comes in through the same door and runs Python over
 data that comes with the call.
 
@@ -50,7 +52,10 @@ v0.6.0's are `docs/superpowers/specs/2026-11-18-write-presentation-design.md` an
 spec `docs/superpowers/specs/2026-11-20-ghostwriter-vision-design.md` and its plan
 `docs/superpowers/plans/2026-11-20-ghostwriter-vision-workbench-v0.7.md`; v0.8.0's
 (Office files drawn as pages and slides) is the same spec and deploy's plan
-`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.8.md`.
+`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.8.md`; v0.9.0's
+(a clip's transcript and frames from Nextext's artifacts) is the same spec, deploy's
+`docs/decisions/0009-ghostwriter-sees-images-and-media.md` and its plan
+`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.9.md`.
 Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
@@ -93,13 +98,18 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
   `staging/<job-id>/`, `jobs/<job-id>/` and `workbench.db` (SQLite, WAL). Only
   `make nuke` removes it. `workbench-run` holds only the executor's socket.
   The renders of a file (a picture, the pages of a PDF, the pages or slides of
-  an Office file) and the PDF an Office file was converted to are its **derived
-  files**: `<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`; `.pdf`, role
-  `pdf`, for the conversion), each a row of the `derived` table bound to its
-  source. They are as old as it, count in the user's quota, go with it, and no
+  an Office file, the frames of a clip), the PDF an Office file was converted to
+  and the transcript of a clip are its **derived files**:
+  `<chat-id>/.derived/<source-id>/<id>.jpg` (or `.png`; `.pdf`, role `pdf`, for
+  the conversion; `.txt`, role `transcript`; `.jsonl` and `.zip`, roles
+  `nextext_jsonl` and `nextext_zip`, for the two raw artifacts Nextext made of a
+  clip), each a row of the `derived` table bound to its
+  source. They are as old as it, count in the user's quota (and in its 64 MiB of
+  derived files), go with it, and no
   path reaches `.derived` (`layout.DERIVED`, a reserved name that no upload,
-  output or folder takes). Only renders ever leave: the converted PDF is read by
-  the render jobs alone.
+  output or folder takes). Only renders and a transcript's text ever leave: the
+  converted PDF and a clip's raw artifacts are read by the one job that makes
+  renders of them alone.
 - **Bring-up order**: inference → data → obs → workbench → apps → edge.
 
 Shared modules: `workbench/config.py` (settings for both roles),
@@ -111,7 +121,14 @@ the runner checks again, as with `tables.py`), `workbench/renders.py` (the bound
 of a render, `RenderAnswer` and its checks, `kind_of` (which names an Office file,
 `OFFICE_SUFFIXES`, and `unit_of` whether its pages count as pages or slides), the
 converted PDF's name, type and cap, the strip rule and `render_name`, which the
-api checks the executor's answer against; it imports no imaging library and
+api checks the executor's answer against, and a clip's rules: `MEDIA_SUFFIXES`
+and `MEDIA_TYPES` (`kind_of` names a clip `media`), `MEDIA_FRAMES_MAX` (19, as one
+job has at most 20 outputs and one is the transcript), `FRAME_LONG_SIDE`,
+`JSONL_MAX_BYTES`, `ZIP_MAX_BYTES`, `TRANSCRIPT_MAX_BYTES`, `ARTIFACTS` (the two
+roles, their types and extensions), `TRANSCRIPT_NAME`, the three hints
+`NOTHING_FOUND`, `NO_SPEECH` and `TRANSCRIPT_UNREADABLE`, `MediaRequest` (the
+artifacts' derived paths, the clip's own never), and the stamps (`stamp`,
+`parse_stamp`, `frame_label`); it imports no imaging library and
 nothing of LibreOffice). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
 a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
@@ -132,7 +149,8 @@ in `tests/api/golden/`). The ten: `list_files`, `read_document`,
 **Images only for a call that takes them.** A call on `/mcp` that does not send
 `X-Accept-Images: 1` (`workbench/api/auth.py:accepts_images`; Ghostwriter 0.3.0
 sends it) is told and shown what 0.6 was: no `view_file` (its row is
-`images_only`), `read_document` told its row's `text_description` (0.6's words)
+`images_only`), `read_document` told its row's `text_description` (0.6's words, plus the one
+sentence that says a clip is read as its transcript: a transcript is text)
 and read as text alone, `write_presentation` told its row's `text_description`
 (0.8.0's words, which name no `view_file`), the read job's hint in 0.6's words
 (`images` in its arguments), the 0.6 server instructions
@@ -162,6 +180,17 @@ what the model is told and shown, never what a caller may reach.
   never one that is not what the row says. A render becomes visible only after its `modify` /
   `file.prepare` event, and leaves only after its `disclose` / `file.view`,
   `query` / `tool.view_file` or `query` / `tool.read_document` event names it.
+  **A clip** (audio or video) is read as its transcript, whether or not the call
+  takes images (`read_document`: kind `transcript`, lines as a text file's parts,
+  its one job reading the transcript row alone, never the clip; with no
+  transcript row it answers `NO_SPEECH`, or `TRANSCRIPT_UNREADABLE` when a jsonl
+  artifact is there, with no job), and `view_file` shows its frames by number,
+  range or time (`frame_window`: `frame 3`, `frames 2-5`, `at 01:24`; none left
+  out, 8 spread over the clip). A clip's frames are never made one by one and
+  never cut into strips: a frame whose row or file is lost is skipped and named in
+  the hint (in a rendition view it is a 404), and the set comes back only when
+  the head (the transcript row, else frame 1, which holds the clip's facts) is
+  gone and the next prepare makes it again.
 - `workbench/api/tools_templates.py`, `workbench/api/tools_output.py`: the
   template and output tools. A new tool gets a module of its own, as
   `workbench/api/tools_presentations.py` (`write_presentation`) has: it first
@@ -174,13 +203,38 @@ what the model is told and shown, never what a caller may reach.
   layout that takes it (`presentations/deck.py:fitting`), and a title slide's
   only text block is its subtitle (`subtitle_as_meant`).
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
-  an upload not yet sent, `POST /files/derived` (Nextext's two artifacts of a
-  clip, streamed in as its derived files), prepare, view, the chat delete). `POST /files/prepare` renders a picture, or the first 20
+  an upload not yet sent, `POST /files/derived`, prepare, view, the chat delete).
+  `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
   the conversion gate; with `strips` 2 or 3 it also cuts a picture into strips, on
   the prepare gate) and `GET /files/view?rendition=` serves one render, made first
   on the user's own turn when it does not exist yet.
+  **`POST /files/derived?source=&role=nextext_jsonl|nextext_zip`** keeps one of
+  the two raw artifacts Nextext made of a clip (the request body, streamed, not
+  multipart) as a derived file of it: `Store.stage_derived` reads it whole into
+  `<id>.part` in the clip's `.derived/<source-id>/` and checks its first bytes
+  (a zip's four, a jsonl's first line of at most 64 KiB, a JSON object: the api
+  parses nothing more), all before the route waits for anything; then, under the
+  clip's lock (`SOURCE_LOCK_WAIT_S`, 120 s, then 503: an artifact posted again
+  while a prepare of the clip runs waits for it), `Store.place_derived` records
+  `modify` / `file.derived` first, renames it into place and inserts it, replacing
+  the row of its role and every `transcript` and `frame` row made from the old
+  input (all named in the one event; `replaced` counts every row replaced, the
+  ids following the store's order), and the route forgets a refusal remembered
+  for the clip. A client gone mid-body is a quiet 400. **A clip's prepare** is one
+  job over the two artifacts at their derived paths (`submit_renders(...,
+  artifacts=)`), on the prepare gate only, never the conversion gate; a clip with
+  neither artifact is answered at once, `total` 0, with no job and no event; a
+  retry replaces the leftover `transcript` and `frame` rows (`_RemakingKeeper`:
+  the `file.prepare` event then carries `replaced`); a clip taken back while its
+  prepare waits is a 404, and taking it back (`DELETE /files/upload`) removes its
+  artifacts, transcript and frames, named in the one `file.delete` event.
+  **A clip enters no executor job.** `read_document` reads only its transcript row;
+  `run_python` and `search_files` leave clip uploads out of their inputs (and say
+  so in the hint); a clip named as the path or source of `fill_template`,
+  `inspect_template` or `write_presentation` is `422 unsupported_format: a clip
+  is read with read_document` (`tools.is_clip`).
 - `workbench/executor/runners/`: one runner per tool that needs file content
   (`RUNNERS`); `presentations.py` is `write_presentation`'s, `render.py` is
   `prepare_file`'s, which the render routes and tools run, and `convert.py` is
@@ -195,7 +249,25 @@ what the model is told and shown, never what a caller may reach.
   `out/converted.pdf`. `prepare_file` then draws the pages from that PDF, which
   the api hands it at its derived path, never one a caller names.
   `workbench/api/jobs.py:JobQueue` sends the job, keeps what it made and settles
-  its record. A render job (`submit_renders`) keeps its outputs as derived files
+  its record. **The media branch** (`render/media.py:prepare_media`) reads
+  the jsonl as `utf-8-sig`, split on `"\n"` alone (a sentence may hold a character
+  other readers take for a break), one stamped line per record
+  (`[mm:ss] Speaker N: text`, `[h:mm:ss]` from an hour; every whitespace run in the
+  text one space; a speaker label kept only when it is a plain short name; the
+  file's name, hash, language and sentence number dropped; a time outside 0-100 h
+  skips the record); and the zip, after `check_zip`, member by member: only
+  `frame_NNN.jpg` and `manifest.json` (anything else, a folder or a name twice
+  refuses the set), the JPEG signature, the 120 MP cap from the header before any
+  decode, Pillow's JPEG decoder alone, EXIF and every other metadata stripped, a
+  1280 px long side, q85, each under 768 KiB, at most 19 kept (spread evenly), numbered from
+  1 in time order. The manifest's times are kept only when they never decrease
+  along the frames, else the frames carry none. One part may fail without the
+  other (a hint says which); only when nothing usable comes from the inputs
+  present is it `unreadable_file: nothing in the clip's artifacts could be read`,
+  remembered at once (the artifacts decide it) and forgotten by a new artifact.
+  `duration_s` is the later of the last speech end and the last frame's time
+  (Nextext gives no duration). A permission error yields a fixed message, never a
+  path. A render job (`submit_renders`) keeps its outputs as derived files
   of its source (`Store.register_derived`), never as files of the chat. **The
   prepare gate and the conversion gate:** a prepare, the render job of a picture or
   a PDF just attached (`gate="prepare"`), waits for its caller's prepare gate in
@@ -213,7 +285,9 @@ what the model is told and shown, never what a caller may reach.
   colour profile, and upright;
   `encode.py` writes JPEG or PNG under 768 KiB with none of the source's
   metadata, and cuts strips; `pages.py` opens a PDF with pdfium, finds the pages
-  with no text and draws one at 1600 px. Imported by the executor only.
+  with no text and draws one at 1600 px. `media.py` is `prepare_file`'s media
+  branch: from Nextext's JSON Lines and its keyframes zip, the two inputs, it makes
+  `transcript.txt` and the frames (see below). Imported by the executor only.
   `office.py` is `convert_office`'s: LibreOfficeKit loaded through
   ctypes in a **forked child** (it starts once per process and a hung C call can
   only be stopped by killing the process), with a profile of its own, filter data
@@ -290,6 +364,12 @@ starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
 - **Files live only inside chat folders.** Nothing is ever a file directly
   under `/workspace`. Renders live in the chat's reserved `.derived/` folder,
   which no path of any principal reaches.
+- **A clip never enters a job.** No decoder of audio or video lives in
+  workbench. What a clip's prepare job reads are the two artifacts Nextext made of
+  it (a JSON Lines of its speech and a zip of keyframes), kept as derived files and
+  parsed in the executor alone, a zip checked before any member is read
+  (`docs/sandbox.md` § Residual risks); Nextext's pipeline is the one media
+  exception (deploy ADR 0009).
 - **Every render is made in the executor and stripped.** A picture or PDF is
   decoded only in a job (Pillow, pi-heif, pdfium: hostile input, `docs/sandbox.md`
   § Residual risks), and what comes back is a JPEG or PNG with none of the
@@ -343,7 +423,7 @@ container is set up as compose sets it.
 - **Retention** (`workbench/api/retention.py`, `docs/retention.md`): every file
   is deleted `WORKBENCH_RETENTION_DAYS` after it was made, each batch recorded
   first, the renders of a file with it (a batch names its files, then their
-  renders); leftovers of interrupted work after an hour, recorded first, and
+  renders; for a clip its artifacts, transcript and frames are among them); leftovers of interrupted work after an hour, recorded first, and
   renders with no source (`rule: derived`); empty folders and old job records
   without a record. A changed period applies at
   once, with no notice. `make retention-dry-run [DAYS=n]`.
@@ -457,7 +537,8 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   remembered at once: every `unsupported_format`, and an `unreadable_file` whose
   text is in `renders.FILE_DECIDED` (damaged, encrypted, a picture over 120 MP,
   too many pictures, also when a conversion redone in parts runs out of its time,
-  no pages, a PDF past 32 MB). `FILE_DECIDED` is an allow-list of copies of the
+  no pages, a PDF past 32 MB, a clip none of whose artifacts could be read: a new
+  artifact is a new input, and the route that keeps it forgets the refusal). `FILE_DECIDED` is an allow-list of copies of the
   runners' texts (the api imports nothing of the executor), pinned to their
   constants by `tests/api/test_renders.py`. Any other `unreadable_file` (a write
   that failed in the job's sandbox, a conversion that ended for no reason the file
