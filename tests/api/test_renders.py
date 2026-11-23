@@ -260,6 +260,8 @@ async def test_a_manifest_names_pages_without_text_and_renditions(world: World) 
         "pages_without_text": [2],
         "frames": None,
         "hint": None,
+        "duration_s": None,
+        "transcript": False,
     }
     assert [r.n for r in manifest.renditions] == [row.ordinal for row in rows] == [1, 2, 3]
     assert [r.bytes for r in manifest.renditions] == [world.file_of(row).stat().st_size for row in rows]
@@ -288,6 +290,8 @@ async def test_a_spreadsheet_is_kind_none_without_a_job(world: World) -> None:
         "renditions": [],
         "frames": None,
         "hint": NOT_SHOWN,
+        "duration_s": None,
+        "transcript": False,
     }
     assert (world.executor.requests, len(world.lines())) == ([], events)
     assert await world.renders(source, manifest, [1]) == []
@@ -1427,7 +1431,7 @@ async def test_a_refusal_the_file_decides_is_remembered_at_once(world: World, de
 def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
     """The allow-list is the runners' own texts of refusals the file decides, each tied to the constant that says it."""
     from workbench.executor import readers
-    from workbench.executor.render import encode, images, office, pages
+    from workbench.executor.render import encode, images, media, office, pages
     from workbench.executor.runners import convert
 
     said = {
@@ -1443,9 +1447,10 @@ def test_the_refusals_remembered_at_once_are_the_runners_own_words() -> None:
         convert._LOCKED,
         convert._PICTURE_TOO_LARGE,
         convert._TOO_LARGE,
+        media._NOTHING_USABLE,
     }
     assert {f"unreadable_file: {text}" for text in said} == api_renders.FILE_DECIDED
-    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, "the renders could not be written"}
+    passing = {convert._NOT_WRITTEN, convert._NOT_CONVERTED, office._NOT_CONVERTED, media._NOT_WRITTEN}
     assert not {f"unreadable_file: {text}" for text in passing} & api_renders.FILE_DECIDED
 
 
@@ -1633,45 +1638,6 @@ def test_a_v07_head_reads_as_unit_page() -> None:
     deck = manifest_of(source("harbour-deck.pptx"), [head({**v07, "kind": "office", "unit": "slide"})])
     assert deck is not None
     assert (deck.kind, deck.unit, deck.total) == ("office", "slide", 1)
-
-
-def test_a_clip_s_facts_make_no_page_manifest() -> None:
-    """Facts of kind media count frames, which a page manifest cannot carry: no manifest, until the media branch."""
-    owner = {"caller": "ghostwriter", "user_id": "user-a", "chat_id": "chat-1"}
-    source = FileRecord(
-        id="f" * 32,
-        name="harbour-tour.mp4",
-        size=9,
-        mime="video/mp4",
-        kind="upload",
-        created_at=1.0,
-        job_id=None,
-        **owner,
-    )
-    facts: dict[str, object] = {
-        "kind": "media",
-        "unit": "frame",
-        "total": 1,
-        "pages_without_text": [],
-        "frames": None,
-        "hint": None,
-        "duration_s": 4.0,
-    }
-    head = DerivedRecord(
-        id="1" * 32,
-        source_id=source.id,
-        role="page",
-        ordinal=1,
-        name=f"{'1' * 32}.jpg",
-        size=5,
-        mime="image/jpeg",
-        width=9,
-        height=9,
-        meta={"facts": facts},
-        created_at=1.0,
-        **owner,
-    )
-    assert manifest_of(source, [head]) is None
 
 
 # --- the shared rules --------------------------------------------------------------------------------------------

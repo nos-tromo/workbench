@@ -21,6 +21,7 @@ from tests.api.test_tools_templates import Local
 from tests.conftest import FakeOffice
 from tests.fixtures import make_fixtures as mk
 from tests.fixtures import make_images as mi
+from tests.fixtures import make_media
 from tests.fixtures import make_templates as mt
 from workbench.api.audit import AuditLog
 from workbench.api.hardening import FILE_HEADERS
@@ -31,13 +32,25 @@ from workbench.api.store import Conflict, QuotaExceeded, Store
 from workbench.config import Settings
 from workbench.executor.runners import RUNNERS
 from workbench.models import DerivedRecord, FileRecord, Principal
+from workbench.renders import NOTHING_FOUND
 
 PURPOSE = {"X-Audit-Purpose": "reason=ghostwriter+chat", "X-Request-ID": "req-1"}
 HEADERS = {**HG, **PURPOSE}
 P2 = Principal("ghostwriter", "user-a", "chat-2", confined=True)
 NOT_FOUND = (404, {"detail": "not found"})
 BUSY = (503, {"detail": "busy, retry later"})
-MANIFEST_KEYS = {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
+MANIFEST_KEYS = {
+    "path",
+    "kind",
+    "unit",
+    "total",
+    "pages_without_text",
+    "renditions",
+    "frames",
+    "hint",
+    "duration_s",
+    "transcript",
+}
 RENDITION_KEYS = {"n", "width", "height", "mime", "bytes"}
 
 
@@ -124,7 +137,7 @@ def hardened(r: Any) -> None:
 def test_prepare_answers_the_manifest_and_records_a_modify(
     client: TestClient, store: Store, audit_lines: AuditLines, built: Path
 ) -> None:
-    """The manifest has all seven keys; one ``modify`` / ``file.prepare`` event carries the purpose and request id."""
+    """The manifest has all ten keys; one ``modify`` / ``file.prepare`` event carries the purpose and request id."""
     source = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026", None, "Quay list"])
     r = prepare(client, source.virtual_path)
 
@@ -224,16 +237,26 @@ def test_prepare_of_a_spreadsheet_is_kind_none_without_a_job(
     assert events_of(audit_lines, "file.prepare") == []
 
 
-def test_prepare_of_a_clip_is_not_shown_yet(
+def test_prepare_of_a_clip_without_artifacts_is_answered_at_once(
     client: TestClient, store: Store, executor: Local, audit_lines: AuditLines
 ) -> None:
-    """A clip is told as media by its suffix, but nothing draws it until its prepare takes its artifacts: no job."""
+    """A clip nothing was made of: the media manifest with nothing found, no job and no event."""
     source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
     r = prepare(client, source.virtual_path)
 
     assert r.status_code == 200
-    assert set(r.json()) == MANIFEST_KEYS
-    assert (r.json()["kind"], r.json()["total"], r.json()["renditions"]) == ("none", 0, [])
+    assert r.json() == {
+        "path": source.virtual_path,
+        "kind": "media",
+        "unit": "frame",
+        "total": 0,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "hint": NOTHING_FOUND,
+        "duration_s": None,
+        "transcript": False,
+    }
     assert executor.requests == []
     assert events_of(audit_lines, "file.prepare") == []
 
@@ -319,7 +342,7 @@ def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
     fake_office: FakeOffice,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A deck's manifest has the eight keys, ``unit`` after ``kind``; its two jobs run in one conversion gate's turn.
+    """A deck's manifest has the ten keys, ``unit`` after ``kind``; its two jobs run in one conversion gate's turn.
 
     The conversion and the drawing each have their event, with the call's purpose and request id.
     """
@@ -341,7 +364,7 @@ def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
 
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"path", "kind", "unit", "total", "pages_without_text", "renditions", "frames", "hint"}
+    assert set(body) == MANIFEST_KEYS
     assert list(body)[:3] == ["path", "kind", "unit"]
     assert (body["path"], body["kind"], body["unit"], body["total"], body["pages_without_text"]) == (
         source.virtual_path,
@@ -368,7 +391,7 @@ def test_prepare_of_a_deck_answers_kind_office_and_unit_slide(
 
 
 def test_every_manifest_carries_unit(client: TestClient, store: Store, built: Path, photo: FileRecord) -> None:
-    """A picture, a PDF and a file of kind ``none`` count by page; every manifest has the same eight keys."""
+    """A picture, a PDF and a file of kind ``none`` count by page; every manifest has the same ten keys."""
     scan = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026"])
     sheet = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
     for source, kind in ((photo, "image"), (scan, "pdf"), (sheet, "none")):
@@ -376,6 +399,125 @@ def test_every_manifest_carries_unit(client: TestClient, store: Store, built: Pa
         assert r.status_code == 200
         assert set(r.json()) == MANIFEST_KEYS
         assert (r.json()["kind"], r.json()["unit"]) == (kind, "page")
+
+
+def test_every_manifest_has_duration_and_transcript(
+    client: TestClient, store: Store, built: Path, photo: FileRecord
+) -> None:
+    """A picture, a PDF and a file of kind ``none`` give ``duration_s`` null and ``transcript`` false."""
+    scan = pdf(store, built, "harbour-report.pdf", ["Harbour figures 2026"])
+    sheet = put(store, "quarterly-figures.xlsx", mk.make_xlsx(built / "quarterly-figures.xlsx").read_bytes(), p=PG)
+    for source in (photo, scan, sheet):
+        body = prepare(client, source.virtual_path).json()
+        assert (body["duration_s"], body["transcript"]) == (None, False)
+
+
+def delete(client: TestClient, path: str) -> Any:
+    """Take back the upload at ``path`` as Ghostwriter does."""
+    return client.delete("/files/upload", params={"path": path}, headers=HEADERS)
+
+
+def artifact(client: TestClient, path: str, role: str, data: bytes) -> Any:
+    """Post an artifact of a clip as Ghostwriter does: the raw body, its own type."""
+    types = {"nextext_jsonl": "application/x-ndjson", "nextext_zip": "application/zip"}
+    return client.post(
+        "/files/derived",
+        params={"source": path, "role": role},
+        content=data,
+        headers={**HEADERS, "Content-Type": types[role]},
+    )
+
+
+def speech(built: Path) -> bytes:
+    """Nextext's JSON Lines of an invented tour, its last sentence ending at 91 s."""
+    records = [
+        make_media.jsonl_record(0, 5, "The quay opens at nine.", speaker="Speaker 1", index=0),
+        make_media.jsonl_record(60, 91, "The tour ends at the lighthouse.", speaker="Speaker 2", index=1),
+    ]
+    return make_media.make_jsonl(built / "speech.jsonl", records).read_bytes()
+
+
+def keyframes(built: Path) -> bytes:
+    """Nextext's keyframes zip of three invented frames."""
+    return make_media.make_keyframes_zip(built / "keyframes.zip", 3).read_bytes()
+
+
+def test_prepare_of_a_clip_answers_the_media_manifest(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, executor: Local
+) -> None:
+    """After both artifacts, the manifest has exactly the contract's ten keys and one event records the prepare."""
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 200
+    assert artifact(client, source.virtual_path, "nextext_zip", keyframes(built)).status_code == 200
+    r = prepare(client, source.virtual_path)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == MANIFEST_KEYS
+    assert [item["n"] for item in body.pop("renditions")] == [1, 2, 3]
+    assert body == {
+        "path": source.virtual_path,
+        "kind": "media",
+        "unit": "frame",
+        "total": 3,
+        "pages_without_text": [],
+        "frames": None,
+        "hint": None,
+        "duration_s": 91.0,
+        "transcript": True,
+    }
+    assert [req.tool for req in executor.requests] == ["prepare_file"]
+    (event,) = events_of(audit_lines, "file.prepare")
+    assert (event["action"], event["outcome"], event["purpose"]) == ("modify", "ok", {"reason": "ghostwriter chat"})
+    assert event["target"]["ids"][0] == source.id
+    assert len(event["target"]["ids"]) == 1 + 1 + 3  # the clip, the transcript, the frames
+    assert prepare(client, source.virtual_path).json()["total"] == 3
+    assert len(executor.requests) == 1  # answered from the rows
+
+
+def test_a_refusal_of_unusable_artifacts_is_remembered_until_a_new_artifact_comes(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, executor: Local
+) -> None:
+    """The refusal needs nothing but the artifacts, so it is remembered at once; posting an artifact forgets it."""
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    notes = make_media.make_keyframes_zip(built / "notes.zip", 0, times=None, extra={"notes.txt": b"not frames"})
+    assert artifact(client, source.virtual_path, "nextext_zip", notes.read_bytes()).status_code == 200
+    refusal = "unreadable_file: nothing in the clip's artifacts could be read"
+
+    for _ in range(2):
+        r = prepare(client, source.virtual_path)
+        assert (r.status_code, r.json()) == (422, {"detail": refusal})
+    assert len(executor.requests) == 1  # the second answer came from memory
+    assert [e["criteria"].get("remembered") for e in events_of(audit_lines, "file.prepare")] == [None, True]
+
+    assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 200
+    r = prepare(client, source.virtual_path)
+    assert r.status_code == 200  # the zip still gives no frame, but the speech is read: a job ran again
+    assert (r.json()["total"], r.json()["transcript"], r.json()["hint"]) == (0, True, "The frames could not be read.")
+    assert len(executor.requests) == 2
+
+
+def test_a_clip_taken_back_after_its_prepare_takes_what_was_made_with_it(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, settings: Settings
+) -> None:
+    """Ruling W4: its artifacts, its transcript and its frames, rows and files, go; one event names every id."""
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    artifact(client, source.virtual_path, "nextext_jsonl", speech(built))
+    artifact(client, source.virtual_path, "nextext_zip", keyframes(built))
+    assert prepare(client, source.virtual_path).json()["total"] == 3
+    rows = store.derived_of(source)
+    assert sorted(rec.role for rec in rows) == ["frame"] * 3 + ["nextext_jsonl", "nextext_zip", "transcript"]
+    folder = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1" / ".derived"
+    assert sum(1 for each in folder.rglob("*") if each.is_file()) == 6
+
+    r = delete(client, source.virtual_path)
+    assert (r.status_code, r.json()) == (200, {"deleted": 1, "renders": 6})
+    assert store.derived_of(source) == []
+    assert [each for each in folder.rglob("*") if each.is_file()] == []
+    (event,) = events_of(audit_lines, "file.delete")
+    assert sorted(event["target"]["ids"]) == sorted([source.id, *(rec.id for rec in rows)])
+    assert event["criteria"]["renders"] == 6
+    assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 404
 
 
 def test_a_slide_rendition_is_named_by_its_slide(

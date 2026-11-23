@@ -18,6 +18,7 @@ from typing import Any, override
 import pytest
 
 from tests.api.conftest import CALL, PG_SETUP, put, unrecorded
+from tests.api.test_store import keep_artifact
 from tests.conftest import scaled
 from workbench.api import tools_mcp
 from workbench.api.jobs import (
@@ -67,6 +68,8 @@ from workbench.renders import (
     CONVERTED_SIGNATURE,
     RENDER_MAX_BYTES,
     SIGNATURES,
+    TRANSCRIPT_MAX_BYTES,
+    TRANSCRIPT_NAME,
     render_name,
 )
 from workbench.utils.audit_event import AuditWriteError
@@ -3145,3 +3148,357 @@ async def test_waiting_conversions_are_counted_apart_from_the_queue_and_the_prep
     await asyncio.gather(converting, preparing, *waiting)
     assert sample(metrics, "workbench_queue_length") == 0
     assert queue.tracked_users == 0
+
+
+# --- version 0.9: a clip's artifacts are the only input of its job, its frames and transcript the renders -----------
+
+#: One line of Nextext's JSON Lines and the first bytes of its zip: the api reads neither, only the executor does.
+JSONL_LINE = b'{"text": "an invented sentence"}\n'
+ZIP_BYTES = b"PK\x03\x04" + bytes(40)
+#: The facts a clip's answer carries; every one of them is a clip's.
+CLIP_FACTS: dict[str, Any] = {
+    "kind": "media",
+    "unit": "frame",
+    "total": 2,
+    "pages_without_text": [],
+    "frames": None,
+    "hint": None,
+    "duration_s": 12.0,
+}
+
+
+def clip(store: Store, p: Principal = PG_SETUP, name: str = "harbour-tour.mp4") -> FileRecord:
+    """An invented clip of ``p``'s chat: the source of a clip's renders, which no job ever reads."""
+    return put(store, name, b"synthetic clip bytes", p=p)
+
+
+def artifacts(store: Store, source: FileRecord, *, jsonl: bool = True, zipped: bool = True) -> list[DerivedRecord]:
+    """Keep the artifacts of a clip as ``POST /files/derived`` does, the JSON Lines first."""
+    held = [keep_artifact(store, source, JSONL_LINE, "nextext_jsonl")[0]] if jsonl else []
+    return held + ([keep_artifact(store, source, ZIP_BYTES, "nextext_zip")[0]] if zipped else [])
+
+
+def frame(n: int, time_s: float | None = None) -> dict[str, Any]:
+    """One entry of a clip's answer: frame ``n``, named as ``render_name`` names it."""
+    return {
+        "name": render_name(n, 1, 1, "image/jpeg"),
+        "role": "frame",
+        "n": n,
+        "strip": 1,
+        "strips": 1,
+        "width": 128,
+        "height": 72,
+        "mime": "image/jpeg",
+        "time_s": time_s,
+    }
+
+
+def clip_made(
+    executor: FakeClient, *entries: dict[str, Any], lines: int | None = 3, transcript: bytes = b"[00:00] Hello\n"
+) -> None:
+    """Script a clip's prepare: the answer for ``entries`` and, with ``lines``, a transcript of that many lines."""
+    answer: dict[str, Any] = {**CLIP_FACTS, "total": len(entries), "renders": list(entries)}
+    files = {entry["name"]: JPEG for entry in entries}
+    if lines is not None:
+        answer["transcript"] = {"name": TRANSCRIPT_NAME, "lines": lines}
+        files[TRANSCRIPT_NAME] = transcript
+    executor.answer, executor.files = answer, files
+
+
+async def prepare_clip(
+    queue: JobQueue, p: Principal, source: FileRecord, held: Sequence[DerivedRecord], keeper: Keeper | None = None
+) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
+    """Prepare a clip from its artifacts, as the prepare route does: on the prepare gate."""
+    return await queue.submit_renders(
+        p, source, {"budget_s": 90, "facts": True}, keeper or KeepAll(), call=CALL, gate="prepare", artifacts=held
+    )
+
+
+async def test_a_clips_artifacts_are_its_jobs_only_inputs(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The input files are the artifacts' derived paths, JSON Lines first, and the clip's own name is not among them.
+
+    ``media`` is made from the rows alone, whatever the arguments name; ``path`` stays the clip's name, which is read
+    for its kind and nothing else.
+    """
+    me = user("user-a")
+    source = clip(store)
+    jsonl, zipped = artifacts(store, source)
+    clip_made(executor, frame(1, 0.0), frame(2, 4.0))
+    queue = queue_for(settings, executor, store, metrics)
+    forged = {
+        "budget_s": 90,
+        "facts": True,
+        "path": "other.mp4",
+        "media": {"nextext_jsonl": "../x.jsonl", "video": False},
+    }
+    await queue.submit_renders(me, source, forged, KeepAll(), call=CALL, gate="prepare", artifacts=[zipped, jsonl])
+
+    (req,) = executor.requests
+    assert (req.tool, req.input_files) == ("prepare_file", [jsonl.relative_path, zipped.relative_path])
+    assert source.name not in req.input_files
+    assert req.args == {
+        "budget_s": 90,
+        "facts": True,
+        "path": source.name,
+        "media": {"nextext_jsonl": jsonl.relative_path, "nextext_zip": zipped.relative_path, "video": True},
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "jsonl", "zipped", "video"),
+    [
+        ("harbour-tour.mp4", True, False, True),
+        ("harbour-tour.MKV", False, True, True),
+        ("voice-memo.m4a", True, False, False),
+    ],
+    ids=["video-without-pictures", "uppercase-suffix", "audio"],
+)
+async def test_a_clip_with_one_artifact_names_the_other_none(
+    name: str,
+    jsonl: bool,
+    zipped: bool,
+    video: bool,
+    settings: Settings,
+    store: Store,
+    executor: FakeClient,
+    metrics: Metrics,
+) -> None:
+    """A role the clip has no row of is ``None`` in ``media``; ``video`` is told by the clip's suffix."""
+    me = user("user-a")
+    source = clip(store, name=name)
+    held = artifacts(store, source, jsonl=jsonl, zipped=zipped)
+    clip_made(executor, lines=1)
+    queue = queue_for(settings, executor, store, metrics)
+    await prepare_clip(queue, me, source, held)
+
+    (req,) = executor.requests
+    assert req.input_files == [rec.relative_path for rec in held]
+    assert req.args["media"] == {
+        "nextext_jsonl": held[0].relative_path if jsonl else None,
+        "nextext_zip": held[-1].relative_path if zipped else None,
+        "video": video,
+    }
+
+
+async def test_an_artifact_of_another_source_is_refused(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Another clip's artifact, a row that is no artifact, a changed record or two of a role: a programming error.
+
+    Nothing more is sent, no job row is made, and no turn is left held.
+    """
+    me = user("user-a")
+    source, other = clip(store), clip(store, name="quay-tour.mp4")
+    jsonl, zipped = artifacts(store, source)
+    (foreign,) = artifacts(store, other, zipped=False)
+    clip_made(executor, frame(1, 0.0))
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, kept = await prepare_clip(queue, me, source, [jsonl, zipped])
+    a_frame = next(rec for rec in kept if rec.role == "frame")
+    before = (len(executor.requests), jobs_recorded(settings))
+
+    for wrong in (
+        [foreign, zipped],
+        [jsonl, a_frame],
+        [dataclasses.replace(jsonl, name="harbour-tour.mp4")],
+        [dataclasses.replace(jsonl, mime="application/zip")],
+        [dataclasses.replace(zipped, chat_id="chat-2")],
+        [dataclasses.replace(zipped, role="nextext_jsonl")],
+        [jsonl, jsonl],
+    ):
+        with pytest.raises(ValueError, match="artifacts"):
+            await prepare_clip(queue, me, source, wrong)
+    assert (len(executor.requests), jobs_recorded(settings), queue.tracked_users) == (*before, 0)
+
+
+async def test_a_clip_is_never_its_own_input_and_nothing_else_reads_artifacts(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A clip's job without its artifacts, artifacts beside a converted PDF or for a file that is no clip: refused.
+
+    Each is a programming error: nothing is sent, no job row is made, and the clip's bytes are never copied to a slot.
+    """
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source)
+    deck_source = deck(store)
+    converts(executor)
+    queue = queue_for(settings, executor, store, metrics)
+    _, _, (pdf,) = await convert(queue, me, deck_source)
+    before = (len(executor.requests), jobs_recorded(settings))
+
+    with pytest.raises(ValueError, match="artifacts"):
+        await queue.submit_renders(me, source, {"pages": None}, KeepAll(), call=CALL, gate="prepare")
+    with pytest.raises(ValueError, match="artifacts"):
+        await queue.submit_renders(me, deck_source, {}, KeepAll(), call=CALL, converted=pdf, artifacts=held)
+    with pytest.raises(ValueError, match="artifacts"):
+        await queue.submit_renders(me, deck_source, {}, KeepAll(), call=CALL, artifacts=held)
+    assert (len(executor.requests), jobs_recorded(settings), queue.tracked_users) == (*before, 0)
+
+
+async def test_a_frame_keeps_its_time(settings: Settings, store: Store, executor: FakeClient, metrics: Metrics) -> None:
+    """A frame is a ``frame`` row of the clip with its time in ``meta``, and none where the zip gave none."""
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source, jsonl=False)
+    clip_made(executor, frame(1, 0.0), frame(2, 4.0), frame(3), lines=None)
+    executor.answer = {**(executor.answer or {}), "total": 3}
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await prepare_clip(queue, me, source, held)
+
+    frames = [rec for rec in store.derived_of(source) if rec.role == "frame"]
+    assert [(rec.ordinal, rec.mime, rec.width, rec.height, rec.size) for rec in frames] == [
+        (n, "image/jpeg", 128, 72, len(JPEG)) for n in (1, 2, 3)
+    ]
+    assert [rec.meta.get("time_s") for rec in frames] == [0.0, 4.0, None]
+    assert frames[1].meta["time_s"] == 4.0
+    assert {rec.id for rec in kept} == {rec.id for rec in frames}
+    assert result.message == ""
+    assert [rec.role for rec in store.derived_of(source)].count("nextext_zip") == 1  # the artifact is not touched
+
+
+async def test_the_facts_ride_on_the_transcript_else_on_frame_one(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """With a transcript the facts are on it, with its line count; without one they are on frame 1 alone."""
+    me = user("user-a")
+    queue = queue_for(settings, executor, store, metrics)
+    spoken = clip(store)
+    clip_made(executor, frame(1, 0.0), frame(2, 4.0), lines=3)
+    await prepare_clip(queue, me, spoken, artifacts(store, spoken))
+    transcript = next(rec for rec in store.derived_of(spoken) if rec.role == "transcript")
+    assert (transcript.ordinal, transcript.mime, transcript.width, transcript.height) == (0, "text/plain", None, None)
+    assert transcript.relative_path == f".derived/{spoken.id}/{transcript.id}.txt"
+    assert dict(transcript.meta) == {"lines": 3, "facts": {**CLIP_FACTS, "total": 2}}
+    assert all("facts" not in rec.meta for rec in store.derived_of(spoken) if rec.role == "frame")
+
+    silent = clip(store, name="quay-tour.mp4")
+    clip_made(executor, frame(1, 0.0), frame(2, 4.0), lines=None)
+    await prepare_clip(queue, me, silent, artifacts(store, silent, jsonl=False))
+    rows = {(rec.role, rec.ordinal): rec for rec in store.derived_of(silent)}
+    assert ("transcript", 0) not in rows
+    assert rows["frame", 1].meta["facts"] == {**CLIP_FACTS, "total": 2}
+    assert "facts" not in rows["frame", 2].meta
+
+
+async def test_a_job_that_did_not_look_for_facts_stores_none_on_a_clip(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """``facts: False`` keeps no facts on the transcript either."""
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source)
+    clip_made(executor, frame(1, 0.0))
+    queue = queue_for(settings, executor, store, metrics)
+    await queue.submit_renders(me, source, {"facts": False}, KeepAll(), call=CALL, gate="prepare", artifacts=held)
+    assert [dict(rec.meta) for rec in store.derived_of(source) if rec.role == "transcript"] == [{"lines": 3}]
+
+
+async def test_a_transcript_over_its_cap_is_not_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """One byte past ``TRANSCRIPT_MAX_BYTES`` is lost as invalid, named again by its id; the frames are kept."""
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source)
+    clip_made(executor, frame(1, 0.0), transcript=b"x" * (TRANSCRIPT_MAX_BYTES + 1))
+    keeper = KeepAll()
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, kept = await prepare_clip(queue, me, source, held, keeper)
+
+    ((_, planned, _),) = keeper.recorded
+    assert keeper.again_ids == [[planned[list(executor.files).index(TRANSCRIPT_NAME)]]]
+    assert result.message == "1 output could not be kept (invalid)"
+    assert [rec.role for rec in kept] == ["frame"]
+    assert [rec.role for rec in store.derived_of(source)].count("transcript") == 0
+
+
+async def test_a_transcript_of_exactly_its_cap_is_kept(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The cap is the most a transcript may have."""
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source)
+    clip_made(executor, frame(1, 0.0), transcript=b"x" * TRANSCRIPT_MAX_BYTES)
+    queue = queue_for(settings, executor, store, metrics)
+    _, result, _ = await prepare_clip(queue, me, source, held)
+    (transcript,) = (rec for rec in store.derived_of(source) if rec.role == "transcript")
+    assert (transcript.size, result.message) == (TRANSCRIPT_MAX_BYTES, "")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-transcript-in-the-answer",
+        "a-transcript-of-a-picture",
+        "a-frame-of-a-pdf",
+        "a-page-of-a-clip",
+        "a-pdfs-facts-for-a-clip",
+        "a-clips-facts-for-a-pdf",
+    ],
+)
+async def test_what_is_not_a_clips_is_not_kept_as_a_clips(
+    case: str, settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A ``transcript.txt`` the answer does not name, a transcript, a frame or facts that are not the source's kind.
+
+    A transcript of a PDF, a frame of a PDF, a page of a clip, a PDF's facts for a clip and a clip's for a PDF: each is
+    lost as invalid and named again, and the facts of a clip that are not a clip's are never stored.
+    """
+    me = user("user-a")
+    queue = queue_for(settings, executor, store, metrics)
+    keeper = KeepAll()
+    if case in ("no-transcript-in-the-answer", "a-page-of-a-clip", "a-pdfs-facts-for-a-clip"):
+        source = clip(store)
+        held = artifacts(store, source)
+        clip_made(executor, frame(1, 0.0), lines=None)
+        if case == "no-transcript-in-the-answer":
+            executor.files[TRANSCRIPT_NAME] = b"[00:00] Hello\n"
+        elif case == "a-page-of-a-clip":
+            executor.answer = {**CLIP_FACTS, "total": 1, "renders": [page(1)]}
+            executor.files = {page(1)["name"]: JPEG}
+        else:
+            executor.answer = {**FACTS, "renders": [frame(1, 0.0)]}
+        _, result, kept = await prepare_clip(queue, me, source, held, keeper)
+        assert [rec.role for rec in kept] == (["frame"] if case == "no-transcript-in-the-answer" else [])
+    else:
+        source = scan(store)
+        entries = [frame(1, 0.0)] if case in ("a-frame-of-a-pdf", "a-clips-facts-for-a-pdf") else [page(1)]
+        executor.answer = {**(CLIP_FACTS if case == "a-clips-facts-for-a-pdf" else FACTS), "renders": entries}
+        executor.files = {entry["name"]: JPEG for entry in entries}
+        if case == "a-transcript-of-a-picture":
+            executor.answer = {**FACTS, "renders": entries, "transcript": {"name": TRANSCRIPT_NAME, "lines": 1}}
+            executor.files[TRANSCRIPT_NAME] = b"[00:00] Hello\n"
+        _, result, kept = await prepare(queue, me, source, keeper)
+        assert [rec.role for rec in kept] == (["page"] if case == "a-transcript-of-a-picture" else [])
+    assert "could not be kept (invalid)" in result.message
+    assert [rec.role for rec in store.derived_of(source)].count("transcript") == 0
+
+
+async def test_what_a_clips_job_kept_is_removed_when_its_record_fails_and_the_artifacts_stay(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A frame kept before the transcript is lost, and an event of that loss that cannot be written: no row stays.
+
+    The frame's row and file go; the two artifacts, which the job only read, are never touched.
+    """
+    me = user("user-a")
+    source = clip(store)
+    held = artifacts(store, source)
+    clip_made(executor, frame(1, 0.0), transcript=b"x" * (TRANSCRIPT_MAX_BYTES + 1))
+
+    class NoAgain(KeepAll):
+        @override
+        def again(self, ids: Sequence[str]) -> None:
+            raise AuditWriteError("synthetic audit stream failure")
+
+    queue = queue_for(settings, executor, store, metrics)
+    with pytest.raises(AuditWriteError):
+        await prepare_clip(queue, me, source, held, NoAgain())
+
+    assert [rec.role for rec in store.derived_of(source)] == ["nextext_jsonl", "nextext_zip"]
+    folder = _chat_folder(settings, me) / ".derived" / source.id
+    assert sorted(each.name for each in folder.iterdir()) == sorted(rec.name for rec in held)

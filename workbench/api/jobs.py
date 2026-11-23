@@ -59,7 +59,7 @@ import stat
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, get_args
 
@@ -100,9 +100,13 @@ from workbench.renders import (
     CONVERTED_SIGNATURE,
     RENDER_MAX_BYTES,
     SIGNATURES,
+    TRANSCRIPT_MAX_BYTES,
+    VIDEO_SUFFIXES,
     ConvertAnswer,
+    MediaRequest,
     RenderAnswer,
     RenderFacts,
+    kind_of,
     signature_ok,
 )
 
@@ -636,6 +640,54 @@ def _converted_input(source: FileRecord, converted: DerivedRecord) -> str:
     return converted.relative_path
 
 
+#: The extension each artifact role's file has, and the order the job's inputs come in: the JSON Lines first.
+_ARTIFACT_EXTENSIONS: Final = (
+    ("nextext_jsonl", "application/x-ndjson", "jsonl"),
+    ("nextext_zip", "application/zip", "zip"),
+)
+
+
+def _media_request(source: FileRecord, artifacts: Sequence[DerivedRecord]) -> MediaRequest:
+    """The ``media`` argument of a render job over a clip: the artifacts' derived paths, taken from their records alone.
+
+    Args:
+        source: The clip.
+        artifacts: Its raw artifacts as the store keeps them, at most one of each role.
+
+    Returns:
+        The request: the path of each role the clip has a row of, ``None`` for the other, and whether the clip is a
+        video, told by its suffix.
+
+    Raises:
+        ValueError: ``artifacts`` is empty, holds a row that is not one of the source's own artifacts (another role or
+            type, another source or owner, or a name that is not its id's), or two rows of one role; that is a
+            programming error.
+    """
+    paths: dict[str, str | None] = {}
+    for role, mime, extension in _ARTIFACT_EXTENSIONS:
+        found = [rec for rec in artifacts if rec.role == role]
+        if len(found) > 1:
+            raise ValueError("a clip's job reads at most one of each of its artifacts")
+        paths[role] = None
+        if found:
+            (rec,) = found
+            if (
+                rec.mime != mime
+                or rec.name != f"{rec.id}.{extension}"
+                or (rec.source_id, rec.caller, rec.user_id, rec.chat_id)
+                != (source.id, source.caller, source.user_id, source.chat_id)
+            ):
+                raise ValueError("a clip's job reads its own artifacts")
+            paths[role] = rec.relative_path
+    if not any(paths.values()) or sum(v is not None for v in paths.values()) != len(artifacts):
+        raise ValueError("a clip's job reads its own artifacts, the JSON Lines and the keyframes zip")
+    return MediaRequest(
+        nextext_jsonl=paths["nextext_jsonl"],
+        nextext_zip=paths["nextext_zip"],
+        video=PurePosixPath(source.name).suffix.lower() in VIDEO_SUFFIXES,
+    )
+
+
 class JobQueue:
     """Runs jobs in the executor within the global, per-caller, per-user, prepare, conversion and queue limits.
 
@@ -748,19 +800,22 @@ class JobQueue:
         gate: Gate = "user",
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
-        """Render a picture or pages of a PDF in the executor, when its turn comes, and keep the renders.
+        """Render a picture, pages of a PDF or the frames of a clip in the executor, and keep the renders.
 
         The job is ``prepare_file`` with the source as its one input and its ``path``; or, for an Office file, the PDF
-        it was converted to, at its derived path. Its outputs become derived files of the source, never files of the
+        it was converted to, at its derived path; or, for a clip, its raw artifacts at their derived paths and no
+        other input, never the clip: its ``path`` is the clip's name, which the runner reads for the kind alone, and
+        its ``media`` argument names the artifacts. Its outputs become derived files of the source, never files of the
         chat: the keeper records the job by the ids planned for them first, as for :meth:`submit`, and each output it
-        chose is kept only as the render the answer names (:meth:`_render_place`).
+        chose is kept only as the render the answer names (:meth:`_render_place`), or as the transcript.
 
         Args:
             p: The caller, user and chat the job runs for: the source's own.
             source: The file to render.
             args: The runner's other arguments (``pages``, ``strips``, ``have``, ``budget_s``, ``facts``, ``office``);
-                ``path`` is set to the input's whatever they hold.
+                ``path`` is set to the input's whatever they hold, and ``media`` is made from ``artifacts`` or left out.
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             call: The call's wall, wait and caller slots.
             gate: ``user`` waits for the user's own turn, as every other job; ``prepare`` waits for the caller's
@@ -770,15 +825,18 @@ class JobQueue:
                 ``None`` waits for a turn of the job's own.
             converted: The source's own PDF (role ``pdf``), which the job reads in place of the source; ``None`` reads
                 the source itself.
+            artifacts: A clip's raw artifacts (roles ``nextext_jsonl`` and ``nextext_zip``, at most one each), which
+                the job reads in place of the clip; none reads the source itself, or ``converted``.
 
         Returns:
             The job record with its final status, the executor's answer without its staged outputs (its message names
             the renders that could not be kept) and the renders kept, in the order the job staged them.
 
         Raises:
-            ValueError: ``p`` is not the source's caller, user and chat; ``converted`` is not the source's own PDF; or
-                ``turn`` is not held, or is another caller's, user's or gate's, or runs a job already. Each is a
-                programming error, raised before any job record.
+            ValueError: ``p`` is not the source's caller, user and chat; ``converted`` is not the source's own PDF;
+                the source is a clip and ``artifacts`` are none, or are not its own, or come with ``converted``, or
+                they are given for a file that is no clip; or ``turn`` is not held, or is another caller's, user's or
+                gate's, or runs a job already. Each is a programming error, raised before any job record.
             PathError: The source's name is not a plain path below the chat folder, or an id is not a safe id.
             Busy: The queue or the gate's line is full, the user's or the caller's share is, the turn did not come in
                 time, or the executor has no free slot or cannot be reached.
@@ -787,15 +845,23 @@ class JobQueue:
                 settle the job's record; the renders kept are removed again first, and the keeper records each again.
         """
         _check_source(p, source)
+        if (kind_of(source.name) == "media") != bool(artifacts) or (artifacts and converted is not None):
+            raise ValueError("a clip's job reads its artifacts and nothing else, and no other job reads artifacts")
         path = source.name if converted is None else _converted_input(source, converted)
+        sent = {name: value for name, value in args.items() if name != "media"}  # a caller names no input of its own
         input_files = [path]
+        if artifacts:
+            media = _media_request(source, artifacts)
+            input_files = [rel for rel in (media.nextext_jsonl, media.nextext_zip) if rel is not None]
+            sent["media"] = media.model_dump(mode="json")
+            _check_inputs([path])
         _check_inputs(input_files)
         facts = args.get("facts", True) is True  # an answer of a job told not to look has no real facts
         async with self._within(p, call, gate, turn):
             return await self._run(
                 p,
                 "prepare_file",
-                {**args, "path": path},
+                {**sent, "path": path},
                 input_files,
                 keeper,
                 call,
@@ -1678,9 +1744,11 @@ class JobQueue:
 
         For each output, the place finds the answer's one entry of its name; checks the first bytes of the staged file
         against the entry's type and its size against ``RENDER_MAX_BYTES`` (the api decodes nothing); and registers it
-        with the entry's role, page, type and size. A strip keeps its ``strip`` and ``strips``; the whole render of
-        page 1 also keeps the answer's facts, but only from a job that looked for them: one told ``facts: False``
-        answers no real list of the pages without text.
+        with the entry's role, page, type and size. A strip keeps its ``strip`` and ``strips``; a frame of a clip its
+        time. The whole render of page 1 also keeps the answer's facts, but only from a job that looked for them: one
+        told ``facts: False`` answers no real list of the pages without text. A clip's facts ride on its transcript,
+        else on its frame 1. The one output of the name ``TRANSCRIPT_NAME`` that a clip's answer names is kept as the
+        clip's ``transcript``, if it is a regular file of at most ``TRANSCRIPT_MAX_BYTES``.
 
         Args:
             source: The file the renders are of.
@@ -1688,22 +1756,29 @@ class JobQueue:
             facts: Whether the job looked for the facts.
 
         Returns:
-            The place. It raises ``_Invalid`` (lost as ``invalid``) for an answer that is no render answer, an output
-            it does not name once, a wrong signature, a file too large or one that cannot be read; else what
+            The place. It raises ``_Invalid`` (lost as ``invalid``) for an answer that is no render answer, or none of
+            the source's kind (a clip's answer for a file that is no clip, or the other way round), an output it does
+            not name once, a wrong signature, a file too large or one that cannot be read; else what
             :meth:`~workbench.api.store.Store.register_derived` raises.
         """
         try:
             answer = RenderAnswer.model_validate(result.result) if result.status == "ok" else None
         except ValidationError:
             answer = None
+        clip = kind_of(source.name) == "media"
+        if answer is not None and (answer.kind == "media") != clip:
+            answer = None  # a clip's answer is for a clip alone, and a clip's job answers nothing else
+        transcript = answer.transcript if clip and answer is not None else None
         head = None
         if answer is not None and facts:
-            facts_of = answer.model_dump(exclude={"renders", "transcript"})  # a clip's transcript is no fact of it
+            facts_of = answer.model_dump(
+                include=set(RenderFacts.model_fields)
+            )  # the facts alone, so no new field leaks in
             head = RenderFacts.model_validate(facts_of).model_dump(mode="json")
         quota = self._settings.workspace_max_mb * _MIB
 
         def place(staged: Path, output: OutputFile, file_id: str) -> DerivedRecord:
-            """Keep one render.
+            """Keep one render, or a clip's transcript.
 
             Args:
                 staged: Its staged file, checked to be the job's own.
@@ -1714,23 +1789,39 @@ class JobQueue:
                 The new derived file.
 
             Raises:
-                _Invalid: It is not the render the answer names.
+                _Invalid: It is not the render, or the transcript, the answer names.
             """
             if answer is None:
                 raise _Invalid("not a render answer")
+            if transcript is not None and output.name == transcript.name:
+                try:
+                    _, size = _read_regular(staged, 0)
+                except OSError:
+                    raise _Invalid("unreadable") from None
+                if size > TRANSCRIPT_MAX_BYTES:
+                    raise _Invalid("not a transcript")
+                meta: dict[str, object] = {"lines": transcript.lines}
+                if head is not None:
+                    meta["facts"] = head
+                spec = DerivedSpec("transcript", 0, "text/plain", None, None, meta)
+                return self._store.register_derived(source, staged, spec, file_id=file_id, quota_bytes=quota)
             entries = [entry for entry in answer.renders if entry.name == output.name]
             if len(entries) != 1:
                 raise _Invalid("not a render of the answer")
             (entry,) = entries
+            if (entry.role == "frame") != clip:
+                raise _Invalid("not a render of the source's kind")
             try:
                 first, size = _read_regular(staged, _SIGNATURE_BYTES)
             except OSError:
                 raise _Invalid("unreadable") from None
             if size >= RENDER_MAX_BYTES or not signature_ok(first, entry.mime):
                 raise _Invalid("not a render")
-            meta: dict[str, object] = {"strip": entry.strip, "strips": entry.strips} if entry.strips > 1 else {}
-            if head is not None and entry.n == 1 and entry.strips == 1:
-                meta["facts"] = head
+            meta = {"strip": entry.strip, "strips": entry.strips} if entry.strips > 1 else {}
+            if entry.time_s is not None:
+                meta["time_s"] = entry.time_s
+            if head is not None and entry.n == 1 and entry.strips == 1 and transcript is None:
+                meta["facts"] = head  # a clip with a transcript keeps them on that
             spec = DerivedSpec(entry.role, entry.n, entry.mime, entry.width, entry.height, meta)
             return self._store.register_derived(source, staged, spec, file_id=file_id, quota_bytes=quota)
 

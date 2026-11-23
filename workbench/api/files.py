@@ -615,7 +615,7 @@ async def _view_rendition(
     wall, budgeted = _wall_of(settings, caller)
     jobs = _render_jobs(queue, wall, MCP_QUEUE_WAIT_S, caller, "user")
     manifest = await prepared(p, source, settings=budgeted, store=store, audit=audit, jobs=jobs)
-    if manifest.kind == "none" or rendition > manifest.total:
+    if manifest.kind in ("none", "media") or rendition > manifest.total:  # a clip's frames are not served here yet
         raise NotFound("no such rendition")
     made = await renders_for(
         p, source, manifest, [rendition], strips, settings=budgeted, store=store, audit=audit, jobs=jobs

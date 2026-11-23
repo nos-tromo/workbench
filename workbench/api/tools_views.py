@@ -363,7 +363,7 @@ async def view_file(
     paged = body.part is not None
     kind = manifest.kind
     limit = settings.result_max_kb * 1024
-    if kind == "none":
+    if kind in ("none", "media"):  # a clip's frames are not shown by this tool yet
         await run_in_threadpool(_record, audit, p, source, [], strips, paged=paged)
         nothing = ViewedFile(
             path=source.virtual_path,
@@ -377,7 +377,7 @@ async def view_file(
         )
         return _within(nothing, limit, keep_none=True)
 
-    noun = manifest.unit  # what the parts and the sentences count: a picture and a PDF count by page
+    noun: PagedUnit = "slide" if manifest.unit == "slide" else "page"  # what the parts count: a picture counts by page
     first, last = page_window(body.part, manifest.total, default_last=DEFAULT_LAST, unit=noun)
     through = min(last, first + MAX_VIEW_IMAGES // strips - 1)  # the pages one answer may take
     at_limit = False

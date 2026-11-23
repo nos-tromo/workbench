@@ -155,8 +155,9 @@ class CallJobs:
         *,
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
-        """Render a picture or pages of a PDF as :meth:`JobQueue.submit_renders` does, within the call's limits.
+        """Render a picture, pages of a PDF or a clip's frames as :meth:`JobQueue.submit_renders` does, in the limits.
 
         It waits for the user's own turn, or runs in the one held; the renders are not the call's outputs.
 
@@ -167,13 +168,14 @@ class CallJobs:
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             turn: The turn the call holds (:meth:`turn`), the user's or its conversion's, or ``None`` to wait for one.
             converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
+            artifacts: A clip's raw artifacts, which the job reads in place of the clip.
 
         Returns:
             What :meth:`JobQueue.submit_renders` returns.
         """
         gate = gate_for(turn, "user")
         return await self._queue.submit_renders(
-            p, source, args, keeper, call=self.call, gate=gate, turn=turn, converted=converted
+            p, source, args, keeper, call=self.call, gate=gate, turn=turn, converted=converted, artifacts=artifacts
         )
 
     async def submit_conversion(

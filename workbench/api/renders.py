@@ -13,6 +13,9 @@ nothing of LibreOffice: a render, like the PDF, is checked by its signature and 
   facts (kind, unit, page count, pages without text), which the whole render of page 1 keeps; an Office file is
   converted first, in the same turn. Every later call answers from the rows, with no job, no event and no wait for the
   source's lock.
+  A clip (a video or an audio file) is never read by a job: its prepare runs one job over the two artifacts Nextext
+  made of it, kept as its derived files, on the caller's prepare gate, and keeps the transcript and the frames that come
+  back (:func:`media_manifest_of`). A clip with no artifact is answered at once, with no job and no event.
 - :func:`renders_for` answers the renders of some pages at a strip count, and makes those that are missing, unless
   the source's renders leave no room for one more.
 - :func:`read_render` reads one back, or nothing when it is not what its row says.
@@ -59,6 +62,7 @@ from workbench.protocol import JobResult
 from workbench.renders import (
     DERIVED_MAX_BYTES,
     MAX_STRIPS,
+    NOTHING_FOUND,
     RENDER_MAX_BYTES,
     RENDERS_PER_JOB,
     SIGNATURES,
@@ -66,6 +70,7 @@ from workbench.renders import (
     PagedUnit,
     RenderAnswer,
     RenderFacts,
+    Unit,
     kind_of,
     signature_ok,
     unit_of,
@@ -86,8 +91,13 @@ NOT_SHOWN: Final = "This kind of file, such as a spreadsheet, is not shown as pi
 #: The text of the 500 for a render the store lost for a reason it cannot name (:func:`_lost`).
 NOT_KEPT: Final = "the renders of this file could not be kept"
 
-#: The roles of the derived files that are renders.
+#: The roles of the derived files that are renders of a picture, a PDF or an Office file.
 _RENDER_ROLES: Final = frozenset({"image", "page"})
+
+#: The roles of the two raw artifacts of a clip, which only the clip's prepare job reads, and of what it makes of them.
+_ARTIFACT_ROLES: Final = frozenset({"nextext_jsonl", "nextext_zip"})
+_TRANSCRIPT_ROLE: Final = "transcript"
+_FRAME_ROLE: Final = "frame"
 
 #: The role of the PDF an Office file was converted to, which is a derived file of it but no render.
 _CONVERTED_ROLE: Final = "pdf"
@@ -102,7 +112,8 @@ REMEMBERED: Final = frozenset({"unreadable_file", "unsupported_format"})
 #: damaged or not what its name says, too large to read within the memory limit, password-protected (a PDF, an Office
 #: file or an old binary one), not opened by LibreOffice, more or larger pictures than can be drawn within the memory
 #: limit (also when a conversion redone in parts runs out of its time: ruling R23), a picture over 120 megapixels, a PDF
-#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB.
+#: with no pages, a picture that cannot be made small enough, a converted PDF past 32 MB, a clip none of whose
+#: artifacts could be read (the artifacts decide it, a new one is a new input: the route that keeps it forgets it).
 #:
 #: These are copies, never imports (ruling R25): the api imports nothing of the executor, whose modules that hold them
 #: load the runners, Pillow or pdfium, none of which the api's image has. A pin test in ``tests/api/test_renders.py``
@@ -128,6 +139,7 @@ FILE_DECIDED: Final = frozenset(
         "the file is password-protected (encrypted)",
         "the file holds a picture larger than 120 megapixels",
         "the converted file is larger than 32 MB",
+        "nothing in the clip's artifacts could be read",
     )
 )
 
@@ -178,24 +190,31 @@ class Manifest(BaseModel):
 
     Attributes:
         path: The file's path.
-        kind: ``image``, ``pdf``, ``office`` for a text document or a deck drawn from the PDF it was converted to, or
-            ``none`` for a file that is not shown as pictures.
-        unit: What ``total`` and the pages count: ``slide`` for a deck, ``page`` for every other file, ``none`` too.
-        total: Pages of a PDF or a document, slides of a deck; 1 for a picture, 0 for ``none``.
-        pages_without_text: The pages or slides with no text of their own (scans, pictures).
-        renditions: The whole renders that exist now, by page or slide.
-        frames: The frame count of a picture with several, of which only the first is shown; else ``None``.
+        kind: ``image``, ``pdf``, ``office`` for a text document or a deck drawn from the PDF it was converted to,
+            ``media`` for a clip, or ``none`` for a file that is not shown as pictures.
+        unit: What ``total`` and the pages count: ``slide`` for a deck, ``frame`` for a clip, ``page`` for every other
+            file, ``none`` too.
+        total: Pages of a PDF or a document, slides of a deck, frames of a clip (none for audio, and for a clip with no
+            pictures); 1 for a picture, 0 for ``none``.
+        pages_without_text: The pages or slides with no text of their own (scans, pictures); empty for a clip.
+        renditions: The whole renders that exist now, by page, slide or frame.
+        frames: The frame count of a picture with several, of which only the first is shown; else ``None``, a clip's
+            too (its frames are ``total``).
         hint: A short note, such as which pages were not checked for text; ``None`` for none.
+        duration_s: The length of a clip in seconds, as far as its artifacts say; ``None`` for any other file.
+        transcript: Whether a clip has a transcript to read; ``False`` for any other file.
     """
 
     path: str
-    kind: Literal["image", "pdf", "office", "none"]
-    unit: PagedUnit = "page"
+    kind: Literal["image", "pdf", "office", "media", "none"]
+    unit: Unit = "page"
     total: int
     pages_without_text: list[int]
     renditions: list[Rendition]
     frames: int | None
     hint: str | None
+    duration_s: float | None = None
+    transcript: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,8 +246,9 @@ class RenderJobs(Protocol):
         *,
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
-        """Render a picture or pages of a PDF, as :meth:`~workbench.api.jobs.JobQueue.submit_renders` does.
+        """Render a picture, pages of a PDF or a clip's frames, as :meth:`~workbench.api.jobs.JobQueue.submit_renders`.
 
         Args:
             p: The caller, user and chat the job runs for: the source's own.
@@ -237,6 +257,7 @@ class RenderJobs(Protocol):
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             turn: The turn of the gate the caller holds (:meth:`turn`), in which the job runs; ``None`` waits for one.
             converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
+            artifacts: A clip's raw artifacts, which the job reads in place of the clip.
 
         Returns:
             The job record, the executor's answer and the renders kept.
@@ -325,6 +346,7 @@ class RouteJobs:
         *,
         turn: Turn | None = None,
         converted: DerivedRecord | None = None,
+        artifacts: Sequence[DerivedRecord] = (),
     ) -> tuple[JobRecord, JobResult, list[DerivedRecord]]:
         """Render within the call's limits, on the route's gate.
 
@@ -335,12 +357,21 @@ class RouteJobs:
             keeper: Records the job before any render becomes visible, and picks the renders to keep.
             turn: The turn of the route's gate the call holds (:meth:`turn`), or ``None`` to wait for one.
             converted: The PDF an Office source was converted to, which the job reads; ``None`` reads the source.
+            artifacts: A clip's raw artifacts, which the job reads in place of the clip.
 
         Returns:
             What :meth:`~workbench.api.jobs.JobQueue.submit_renders` returns.
         """
         return await self.queue.submit_renders(
-            p, source, args, keeper, call=self.call, gate=gate_for(turn, self.gate), turn=turn, converted=converted
+            p,
+            source,
+            args,
+            keeper,
+            call=self.call,
+            gate=gate_for(turn, self.gate),
+            turn=turn,
+            converted=converted,
+            artifacts=artifacts,
         )
 
     async def submit_conversion(
@@ -431,17 +462,14 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
 
     Returns:
         The manifest: the facts of the whole render of page 1 and every whole render of its role, by page. ``None``
-        when there is no whole render of page 1 that carries its facts: the file is not prepared yet, or its facts
-        are a clip's, which a manifest of this kind cannot carry. The unit is the facts'; a head kept before there
-        were units has none, and reads as ``page``.
+        when there is no whole render of page 1 that carries its facts: the file is not prepared yet. The unit is the
+        facts'; a head kept before there were units has none, and reads as ``page``.
     """
     whole = [rec for rec in rows if _is_render(rec) and rec.strips == 1]
     head = next((rec for rec in whole if rec.ordinal == 1), None)
     facts = None if head is None else _facts(head)
     if head is None or facts is None:
         return None
-    if facts.kind == "media" or facts.unit == "frame":
-        return None  # a clip's facts: the media branch of prepare answers for them, as a manifest of its own
     renditions = [
         Rendition.model_validate(
             {"n": rec.ordinal, "width": rec.width, "height": rec.height, "mime": rec.mime, "bytes": rec.size}
@@ -458,6 +486,59 @@ def manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest |
         renditions=renditions,
         frames=facts.frames,
         hint=facts.hint,
+    )
+
+
+def _is_frame(rec: DerivedRecord) -> bool:
+    """Tell whether a derived file is a frame of a clip: a JPEG of its role with its size.
+
+    Args:
+        rec: The derived file.
+
+    Returns:
+        Whether it is.
+    """
+    return rec.role == _FRAME_ROLE and rec.mime in SIGNATURES and rec.width is not None and rec.height is not None
+
+
+def media_manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest | None:
+    """Build a clip's manifest from its rows alone.
+
+    The facts ride on the transcript, else on frame 1 (:meth:`~workbench.api.jobs.JobQueue._render_place`), and are read
+    leniently as a picture's are (:func:`_facts`).
+
+    Args:
+        source: The clip.
+        rows: Its derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The manifest: the frames that exist, by their number, and whether a transcript does. ``None`` when the clip has
+        neither the transcript nor frame 1 with facts of a clip that can be read: it is not prepared yet, or what it
+        was prepared as is gone.
+    """
+    transcript = next((rec for rec in rows if rec.role == _TRANSCRIPT_ROLE), None)
+    frames = sorted((rec for rec in rows if _is_frame(rec)), key=lambda rec: rec.ordinal)
+    head = transcript or next((rec for rec in frames if rec.ordinal == 1), None)
+    facts = None if head is None else _facts(head)
+    if facts is None or facts.kind != "media":
+        return None
+    renditions = [
+        Rendition.model_validate(
+            {"n": rec.ordinal, "width": rec.width, "height": rec.height, "mime": rec.mime, "bytes": rec.size}
+        )
+        for rec in frames
+    ]
+    return Manifest(
+        path=source.virtual_path,
+        kind="media",
+        unit="frame",
+        total=facts.total,
+        pages_without_text=[],
+        renditions=renditions,
+        frames=None,
+        hint=facts.hint,
+        duration_s=facts.duration_s,
+        transcript=transcript is not None,
     )
 
 
@@ -737,12 +818,94 @@ def not_shown(source: FileRecord) -> Manifest:
     )
 
 
+def nothing_found(source: FileRecord) -> Manifest:
+    """The manifest of a clip that has neither artifact: no frame, no transcript, and the hint that nothing was found.
+
+    Args:
+        source: The clip.
+
+    Returns:
+        The manifest, counted by frame.
+    """
+    return Manifest(
+        path=source.virtual_path,
+        kind="media",
+        unit="frame",
+        total=0,
+        pages_without_text=[],
+        renditions=[],
+        frames=None,
+        hint=NOTHING_FOUND,
+    )
+
+
+async def _prepared_clip(
+    p: Principal, source: FileRecord, *, settings: Settings, store: Store, audit: AuditLog, jobs: RenderJobs
+) -> Manifest:
+    """Answer a clip's manifest, making its transcript and frames from its artifacts the first time.
+
+    The clip itself is no input of any job: the one job reads the artifacts Nextext made of it, which the store keeps as
+    its derived files, and runs on the caller's prepare gate, as a picture's does, never the conversion gate.
+
+    Args:
+        p: The caller, user and chat of the clip.
+        source: The clip.
+        settings: The api's settings; ``job_wall_s`` gives the runner's time.
+        store: The store.
+        audit: The audit log, bound to the call.
+        jobs: The queue, within the call's limits and on its gate.
+
+    Returns:
+        The manifest.
+
+    Raises:
+        PurposeRequired: The call had to state a purpose for ``modify`` and did not; no job runs.
+        AuditWriteError: The job's event, or that of a refusal remembered, could not be written; nothing is kept, and
+            no refusal goes out.
+        Busy: The lock or the queue did not come free in time, or the executor is busy.
+        HTTPException: The runner refused the artifacts (422 ``unreadable_file``: neither gave anything usable, which
+            is remembered), or an earlier prepare did; the job ran out of time (422), or failed or answered what cannot
+            be read (500); or neither the transcript nor frame 1, which holds the facts, was kept for a reason that is
+            not one of the three below (500).
+        QuotaExceeded: The transcript or a frame would take the user over their quota (507).
+        RendersFull: It would take the clip over its cap of derived files (507).
+        StorageFull: The volume is full (507).
+        NotFound: The clip went while the job ran, with its chat (404).
+    """
+    rows = await run_in_threadpool(store.derived_of, source)
+    manifest = media_manifest_of(source, rows)
+    if manifest is not None:
+        return manifest
+    if not any(rec.role in _ARTIFACT_ROLES for rec in rows):
+        return nothing_found(source)
+    async with jobs.source_lock(source.id):
+        rows = await run_in_threadpool(store.derived_of, source)
+        manifest = media_manifest_of(source, rows)
+        if manifest is not None:
+            return manifest
+        held = [rec for rec in rows if rec.role in _ARTIFACT_ROLES]
+        if not held:  # the clip, or its artifacts, went while the call waited for the lock
+            return nothing_found(source)
+        await run_in_threadpool(audit.check, "prepare", p)
+        await _refuse_remembered(p, source, store=store, audit=audit, strips=1, on_demand=False)
+        args: dict[str, Any] = {"budget_s": _budget(settings), "facts": True}
+        keeper = _keeper(audit, p, source, strips=1, on_demand=False)
+        _, result, _ = await jobs.submit_renders(p, source, args, keeper, artifacts=held)
+        _parse(RenderAnswer, _settled(store, source, result))
+        manifest = media_manifest_of(source, await run_in_threadpool(store.derived_of, source))
+        if manifest is None:
+            raise _lost(result.message)
+    return manifest
+
+
 async def prepared(
     p: Principal, source: FileRecord, *, settings: Settings, store: Store, audit: AuditLog, jobs: RenderJobs
 ) -> Manifest:
     """Answer a file's manifest, rendering its first pages the first time.
 
-    A file that is neither a picture, a PDF nor an Office file is answered at once, ``kind: none``, with no job. A file
+    A file that is neither a picture, a PDF, an Office file nor a clip is answered at once, ``kind: none``, with no job.
+    A clip is answered by :func:`_prepared_clip`: from its artifacts, in one job on the prepare gate, the first time,
+    and at once, with no job and no event, when it has none. A file
     whose rows hold the manifest is answered from them, with no job, no event and no wait for the source's lock, which a
     job of later pages may hold. One that does not takes the lock, reads the rows again inside it, and has one job,
     which draws the first pages (but those whole pages it has already), finds the facts and is recorded before any
@@ -778,8 +941,10 @@ async def prepared(
         NotFound: The file went while the job ran, with its chat (404).
     """
     kind = kind_of(source.name)
-    if kind in ("none", "media"):  # a clip is not shown until its prepare is taught the artifacts
+    if kind == "none":
         return not_shown(source)
+    if kind == "media":
+        return await _prepared_clip(p, source, settings=settings, store=store, audit=audit, jobs=jobs)
     manifest = manifest_of(source, await run_in_threadpool(store.derived_of, source))
     if manifest is not None:
         return manifest
@@ -906,7 +1071,7 @@ async def renders_for(
     """
     if not 1 <= strips <= MAX_STRIPS:
         raise ValueError(f"strips is 1 to {MAX_STRIPS}")
-    if manifest.kind == "none":
+    if manifest.kind in ("none", "media"):  # a clip's frames are made with its transcript, never one by one
         return []
     role = "image" if manifest.kind == "image" else "page"
     wanted = sorted({n for n in pages if 1 <= n <= manifest.total})
@@ -1008,12 +1173,13 @@ def noun_of(manifest: Manifest) -> Noun:
 
     Returns:
         ``image`` for a picture, ``page`` for a PDF, the unit of an Office file (``page`` or ``slide``); ``page`` for a
-        file that is not shown, which has no renders.
+        file that is not shown, which has no renders, and for a clip, whose frames are labelled by
+        :func:`~workbench.renders.frame_label`.
     """
     if manifest.kind == "image":
         return "image"
-    if manifest.kind == "office":
-        return manifest.unit
+    if manifest.kind == "office" and manifest.unit == "slide":
+        return "slide"
     return "page"
 
 
