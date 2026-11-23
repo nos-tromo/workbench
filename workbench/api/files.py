@@ -41,6 +41,7 @@ import anyio.from_thread
 from fastapi import APIRouter, HTTPException, Query, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from workbench.api.audit import AuditLog
 from workbench.api.auth import CHAT_PATH, DERIVED_PATH, PREPARE_PATH, Caller
@@ -107,6 +108,9 @@ ROLE_TYPES: Final[Mapping[ArtifactRole, tuple[str, int]]] = {
 
 #: The answer for a source that is no audio or video upload.
 UNSUPPORTED_SOURCE: Final = "unsupported_format: the source is not an audio or video upload"
+
+#: The answer for a client that went before its body was whole: the text FastAPI gives an upload in that case.
+BODY_NOT_READ: Final = "There was an error parsing the body"
 
 #: The first four bytes of a zip, and the most bytes of a jsonl's first line the api parses.
 _ZIP_SIGNATURE: Final = b"PK\x03\x04"
@@ -395,8 +399,15 @@ async def store_derived(
     artifact posted again after a restart) finishes first. Under the lock the artifact is recorded by its id and the
     ids it replaces, renamed into place and inserted with the deletion of what it replaces: the artifact of its role,
     and the transcript and frames made from the old one. A refusal remembered for the clip is forgotten, as its input
-    is new. Whatever ends the call before the artifact is placed (a busy clip, a client that is gone, any error)
-    removes the ``.part``.
+    is new.
+
+    The ``.part`` is removed whenever the call ends before the artifact is placed: by the stage itself when the body
+    cannot be read whole (a client that is gone, a body past its bound, a refusal of the check or of the quota), and
+    by this route when the clip is busy, the call is cancelled while it waits for the lock, or the store refuses to
+    place it. One case is left to retention: a handler cancelled natively in the middle of the transfer (in practice a
+    server shutdown) leaves its worker thread running on to the end of the stage, with nobody to receive its result,
+    so the ``.part`` stays until the orphan sweep removes it, recorded by its id. A client that goes while its body
+    comes is answered ``400`` and :data:`BODY_NOT_READ`, quietly, as an upload's is.
 
     Args:
         source: The clip's virtual path, in the request's chat.
@@ -413,7 +424,8 @@ async def store_derived(
         or ``None``.
 
     Raises:
-        HTTPException: 422 ``unsupported_format`` for a source that is no audio or video upload. The store's refusals
+        HTTPException: 422 ``unsupported_format`` for a source that is no audio or video upload; 400 for a client
+            that went before its body was whole. The store's refusals
             (a missing clip, a body over its bound, the quota, an artifact that is not what its role says) and a busy
             clip are answered by the app's handlers.
     """
@@ -431,7 +443,10 @@ async def store_derived(
             clip, body, spec, max_bytes=max_bytes, quota_bytes=quota_bytes, check=_artifact_check(role)
         )
 
-    staged = await run_in_threadpool(stage)
+    try:
+        staged = await run_in_threadpool(stage)
+    except ClientDisconnect:  # the stage has removed its .part; a client that goes is no fault, as for an upload
+        raise HTTPException(status_code=400, detail=BODY_NOT_READ) from None
 
     def record(file_id: str, size: int, replaced: Sequence[str], outcome: str) -> None:
         audit.record(

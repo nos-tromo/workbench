@@ -8,12 +8,15 @@ lock, and that nothing is left behind by any way out. What the store does with a
 import asyncio
 import contextlib
 import dataclasses
+import json
+import logging
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import anyio
 import pytest
@@ -91,6 +94,11 @@ def post(
         content=sent,
         headers={**headers, "Content-Type": TYPES[role]},
     )
+
+
+def post_chunked(client: TestClient, path: str, role: str, chunks: Sequence[bytes]) -> Any:
+    """Send an artifact as a body of no declared length, so that only the count of what arrives can stop it."""
+    return client.post("/files/derived", params={"source": path, "role": role}, content=iter(chunks), headers=HEADERS)
 
 
 def derived_dir(settings: Settings) -> Path:
@@ -396,9 +404,9 @@ def test_a_check_that_finds_the_chat_gone_is_404_not_422(
 def test_a_jsonl_past_its_bound_is_413(
     client: TestClient, store: Store, settings: Settings, audit_lines: AuditLines
 ) -> None:
-    """A jsonl of 8 MiB and a byte is refused as it is read, a zip's bound being the larger: nothing is left."""
+    """A jsonl of 8 MiB and a byte, sent chunked, is refused as it is read, a zip's bound being the larger."""
     source = clip(store)
-    r = post(client, source.virtual_path, "nextext_jsonl", b"x" * (JSONL_MAX_BYTES + 1))
+    r = post_chunked(client, source.virtual_path, "nextext_jsonl", [b"x" * JSONL_MAX_BYTES, b"x"])
     assert (r.status_code, r.json()) == (413, {"detail": "file too large"})
     nothing_left(settings, store, source, audit_lines)
 
@@ -423,13 +431,7 @@ def test_a_zip_at_its_bound_is_kept_and_one_past_it_is_413(
     assert row.size == ZIP_MAX_BYTES
 
     again = clip(store, "quay-tour.mp4")
-    chunks = iter([body, b"\0"])  # a body of no declared length: the count stops it
-    r = client.post(
-        "/files/derived",
-        params={"source": again.virtual_path, "role": "nextext_zip"},
-        content=chunks,
-        headers=HEADERS,
-    )
+    r = post_chunked(client, again.virtual_path, "nextext_zip", [body, b"\0"])
     assert (r.status_code, r.json()) == (413, {"detail": "file too large"})
     assert store.derived_of(again) == []
     assert on_disk(settings) == [row.name]
@@ -694,6 +696,51 @@ def a_request(chunks: Sequence[bytes], *, disconnect: bool = False) -> tuple[Req
         return pending.pop(0)
 
     return Request({"type": "http", "headers": []}, receive), asked
+
+
+def test_a_client_that_goes_mid_body_is_a_quiet_400(
+    app: FastAPI,
+    client: TestClient,
+    store: Store,
+    settings: Settings,
+    audit_lines: AuditLines,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Through the whole app, a client that goes while its body comes is answered as an upload's is, without a log.
+
+    The answer is a fixed 400, no event is written, the ``.part`` is removed, and nothing is logged as an error: a
+    client that goes is not a fault of the server.
+    """
+    source = clip(store)
+    portal = client.portal
+    assert portal is not None
+    pending: list[Message] = [{"type": "http.request", "body": JSONL, "more_body": True}, {"type": "http.disconnect"}]
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        return pending.pop(0) if pending else {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    query = urlencode({"source": source.virtual_path, "role": "nextext_jsonl"})
+    headers = [(name.lower().encode(), value.encode()) for name, value in HEADERS.items()]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/files/derived",
+        "root_path": "",
+        "query_string": query.encode(),
+        "headers": headers,
+    }
+    with caplog.at_level(logging.DEBUG):
+        portal.call(app, scope, receive, send)
+    started = next(message for message in sent if message["type"] == "http.response.start")
+    assert started["status"] == 400
+    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    assert json.loads(body) == {"detail": files_module.BODY_NOT_READ}
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+    nothing_left(settings, store, source, audit_lines)
 
 
 def test_the_body_is_read_in_the_pieces_asked_for_and_one_chunk_at_a_time() -> None:
