@@ -29,7 +29,7 @@ from PIL import Image
 
 from tests.conftest import scaled
 from tests.executor.conftest import IPC_SHAPE, SHARED_IPC_ONLY
-from tests.fixtures import make_fixtures, make_images, make_templates
+from tests.fixtures import make_fixtures, make_images, make_media, make_templates
 from workbench.config import Settings, load_settings
 from workbench.executor import supervisor
 from workbench.executor.prepare_volume import Owners, prepare_volume
@@ -2405,6 +2405,56 @@ async def test_as_root_a_photo_and_a_scan_are_prepared_in_a_slot(root_volume: Pa
             data = staged[entry.name].read_bytes()
             assert signature_ok(data, entry.mime)
             assert Image.open(io.BytesIO(data)).size == (entry.width, entry.height)
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_clips_artifacts_are_prepared_in_a_slot(root_volume: Path) -> None:
+    """``prepare_file`` on a clip, the real entry point under production's limits and the filter, reads its artifacts.
+
+    The two artifacts are in the chat folder at the derived paths the api keeps them at and are named in ``media``; the
+    clip is nowhere. The job ends ``ok``, stages ``transcript.txt`` and a frame for each keyframe under the names its
+    answer gives, and every staged frame is signed and as large as its entry says.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    source_id = "0123456789abcdef0123456789abcdef"
+    jsonl = f".derived/{source_id}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl"
+    keyframes = f".derived/{source_id}/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.zip"
+    records = [
+        make_media.jsonl_record(0.0, 2.5, "Welcome aboard.", speaker="Speaker 1"),
+        make_media.jsonl_record(84.2, 86.0, "The quay opens at nine.", speaker="Speaker 2", index=1),
+    ]
+    files = {
+        jsonl: make_media.make_jsonl(scratch / "docint.jsonl", records).read_bytes(),
+        keyframes: make_media.make_keyframes_zip(scratch / "keyframes.zip", size=(1920, 1080)).read_bytes(),
+    }
+    _chat(root_volume, files)
+    limits = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
+    media_args = {"nextext_jsonl": jsonl, "nextext_zip": keyframes, "video": True}
+    args: dict[str, Any] = {"path": "harbour-tour.mp4", "pages": None, "strips": 1, "have": [], "budget_s": 100}
+    request = _request(
+        tool="prepare_file", args={**args, "media": media_args}, input_files=sorted(files), limits=limits
+    )
+
+    answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+    assert answer.status == "ok", answer
+    result = RenderAnswer.model_validate(answer.result)
+    assert (result.kind, result.unit, result.total, result.duration_s) == ("media", "frame", 3, 86.0)
+    assert result.transcript is not None
+    assert (result.transcript.name, result.transcript.lines) == ("transcript.txt", 2)
+    assert [entry.time_s for entry in result.renders] == [0.0, 4.0, 8.0]
+    assert sorted(output.name for output in answer.outputs) == sorted(
+        ["transcript.txt", *(entry.name for entry in result.renders)]
+    )
+    staged = {output.name: Path(output.staged_path) for output in answer.outputs}
+    assert staged["transcript.txt"].read_text() == (
+        "[00:00] Speaker 1: Welcome aboard.\n[01:24] Speaker 2: The quay opens at nine.\n"
+    )
+    for entry in result.renders:
+        data = staged[entry.name].read_bytes()
+        assert signature_ok(data, entry.mime)
+        assert Image.open(io.BytesIO(data)).size == (entry.width, entry.height) == (1280, 720)
 
 
 #: The cases that run LibreOfficeKit: root on Linux, to switch to a slot uid, in the image that has LibreOffice.

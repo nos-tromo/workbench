@@ -2,7 +2,8 @@
 
 A PDF that an Office file was converted to (``convert_office``) is drawn as any PDF is; its ``office`` argument says it
 stands for a deck or a document, so the answer is of kind ``office`` and its words count slides or pages. An Office file
-itself is never drawn here: it is converted first.
+itself is never drawn here: it is converted first. A clip is never drawn either: given its ``media`` argument, the job
+reads the clip's two artifacts and makes its transcript and frames (:mod:`workbench.executor.render.media`).
 
 The job's working folder is the chat folder, as for ``read_document``. A picture is brought to the bounds of a render
 (:mod:`workbench.executor.render.images`) and a PDF page is drawn at ``PAGE_LONG_SIDE``
@@ -326,7 +327,10 @@ def _fit(answer: dict[str, Any], blank: list[int], notes: list[str], max_chars: 
 def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     """Draw a picture or the pages of a PDF into ``out/``, for a model to look at.
 
-    A PDF that ``convert_office`` made of an Office file is drawn with ``office`` naming what it stands for.
+    A PDF that ``convert_office`` made of an Office file is drawn with ``office`` naming what it stands for. A clip is
+    never drawn: given ``media``, its artifacts make its transcript and its frames
+    (:func:`workbench.executor.render.media.prepare_media`), and the clip is no input of the job; without it, a clip is
+    refused.
 
     Args:
         args: ``path``, relative to the chat folder; ``pages``, the pages to draw or ``None`` for the first
@@ -336,7 +340,9 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             page of a PDF for text (the caller has that already), so ``pages_without_text`` is ``[]`` with no hint
             about it; ``office``, an :class:`workbench.renders.OfficeRequest` as JSON, given only with the PDF an Office
             file was converted to, which then answers as kind ``office`` by its unit (and says so when a deck's slides
-            are not the PDF's pages); and ``budget_s``, the seconds after which the job stops.
+            are not the PDF's pages); ``media``, a :class:`workbench.renders.MediaRequest` as JSON, given only for a
+            clip, whose ``path`` is then no input (the other arguments do not apply to it); and ``budget_s``, the
+            seconds after which the job stops.
         ctx: The job's surroundings.
 
     Returns:
@@ -347,13 +353,20 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
     Raises:
         ValueError: ``strips`` is out of range, ``facts`` is not a bool, ``office`` is not an ``OfficeRequest`` or is
-            given with an input that is not a PDF, or more renders are asked for than one job may make.
+            given with an input that is not a PDF, ``media`` is given with a path that is not a clip's (or is not a
+            ``MediaRequest``), or more renders are asked for than one job may make.
     """
     name = protocol.check_input_path(str(args["path"]))
+    kind = kind_of(name)
+    if args.get("media") is not None:
+        if kind != "media":
+            raise ValueError("media names the artifacts of a clip, and the input is not a clip")
+        from workbench.executor.render import media
+
+        return media.prepare_media(args, ctx)  # the clip is no input of the job: its artifacts are
     real = ctx.work_dir / name
     if name.split("/")[0] == "out" or not real.is_file():
         return error("file_not_found", "there is no such file in this conversation's workspace")
-    kind = kind_of(name)
     if args.get("office") is not None and kind != "pdf":
         raise ValueError("office names what a converted PDF stands for, and the input is not a PDF")
     if kind in ("none", "media"):  # a clip's frames come from its artifacts, never from the clip
