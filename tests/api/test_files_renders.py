@@ -577,10 +577,17 @@ def test_a_frame_rendition_with_strips_is_422(
     unprepared = put(store, "quay-walk.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
 
     for path in (source.virtual_path, unprepared.virtual_path):
-        for strips, strip in ((2, 1), (3, 2)):
+        for strips, strip in ((2, 1), (3, 2), (2, None), (3, None)):  # with or without a strip: the clip's own refusal
             r = rendition(client, path, 1, strips=strips, strip=strip)
             assert (r.status_code, r.json()) == (422, {"detail": "a clip's frames are not cut into strips"})
     assert (len(executor.requests), len(events_of(audit_lines, "file.view"))) == (requests, views)
+
+
+def test_strips_without_a_strip_on_a_picture_keep_the_routes_own_422(client: TestClient, photo: FileRecord) -> None:
+    """The clip's refusal does not change the route's for any other file: ``strips`` needs a ``strip`` there."""
+    r = rendition(client, photo.virtual_path, 1, strips=2)
+
+    assert (r.status_code, r.json()) == (422, {"detail": "strip is 1 to strips"})
 
 
 def test_a_frame_past_the_clip_is_404(
@@ -616,19 +623,56 @@ def test_a_frame_that_went_is_404_not_500(client: TestClient, store: Store, buil
     assert len(executor.requests) == requests
 
 
-def test_a_frame_that_is_not_what_its_row_says_is_not_served(
-    client: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines
+def test_a_frame_whose_file_is_lost_or_wrong_is_404_not_500(
+    client: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines, executor: Local
 ) -> None:
-    """As for any render: a file that is not a JPEG whatever its row says is an internal error, and nothing is sent."""
-    source = prepared_clip(client, store, built)
-    frame = frame_rows(store, source)[1]
-    folder = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
-    (folder / frame.relative_path).write_bytes(b"not a picture, whatever its row says")
-    r = rendition(client, source.virtual_path, 1)
+    """A frame is not made on its own: one whose row is there but whose file is gone, or is no JPEG, is not found.
 
-    assert r.status_code == 500
-    assert "not a picture" not in r.text
-    assert events_of(audit_lines, "file.view") == []
+    ``view_file`` skips and names the same frame; the other frames are served, and nothing is recorded for the lost.
+    """
+    source = prepared_clip(client, store, built)
+    frames = frame_rows(store, source)
+    folder = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
+    (folder / frames[1].relative_path).write_bytes(b"not a picture, whatever its row says")
+    (folder / frames[2].relative_path).unlink()
+    requests = len(executor.requests)
+
+    for n in (1, 2):
+        r = rendition(client, source.virtual_path, n)
+        assert (r.status_code, r.json()) == NOT_FOUND, n
+        assert "not a picture" not in r.text
+    assert rendition(client, source.virtual_path, 3).status_code == 200
+    (event,) = events_of(audit_lines, "file.view")
+    assert event["target"]["ids"] == [source.id, frames[3].id]
+    assert len(executor.requests) == requests
+
+
+@pytest.mark.parametrize("lost", ["frame", "transcript"])
+def test_a_clip_whose_head_is_gone_is_prepared_again_with_its_frames(
+    client: TestClient, store: Store, built: Path, executor: Local, lost: str
+) -> None:
+    """The one way a frame comes back: the row holding the clip's facts (the transcript, else frame 1) is gone.
+
+    The next view prepares the clip again, which replaces the set and makes every frame; a frame lost beside a head
+    that is there stays lost (404).
+    """
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    assert artifact(client, source.virtual_path, "nextext_zip", keyframes(built)).status_code == 200
+    if lost == "transcript":
+        assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 200
+    assert prepare(client, source.virtual_path).json()["total"] == 3
+    rows = store.derived_of(source)
+    head = next(rec for rec in rows if rec.role == lost and (lost == "transcript" or rec.ordinal == 1))
+    if lost == "frame":
+        store.remove_derived(frame_rows(store, source)[2])
+        assert rendition(client, source.virtual_path, 2).status_code == 404  # frame 1, the head, is there
+    requests = len(executor.requests)
+    store.remove_derived(head)
+
+    r = rendition(client, source.virtual_path, 1)
+    assert (r.status_code, r.headers["content-type"]) == (200, "image/jpeg")
+    assert len(executor.requests) == requests + 1
+    assert sorted(frame_rows(store, source)) == [1, 2, 3]  # the whole set was made again, frame 2 too
 
 
 def test_a_slide_rendition_is_named_by_its_slide(

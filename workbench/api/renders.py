@@ -523,7 +523,8 @@ def frames_of(rows: Sequence[DerivedRecord]) -> dict[int, DerivedRecord]:
 
     Returns:
         The frames that exist, by their number (counted from 1 in time order). A number may be missing inside
-        ``1..total``: a clip has no way to remake a frame that went.
+        ``1..total``: a frame is not made on its own. It comes back only with the whole set, when the clip's head (the
+        transcript, else frame 1) is gone and the next prepare runs (:func:`_prepared_clip`).
     """
     return {rec.ordinal: rec for rec in rows if _is_frame(rec)}
 
@@ -1393,6 +1394,10 @@ def frame_window(part: str | None, total: int, times: Mapping[int, float]) -> li
 
     Returns:
         The frames, by number, in the order they are shown; none for a clip without frames asked for no part.
+
+    Note:
+        ``view_file`` reads a part only for a clip that has frames; a part of one that has none is answered with its
+        hint, so the refusals below for ``total`` 0 are for a caller that asks directly.
 
     Raises:
         HTTPException: 422 ``no_such_part: …``: ``part`` is none of the grammar's, its end comes before its start, N is

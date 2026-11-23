@@ -112,6 +112,9 @@ UNSUPPORTED_SOURCE: Final = "unsupported_format: the source is not an audio or v
 #: The answer for a client that went before its body was whole: the text FastAPI gives an upload in that case.
 BODY_NOT_READ: Final = "There was an error parsing the body"
 
+#: The refusal of ``strips`` above 1 for a view of a clip's frame: they are never cut.
+CLIP_NOT_CUT: Final = "a clip's frames are not cut into strips"
+
 #: The first four bytes of a zip, and the most bytes of a jsonl's first line the api parses.
 _ZIP_SIGNATURE: Final = b"PK\x03\x04"
 _FIRST_LINE_MAX: Final = 64 * 1024
@@ -592,8 +595,9 @@ async def _view_rendition(
 ) -> Response:
     """Send one render of a file, making it first when it does not exist yet.
 
-    A clip's frame ``rendition`` is one of the rows its prepare made: it is served whole, and one that went is not made
-    again.
+    A clip's frame ``rendition`` is one of the rows its prepare made: it is served whole. One that is lost, its row or
+    its file, is not found (404), never an internal error: a frame is not made on its own, and comes back only with the
+    whole set when the clip's head (the transcript, else frame 1) is gone and the prepare runs again.
 
     Args:
         path: The file's virtual path.
@@ -611,16 +615,16 @@ async def _view_rendition(
         The render, whole, with its own type and the name of its source.
 
     Raises:
-        NotFound: The file is not shown as pictures, or has no such page, slide or frame (a clip's frame that went too).
+        NotFound: The file is not shown as pictures, or has no such page, slide or frame (a clip's lost frame too).
         HTTPException: 422 for ``strips`` above 1 of a clip, before any job; 500 ``internal error``: the job made no
-            such render without saying why, or what it made is not what its row says. Any other refusal is what
-            :func:`~workbench.api.renders.prepared` and :func:`~workbench.api.renders.renders_for` raise, as the prepare
-            answers it.
+            such render without saying why, or what it made is not what its row says (not a clip's frame). Any other
+            refusal is what :func:`~workbench.api.renders.prepared` and :func:`~workbench.api.renders.renders_for`
+            raise, as the prepare answers it.
     """
     await run_in_threadpool(audit.check, "view", p)
     source = await run_in_threadpool(store.get, p, path)
     if strips > 1 and kind_of(source.name) == "media":  # before any job: a clip's frames are never cut
-        raise HTTPException(status_code=422, detail="a clip's frames are not cut into strips")
+        raise HTTPException(status_code=422, detail=CLIP_NOT_CUT)
     wall, budgeted = _wall_of(settings, caller)
     jobs = _render_jobs(queue, wall, MCP_QUEUE_WAIT_S, caller, "user")
     manifest = await prepared(p, source, settings=budgeted, store=store, audit=audit, jobs=jobs)
@@ -630,10 +634,10 @@ async def _view_rendition(
         p, source, manifest, [rendition], strips, settings=budgeted, store=store, audit=audit, jobs=jobs
     )
     render = next((rec for rec in made if rec.strip == strip), None)
-    if render is None and manifest.kind == "media":  # a clip's frame that went is not made again
-        raise NotFound("no such rendition")
     data = None if render is None else await run_in_threadpool(read_render, store, render)
     if render is None or data is None:
+        if manifest.kind == "media":  # a frame is not made on its own: one lost (its row, its file) is not found
+            raise NotFound("no such rendition")
         raise HTTPException(status_code=500, detail=INTERNAL)
     await run_in_threadpool(audit.record, "view", p, file_ids=[source.id, render.id])
     disposition = _rendition_disposition(source, render, noun_of(manifest))
@@ -665,7 +669,8 @@ async def view_file(
 
     With ``rendition`` the answer is one render of a picture or a PDF instead: page ``rendition``, or the picture for
     1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. Of a clip it is frame ``rendition``,
-    whole (``strips`` above 1 is 422), made with its transcript when the clip is prepared and never one by one. A page
+    whole (``strips`` above 1 is 422, with or without a ``strip``), made with its transcript when the clip is prepared
+    and never one by one; one that is lost is 404. A page
     or the strips of it that do not exist yet are made first, in one job on the user's own turn, which waits at most
     :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. An Office file with no PDF kept is converted on demand first, and
     drawn, in one turn of the caller's conversion gate, which waits for that gate and then a slot up to
@@ -694,6 +699,8 @@ async def view_file(
     """
     if rendition is None:
         return await run_in_threadpool(_view_whole, path, p, store, audit)
+    if strips > 1 and kind_of(path) == "media":  # the clip's own refusal comes first, with or without a strip
+        raise HTTPException(status_code=422, detail=CLIP_NOT_CUT)
     if (strip is not None and strip > strips) or (strip is None and strips > 1):
         raise HTTPException(status_code=422, detail="strip is 1 to strips")
     if queue is None:

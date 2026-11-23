@@ -977,6 +977,26 @@ def test_view_file_of_audio_says_read_the_transcript(
     assert again["structuredContent"]["hint"] == NO_PICTURES
 
 
+@pytest.mark.parametrize("part", ["frame 2", "frames 1-3", "at 01:24"])
+def test_a_part_of_a_clip_without_frames_is_answered_with_its_hint_not_refused(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, part: str
+) -> None:
+    """Audio, and a clip nothing was made of, have no frames to name: any part gets the hint, and is recorded."""
+    memo = put(store, "voice-memo.m4a", CLIP_BYTES, p=PG)
+    speech(client, memo, built)
+    bare = put(store, "quay-walk.mp4", CLIP_BYTES, p=PG)
+
+    for source, hint in ((memo, NO_PICTURES), (bare, NOTHING_FOUND)):
+        answer = seen(view(client, source.virtual_path, part))
+        assert len(answer["content"]) == 1
+        structured = answer["structuredContent"]
+        assert (structured["total"], structured["shown"], structured["truncated"]) == (0, [], False)
+        assert (structured["next_part"], structured["hint"]) == (None, hint)
+    first, second = events(audit_lines)
+    assert (first["target"]["ids"], second["target"]["ids"]) == ([memo.id], [bare.id])
+    assert [event["criteria"]["paged"] for event in (first, second)] == [True, True]
+
+
 def test_view_file_of_a_clip_with_nothing_found_says_so(client: TestClient, store: Store, fake_executor: Local) -> None:
     """A clip nothing was made of has no frames and no transcript: the hint says nothing was found, and no job ran."""
     source = put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
@@ -1057,6 +1077,34 @@ def test_a_frame_whose_row_is_gone_is_skipped_and_named(
     assert 7 not in [shown["n"] for shown in spread["shown"]]
     assert spread["hint"].startswith("Frame 7 could not be shown. 7 of the clip's 9 frames are shown")
     assert len(fake_executor.requests) == jobs  # the frame is not made again
+
+
+@pytest.mark.parametrize(("with_speech", "lost"), [(False, "frame"), (True, "transcript")])
+def test_a_clip_whose_head_is_gone_has_its_frames_made_again_with_the_set(
+    client: TestClient, store: Store, built: Path, fake_executor: Local, with_speech: bool, lost: str
+) -> None:
+    """The one way a frame comes back: the row holding the clip's facts (the transcript, else frame 1) is gone.
+
+    The view prepares the clip again, one recorded job, and shows every frame, the lost one too and one lost beside
+    it; with the head there a frame lost on its own stays lost and is named.
+    """
+    source = clip(client, store, built, 3)
+    if with_speech:
+        speech(client, source, built)
+    seen(view(client, source.virtual_path))
+    head = next(
+        rec for rec in store.derived_of(source) if rec.role == lost and (lost == "transcript" or rec.ordinal == 1)
+    )
+    store.remove_derived(frames_in(store, source)[2])
+    named = seen(view(client, source.virtual_path))["structuredContent"]
+    assert ([shown["n"] for shown in named["shown"]], named["hint"]) == ([1, 3], "Frame 2 could not be shown.")
+    jobs = len(fake_executor.requests)
+    store.remove_derived(head)
+
+    structured = seen(view(client, source.virtual_path))["structuredContent"]
+    assert ([shown["n"] for shown in structured["shown"]], structured["hint"]) == ([1, 2, 3], None)
+    assert len(fake_executor.requests) == jobs + 1
+    assert sorted(frames_in(store, source)) == [1, 2, 3]
 
 
 def test_strips_are_ignored_on_a_clip(
@@ -1338,7 +1386,10 @@ def test_a_shown_image_is_described_as_a_page_or_a_slide(client: TestClient) -> 
         shown = tool["outputSchema"]["$defs"]["ShownImage"]
         assert "'slide 3'" in shown["properties"]["label"]["description"], name
         assert shown["properties"]["n"]["description"].startswith("The page or slide"), name
+        assert "frame of a clip" in shown["properties"]["n"]["description"], name
+        assert "'frame 3 (01:24)'" in shown["properties"]["label"]["description"], name
         assert "``slide 3``" in shown["description"], name
+        assert "``frame 3 (01:24)``" in shown["description"], name
 
 
 def test_the_description_names_a_clips_frames(client: TestClient) -> None:
@@ -1352,6 +1403,15 @@ def test_the_description_names_a_clips_frames(client: TestClient) -> None:
     answer = tool["outputSchema"]["properties"]
     assert "media" in answer["kind"]["enum"]
     assert "frame" in answer["unit"]["anyOf"][0]["enum"]
+
+
+def test_the_part_argument_names_a_clips_grammar(client: TestClient) -> None:
+    """The argument's own description tells a clip's grammar beside the pages' and the slides'."""
+    (tool,) = [t for t in tools_of(client, HG) if t["name"] == "view_file"]
+    part = tool["inputSchema"]["properties"]["part"]["description"]
+
+    for phrase in ("'page 3'", "'slide 3'", "'frame 3'", "'frames 2-5'", "'at 01:24'"):
+        assert phrase in part, phrase
 
 
 def test_ghostwriter_is_offered_view_file(client: TestClient) -> None:

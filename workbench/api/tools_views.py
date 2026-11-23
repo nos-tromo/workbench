@@ -29,10 +29,12 @@ fall back on, and fails with them as ``view_file`` does. A Word or OpenDocument 
 its first read says that ``view_file`` shows its pages.
 
 ``view_file`` shows a clip's frames too, as the frames, by number, range or time (``frame 3``, ``frames 2-5``, ``at
-01:24``), from the rows its prepare made: no job runs, and a frame whose row or file is gone is named, not made again.
-A clip's frames are labelled ``frame 3 (01:24)``; left out, a part shows up to ``MAX_VIEW_IMAGES`` frames spread over
-the clip, and the hint says so. ``strips`` is ignored for a clip. Audio has no frames: the hint says to read its
-transcript with ``read_document``.
+01:24``), from the rows its prepare made: no job runs for a frame, and a frame whose row or file is gone is named in
+the hint, not shown. It is made again only with the whole set, when the clip's head (the transcript, else frame 1) is
+gone and the next prepare runs. A clip's frames are labelled ``frame 3 (01:24)``; left out, a part shows up to
+``MAX_VIEW_IMAGES`` frames spread over the clip, and the hint says so. ``strips`` is ignored for a clip. Audio, or a
+clip without frames, has none to name: whatever its ``part`` says, the answer is the hint that says to read its
+transcript with ``read_document`` (or that nothing was found), never a refusal.
 
 Every call is recorded as a ``query`` of the source and of each render shown, before any block is returned; a file that
 shows no image is recorded too, with none. If the event cannot be written the call fails and no image leaves.
@@ -138,7 +140,7 @@ class ViewFileRequest(BaseModel):
 
     Attributes:
         path: The file's absolute path.
-        part: Which pages or slides to show; left out, the picture or the first four.
+        part: Which pages, slides or frames to show; left out, the picture, the first four, or 8 frames of a clip.
         strips: Into how many strips each page is cut.
     """
 
@@ -150,8 +152,8 @@ class ViewFileRequest(BaseModel):
     part: str | None = Field(
         default=None,
         description=(
-            "Which pages or slides to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5'; "
-            "left out: the picture, or the first four."
+            "Which pages, slides or frames to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5', "
+            "for a clip 'frame 3', 'frames 2-5', 'at 01:24'; left out: the picture, the first four, or 8 frames."
         ),
         json_schema_extra=_STRING,
     )
@@ -351,9 +353,12 @@ async def _view_frames(
 
     Whole frames are taken in the order of the window while there are at most ``MAX_VIEW_IMAGES`` images and
     ``MAX_SHOWN_BYTES`` bytes; the first that does not fit ends the answer, and ``next_part`` names where it goes on
-    (``frames 4-8``). A frame whose row is not there (a clip has no way to make it again) or whose file is not what its
-    row says is left out and named. A call that names no part of a clip of more frames than one answer holds is shown
-    that many, spread over the clip, and told so. ``strips`` is ignored: a clip's frames are never cut.
+    (``frames 4-8``). A frame whose row is not there or whose file is not what its row says is left out and named: a
+    frame is not made on its own, and comes back only with the whole set when the clip's head (the transcript, else
+    frame 1) is gone, which :func:`~workbench.api.renders.prepared` has made good before this runs. A call that names no
+    part of a clip of more frames than one answer holds is shown that many, spread over the clip, and told so.
+    ``strips`` is ignored: a clip's frames are never cut. A clip without frames answers its hint whatever ``part``
+    says: a part is read only when there are frames to name.
 
     Args:
         body: The call: ``part`` says which frames.
@@ -368,7 +373,8 @@ async def _view_frames(
         The answer alone for a clip with no frames; otherwise it with the image blocks that follow its ``shown``.
 
     Raises:
-        HTTPException: 422 ``no_such_part``: ``part`` is none of a clip's, or names a frame or a time the clip has not.
+        HTTPException: 422 ``no_such_part``: the clip has frames, and ``part`` is none of the grammar's or names a
+            frame or a time it has not.
         AuditWriteError: The event could not be written; no image goes out.
     """
     paged = body.part is not None

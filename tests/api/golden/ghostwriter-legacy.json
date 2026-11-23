@@ -1106,16 +1106,16 @@
             "type": "object"
           },
           "ShownImage": {
-            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, or a strip of one.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``page 3, strip 1 of 2``.\n    n: The page or slide, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
+            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, a frame of a clip, or a strip.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``frame 3 (01:24)``, ``page 3, strip 1 of 2``.\n    n: The page or slide, or the frame of a clip, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
             "properties": {
               "label": {
-                "description": "What the image is: 'image', 'page 3', 'slide 3' or 'page 3, strip 1 of 2'.",
+                "description": "What the image is: 'image', 'page 3', 'slide 3', 'frame 3 (01:24)' or 'page 3, strip 1 of 2'.",
                 "maxLength": 100,
                 "title": "Label",
                 "type": "string"
               },
               "n": {
-                "description": "The page or slide, counted from 1; 1 for a picture.",
+                "description": "The page or slide, or the frame of a clip, counted from 1; 1 for a picture.",
                 "title": "N",
                 "type": "integer"
               },
@@ -1755,7 +1755,7 @@
       "title": "Look at a picture, or the pages or slides of a file",
       "description": "Show a picture, or the pages or slides of a file of this conversation, as images for you to see, with their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or 'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Video: a clip's frames, 'frame 3', 'frames 2-5' or 'at 01:24' (the frame nearest that time); left out, up to 8 frames spread over the clip. Audio has no pictures: read its transcript with read_document. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, call again with part set to next_part. Pages or slides that could not be shown are named in hint. Spreadsheets are not shown: read them with read_document. Never describe an image you have not looked at.",
       "inputSchema": {
-        "description": "Body of ``view_file``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Which pages or slides to show; left out, the picture or the first four.\n    strips: Into how many strips each page is cut.",
+        "description": "Body of ``view_file``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Which pages, slides or frames to show; left out, the picture, the first four, or 8 frames of a clip.\n    strips: Into how many strips each page is cut.",
         "properties": {
           "path": {
             "description": "The file's absolute path, for example /workspace/<chat>/report.pdf, as list_files gives it.",
@@ -1774,7 +1774,7 @@
               }
             ],
             "default": null,
-            "description": "Which pages or slides to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5'; left out: the picture, or the first four.",
+            "description": "Which pages, slides or frames to show: 'page 3', 'pages 2-5', for a deck 'slide 3', 'slides 2-5', for a clip 'frame 3', 'frames 2-5', 'at 01:24'; left out: the picture, the first four, or 8 frames.",
             "title": "Part",
             "type": "string"
           },
@@ -1855,16 +1855,16 @@
             "type": "object"
           },
           "ShownImage": {
-            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, or a strip of one.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``page 3, strip 1 of 2``.\n    n: The page or slide, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
+            "description": "An image that comes with the answer for you to see: a picture, a page or a slide, a frame of a clip, or a strip.\n\nAttributes:\n    label: What it is: ``image``, ``page 3``, ``slide 3``, ``frame 3 (01:24)``, ``page 3, strip 1 of 2``.\n    n: The page or slide, or the frame of a clip, counted from 1; 1 for a picture.\n    width: Its width in pixels.\n    height: Its height in pixels.\n    mime: Its type.",
             "properties": {
               "label": {
-                "description": "What the image is: 'image', 'page 3', 'slide 3' or 'page 3, strip 1 of 2'.",
+                "description": "What the image is: 'image', 'page 3', 'slide 3', 'frame 3 (01:24)' or 'page 3, strip 1 of 2'.",
                 "maxLength": 100,
                 "title": "Label",
                 "type": "string"
               },
               "n": {
-                "description": "The page or slide, counted from 1; 1 for a picture.",
+                "description": "The page or slide, or the frame of a clip, counted from 1; 1 for a picture.",
                 "title": "N",
                 "type": "integer"
               },
