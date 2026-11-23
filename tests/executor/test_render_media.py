@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from tests.conftest import scaled
 from tests.fixtures import make_media
@@ -273,6 +273,17 @@ def test_blank_lines_are_ignored(tmp_path: Path) -> None:
     assert (transcript.lines, transcript.skipped) == (1, 0)
 
 
+def test_a_byte_order_mark_leading_the_file_is_no_reason_to_refuse_it(tmp_path: Path) -> None:
+    """The api reads a first line that a BOM leads, so the executor does too: the transcript is the same."""
+    path = make_media.make_jsonl(tmp_path / "docint.jsonl", HELLO)
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+
+    transcript = media.read_transcript(path)
+
+    assert transcript == _transcript(tmp_path, HELLO)
+    assert transcript.text.startswith("[00:00] Speaker 1: Welcome aboard.\n")
+
+
 def test_a_lone_surrogate_is_replaced_and_the_text_stays_encodable(tmp_path: Path) -> None:
     """JSON can carry half of a surrogate pair; the transcript is UTF-8, so it cannot, and the sentence is kept."""
     path = tmp_path / "docint.jsonl"
@@ -325,23 +336,20 @@ def test_a_jsonl_that_is_not_json_lines_is_unreadable(tmp_path: Path, content: b
 def test_a_jsonl_over_the_cap_is_not_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The api keeps the cap; the executor holds to it as well, and reads nothing of a larger file."""
     monkeypatch.setattr(media, "JSONL_MAX_BYTES", 50)
-    path = _transcript_path(tmp_path)
+    path = make_media.make_jsonl(tmp_path / "docint.jsonl", HELLO)
 
     with pytest.raises(UnreadableFile):
         media.read_transcript(path)
-
-
-def _transcript_path(tmp_path: Path) -> Path:
-    """A transcript file of the three sentences."""
-    return make_media.make_jsonl(tmp_path / "docint.jsonl", HELLO)
 
 
 # --- the frames -----------------------------------------------------------------------------
 
 
 def test_frames_are_scaled_to_1280_without_metadata(tmp_path: Path) -> None:
-    """Three 4K frames come out 1280 by 720, under the cap, in time order, each with its time and no EXIF."""
-    keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", size=(3840, 2160))
+    """Three 4K frames come out 1280 by 720, under the cap, in time order, each with its time and none of its EXIF."""
+    keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", size=(3840, 2160), exif=True)
+    assert keyframes.read_bytes().count(b"Exif") == 3  # every source frame does carry its EXIF block
+    assert keyframes.read_bytes().count(make_media.CAMERA_MODEL.encode()) == 3
 
     frames, held = media.read_frames(keyframes, file_mb=50)
 
@@ -353,8 +361,11 @@ def test_frames_are_scaled_to_1280_without_metadata(tmp_path: Path) -> None:
         assert signature_ok(frame.data, frame.mime)
         assert len(frame.data) < RENDER_MAX_BYTES
         assert b"Exif" not in frame.data
+        assert make_media.CAMERA_MODEL.encode() not in frame.data
         decoded = Image.open(io.BytesIO(frame.data))
         assert decoded.size == (1280, 720)
+        assert not decoded.getexif()
+        assert not {"exif", "icc_profile", "xmp"} & set(decoded.info)
         assert _close(decoded.convert("RGB").getpixel((640, 360)), make_media.frame_colour(index))
 
 
@@ -363,8 +374,6 @@ def test_frames_are_made_at_the_spec_quality_and_subsampling(tmp_path: Path) -> 
     keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", frames=1, size=(2560, 1440), times=(0.0,))
 
     (frame,), _ = media.read_frames(keyframes, file_mb=50)
-
-    from PIL import JpegImagePlugin
 
     assert max(frame.width, frame.height) == FRAME_LONG_SIDE
     assert JpegImagePlugin.get_sampling(Image.open(io.BytesIO(frame.data))) == 2  # 4:2:0
@@ -426,12 +435,61 @@ def test_a_time_that_is_no_time_is_left_off_its_frame(tmp_path: Path) -> None:
     assert [frame.time_s for frame in frames] == [1.5, None, None, None, None]
 
 
+@pytest.mark.parametrize(
+    "times",
+    [(5.0, 2.0, 9.0), (0.0, 4.0, 3.9), (9.0, 4.0, 0.0), (0.0, 2.0, 1e-3)],
+    ids=["middle-back", "last-back", "all-back", "last-a-hair-back"],
+)
+def test_times_that_run_backwards_are_not_kept(tmp_path: Path, times: tuple[float, ...]) -> None:
+    """A frame is numbered by its place in time; a manifest that says otherwise is dropped whole, like a bad one."""
+    keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", times=times, size=(8, 8))
+
+    frames, held = media.read_frames(keyframes, file_mb=50)
+
+    assert (held, [frame.n for frame in frames]) == (3, [1, 2, 3])
+    assert [frame.time_s for frame in frames] == [None, None, None]
+
+
+def test_times_that_stand_still_or_run_forward_are_kept(tmp_path: Path) -> None:
+    """Two frames at one moment are fine: the times never decrease."""
+    keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", times=(1.0, 1.0, 2.5), size=(8, 8))
+
+    frames, _ = media.read_frames(keyframes, file_mb=50)
+
+    assert [frame.time_s for frame in frames] == [1.0, 1.0, 2.5]
+
+
+def test_the_order_of_times_is_judged_over_every_frame_not_only_those_kept(tmp_path: Path) -> None:
+    """A frame left out for length that is out of order still marks the manifest as one to distrust."""
+    times = [float(i) for i in range(30)]
+    times[1], times[2] = times[2], times[1]  # frames 2 and 3 of 30 are not among the 19 kept
+    keyframes = make_media.make_keyframes_zip(tmp_path / "keyframes.zip", frames=30, times=times, size=(8, 8))
+
+    frames, held = media.read_frames(keyframes, file_mb=50)
+
+    assert held == 30
+    assert {frame.time_s for frame in frames} == {None}
+
+
+def test_a_gap_in_the_manifest_does_not_make_the_rest_distrusted(tmp_path: Path) -> None:
+    """A frame the manifest says nothing of has no time of its own; the others, in order, keep theirs."""
+    path = tmp_path / "keyframes.zip"
+    make_media.make_keyframes_zip(path, frames=3, times=None, size=(8, 8))
+    manifest = {"frames": [{"file": "frame_000.jpg", "time_sec": 1.0}, {"file": "frame_002.jpg", "time_sec": 2.0}]}
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+
+    frames, _ = media.read_frames(path, file_mb=50)
+
+    assert [frame.time_s for frame in frames] == [1.0, None, 2.0]
+
+
 def test_frames_come_in_the_order_of_their_numbers(tmp_path: Path) -> None:
     """A zip that lists its frames out of order is read in the order of the numbers in their names."""
     path = tmp_path / "keyframes.zip"
     with zipfile.ZipFile(path, "w") as archive:
         for index in (2, 0, 1):
-            archive.writestr(f"frame_{index:03d}.jpg", make_media._jpeg((64, 36), make_media.frame_colour(index)))
+            archive.writestr(f"frame_{index:03d}.jpg", make_media.jpeg((64, 36), make_media.frame_colour(index)))
         archive.writestr(
             "manifest.json",
             json.dumps({"frames": [{"file": f"frame_{i:03d}.jpg", "index": i, "time_sec": i * 5} for i in range(3)]}),
@@ -708,7 +766,14 @@ def test_bad_frames_leave_the_transcript(ctx: JobContext) -> None:
 
 def test_a_hostile_zip_leaves_the_transcript_whatever_its_trick(ctx: JobContext) -> None:
     """A member out of the folder, a PNG as a frame and a header that claims 144 megapixels each give the same."""
-    for extra in ({"../x.jpg": b"x"}, {"frame_003.jpg": make_media.jpeg_claiming(12000, 12000)}):
+    png = io.BytesIO()
+    Image.new("RGB", (16, 16), (0, 0, 255)).save(png, "PNG")
+    tricks = (
+        {"../x.jpg": b"x"},
+        {"frame_003.jpg": png.getvalue()},
+        {"frame_003.jpg": make_media.jpeg_claiming(12000, 12000)},
+    )
+    for extra in tricks:
         _jsonl(ctx)
         _zip(ctx, extra=extra)
 
@@ -719,6 +784,20 @@ def test_a_hostile_zip_leaves_the_transcript_whatever_its_trick(ctx: JobContext)
         assert _written(ctx) == ["transcript.txt"]
         for leftover in ctx.out_dir.iterdir():
             leftover.unlink()
+
+
+def test_a_manifest_that_runs_backwards_gives_no_times_and_no_duration(ctx: JobContext) -> None:
+    """A late time in an out-of-order manifest sets neither a frame's time nor the length of the clip."""
+    _jsonl(ctx)
+    _zip(ctx, times=(359_000.0, 10.0, 20.0))
+
+    result = RenderAnswer.model_validate(_prepare(ctx))
+
+    assert [entry.time_s for entry in result.renders] == [None, None, None]
+    assert result.duration_s == 91.0  # the speech's own end, as the frames say nothing
+
+    _zip(ctx, times=(359_000.0, 10.0, 20.0))
+    assert RenderAnswer.model_validate(_prepare(ctx, jsonl=False)).duration_s is None
 
 
 def test_nothing_usable_is_unreadable_file(ctx: JobContext) -> None:
@@ -752,6 +831,82 @@ def test_an_artifact_that_is_not_there_is_unreadable_not_a_crash(ctx: JobContext
     result = RenderAnswer.model_validate(_prepare(ctx))  # the jsonl is named and absent
 
     assert (result.total, result.transcript, result.hint) == (3, None, "The transcript could not be read.")
+
+
+def _refusing_to_look(monkeypatch: pytest.MonkeyPatch, suffix: str) -> None:
+    """Make ``Path.is_file`` fail with ``EACCES`` for the files with a suffix, as a folder the job cannot enter does."""
+    real = Path.is_file
+
+    def is_file(self: Path, **kwargs: Any) -> bool:
+        if self.suffix == suffix:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", ".zip"])
+def test_an_artifact_that_cannot_be_looked_at_costs_its_part_and_names_no_path(
+    ctx: JobContext, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    """An ``OSError`` of a look at a file is a part that could not be read, not a job that dies quoting its path."""
+    _jsonl(ctx)
+    _zip(ctx)
+    _refusing_to_look(monkeypatch, suffix)
+
+    result = RenderAnswer.model_validate(_prepare(ctx))
+
+    if suffix == ".jsonl":
+        assert (result.total, result.transcript, result.hint) == (3, None, "The transcript could not be read.")
+    else:
+        assert (result.total, result.hint) == (0, "The frames could not be read.")
+        assert result.transcript is not None
+    text = json.dumps(result.model_dump())
+    assert str(ctx.work_dir) not in text
+    assert "Permission" not in text
+
+
+def test_when_nothing_can_be_looked_at_the_error_is_the_fixed_text(
+    ctx: JobContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both artifacts out of reach end as ``unreadable_file`` with no path and no ``errno``."""
+    _jsonl(ctx)
+    _zip(ctx)
+    real = Path.is_file
+
+    def is_file(self: Path, **kwargs: Any) -> bool:
+        if self.suffix in (".jsonl", ".zip"):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+
+    answer = _prepare(ctx)
+
+    assert answer == {"error": "unreadable_file: nothing in the clip's artifacts could be read"}
+
+
+def test_a_zip_check_that_fails_with_an_os_error_is_unreadable_and_names_no_path(
+    ctx: JobContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``check_zip`` falls back to opening the file, which can fail as well: that is the frames lost, not the job."""
+
+    def failing(path: Path, file_mb: int) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    _jsonl(ctx)
+    _zip(ctx)
+    monkeypatch.setattr(readers, "check_zip", failing)
+
+    result = RenderAnswer.model_validate(_prepare(ctx))
+
+    assert (result.total, result.hint) == (0, "The frames could not be read.")
+    assert result.transcript is not None
+    assert str(ctx.work_dir) not in json.dumps(result.model_dump())
+
+    with pytest.raises(UnreadableFile) as caught:
+        media.read_frames(ctx.work_dir / ZIP, file_mb=50)
+    assert str(caught.value) == DAMAGED
 
 
 def test_audio_says_nothing_of_frames(ctx: JobContext) -> None:
@@ -981,6 +1136,17 @@ def test_media_with_a_file_that_is_no_clip_is_a_mistake(ctx: JobContext) -> None
 
     with pytest.raises(ValueError):
         RUNNERS["prepare_file"]({"path": "photo.jpg", "media": request}, ctx)
+
+
+def test_media_and_office_together_are_a_mistake(ctx: JobContext) -> None:
+    """``office`` names a converted PDF, and a clip is none: given with ``media`` it is not silently dropped."""
+    request = {"nextext_jsonl": JSONL, "nextext_zip": None, "video": False}
+
+    with pytest.raises(ValueError):
+        RUNNERS["prepare_file"](
+            {"path": "voice-memo.m4a", "media": request, "office": {"unit": "page"}},
+            ctx,
+        )
 
 
 def test_a_clip_without_a_media_argument_is_still_refused(ctx: JobContext) -> None:

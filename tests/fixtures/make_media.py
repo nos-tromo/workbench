@@ -16,9 +16,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import ExifTags, Image
 
 from workbench.renders import stamp
+
+#: The camera model a frame's EXIF block says when it has one: invented.
+CAMERA_MODEL = "Invented Camera Co. Model 1"
 
 #: What the records of a transcript say of their clip, as Nextext writes them.
 _SOURCE_FILE = "media.mp4"
@@ -81,18 +84,25 @@ def frame_colour(index: int) -> tuple[int, int, int]:
     return (40 + index * 70) % 256, (200 - index * 37) % 256, (90 + index * 111) % 256
 
 
-def _jpeg(size: tuple[int, int], colour: tuple[int, int, int]) -> bytes:
+def jpeg(size: tuple[int, int], colour: tuple[int, int, int], *, exif: bool = False) -> bytes:
     """Encode a flat picture as a JPEG.
 
     Args:
         size: Width and height.
         colour: The colour of every pixel.
+        exif: Whether the JPEG carries an EXIF block, with an invented camera model and an orientation of 1.
 
     Returns:
         The JPEG's bytes.
     """
+    options: dict[str, Any] = {"quality": 90, "subsampling": 0}
+    if exif:
+        block = Image.Exif()
+        block[ExifTags.Base.Orientation] = 1
+        block[ExifTags.Base.Model] = CAMERA_MODEL
+        options["exif"] = block
     buffer = io.BytesIO()
-    Image.new("RGB", size, colour).save(buffer, "JPEG", quality=90, subsampling=0)
+    Image.new("RGB", size, colour).save(buffer, "JPEG", **options)
     return buffer.getvalue()
 
 
@@ -102,6 +112,7 @@ def make_keyframes_zip(
     *,
     size: tuple[int, int] = (64, 36),
     times: Sequence[float] | None = (0.0, 4.0, 8.0),
+    exif: bool = False,
     extra: Mapping[str, bytes] | None = None,
 ) -> Path:
     """Write a keyframes zip: ``frame_000.jpg`` and on in distinct colours, and a manifest that gives their times.
@@ -112,6 +123,7 @@ def make_keyframes_zip(
         size: Width and height of each, in pixels.
         times: The time of each frame in seconds, for as many frames as it has entries; ``None`` writes no
             ``manifest.json`` at all.
+        exif: Whether each frame carries an EXIF block (see :func:`jpeg`).
         extra: More members to write after those, by name, such as a second ``frame_000.jpg`` (which makes a
             duplicate) or a name no keyframes zip has.
 
@@ -122,7 +134,7 @@ def make_keyframes_zip(
         warnings.simplefilter("ignore", UserWarning)  # a duplicate name is a case under test
         with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
             for index in range(frames):
-                archive.writestr(f"frame_{index:03d}.jpg", _jpeg(size, frame_colour(index)))
+                archive.writestr(f"frame_{index:03d}.jpg", jpeg(size, frame_colour(index), exif=exif))
             if times is not None:
                 manifest = {
                     "frames": [
@@ -146,7 +158,7 @@ def jpeg_claiming(width: int, height: int) -> bytes:
     Returns:
         The JPEG's bytes: an 8 by 8 picture with its ``SOF0`` segment rewritten.
     """
-    data = bytearray(_jpeg((8, 8), (200, 30, 30)))
+    data = bytearray(jpeg((8, 8), (200, 30, 30)))
     offset = 2  # past the start-of-image marker
     while offset + 4 <= len(data):
         marker = data[offset + 1]

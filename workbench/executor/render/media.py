@@ -15,6 +15,7 @@ pixel is. Nothing is written until every output is made, so a failure leaves ``o
 """
 
 import io
+import itertools
 import json
 import re
 import time
@@ -167,7 +168,7 @@ def read_transcript(path: Path) -> Transcript:
     try:
         if path.stat().st_size > JSONL_MAX_BYTES:
             raise UnreadableFile(TOO_BIG)
-        text = path.read_bytes().decode("utf-8")
+        text = path.read_bytes().decode("utf-8-sig")  # a BOM leads a file some tools wrote
     except UnreadableFile:
         raise
     except MemoryError:
@@ -272,6 +273,24 @@ def _times(archive: zipfile.ZipFile, manifest: zipfile.ZipInfo | None) -> dict[s
     return times
 
 
+def _ordered(times: dict[str, float], members: list[zipfile.ZipInfo]) -> dict[str, float]:
+    """Trust the manifest's times only when they run forward with the frame numbers.
+
+    Frames are numbered by their names, and a frame's number is its place in time order. A manifest that puts a later
+    frame earlier in the clip than one before it contradicts that, and nothing in it can be told from a mistake, so
+    none of its times is kept, as when it does not read.
+
+    Args:
+        times: The time of each frame the manifest gave one.
+        members: The frames of the zip in the order of their numbers.
+
+    Returns:
+        ``times`` when those given never decrease along the frames; otherwise no times.
+    """
+    given = [times[info.filename] for info in members if info.filename in times]
+    return times if all(later >= earlier for earlier, later in itertools.pairwise(given)) else {}
+
+
 def _spread(count: int) -> list[int]:
     """Pick which of ``count`` frames to keep.
 
@@ -305,9 +324,9 @@ def read_frames(path: Path, *, file_mb: int) -> tuple[list[Frame], int]:
 
     The zip is checked as an Office file's is, and then by its names: ``frame_NNN.jpg`` and ``manifest.json``, once
     each, and nothing else. At most ``MEDIA_FRAMES_MAX`` frames are kept, spread evenly from the first to the last, and
-    only those are read. Each is read as far as it declares, must begin as a JPEG, and is brought to
-    ``FRAME_LONG_SIDE`` and encoded under the render cap with none of its metadata. Any frame that fails refuses the
-    whole set.
+    only those are read. The manifest's times are kept only when they never decrease along the frames. Each frame is
+    read as far as it declares, must begin as a JPEG, and is brought to ``FRAME_LONG_SIDE`` and encoded under the render
+    cap with none of its metadata. Any frame that fails refuses the whole set.
 
     Args:
         path: The zip.
@@ -321,11 +340,11 @@ def read_frames(path: Path, *, file_mb: int) -> tuple[list[Frame], int]:
             frame is damaged, encrypted, too large, or a picture over 120 megapixels.
         readers.ReadTimeout: The deadline passed.
     """
-    readers.check_zip(path, file_mb)
     try:
+        readers.check_zip(path, file_mb)
         with zipfile.ZipFile(path) as archive:
             members, manifest = _members(archive)
-            times = _times(archive, manifest)
+            times = _ordered(_times(archive, manifest), members)
             frames: list[Frame] = []
             for position in _spread(len(members)):
                 readers.check()
@@ -370,10 +389,14 @@ def _artifact(ctx: JobContext, relative: str) -> Path:
         The file.
 
     Raises:
-        UnreadableFile: There is no such file in the job folder.
+        UnreadableFile: There is no such file in the job folder, or it cannot be looked at.
     """
     real = ctx.work_dir / relative
-    if not real.is_file():
+    try:
+        found = real.is_file()
+    except OSError:  # its text holds the path
+        found = False
+    if not found:
         raise UnreadableFile(DAMAGED)
     return real
 

@@ -353,14 +353,16 @@ def prepare_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
     Raises:
         ValueError: ``strips`` is out of range, ``facts`` is not a bool, ``office`` is not an ``OfficeRequest`` or is
-            given with an input that is not a PDF, ``media`` is given with a path that is not a clip's (or is not a
-            ``MediaRequest``), or more renders are asked for than one job may make.
+            given with an input that is not a PDF, ``media`` is not a ``MediaRequest``, or is given with a path that is
+            not a clip's or with ``office``, or more renders are asked for than one job may make.
     """
     name = protocol.check_input_path(str(args["path"]))
     kind = kind_of(name)
     if args.get("media") is not None:
         if kind != "media":
             raise ValueError("media names the artifacts of a clip, and the input is not a clip")
+        if args.get("office") is not None:
+            raise ValueError("office names what a converted PDF stands for, and a clip is none")
         from workbench.executor.render import media
 
         return media.prepare_media(args, ctx)  # the clip is no input of the job: its artifacts are
