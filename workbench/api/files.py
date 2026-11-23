@@ -561,14 +561,17 @@ def _rendition_disposition(source: FileRecord, render: DerivedRecord, noun: Noun
         noun: What the file's renders show (:func:`~workbench.api.renders.noun_of`): ``slide`` names a deck's.
 
     Returns:
-        ``inline`` and the name ``<stem>-page-3-strip-1-of-2.jpg`` (``<stem>-slide-3.jpg`` for a slide): a picture
-        shown whole has its stem alone, a page or slide its number, a strip its place among the strips of its page.
+        ``inline`` and the name ``<stem>-page-3-strip-1-of-2.jpg`` (``<stem>-slide-3.jpg`` for a slide,
+        ``<stem>-frame-3.jpg`` for a frame of a clip): a picture shown whole has its stem alone, a page, slide or frame
+        its number, a strip its place among the strips of its page.
         Never the render's own name, which is an id.
     """
     stem = posixpath.splitext(posixpath.basename(source.name))[0]
     parts = [stem]
     if render.role == "page":
         parts.append(f"{'slide' if noun == 'slide' else 'page'}-{render.ordinal}")
+    elif render.role == "frame":
+        parts.append(f"frame-{render.ordinal}")
     if render.strips > 1:
         parts.append(f"strip-{render.strip}-of-{render.strips}")
     name = "-".join(parts) + posixpath.splitext(render.name)[1]
@@ -589,10 +592,13 @@ async def _view_rendition(
 ) -> Response:
     """Send one render of a file, making it first when it does not exist yet.
 
+    A clip's frame ``rendition`` is one of the rows its prepare made: it is served whole, and one that went is not made
+    again.
+
     Args:
         path: The file's virtual path.
-        rendition: The page or slide, counted from 1; 1 for a picture.
-        strips: Into how many strips the page is cut.
+        rendition: The page, slide or frame, counted from 1; 1 for a picture.
+        strips: Into how many strips the page is cut; a clip's frames are not cut.
         strip: Which strip to send, counted from 1.
         p: The caller, user and chat.
         caller: The caller, whose wall and slots bound the job.
@@ -605,22 +611,27 @@ async def _view_rendition(
         The render, whole, with its own type and the name of its source.
 
     Raises:
-        NotFound: The file is not shown as pictures, or has no such page.
-        HTTPException: 500 ``internal error``: the job made no such render without saying why, or what it made is not
-            what its row says. Any other refusal is what :func:`~workbench.api.renders.prepared` and
-            :func:`~workbench.api.renders.renders_for` raise, as the prepare answers it.
+        NotFound: The file is not shown as pictures, or has no such page, slide or frame (a clip's frame that went too).
+        HTTPException: 422 for ``strips`` above 1 of a clip, before any job; 500 ``internal error``: the job made no
+            such render without saying why, or what it made is not what its row says. Any other refusal is what
+            :func:`~workbench.api.renders.prepared` and :func:`~workbench.api.renders.renders_for` raise, as the prepare
+            answers it.
     """
     await run_in_threadpool(audit.check, "view", p)
     source = await run_in_threadpool(store.get, p, path)
+    if strips > 1 and kind_of(source.name) == "media":  # before any job: a clip's frames are never cut
+        raise HTTPException(status_code=422, detail="a clip's frames are not cut into strips")
     wall, budgeted = _wall_of(settings, caller)
     jobs = _render_jobs(queue, wall, MCP_QUEUE_WAIT_S, caller, "user")
     manifest = await prepared(p, source, settings=budgeted, store=store, audit=audit, jobs=jobs)
-    if manifest.kind in ("none", "media") or rendition > manifest.total:  # a clip's frames are not served here yet
+    if manifest.kind == "none" or rendition > manifest.total:
         raise NotFound("no such rendition")
     made = await renders_for(
         p, source, manifest, [rendition], strips, settings=budgeted, store=store, audit=audit, jobs=jobs
     )
     render = next((rec for rec in made if rec.strip == strip), None)
+    if render is None and manifest.kind == "media":  # a clip's frame that went is not made again
+        raise NotFound("no such rendition")
     data = None if render is None else await run_in_threadpool(read_render, store, render)
     if render is None or data is None:
         raise HTTPException(status_code=500, detail=INTERNAL)
@@ -653,8 +664,9 @@ async def view_file(
     :mod:`workbench.api.hardening`.
 
     With ``rendition`` the answer is one render of a picture or a PDF instead: page ``rendition``, or the picture for
-    1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. A page or the strips of it that do not
-    exist yet are made first, in one job on the user's own turn, which waits at most
+    1, in one piece or, with ``strips`` of 2 or 3, its strip number ``strip``. Of a clip it is frame ``rendition``,
+    whole (``strips`` above 1 is 422), made with its transcript when the clip is prepared and never one by one. A page
+    or the strips of it that do not exist yet are made first, in one job on the user's own turn, which waits at most
     :data:`~workbench.api.jobs.MCP_QUEUE_WAIT_S`. An Office file with no PDF kept is converted on demand first, and
     drawn, in one turn of the caller's conversion gate, which waits for that gate and then a slot up to
     :data:`~workbench.api.jobs.SOURCE_LOCK_WAIT_S`. While another call makes the file's renders, such as its prepare

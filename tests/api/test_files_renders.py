@@ -520,6 +520,117 @@ def test_a_clip_taken_back_after_its_prepare_takes_what_was_made_with_it(
     assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 404
 
 
+def prepared_clip(client: TestClient, store: Store, built: Path, name: str = "harbour-tour.mp4") -> FileRecord:
+    """A clip with both artifacts, prepared: 3 frames and a transcript."""
+    source = put(store, name, b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    assert artifact(client, source.virtual_path, "nextext_jsonl", speech(built)).status_code == 200
+    assert artifact(client, source.virtual_path, "nextext_zip", keyframes(built)).status_code == 200
+    assert prepare(client, source.virtual_path).json()["total"] == 3
+    return source
+
+
+def frame_rows(store: Store, source: FileRecord) -> dict[int, DerivedRecord]:
+    """A clip's frames, by their number."""
+    return {rec.ordinal: rec for rec in store.derived_of(source) if rec.role == "frame"}
+
+
+def test_a_frame_rendition_is_served_whole(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, executor: Local
+) -> None:
+    """A clip's frame is its row's file, whole, as a JPEG: the hardening headers, its name, and one view event."""
+    source = prepared_clip(client, store, built)
+    frames = frame_rows(store, source)
+    requests = len(executor.requests)
+    r = rendition(client, source.virtual_path, 2)
+
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.headers["content-disposition"] == "inline; filename*=UTF-8''harbour-tour-frame-2.jpg"
+    hardened(r)
+    assert r.content == store.open_derived(frames[2]).read()
+    assert r.content[:3] == b"\xff\xd8\xff"
+    (event,) = events_of(audit_lines, "file.view")
+    assert (event["action"], event["outcome"]) == ("disclose", "ok")
+    assert event["target"]["ids"] == [source.id, frames[2].id]
+    assert len(executor.requests) == requests  # no job: the frame was made with the transcript
+
+
+def test_a_frame_rendition_of_a_clip_not_yet_prepared_prepares_it_first(
+    client: TestClient, store: Store, built: Path, executor: Local
+) -> None:
+    """A view that comes first prepares the clip on its own, then serves the frame."""
+    source = put(store, "harbour-tour.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+    assert artifact(client, source.virtual_path, "nextext_zip", keyframes(built)).status_code == 200
+    r = rendition(client, source.virtual_path, 3)
+
+    assert (r.status_code, r.headers["content-type"]) == (200, "image/jpeg")
+    assert r.content == store.open_derived(frame_rows(store, source)[3]).read()
+    assert [req.tool for req in executor.requests] == ["prepare_file"]
+
+
+def test_a_frame_rendition_with_strips_is_422(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, executor: Local
+) -> None:
+    """A clip's frames are never cut: ``strips`` above 1 is refused at once, before any job and any event."""
+    source = prepared_clip(client, store, built)
+    requests, views = len(executor.requests), len(events_of(audit_lines, "file.view"))
+    unprepared = put(store, "quay-walk.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+
+    for path in (source.virtual_path, unprepared.virtual_path):
+        for strips, strip in ((2, 1), (3, 2)):
+            r = rendition(client, path, 1, strips=strips, strip=strip)
+            assert (r.status_code, r.json()) == (422, {"detail": "a clip's frames are not cut into strips"})
+    assert (len(executor.requests), len(events_of(audit_lines, "file.view"))) == (requests, views)
+
+
+def test_a_frame_past_the_clip_is_404(
+    client: TestClient, store: Store, built: Path, audit_lines: AuditLines, executor: Local
+) -> None:
+    """A number past the last frame is not found, and neither is any for audio, or for a clip nothing was made of."""
+    source = prepared_clip(client, store, built)
+    memo = put(store, "voice-memo.m4a", b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 16, p=PG)
+    assert artifact(client, memo.virtual_path, "nextext_jsonl", speech(built)).status_code == 200
+    bare = put(store, "quay-walk.mp4", b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 16, p=PG)
+
+    for path, n in (
+        (source.virtual_path, 4),
+        (source.virtual_path, 1000),
+        (memo.virtual_path, 1),
+        (bare.virtual_path, 1),
+    ):
+        r = rendition(client, path, n)
+        assert (r.status_code, r.json()) == NOT_FOUND, (path, n)
+    assert events_of(audit_lines, "file.view") == []
+    assert [req.tool for req in executor.requests] == ["prepare_file"] * 2  # the clip's, the recording's: no more
+
+
+def test_a_frame_that_went_is_404_not_500(client: TestClient, store: Store, built: Path, executor: Local) -> None:
+    """Ruling R-W12: a number inside the clip whose row is gone is not found; a clip cannot make it again."""
+    source = prepared_clip(client, store, built)
+    store.remove_derived(frame_rows(store, source)[2])
+    requests = len(executor.requests)
+
+    r = rendition(client, source.virtual_path, 2)
+    assert (r.status_code, r.json()) == NOT_FOUND
+    assert rendition(client, source.virtual_path, 3).status_code == 200  # the others are there
+    assert len(executor.requests) == requests
+
+
+def test_a_frame_that_is_not_what_its_row_says_is_not_served(
+    client: TestClient, store: Store, built: Path, settings: Settings, audit_lines: AuditLines
+) -> None:
+    """As for any render: a file that is not a JPEG whatever its row says is an internal error, and nothing is sent."""
+    source = prepared_clip(client, store, built)
+    frame = frame_rows(store, source)[1]
+    folder = settings.data_dir / "workspaces" / "ghostwriter" / "user-a" / "chat-1"
+    (folder / frame.relative_path).write_bytes(b"not a picture, whatever its row says")
+    r = rendition(client, source.virtual_path, 1)
+
+    assert r.status_code == 500
+    assert "not a picture" not in r.text
+    assert events_of(audit_lines, "file.view") == []
+
+
 def test_a_slide_rendition_is_named_by_its_slide(
     client: TestClient, store: Store, built: Path, audit_lines: AuditLines, fake_office: FakeOffice
 ) -> None:

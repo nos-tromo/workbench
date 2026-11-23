@@ -1753,7 +1753,7 @@
     {
       "name": "view_file",
       "title": "Look at a picture, or the pages or slides of a file",
-      "description": "Show a picture, or the pages or slides of a file of this conversation, as images for you to see, with their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or 'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, call again with part set to next_part. Pages or slides that could not be shown are named in hint. Spreadsheets are not shown: read them with read_document. Never describe an image you have not looked at.",
+      "description": "Show a picture, or the pages or slides of a file of this conversation, as images for you to see, with their metadata removed. Shown: pictures (PNG, JPEG, WebP, GIF, BMP, TIFF, HEIC), the pages of a PDF, Word (DOCX, DOTX) or OpenDocument text (ODT) file and the slides of a PowerPoint (PPTX, POTX) file, drawn as they would print. part chooses them: 'page 3' or 'pages 2-5', for a deck 'slide 3' or 'slides 2-5'; left out, a picture is shown, or the first four pages or slides. Video: a clip's frames, 'frame 3', 'frames 2-5' or 'at 01:24' (the frame nearest that time); left out, up to 8 frames spread over the clip. Audio has no pictures: read its transcript with read_document. Use it for what text cannot tell you: layout, design, charts, handwriting, photos, scans; and to look at a chart or picture a tool made, such as one run_python wrote. At most 8 images come back at once: when truncated is true, call again with part set to next_part. Pages or slides that could not be shown are named in hint. Spreadsheets are not shown: read them with read_document. Never describe an image you have not looked at.",
       "inputSchema": {
         "description": "Body of ``view_file``.\n\nAttributes:\n    path: The file's absolute path.\n    part: Which pages or slides to show; left out, the picture or the first four.\n    strips: Into how many strips each page is cut.",
         "properties": {
@@ -1959,11 +1959,12 @@
             "type": "string"
           },
           "kind": {
-            "description": "image, pdf, office (Word, OpenDocument text, PowerPoint), or none for a file not shown as pictures.",
+            "description": "image, pdf, office (Word, OpenDocument text, PowerPoint), media (a video or audio clip), or none for a file not shown as pictures.",
             "enum": [
               "image",
               "pdf",
               "office",
+              "media",
               "none"
             ],
             "title": "Kind",
@@ -1974,7 +1975,8 @@
               {
                 "enum": [
                   "page",
-                  "slide"
+                  "slide",
+                  "frame"
                 ],
                 "type": "string"
               },
@@ -1983,11 +1985,11 @@
               }
             ],
             "default": null,
-            "description": "slide for a deck, page for a PDF or a document; null for a picture or a file not shown.",
+            "description": "slide for a deck, page for a PDF or a document, frame for a clip; null for a picture or a file not shown.",
             "title": "Unit"
           },
           "total": {
-            "description": "How many pages or slides the file has; 1 for a picture, 0 for none.",
+            "description": "How many pages, slides or frames the file has; 1 for a picture, 0 for none and for audio.",
             "title": "Total",
             "type": "integer"
           },

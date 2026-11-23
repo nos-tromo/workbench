@@ -586,13 +586,19 @@ async def test_a_clips_frames_are_the_rows_by_their_number(world: World) -> None
 
 
 async def test_a_clips_frames_are_never_made_one_by_one(world: World) -> None:
-    """A page that is missing is made by a job of its own; a clip's frames come with its transcript, so none runs."""
+    """A page that is missing is made by a job of its own; a clip's frames come with its transcript, so none runs.
+
+    The rows there are answered, by their number and whole whatever the strips; one that went is left out.
+    """
     source = clip(world)
     add_zip(world, source)
     manifest = await world.prepare(source)
     requests, events = len(world.executor.requests), len(world.lines())
+    frames = {rec.ordinal: rec for rec in rows_of(world, source, "frame")}
 
-    assert await world.renders(source, manifest, [1, 2, 3]) == []
+    assert await world.renders(source, manifest, [3, 1, 2, 9, 0]) == [frames[1], frames[2], frames[3]]
+    world.store.remove_derived(frames[2])
+    assert await world.renders(source, manifest, [1, 2, 3]) == [frames[1], frames[3]]
     assert (len(world.executor.requests), len(world.lines())) == (requests, events)
 
 

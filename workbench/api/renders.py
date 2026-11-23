@@ -20,7 +20,9 @@ nothing of LibreOffice: a render, like the PDF, is checked by its signature and 
   the source's renders leave no room for one more.
 - :func:`read_render` reads one back, or nothing when it is not what its row says.
 - :func:`image_block`, :func:`noun_of`, :func:`label`, :func:`shown_image` and :func:`page_window` are what the tools
-  that show images share, with the caps of what one answer shows.
+  that show images share, with the caps of what one answer shows; :func:`frames_of`, :func:`shown_frame` and
+  :func:`frame_window` are a clip's frames: the rows there are, labelled by number and time, and which of them a part
+  asks for. A clip's frames are never made one by one: :func:`renders_for` answers those that exist.
 
 Every job is recorded before any file it made is visible (``modify`` / ``file.prepare``, by the source's id and then
 each render's, or the PDF's), and one call at a time makes the renders of a source (:meth:`RenderJobs.source_lock`), so
@@ -42,6 +44,7 @@ starting the count again; out of time, a busy executor or a failure is never rem
 import base64
 import dataclasses
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -72,7 +75,9 @@ from workbench.renders import (
     RenderAnswer,
     RenderFacts,
     Unit,
+    frame_label,
     kind_of,
+    parse_stamp,
     signature_ok,
     unit_of,
 )
@@ -165,6 +170,15 @@ _GRAMMAR: Final[Mapping[PagedUnit, str]] = {
     "page": "no_such_part: give a page as 'page 3', or pages as 'pages 2-5'",
     "slide": "no_such_part: give a slide as 'slide 3', or slides as 'slides 2-5'",
 }
+
+#: What a frame or a window of frames of a clip may be written as: ``frame 3``, ``3``, ``frames 2-5`` or ``2-5``, in any
+#: case. Nine digits at most, as a page's.
+_FRAME_PART: Final = re.compile(r"(?:frames?\s*)?(\d{1,9})(?:\s*-\s*(\d{1,9}))?", re.IGNORECASE)
+#: What a time of a clip may be written as: ``at 01:24`` or ``at 1:02:03``, which :func:`~workbench.renders.parse_stamp`
+#: reads.
+_FRAME_AT: Final = re.compile(r"at\s+(\S+)", re.IGNORECASE)
+#: What a part that is none of these is told.
+FRAME_GRAMMAR: Final = "no_such_part: give a frame as 'frame 3', frames as 'frames 2-5', or a time as 'at 01:24'"
 
 
 class Rendition(BaseModel):
@@ -499,6 +513,34 @@ def _is_frame(rec: DerivedRecord) -> bool:
         Whether it is.
     """
     return rec.role == _FRAME_ROLE and rec.mime in SIGNATURES and rec.width is not None and rec.height is not None
+
+
+def frames_of(rows: Sequence[DerivedRecord]) -> dict[int, DerivedRecord]:
+    """Find the frames of a clip among its derived files.
+
+    Args:
+        rows: The clip's derived files, as :meth:`~workbench.api.store.Store.derived_of` lists them.
+
+    Returns:
+        The frames that exist, by their number (counted from 1 in time order). A number may be missing inside
+        ``1..total``: a clip has no way to remake a frame that went.
+    """
+    return {rec.ordinal: rec for rec in rows if _is_frame(rec)}
+
+
+def frame_time(rec: DerivedRecord) -> float | None:
+    """Read the time a frame's row keeps, which the zip's manifest gave it.
+
+    Args:
+        rec: The frame.
+
+    Returns:
+        Its time in seconds; ``None`` when the zip gave none (or a row keeps what is no time).
+    """
+    time_s = rec.meta.get("time_s")
+    if isinstance(time_s, bool) or not isinstance(time_s, int | float) or not math.isfinite(time_s) or time_s < 0:
+        return None
+    return float(time_s)
 
 
 def media_manifest_of(source: FileRecord, rows: Sequence[DerivedRecord]) -> Manifest | None:
@@ -1132,7 +1174,8 @@ async def renders_for(
         jobs: The queue, within the call's limits and on its gate.
 
     Returns:
-        The renders, by page and then by strip; every strip of each page, or none of it.
+        The renders, by page and then by strip; every strip of each page, or none of it. A clip's frames are the rows
+        there are, by number, whole whatever ``strips`` says; one that went is left out, and no job runs.
 
     Raises:
         ValueError: ``strips`` is not 1 to ``MAX_STRIPS``; the caller checks it first, so this is a programming error.
@@ -1151,8 +1194,11 @@ async def renders_for(
     """
     if not 1 <= strips <= MAX_STRIPS:
         raise ValueError(f"strips is 1 to {MAX_STRIPS}")
-    if manifest.kind in ("none", "media"):  # a clip's frames are made with its transcript, never one by one
+    if manifest.kind == "none":
         return []
+    if manifest.kind == "media":  # a clip's frames are made with its transcript, never one by one: those there are
+        frames = frames_of(await run_in_threadpool(store.derived_of, source))
+        return [frames[n] for n in sorted({n for n in pages if 1 <= n <= manifest.total}) if n in frames]
     role = "image" if manifest.kind == "image" else "page"
     wanted = sorted({n for n in pages if 1 <= n <= manifest.total})
     complete = _complete(await run_in_threadpool(store.derived_of, source), role, strips)
@@ -1299,6 +1345,87 @@ def shown_image(noun: Noun, rec: DerivedRecord) -> ShownImage:
             "mime": rec.mime,
         }
     )
+
+
+def shown_frame(rec: DerivedRecord) -> ShownImage:
+    """Describe a frame of a clip that comes with an answer.
+
+    Args:
+        rec: The frame.
+
+    Returns:
+        Its label (``frame 3 (01:24)``, or ``frame 3`` when the zip gave no time), number, size and type.
+    """
+    return ShownImage.model_validate(
+        {
+            "label": frame_label(rec.ordinal, frame_time(rec)),
+            "n": rec.ordinal,
+            "width": rec.width,
+            "height": rec.height,
+            "mime": rec.mime,
+        }
+    )
+
+
+def _no_such_frame(total: int) -> HTTPException:
+    """Refuse a frame the clip does not have, and say how many it has.
+
+    Args:
+        total: The clip's frames.
+
+    Returns:
+        The 422 ``no_such_part``.
+    """
+    has = "no frames" if total == 0 else "1 frame" if total == 1 else f"{total} frames"
+    return HTTPException(status_code=422, detail=f"no_such_part: this clip has {has}")
+
+
+def frame_window(part: str | None, total: int, times: Mapping[int, float]) -> list[int]:
+    """Read which frames of a clip a call asks to see.
+
+    Args:
+        part: ``frame N`` or ``N`` for one frame; ``frames N-M`` or ``N-M`` for N to M; ``at mm:ss`` (or ``h:mm:ss``)
+            for the frame whose time is nearest, the earlier one on a tie; ``None`` for all of the frames, or, when
+            there are more than ``MAX_VIEW_IMAGES``, that many spread evenly from the first to the last.
+        total: How many frames the clip has.
+        times: The frames' times in seconds, by number; a frame the zip gave no time is not in it. Only the frames of
+            ``1..total`` are considered.
+
+    Returns:
+        The frames, by number, in the order they are shown; none for a clip without frames asked for no part.
+
+    Raises:
+        HTTPException: 422 ``no_such_part: …``: ``part`` is none of the grammar's, its end comes before its start, N is
+            not a frame of the clip, or a time is asked for and no frame has one.
+    """
+    if part is None:
+        if total <= MAX_VIEW_IMAGES:
+            return list(range(1, total + 1))
+        return [1 + round(i * (total - 1) / (MAX_VIEW_IMAGES - 1)) for i in range(MAX_VIEW_IMAGES)]
+    text = part.strip()
+    if (at := _FRAME_AT.fullmatch(text)) is not None:
+        wanted = parse_stamp(at.group(1))
+        if wanted is None:
+            raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+        if total == 0:
+            raise _no_such_frame(total)
+        timed = {n: time_s for n, time_s in times.items() if 1 <= n <= total}
+        if not timed:
+            raise HTTPException(
+                status_code=422,
+                detail="no_such_part: the frames of this clip carry no times; ask for 'frame N'",
+            )
+        return [min(timed, key=lambda n: (abs(timed[n] - wanted), n))]
+    found = _FRAME_PART.fullmatch(text)
+    if found is None:
+        raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+    first = int(found.group(1))
+    last = first if found.group(2) is None else int(found.group(2))
+    if last < first:
+        raise HTTPException(status_code=422, detail=FRAME_GRAMMAR)
+    if not 1 <= first <= total:
+        raise _no_such_frame(total)
+    return list(range(first, min(last, total) + 1))
 
 
 def page_window(part: str | None, total: int, *, default_last: int, unit: PagedUnit = "page") -> tuple[int, int]:
