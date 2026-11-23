@@ -9,6 +9,11 @@ the store knows and what the job answers. Each later tool has a module of its ow
 :mod:`workbench.api.tools_views` with ``view_file``: it shows pages and pictures as images, which needs
 :mod:`workbench.api.renders`, and that imports this module, so this one never imports it.
 
+A clip (a video or audio file the user uploaded) is given to no job of these two tools: its bytes never enter the
+executor, where a sandbox would decode them. A search counts it among the files it could not search, and a run says
+that video and audio are not in the sandbox; a clip is read as its transcript (``read_document``) and looked at as its
+frames (``view_file``).
+
 Nothing the job answers is trusted: its answer is validated into the models below, its paths are
 replaced by the store's or checked against the files the job was given, its failures are mapped to
 fixed codes (anything else is "the tool failed"), and the whole answer is cut to ``result_max_kb``
@@ -34,8 +39,9 @@ from pydantic.json_schema import JsonDict
 from workbench.api.audit import AuditLog
 from workbench.api.store import Store
 from workbench.config import Settings
-from workbench.models import Principal
+from workbench.models import FileRecord, Principal
 from workbench.protocol import KILLED, MAX_INPUT_FILES, OUT_DIR, JobResult
+from workbench.renders import kind_of
 
 if TYPE_CHECKING:  # tools_mcp imports this module, through tool_table
     from workbench.api.tools_mcp import CallJobs
@@ -161,6 +167,38 @@ def list_files(p: Principal, settings: Settings, store: Store) -> FileList:
 
 #: The most hits a search may return.
 MAX_HITS: Final = 200
+
+
+def is_clip(rec: FileRecord) -> bool:
+    """Tell whether a file is a clip: a video or audio file the user uploaded, told by its suffix.
+
+    No job of ``search_files`` or ``run_python`` is given one: the clip's bytes enter no executor job at all, whose
+    sandbox could decode them. A file a tool made (an output) is not one, whatever its name, since the code that made it
+    has it already.
+
+    Args:
+        rec: A file of the chat.
+
+    Returns:
+        Whether it is an upload with the suffix of a video or an audio file.
+    """
+    return rec.kind == "upload" and kind_of(rec.name) == "media"
+
+
+def _unsearched(clips: int) -> str:
+    """Say that a search left video and audio out.
+
+    Args:
+        clips: How many clips the chat holds, at least 1.
+
+    Returns:
+        A sentence for the hint; it says how to read a clip's transcript.
+    """
+    return (
+        f"Video and audio are not searched ({clips} {'file' if clips == 1 else 'files'}): "
+        "read a clip's transcript with read_document."
+    )
+
 
 #: The runner's failures the model is told, and the status each is raised with; any other is a 500. The MCP door answers
 #: every one as ``refused`` with its text. Two are the executor's own: ``storage_full``, the data volume is below its
@@ -700,7 +738,9 @@ async def search_files(
     """Search the chat's files in the executor and answer with the hits, cut to the result limit.
 
     Every file of the chat goes to the job, the newest 1000 if there are more (the protocol's limit), and
-    the answer says so. The job is recorded by the ids of the files given to it, once it has answered
+    the answer says so, except a clip (:func:`is_clip`): its bytes enter no job, so it is counted in
+    ``unsupported_files`` and the hint says that video and audio are not searched. A chat of clips alone has no job to
+    run, as a chat of no files has none. The job is recorded by the ids of the files given to it, once it has answered
     and before anything of the answer goes out, a refusal as ``error`` with its code; the query, which may be
     a name, is not recorded.
 
@@ -723,6 +763,12 @@ async def search_files(
             files_searched=0,
             unsupported_files=0,
             hint="This conversation has no files, so there is nothing to search.",
+        )
+    clips = sum(is_clip(rec) for rec in files)
+    files = [rec for rec in files if not is_clip(rec)]
+    if not files:  # nothing but clips: no job runs over them
+        return SearchResult(
+            hits=[], truncated=False, files_searched=0, unsupported_files=clips, hint=_unsearched(clips)
         )
     chosen = files[:MAX_INPUT_FILES]
     max_hits = max(1, min(body.max_hits, MAX_HITS))
@@ -751,6 +797,8 @@ async def search_files(
         update={
             "hits": [hit for hit in answer.hits if hit.path in sent][:max_hits],
             "skipped": [skip for skip in answer.skipped or [] if skip.path in sent] or None,
+            "unsupported_files": answer.unsupported_files + clips,
+            "hint": _join(answer.hint, _unsearched(clips) if clips else None),
         }
     )
     notes: list[str] = []
@@ -766,6 +814,13 @@ async def search_files(
 
 #: The most characters of code one call runs.
 MAX_CODE: Final = 50_000
+
+#: What a run says when the chat holds video or audio, which is not in the code's folder: how to read or see a clip.
+NO_CLIPS_IN_SANDBOX: Final = "Video and audio are not in the sandbox: read a clip's transcript with read_document."
+NO_CLIPS_IN_SANDBOX_SEE: Final = (
+    "Video and audio are not in the sandbox: read a clip's transcript with read_document, "
+    "look at its frames with view_file."
+)
 
 
 class RunPythonRequest(BaseModel):
@@ -989,11 +1044,14 @@ async def run_python(
     store: Store,
     audit: AuditLog,
     jobs: "CallJobs",
+    images: bool,
 ) -> PythonRun:
     """Run the model's code in the executor over the chat's files and answer with its output and new files.
 
     Every file of the chat goes to the job, the newest 1000 if there are more (the protocol's limit), except
-    files below a folder named ``out``, which the executor never copies; the answer says what was left out. The
+    files below a folder named ``out``, which the executor never copies, and the clips (:func:`is_clip`), whose bytes
+    enter no job: the answer says what was left out, and that video and audio are not in the sandbox (to read a clip's
+    transcript, ``read_document``; on a call that takes images, to look at its frames, ``view_file``). The
     run is recorded by the ids of the files it was given and the files it made, whenever it ran, before any of
     those files becomes visible and before the answer goes out; the code is never recorded.
 
@@ -1004,12 +1062,14 @@ async def run_python(
         store: The file store.
         audit: The audit log.
         jobs: The queue, within the call's limits.
+        images: Whether the call takes images (``X-Accept-Images: 1``): the hint names ``view_file`` only then.
 
     Returns:
         What the code printed, the files it made and the job's id.
     """
     files = sorted(await run_in_threadpool(store.files_in_chat, p), key=lambda rec: (-rec.created_at, rec.name))
-    readable = [rec for rec in files if rec.name.split("/")[0] != OUT_DIR]
+    outside = [rec for rec in files if rec.name.split("/")[0] != OUT_DIR]
+    readable = [rec for rec in outside if not is_clip(rec)]
     chosen = readable[:MAX_INPUT_FILES]
     args = python_args(body.code, settings.job_wall_s)
 
@@ -1029,12 +1089,14 @@ async def run_python(
             f"The code was given the {len(chosen)} newest of {len(readable)} files; the "
             f"{len(readable) - len(chosen)} oldest are not in its folder."
         )
-    if len(files) > len(readable):
-        hidden = len(files) - len(readable)
+    if len(files) > len(outside):
+        hidden = len(files) - len(outside)
         notes.append(
             f"{hidden} {'file' if hidden == 1 else 'files'} in the folder out/ "
             f"{'is' if hidden == 1 else 'are'} not given to the code: out/ is where it writes."
         )
+    if len(outside) > len(readable):
+        notes.append(NO_CLIPS_IN_SANDBOX_SEE if images else NO_CLIPS_IN_SANDBOX)
     answer = PythonRun(
         stdout=run.stdout,
         stderr=run.stderr,

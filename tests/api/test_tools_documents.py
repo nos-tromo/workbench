@@ -2020,3 +2020,88 @@ def test_a_transcript_that_goes_while_the_clip_is_read_is_made_again(
     assert len(calls) == 2
     assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
     assert structured["hint"] == SEE_THREE
+
+
+# --- a clip is left out of every job of search_files ------------------------------------------------------------
+
+#: What a search says when it left clips out, for one clip and for two.
+NOT_SEARCHED = "Video and audio are not searched (1 file): read a clip's transcript with read_document."
+TWO_NOT_SEARCHED = "Video and audio are not searched (2 files): read a clip's transcript with read_document."
+
+
+def test_search_leaves_a_clip_out_of_its_job_and_counts_it_as_not_searched(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """The job is given the CSV and not the clip; the clip is counted in ``unsupported_files`` and the hint says so."""
+    sheet = put(store, "quay-list.csv", p=PG)
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    executor.payload = {**hits((f"{CHAT}/quay-list.csv", "line 1", "match here")), "unsupported_files": 1}
+    body = answered(find(client, "match"))
+
+    (req,) = executor.requests
+    assert req.input_files == ["quay-list.csv"]
+    assert (body["files_searched"], body["unsupported_files"], body["truncated"]) == (1, 2, False)
+    assert body["hint"] == NOT_SEARCHED
+    (event,) = tool_events(audit_lines, "search_files")
+    assert event["target"]["ids"] == [sheet.id]  # the job's files, which the clip was not
+
+
+def test_search_counts_every_kind_of_clip_and_the_runners_hint_comes_first(
+    client: TestClient, store: Store, executor: Scripted
+) -> None:
+    """A clip in a folder, in capitals or audio is one too; the runner's own hint and the file counts stay true."""
+    put(store, "quay-list.csv", p=PG)
+    put(store, "voice-memo.M4A", CLIP_BYTES, p=PG)
+    store.mkdir(PG, f"{CHAT}/reports")
+    put(store, "quay-walk.webm", CLIP_BYTES, directory=f"{CHAT}/reports", p=PG_SETUP)
+    executor.payload = {**hits(), "hint": "There are more hits than the limit; narrow the query."}
+    body = answered(find(client, "x"))
+
+    assert [req.input_files for req in executor.requests] == [["quay-list.csv"]]
+    assert body["unsupported_files"] == 2
+    assert body["hint"] == f"There are more hits than the limit; narrow the query. {TWO_NOT_SEARCHED}"
+
+
+def test_search_of_a_chat_of_clips_alone_runs_no_job(
+    client: TestClient, store: Store, executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """Nothing is left to look in: an answer, not a job, and no event, as for a chat with no files."""
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    body = answered(find(client, "x"))
+
+    assert (body["hits"], body["files_searched"], body["unsupported_files"], body["truncated"]) == ([], 0, 1, False)
+    assert body["hint"] == NOT_SEARCHED
+    assert executor.requests == []
+    assert tool_events(audit_lines, "search_files") == []
+
+
+def test_search_only_counts_the_newest_files_that_can_be_searched(
+    client: TestClient, store: Store, executor: Scripted, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 1000-file bound is over the files a job is given: a clip takes none of it, nor is it among the oldest."""
+    monkeypatch.setattr("workbench.api.tools.MAX_INPUT_FILES", 2)
+    tick(store, monkeypatch)
+    put(store, "a-old.txt", p=PG)
+    put(store, "b.txt", p=PG)
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    put(store, "c-new.txt", p=PG)
+    executor.payload = hits()
+    body = answered(find(client, "x"))
+
+    assert executor.requests[0].input_files == ["c-new.txt", "b.txt"]
+    assert body["hint"] == f"{NOT_SEARCHED} Searched the 2 newest of 3 files; the 1 oldest were not searched."
+
+
+def test_a_search_over_a_clip_and_a_text_file_runs_the_real_runner_over_the_text_alone(
+    seeing: TestClient, local: Picky, store: Store
+) -> None:
+    """With the real runner: the text is searched, the clip is not given to it, and its count is the model's to read."""
+    put(store, "quay-notes.txt", b"The quay opens at nine.\n", p=PG)
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    body = answered(find(seeing, "quay"))
+
+    (req,) = local.requests
+    assert req.input_files == ["quay-notes.txt"]
+    assert [hit["path"] for hit in body["hits"]] == [f"{CHAT}/quay-notes.txt"]
+    assert (body["files_searched"], body["unsupported_files"]) == (1, 1)
+    assert body["hint"] == NOT_SEARCHED

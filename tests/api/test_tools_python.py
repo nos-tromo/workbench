@@ -22,9 +22,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from tests.api.conftest import CALL, CHAT, FORMER, HG, PG, PG_SETUP, AuditLines, put, tick, unrecorded
+from tests.api.conftest import CALL, CHAT, FORMER, HG, HG_TEXT, PG, PG_SETUP, AuditLines, put, tick, unrecorded
 from tests.api.mcp_calls import Headers, acall, answered, refusal, refused, result, rpc, sent_size, unavailable
 from tests.api.test_tools_documents import Scripted
+from tests.api.test_tools_views import CLIP_BYTES
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import CallLimits, JobQueue, Keeper
@@ -171,6 +172,90 @@ def test_files_in_a_folder_named_out_are_not_given_to_the_code(
     (event,) = events(audit_lines)
     assert event["target"]["ids"] == [shown.id]
     assert hidden.id not in json.dumps(audit_lines())
+
+
+#: What a run says when the chat holds video or audio, on a call that takes images and on one that does not.
+NO_CLIPS = (
+    "Video and audio are not in the sandbox: read a clip's transcript with read_document, "
+    "look at its frames with view_file."
+)
+NO_CLIPS_TEXT = "Video and audio are not in the sandbox: read a clip's transcript with read_document."
+
+
+def test_a_clip_is_not_given_to_the_code(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """The clip's bytes enter no job: the CSV goes, the clip does not, the event names the CSV, the hint says why."""
+    sheet = put(store, "quay-list.csv", b"quarter,figure\nq1,10\n", p=PG)
+    clip = put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    body = answered(run(client))
+
+    (req,) = fake_executor.requests
+    assert req.input_files == ["quay-list.csv"]
+    assert body["hint"] == NO_CLIPS
+    (event,) = events(audit_lines)
+    assert event["target"]["ids"] == [sheet.id]
+    assert clip.id not in json.dumps(audit_lines())
+
+
+def test_a_run_without_images_is_not_told_of_view_file(
+    client: TestClient, store: Store, fake_executor: Scripted
+) -> None:
+    """``view_file`` is not on the list of a call that takes no images, so it is not named to it."""
+    put(store, "quay-list.csv", b"quarter,figure\nq1,10\n", p=PG)
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    body = answered(run(client, headers=HG_TEXT))
+
+    assert fake_executor.requests[0].input_files == ["quay-list.csv"]
+    assert body["hint"] == NO_CLIPS_TEXT
+
+
+def test_every_kind_of_clip_is_left_out_and_the_other_notes_stay_true(
+    client: TestClient, store: Store, fake_executor: Scripted
+) -> None:
+    """A clip in a folder, one in capitals and an audio file are not given; the ``out/`` note counts what it names."""
+    put(store, "voice-memo.WAV", CLIP_BYTES, p=PG)
+    store.mkdir(PG, f"{CHAT}/reports")
+    put(store, "quay-walk.m4a", CLIP_BYTES, directory=f"{CHAT}/reports", p=PG_SETUP)
+    store.mkdir(PG, f"{CHAT}/out")
+    put(store, "kept.csv", directory=f"{CHAT}/out", p=PG_SETUP)
+    put(store, "a.csv", p=PG)
+    fake_executor.payload = ran(hint="The runner's own words.")
+    body = answered(run(client))
+
+    assert fake_executor.requests[0].input_files == ["a.csv"]
+    assert body["hint"] == (
+        "The runner's own words. 1 file in the folder out/ is not given to the code: out/ is where it writes. "
+        + NO_CLIPS
+    )
+
+
+def test_a_chat_of_clips_alone_still_runs_with_no_input(
+    client: TestClient, store: Store, fake_executor: Scripted, audit_lines: AuditLines
+) -> None:
+    """Code that needs no file runs; the clip is not given to it, and the event names no file."""
+    put(store, "harbour-tour.mp4", CLIP_BYTES, p=PG)
+    body = answered(run(client, "print(1 + 1)"))
+
+    assert fake_executor.requests[0].input_files == []
+    assert body["hint"] == NO_CLIPS
+    (event,) = events(audit_lines)
+    assert "ids" not in event["target"]
+    assert event["target"]["count"] == 0
+
+
+def test_a_file_the_code_made_is_given_back_whatever_its_name(
+    client: TestClient, store: Store, fake_executor: Scripted
+) -> None:
+    """A ``.wav`` the code wrote is its own output, not a user's clip: the next run has it, and is told of no clip."""
+    fake_executor.files = {"tone.wav": b"RIFF"}
+    first = answered(run(client))
+    assert first["files"] == [f"{CHAT}/tone.wav"]
+    fake_executor.files = {}
+    second = answered(run(client))
+
+    assert fake_executor.requests[1].input_files == ["tone.wav"]
+    assert second["hint"] is None
 
 
 def test_over_1000_files_the_newest_1000_go_and_the_answer_says_so(
@@ -491,7 +576,15 @@ def test_a_request_cancelled_as_its_job_returns_leaves_no_output_unrecorded(
     audit.start({})
 
     async def call() -> None:
-        given = {"body": body, "p": PG, "settings": settings, "store": store, "audit": audit, "jobs": queue}
+        given = {
+            "body": body,
+            "p": PG,
+            "settings": settings,
+            "store": store,
+            "audit": audit,
+            "jobs": queue,
+            "images": True,
+        }
         await function(**{name: given[name] for name in inspect.signature(function).parameters})
 
     with contextlib.suppress(asyncio.CancelledError):

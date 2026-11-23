@@ -673,6 +673,13 @@ names fifteen packages, since 0.7.0 pillow and pypdfium2 among them
 The model's code runs in the job process itself, as a script
 (`workbench/executor/runners/python.py:run_python`). What follows from that:
 
+- **No clip is in the folder.** A video or audio file the user uploaded is given to no job of
+  `run_python` (nor of `search_files`), so the code cannot decode it, though
+  `scipy` reads a `.wav`: a clip's bytes enter no executor job. The answer's
+  hint says that video and audio are not in the sandbox; a clip is read as its
+  transcript with `read_document` and looked at as its frames with `view_file`
+  (`workbench/api/tools.py:is_clip`). A file the code itself wrote is its own,
+  whatever its name.
 - **Only Python-level output is captured.** `print` and writes to `sys.stdout`
   and `sys.stderr` come back. Writes straight to file descriptors 1 and 2 (a C
   extension, `os.system`, a child process) go to `/dev/null`.
