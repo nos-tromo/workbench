@@ -101,9 +101,10 @@ def reading(path: str, *parts: tuple[str, str], **extra: Any) -> dict[str, Any]:
 def counted(path: str, *parts: tuple[str, str, list[int] | None, bool], **extra: Any) -> dict[str, Any]:
     """A read runner's answer for ``path`` whose parts say their units and whether they were cut."""
     return {
-        **reading(path, **extra),
+        **reading(path),
         "parts": [{"label": label, "text": text, "units": units, "cut": cut} for label, text, units, cut in parts],
         "total_parts": len(parts),
+        **extra,
     }
 
 
@@ -1792,17 +1793,17 @@ def test_paging_moves_on_at_the_lowest_result_limit_however_long_the_notes(
 
     Text on pages 1 and 3, scans on 2, 4, 5 and 6, the read cut at page 7, the runner's own hint and paths of many
     lengths: the first part is kept, cut if it must be, so that ``next_part`` is never the page the call began at; the
-    notes may then be shortened. Without the guard, names of about 100 to 140 characters stalled on page 1. (Past
-    that, the path, the hint, four ``shown`` entries and the ``cut`` of the part alone fill 1 KB, whatever room the
-    notes are given.)
+    notes may then be shortened. Without the guard, names of about 100 to 125 characters stalled on page 1. (Past
+    that, the path, the hint, four ``shown`` entries and the ``units`` and ``cut`` of the part alone fill 1 KB,
+    whatever room the notes are given.)
     """
-    for length in range(20, 142, 3):
+    for length in range(20, 128, 3):
         name = f"harbour-{'q' * length}.pdf"
         source = pdf(store, built, name, ["A", None, "B", None, None, None, "C", "D"])
-        local.scripted["read_document"] = reading(
+        local.scripted["read_document"] = counted(
             "x",
-            ("page 1", "w" * 400),
-            ("page 3", "w" * 400),
+            ("page 1", "w" * 400, [1, 1], False),
+            ("page 3", "w" * 400, [3, 3], False),
             kind="pdf",
             total_parts=8,
             pages_without_text=[2, 4, 5, 6],

@@ -700,6 +700,14 @@ def test_a_part_the_reader_cut_says_cut(work: Path) -> None:
     assert part["text"].endswith(" [cut]")
 
 
+def test_a_line_the_reader_shortens_with_its_own_cap_is_not_cut(work: Path) -> None:
+    """Only the reader's `` [cut]`` is ``cut``: a line past ``LINE_CAP`` is marked in its own words and is read."""
+    (work / "pier-log.txt").write_text("x" * 2500 + "\n", encoding="utf-8")
+    (part,) = read_doc(work, "pier-log.txt")["parts"]
+    assert (part["label"], part["units"], part["cut"]) == ("line 1", [1, 1], False)
+    assert part["text"].endswith("… [+500 characters]")
+
+
 def test_a_run_short_of_its_tables_end_has_null_units(work: Path) -> None:
     """A run of rows that stops before the table's last row counts no unit, and still carries the key."""
     fx.make_big_table_docx(work / "long-table.docx", rows=300)
