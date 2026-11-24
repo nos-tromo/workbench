@@ -135,7 +135,8 @@ roles, their types and extensions), `TRANSCRIPT_NAME`, the three hints
 artifacts' derived paths, the clip's own never), and the stamps (`stamp`,
 `parse_stamp`, `frame_label`), and what a read counts in: `READ_UNITS`, the
 `ReadUnit` (page, slide, paragraph, row or line) of each `ReaderKind`, which
-`measure_file` and the parts of `read_document` both use; it imports no imaging library and
+the executor's `Measure.of` sets as a measure's unit and the api's `Measured`
+checks it against; it imports no imaging library and
 nothing of LibreOffice). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
 a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
