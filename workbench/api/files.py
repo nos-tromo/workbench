@@ -1,7 +1,7 @@
-"""Ghostwriter's file routes, held to the request's chat: list, upload, take back, artifacts, prepare, view, delete.
+"""Ghostwriter's file routes, held to its chat: list, upload, take back, artifacts, measure, prepare, view, delete.
 
 Any path outside the request's chat is ``404``. The calls state a purpose and a request id,
-which their events carry, and an upload, a prepare or a view that must state a purpose and does not is
+which their events carry, and an upload, a measure, a prepare or a view that must state a purpose and does not is
 ``428``, recorded as denied. ``DELETE /files/upload`` deletes one upload of the chat with its renders, as Ghostwriter
 takes back a file its user has not sent (since 0.8.1); ``DELETE /files/chat`` deletes the request's chat.
 
@@ -9,6 +9,9 @@ takes back a file its user has not sent (since 0.8.1); ``DELETE /files/chat`` de
 derived file of the clip. The body is the artifact itself, read whole into a ``.part`` and checked by its first bytes
 before the route waits for the clip's lock; under the lock it is recorded, made visible, and replaces the artifact of
 its role and what was made from the old one. The api reads no more of it than its first bytes: the executor parses it.
+
+``POST /files/measure`` answers how long a document is, in the units its reader counts and the characters a full read
+of it shows (:mod:`workbench.api.measure`): a ``query``, counts only, remembered for the file.
 
 ``POST /files/prepare`` renders a picture or a PDF once and answers its manifest (:mod:`workbench.api.renders`), and
 with ``strips`` of 2 or 3 also cuts a picture into that many strips. The view of a file answers the file itself; with
@@ -20,8 +23,9 @@ written *before* the content leaves, the file becomes visible or the chat goes: 
 cannot be recorded does not happen. An upload is recorded by the id it was given before its first
 byte was written, before the rename makes it a file of the chat; an artifact is recorded by its id before the rename
 makes it a derived file of its clip. An upload or an artifact that could not be stored after its record is recorded
-again as ``error``. A prepare is recorded by the renders' own job, before any render is visible; a view of a render
-names the source and the render. Listing touches no content and is not recorded (spec section 7).
+again as ``error``. A prepare is recorded by the renders' own job, before any render is visible; a measure by its own
+job, before its counts go out; a view of a render names the source and the render. Listing touches no content and is
+not recorded (spec section 7).
 
 An error answers short fixed text from :mod:`workbench.api.errors`; no answer here carries a
 name, a path or a user id the caller did not just send.
@@ -44,7 +48,7 @@ from fastapi.responses import StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from workbench.api.audit import AuditLog
-from workbench.api.auth import CHAT_PATH, DERIVED_PATH, PREPARE_PATH, Caller
+from workbench.api.auth import CHAT_PATH, DERIVED_PATH, MEASURE_PATH, PREPARE_PATH, Caller
 from workbench.api.deps import CallAuditDep, CallerDep, FilePrincipalDep, JobsDep, MaybeJobsDep, SettingsDep, StoreDep
 from workbench.api.errors import INTERNAL
 from workbench.api.jobs import (
@@ -56,6 +60,7 @@ from workbench.api.jobs import (
     Gate,
     JobQueue,
 )
+from workbench.api.measure import MeasureRequest, measured
 from workbench.api.renders import Noun, RouteJobs, noun_of, prepared, read_render, renders_for
 from workbench.api.routing import EncodableRoute
 from workbench.api.store import (
@@ -553,6 +558,45 @@ async def prepare_file(
     if strips > 1 and manifest.kind == "image":
         await renders_for(p, source, manifest, [1], strips, settings=budgeted, store=store, audit=audit, jobs=gate)
     return manifest.model_dump(mode="json")
+
+
+@router.post(MEASURE_PATH)
+async def measure_file(
+    body: MeasureRequest,
+    p: FilePrincipalDep,
+    caller: CallerDep,
+    settings: SettingsDep,
+    store: StoreDep,
+    audit: CallAuditDep,
+    jobs: JobsDep,
+) -> dict[str, object]:
+    """Answer how long a document is: its units in its reader's terms, and the characters of a full read of it.
+
+    The first measure of a file is one job of the executor, whose readers count (:mod:`workbench.api.measure`),
+    recorded as a ``query`` before the answer goes out; every later one answers from what the store remembers, with no
+    job and no event. A file the readers refuse for what it is is refused again, word for word, at once and recorded as
+    remembered. A picture or a clip is no document: ``422``, with no job and no event. The request waits at most
+    :data:`~workbench.api.jobs.PREPARE_QUEUE_WAIT_S` for its turn, on the caller's measure gate, so that a slow
+    measure never takes the place of a prepare, a conversion or a tool call.
+
+    Args:
+        body: The file's path, and nothing else.
+        p: The caller, user and chat.
+        caller: The caller, whose wall and slots bound the job.
+        settings: The api's settings.
+        store: The file store.
+        audit: The audit log, bound to the call.
+        jobs: The app's job queue.
+
+    Returns:
+        ``path``, ``kind``, ``unit``, ``total``, ``chars`` and ``capped``.
+    """
+    await run_in_threadpool(audit.check, "measure", p)
+    source = await run_in_threadpool(store.get, p, body.path)
+    wall, budgeted = _wall_of(settings, caller)
+    call = CallLimits(wall, PREPARE_QUEUE_WAIT_S, caller.slots)
+    answer = await measured(p, source, settings=budgeted, store=store, audit=audit, queue=jobs, call=call)
+    return answer.model_dump(mode="json")
 
 
 def _rendition_disposition(source: FileRecord, render: DerivedRecord, noun: Noun) -> str:

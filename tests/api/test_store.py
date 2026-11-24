@@ -2939,3 +2939,77 @@ def test_no_refusal_is_remembered_of_a_deleted_chat(store: Store, alice: Princip
     assert store.remember_refusal(source, REFUSED, at_once=False) is False
     assert store.refusal_of(source) is None
     assert store._refusals == {}
+
+
+# --- measures remembered -----------------------------------------------------
+
+#: The five counts of a measure, as the route keeps them: everything of its answer but the path.
+COUNTS = {"kind": "pdf", "unit": "page", "total": 3, "chars": 36, "capped": False}
+#: A measure's refusal, as the runner words it.
+NOT_READ = "unsupported_format: .xls cannot be read here; save it as .xlsx or .csv"
+
+
+def test_a_measure_is_remembered_by_file_and_forgotten_with_it(store: Store, alice: Principal) -> None:
+    """The counts are kept for their file alone; another size or another file inherits none; a refusal round-trips."""
+    rec = put(store, alice, "harbour-report.pdf")
+    other = put(store, alice, "quay-list.pdf")
+    assert store.measure_of(rec) is None
+    store.remember_measure(rec, COUNTS)
+
+    assert store.measure_of(rec) == COUNTS
+    assert store.measure_of(other) is None
+    resized = dataclasses.replace(rec, size=rec.size + 1)
+    assert store.measure_of(resized) is None  # another size: another file's, and the cell goes
+    assert store.measure_of(rec) is None
+
+    store.remember_measure(rec, COUNTS)
+    store.remove_upload(rec, unrecorded)
+    assert store.measure_of(rec) is None
+
+    ledger = put(store, alice, "ledger.xls")
+    store.remember_measure(ledger, NOT_READ)
+    assert store.measure_of(ledger) == NOT_READ
+
+
+def test_a_measure_goes_with_its_source_and_a_restart(store: Store, alice: Principal, tmp_path: Path) -> None:
+    """Removed (retention) or deleted with its chat, a source's measure is forgotten; so is every one on a restart.
+
+    A prepare that went well forgets a refusal that may pass, never a measure.
+    """
+    removed = put(store, alice, "harbour-report.pdf")
+    deleted = put(store, alice, "quay-list.pdf")
+    kept = put(store, alice, "berth-plan.pdf")
+    for rec in (removed, deleted, kept):
+        store.remember_measure(rec, COUNTS)
+
+    store.forget_refusal(kept)
+    assert store.measure_of(kept) == COUNTS
+    store.remove(removed)
+    assert (store.measure_of(removed), store.measure_of(kept)) == (None, COUNTS)
+    assert store.delete_chat(alice, unrecorded) == 2
+    assert (store.measure_of(deleted), store.measure_of(kept)) == (None, None)
+    assert store._measures == {}  # nothing is kept of a file that went
+    survivor = put(
+        store, dataclasses.replace(alice, chat_id="chat-2"), "harbour-report.pdf", directory="/workspace/chat-2"
+    )
+    store.remember_measure(survivor, COUNTS)
+    restarted = Store(tmp_path / "data" / "workbench.db", Workspaces(tmp_path / "data"))
+    assert restarted.measure_of(survivor) is None
+
+
+def test_measures_are_bounded_and_not_kept_for_a_deleted_chat(
+    store: Store, alice: Principal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past ``MEASURES_MAX`` the first of three goes; a job of a chat deleted while it ran leaves none."""
+    assert 1000 <= store_module.MEASURES_MAX <= 10_000
+    monkeypatch.setattr(store_module, "MEASURES_MAX", 2)
+    first, second, third = (put(store, alice, f"report-{n}.pdf") for n in (1, 2, 3))
+    for rec in (first, second, third):
+        store.remember_measure(rec, COUNTS)
+
+    assert [store.measure_of(rec) for rec in (first, second, third)] == [None, COUNTS, COUNTS]
+    assert store.delete_chat(alice, unrecorded) == 3
+    store.remember_measure(second, COUNTS)
+    store.remember_measure(third, NOT_READ)
+    assert (store.measure_of(second), store.measure_of(third)) == (None, None)
+    assert store._measures == {}

@@ -52,7 +52,7 @@ memory and process limits with them
 | `DOCINT_WORKBENCH_TOOLS` | `run_python` | The tools docint may call, comma-separated; each needs an inline form. |
 | `DOCINT_WORKBENCH_WALL_S` | 60 | Wall-clock seconds one docint job may run: from 5 to `WORKBENCH_JOB_WALL_S`. A call's `time_limit_s` is a strict integer in that range (`30.0` is refused). |
 | `DOCINT_WORKBENCH_SLOTS` | 2 | Jobs docint may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. |
-| `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and seven file routes. The same rules; unset, Ghostwriter's door is off. |
+| `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and eight file routes. The same rules; unset, Ghostwriter's door is off. |
 | `GHOSTWRITER_WORKBENCH_TOOLS` | the ten workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. Since 0.7.0 the default includes `view_file`; a list set explicitly must add it, or Ghostwriter offers no images. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
 | `GHOSTWRITER_WORKBENCH_SLOTS` | 4 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), the measure of a document's length a third, and the three run apart, so keep 4 or more: at 4, one is left for the tool calls of all Ghostwriter's users while all three run. At 3 (an `.env` that pinned the default before 0.10.0), a prepare, a conversion and a measure take all three, and every Ghostwriter tool call answers `wait_timeout` after 5 s while they run; at 2, a conversion and a picture's prepare already take both. Nothing warns at start. There is no variable for prepares, conversions or measures of their own. A host whose `.env` pins `WORKBENCH_EXECUTOR_SLOTS` at 4 or fewer, and leaves this unset, refuses to start (4 is not fewer than 4): raise the executor's slots there, or set this lower, at the cost above ([Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)). The executor's memory is its own slots times a job's (below), whatever this is. |
@@ -144,8 +144,8 @@ an `isError` result whose `reason` says why:
   prepares are and apart from them. A client's timeout for the prepare of an
   Office file should cover the 120 s, two walls and 30 s (390 s at the default
   wall).
-- A measure of a document's length (its units and characters, counted in the
-  executor) waits for the caller's **measure gate** in place of its user's
+- A measure of a document's length (`POST /files/measure`: its units and
+  characters, counted in the executor) waits for the caller's **measure gate** in place of its user's
   turn, up to 120 s (`PREPARE_QUEUE_WAIT_S`, fixed; then `503`, "busy, retry
   later"): one measure of a caller runs at a time, over all its users and
   inside its slots, apart from the prepare gate and the conversion gate, so a

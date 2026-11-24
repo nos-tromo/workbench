@@ -31,6 +31,14 @@ record of processing and the impact assessment.
   of JSON Lines and 32 MiB of zip; a second artifact of a role replaces the
   first, and with it the transcript and frames made from it. The clip's own
   bytes are kept as any upload's are and enter no job.
+- **The length of a document** (`POST /files/measure`, Ghostwriter's caller
+  only; `workbench/api/measure.py`). After an upload, Ghostwriter asks how long
+  a document is, to warn on a long one. One job in the executor opens the file
+  with the readers `read_document` uses and counts, in the unit of its kind (a
+  page, a slide, a paragraph, a row or a line), how many units there are and
+  how many characters a full read shows, up to 2,000,000. The api parses no
+  file, and what comes back is counts only: no text, no name, no label. A
+  picture or a clip is no document and is refused by its name, with no job.
 - **Tool arguments the model writes** (`workbench/api/tools*.py`). They reach
   the executor in the job's request. What becomes of them:
   - paths, search queries and Python code end with the job: workbench keeps
@@ -182,6 +190,14 @@ Three more places hold data for a short time:
   with no job, and recorded as the refusal was
   ([audit.md](audit.md#what-is-recorded), `remembered`). It is never written to
   the volume. Uploading the file again makes a new file, which is tried afresh.
+- the api's memory, which also remembers the measure of a file's length: its
+  five counts (kind, unit, total, characters, whether they stopped at the cap),
+  or the refusal of a file the readers refused for what it is
+  (`unsupported_format`, `unreadable_file`; a run that ran out of time is never
+  kept), by the file's id with its creation time and size
+  (`workbench/api/store.py:Store.remember_measure`). A later measure of the file
+  is answered from it, with no job and no event, and a remembered refusal is
+  recorded as `remembered`. Counts only, and nothing is written to the volume.
 
 workbench encrypts nothing at rest. Encryption of the host's disk is the
 operator's.
@@ -194,6 +210,7 @@ operator's.
 | Renders, an Office file's converted PDF, and a clip's artifacts, transcript and frames | as long as their source: they carry its creation time, so they are due with it, and are recorded and deleted in the same batch. One with no source, or one left when its source went, is swept on its own. A clip's artifact that a second one replaces goes at once, in the event that records the second ([retention.md](retention.md#a-clips-artifacts)) | `Sweeper._delete`, `Sweeper._sweep_derived` |
 | Job records | the same period, from the job's start | `Sweeper._forget_jobs` |
 | A refusal remembered or counted, in the api's memory | until its file goes (retention, the upload taken back, or its chat's delete), a new artifact of a clip is kept, the api restarts, or 4096 refusals asked for since push it out (`REFUSALS_MAX`); a new upload under the same name is a new file and inherits nothing. A job of a chat deleted while it ran leaves none. One of a file that retention removes, or that is taken back, while its job runs can stay until it is pushed out, never answered: no file of that id comes back | `Store.remove`, `Store.remove_upload`, `Store.delete_chat`, `Store.remember_refusal` |
+| A measure remembered, in the api's memory | until its file goes (retention, the upload taken back, or its chat's delete), the api restarts, or 4096 measures asked for since push it out (`MEASURES_MAX`); a new upload under the same name is a new file and inherits nothing. A job of a chat deleted while it ran leaves none | `Store.remove`, `Store.remove_upload`, `Store.delete_chat`, `Store.remember_measure` |
 | A job's folder in the executor | until the job ends. One whose removal failed (an I/O error) is root's alone from then on and is tried again every five minutes until it goes, or until the executor restarts, which removes every job folder left | `workbench/executor/supervisor.py:Supervisor._remove`, `_retry_leftovers` |
 | Staging residue (outputs nobody registered) and orphans (files with no row, such as an interrupted upload) | one hour after they were last changed | `Sweeper._prune` |
 | Empty folders, empty chat folders and empty user roots | one hour after they were last changed | `workbench/api/store.py:Store.sweep_user` |
@@ -257,6 +274,12 @@ No core dump holds the data, [a host's handler aside](sandbox.md#residual-risks)
   Ghostwriter and Nextext keep of the flow is for their own records
   (Ghostwriter's `docs/data-flow.md`). What comes back is the two artifacts
   above.
+- **The length of a document goes to Ghostwriter**, as counts alone: the kind,
+  the unit, how many units, how many characters (to a cap of 2,000,000) and
+  whether the count stopped at it, answered to `POST /files/measure` after a
+  `query` / `file.measure` event that names the file and no count. Ghostwriter
+  warns with it on the file's tile; the text, the names and the labels of the
+  file do not go with it.
 - **Files go to Ghostwriter**, and from it to the user's browser, when the user
   views or downloads them, and to Nextext in the case above (`GET /files/view`).
   What a user downloads, and what Nextext holds for its job, is outside

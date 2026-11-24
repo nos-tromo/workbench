@@ -42,6 +42,7 @@ EXPECTED_OPERATIONS = {
     "file_delete": ("delete", "file.delete"),
     "prepare": ("modify", "file.prepare"),
     "derived": ("modify", "file.derived"),
+    "measure": ("query", "file.measure"),
 }
 
 
@@ -327,6 +328,8 @@ def test_no_file_name_reaches_the_stream_through_any_audited_route(
         executor.payload = {"path": csv, "kind": "csv", "parts": [], "total_parts": 0, "pages_without_text": []}
         executor.payload["truncated"] = False
         answered(acall(client, "read_document", {"path": csv}))
+        executor.payload = {"path": csv, "kind": "csv", "unit": "line", "total": 1, "chars": 3, "capped": False}
+        assert client.post("/files/measure", json={"path": csv}, headers=HG).status_code == 200
         executor.payload = {"hits": [], "truncated": False, "files_searched": 2, "unsupported_files": 0}
         answered(acall(client, "search_files", {"query": word}))
         executor.files = {f"{word}-chart.png": b"png"}

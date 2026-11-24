@@ -344,6 +344,7 @@ TOOLS: Final = frozenset(
         "write_presentation",
         "prepare_file",
         "convert_office",
+        "measure_file",
     }
 )
 

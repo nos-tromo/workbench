@@ -29,7 +29,8 @@ lock, and :meth:`Store.place_derived` records it and makes it visible under the 
 
 The store also remembers, in this process alone, how the runner refused a source that cannot be converted or drawn
 (:meth:`Store.remember_refusal`), so that no later call runs that job again; the refusal goes with its source, and with
-a restart.
+a restart. It remembers the same way the measure of a document's length (:meth:`Store.remember_measure`): the five
+counts, or the refusal of a file no reader takes.
 """
 
 import dataclasses
@@ -80,6 +81,10 @@ DELETED_CHAT_HOLD_S: Final = 3600
 REFUSALS_MAX: Final = 4096
 #: How many refusals in a row of one source make one that may pass remembered (:meth:`Store.remember_refusal`).
 REFUSALS_IN_A_ROW: Final = 2
+
+#: Most measures the store remembers, one per source; past it, the one asked for least recently is forgotten. Each is an
+#: id, two numbers and five counts or a short fixed text, so a few thousand cost the api well under a megabyte.
+MEASURES_MAX: Final = 4096
 
 #: A file id: 32 lowercase hex digits (``uuid4().hex``).
 _FILE_ID: Final = re.compile(r"[0-9a-f]{32}")
@@ -775,6 +780,10 @@ class Store:
         # By source id: the source's creation time and size, the runner's last refusal of it and how many came in a row
         # (``REFUSALS_IN_A_ROW`` or more once it is remembered), oldest asked for first.
         self._refusals: OrderedDict[str, tuple[float, int, str, int]] = OrderedDict()
+        self._measures_lock = threading.Lock()
+        # By source id: the source's creation time and size, and what a measure of it answered: its counts, or the
+        # runner's refusal of it as the caller was told it. Oldest asked for first.
+        self._measures: OrderedDict[str, tuple[float, int, Mapping[str, object] | str]] = OrderedDict()
         db_path.parent.mkdir(mode=_PRIVATE_DIR, parents=True, exist_ok=True)
         fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, _PRIVATE_FILE)
         try:
@@ -1476,7 +1485,7 @@ class Store:
             db.executemany("DELETE FROM derived WHERE id = ?", [(rec_id,) for rec_id in named])
             if current is not None:
                 db.execute("DELETE FROM files WHERE id = ?", (current.id,))
-        self._forget_refusals([record.id])
+        self._forget_sources([record.id])
         for folder in folders:
             _remove_empty(folder)
             _remove_empty(folder.parent)
@@ -1568,7 +1577,7 @@ class Store:
                     db.execute("DELETE FROM files WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                     db.execute("DELETE FROM derived WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
                     db.execute("DELETE FROM jobs WHERE caller = ? AND user_id = ? AND chat_id = ?", owner)
-                self._forget_refusals(files)
+                self._forget_sources(files)
                 folder = self._ws.resolve(p, f"{VIRTUAL_ROOT}/{p.chat_id}")
                 try:
                     shutil.rmtree(folder)
@@ -1656,6 +1665,67 @@ class Store:
         with self._refusals_lock:
             for file_id in ids:
                 self._refusals.pop(file_id, None)
+
+    def remember_measure(self, source: FileRecord, outcome: Mapping[str, object] | str) -> None:
+        """Remember what a measure of a source answered, so that later calls answer it without a job.
+
+        The counts are what the measure found of the file, or a refusal the file alone decides: either is the same
+        for this very file whenever it is asked. A measure that ran out of time, found a busy executor or failed is
+        never given here. It lives in this process, never in the database: a restart forgets it, and so does the
+        source's removal (:meth:`remove`, :meth:`remove_upload`, :meth:`delete_chat`); a source of a chat deleted while
+        its job ran is not remembered at all. A source removed by retention or taken back while its job runs can be,
+        until it is pushed out: its id never comes back. It is kept by the source's id with its creation time and
+        size, so no other file inherits it: an upload under the same name is a new record with a new id. Past
+        :data:`MEASURES_MAX` the measure asked for least recently is forgotten, and that file is only measured again.
+
+        Args:
+            source: The file measured.
+            outcome: The five counts of its answer (``kind``, ``unit``, ``total``, ``chars``, ``capped``), or the
+                runner's refusal, its code first, as the caller is told it; neither names a file.
+        """
+        deadline = self._deleted.get((source.caller, source.user_id, source.chat_id))
+        deleted = deadline is not None and deadline > self._monotonic()
+        with self._measures_lock:
+            if deleted:
+                self._measures.pop(source.id, None)
+                return
+            kept = outcome if isinstance(outcome, str) else dict(outcome)
+            self._measures[source.id] = (source.created_at, source.size, kept)
+            self._measures.move_to_end(source.id)
+            while len(self._measures) > MEASURES_MAX:
+                self._measures.popitem(last=False)
+
+    def measure_of(self, source: FileRecord) -> Mapping[str, object] | str | None:
+        """What a measure of a source answered (:meth:`remember_measure`), if this very file was measured.
+
+        Args:
+            source: The file.
+
+        Returns:
+            The counts, or the refusal as the caller was told it; ``None`` when nothing is remembered, or the cell
+            under its id is of a record of another time or size, which is then forgotten.
+        """
+        with self._measures_lock:
+            held = self._measures.get(source.id)
+            if held is None:
+                return None
+            created_at, size, outcome = held
+            if (created_at, size) != (source.created_at, source.size):
+                del self._measures[source.id]
+                return None
+            self._measures.move_to_end(source.id)
+            return outcome if isinstance(outcome, str) else dict(outcome)
+
+    def _forget_sources(self, ids: Sequence[str]) -> None:
+        """Forget what the store remembers of files that went: their refusals and their measures.
+
+        Args:
+            ids: Their file ids; an id with nothing remembered is fine.
+        """
+        self._forget_refusals(ids)
+        with self._measures_lock:
+            for file_id in ids:
+                self._measures.pop(file_id, None)
 
     def checkpoint(self) -> bool:
         """Copy the write-ahead log into the database file and empty it.

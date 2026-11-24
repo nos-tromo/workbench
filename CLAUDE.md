@@ -206,7 +206,12 @@ what the model is told and shown, never what a caller may reach.
   layout that takes it (`presentations/deck.py:fitting`), and a title slide's
   only text block is its subtitle (`subtitle_as_meant`).
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
-  an upload not yet sent, `POST /files/derived`, prepare, view, the chat delete).
+  an upload not yet sent, `POST /files/derived`, measure, prepare, view, the chat
+  delete). `POST /files/measure` (`workbench/api/measure.py`) answers a document's
+  length, its units in its reader's terms and the characters of a full read: one
+  `measure_file` job on the caller's measure gate, `query` / `file.measure`, the
+  counts (or a refusal the file decides) remembered by the store, a picture or a
+  clip refused by its name.
   `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
@@ -349,7 +354,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and seven file routes,
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and eight file routes,
 workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
@@ -551,6 +556,16 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   `Store.remove_upload`, `Store.delete_chat`; a job of a deleted chat remembers
   nothing) and with a
   restart; uploading the file again makes a new file, tried afresh.
+- **A measure is remembered the same way, beside the refusals.** `Store.measure_of`
+  holds, by the source's id, creation time and size (an LRU of `MEASURES_MAX`), the
+  five counts of a measure or a refusal of it; `POST /files/measure` answers from
+  it with no job and no event. Both `unsupported_format` and `unreadable_file` are
+  remembered at once (the readers decide them by the file at the job's fixed
+  limits, with no `FILE_DECIDED` list), recorded as `error` with `remembered`; a
+  `read_timeout`, a `file_not_found`, a busy executor and a failure never are, so
+  the next call tries again. A picture or a clip is refused by its name, before any
+  job and with no event. It goes with the file, as a refusal does
+  (`Store._forget_sources`), and a prepare that went well forgets no measure.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in

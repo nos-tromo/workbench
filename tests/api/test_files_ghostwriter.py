@@ -275,9 +275,17 @@ def _request(app: FastAPI, key: str, path: str = "/files/list", root_path: str =
     return Request({**scope, "headers": [(b"authorization", f"Bearer {key}".encode())]})
 
 
-def test_the_file_caller_check_keeps_ghostwriter_to_its_six_paths(app: FastAPI) -> None:
+def test_the_file_caller_check_keeps_ghostwriter_to_its_seven_paths(app: FastAPI) -> None:
     """Should a request pass the gate, the routes' own check refuses Ghostwriter off its paths and under a root path."""
-    for path in ("/files/list", "/files/upload", "/files/prepare", "/files/view", "/files/chat", "/files/derived"):
+    for path in (
+        "/files/list",
+        "/files/upload",
+        "/files/prepare",
+        "/files/measure",
+        "/files/view",
+        "/files/chat",
+        "/files/derived",
+    ):
         assert asyncio.run(require_file_caller(_request(app, GHOSTWRITER_KEY, path=path))).name == "ghostwriter"
     for refused in (
         _request(app, GHOSTWRITER_KEY, root_path="/prefix"),
