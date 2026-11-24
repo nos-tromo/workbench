@@ -22,6 +22,28 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 - A value exported in the shell that runs `make up` beats `.env`, since compose
   interpolates `${VAR:-default}` from the shell first.
 
+## Upgrading from 0.9: values pinned in `.env`
+
+0.10.0 raises five defaults so that a measure runs on a slot of its own:
+`WORKBENCH_EXECUTOR_SLOTS` 5, `GHOSTWRITER_WORKBENCH_SLOTS` 4,
+`WORKBENCH_QUEUE_MAX` 20, `WORKBENCH_EXECUTOR_MEM_LIMIT` `8192m` and
+`WORKBENCH_EXECUTOR_PIDS_LIMIT` 384. A host that leaves them unset gets the new
+values and needs no change. A host whose `.env` pins one of them at its 0.9
+value, and leaves the others unset, gets this:
+
+| Pinned in `.env` | What happens | Set instead |
+|---|---|---|
+| `WORKBENCH_EXECUTOR_MEM_LIMIT=6656m` | The executor refuses to start: "the container's memory limit is below 5 slots of 1536 MB" (5 × 1536 = 7680 MiB). | `8192m`, or remove the line. |
+| `WORKBENCH_EXECUTOR_PIDS_LIMIT=320` | The executor refuses to start: "the container's process limit is below 5 slots of 64 and 64 more" (5 × 64 + 64 = 384). | `384`, or remove the line. |
+| `WORKBENCH_EXECUTOR_SLOTS=4` | With Ghostwriter's key set, the api refuses to start: "GHOSTWRITER_WORKBENCH_SLOTS must be less than WORKBENCH_EXECUTOR_SLOTS (4)". | Remove the line, for 5. To keep 4 executor slots, also pin `GHOSTWRITER_WORKBENCH_SLOTS=3`, at the cost in its row below. |
+| `WORKBENCH_QUEUE_MAX=16` | Everything starts and nothing warns, but a user's share of waiting calls drops from 4 to 3 (16 // 5). Ghostwriter's waiting places drop from 16 to 12, and docint's from 8 to 6. | `20`, or remove the line. |
+| `GHOSTWRITER_WORKBENCH_SLOTS=3` | Everything starts and nothing warns, but while a prepare, a conversion and a measure run, they take all three slots, and every Ghostwriter tool call answers `wait_timeout` after 5 s. | `4`, or remove the line. |
+
+A host that pins all five at their 0.9 values starts, and runs as 0.9 did, at
+the cost of the last row. Whenever the executor's slots change, change the
+memory and process limits with them
+([the formulas](#the-executor-container)).
+
 ## Callers
 
 | Variable | Default | Meaning |
@@ -33,7 +55,7 @@ python3 -B ../deploy/scripts/check_env_examples.py .
 | `GHOSTWRITER_WORKBENCH_KEY` | none | The bearer key Ghostwriter presents on its MCP door (`/mcp`) and seven file routes. The same rules; unset, Ghostwriter's door is off. |
 | `GHOSTWRITER_WORKBENCH_TOOLS` | the ten workspace tools | The tools Ghostwriter may call, comma-separated; each a workspace tool. Since 0.7.0 the default includes `view_file`; a list set explicitly must add it, or Ghostwriter offers no images. |
 | `GHOSTWRITER_WORKBENCH_WALL_S` | 120 | Wall-clock seconds one Ghostwriter job may run: from 10 to `WORKBENCH_JOB_WALL_S`. |
-| `GHOSTWRITER_WORKBENCH_SLOTS` | 4 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), the measure of a document's length a third, and the three run apart, so keep 4 or more: at 4, one is left for the tool calls of all Ghostwriter's users while all three run. At 3 (an `.env` that pinned the default before 0.10.0), a prepare, a conversion and a measure take all three, and every Ghostwriter tool call answers `wait_timeout` after 5 s while they run; at 2, a conversion and a picture's prepare already take both. Nothing warns at start. There is no variable for prepares, conversions or measures of their own. Since 0.10.0 a host with `WORKBENCH_EXECUTOR_SLOTS` at 4 (the default before 0.10.0) or fewer and this unset refuses to start (4 is not fewer than 4): raise the executor's slots there, or set this lower with the cost above. The executor's memory is its own slots times a job's (below), whatever this is. |
+| `GHOSTWRITER_WORKBENCH_SLOTS` | 4 | Jobs Ghostwriter may have running at once; fewer than `WORKBENCH_EXECUTOR_SLOTS`. A prepare of a picture or a PDF takes one of them, an Office file's conversion another (its conversion and then its drawing, one after the other; on demand too), the measure of a document's length a third, and the three run apart, so keep 4 or more: at 4, one is left for the tool calls of all Ghostwriter's users while all three run. At 3 (an `.env` that pinned the default before 0.10.0), a prepare, a conversion and a measure take all three, and every Ghostwriter tool call answers `wait_timeout` after 5 s while they run; at 2, a conversion and a picture's prepare already take both. Nothing warns at start. There is no variable for prepares, conversions or measures of their own. A host whose `.env` pins `WORKBENCH_EXECUTOR_SLOTS` at 4 or fewer, and leaves this unset, refuses to start (4 is not fewer than 4): raise the executor's slots there, or set this lower, at the cost above ([Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)). The executor's memory is its own slots times a job's (below), whatever this is. |
 
 The api needs at least one of the two keys, or it refuses to start; two
 callers with the same key stop the start too.
@@ -67,8 +89,8 @@ The executor has no network.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKBENCH_EXECUTOR_SLOTS` | 5 | Jobs the executor runs at once, one slot uid each; at most 16, the size of the uid pool. 4 before 0.10.0: the fifth gives Ghostwriter's measure a slot of its own while docint keeps one. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots (below). |
-| `WORKBENCH_QUEUE_MAX` | 20 | Jobs that may wait for a free slot. Past it a call is refused at once (`queue_full`, "busy, retry later"). 16 before 0.10.0: 20 over 5 slots keeps a user's share at 4 (below). |
+| `WORKBENCH_EXECUTOR_SLOTS` | 5 | Jobs the executor runs at once, one slot uid each; at most 16, the size of the uid pool. 4 before 0.10.0: the fifth gives Ghostwriter's measure a slot of its own while docint keeps one. `WORKBENCH_EXECUTOR_MEM_LIMIT` and `WORKBENCH_EXECUTOR_PIDS_LIMIT` must hold the slots (below; a pinned 0.9 value: [Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)). |
+| `WORKBENCH_QUEUE_MAX` | 20 | Jobs that may wait for a free slot. Past it a call is refused at once (`queue_full`, "busy, retry later"). 16 before 0.10.0: 20 over 5 slots keeps a user's share at 4 (below; a pinned 16: [Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)). |
 | `WORKBENCH_JOBS_PER_USER` | 1 | Jobs one user may have **running** at once. Their further calls wait, and hold no slot while they wait. |
 | `WORKBENCH_JOB_WALL_S` | 120 | Wall-clock seconds a job may run; also its CPU-time limit. |
 | `WORKBENCH_JOB_MEMORY_MB` | 1536 | Address space one job may map, in MB. `WORKBENCH_EXECUTOR_MEM_LIMIT` must hold the slots times this. |
@@ -247,12 +269,12 @@ The formulas, for other slot counts or job memory:
 
 - **Memory:** `WORKBENCH_EXECUTOR_SLOTS` × `WORKBENCH_JOB_MEMORY_MB` + 512 MiB
   for the supervisor. The default is 5 × 1536 + 512 = 8192 MiB. The executor
-  refuses to start when its cgroup limit is below slots × job memory: an
-  `.env` that pins `WORKBENCH_EXECUTOR_MEM_LIMIT=6656m` (the default before
-  0.10.0) but not the slots stops it at start (5 × 1536 passes 6656). Raise
-  the limit with the slots, or pin both.
+  refuses to start when its cgroup limit is below slots × job memory, so a
+  limit pinned at 0.9's `6656m` stops it ([Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)).
 - **Processes:** 64 per slot (each job's `RLIMIT_NPROC`) plus 64 for the
-  supervisor and its cleanup helpers: 5 × 64 + 64 = 384.
+  supervisor and its cleanup helpers: 5 × 64 + 64 = 384. The executor refuses
+  to start when its cgroup limit is below slots × 64 + 64, so a limit pinned
+  at 0.9's 320 stops it ([Upgrading from 0.9](#upgrading-from-09-values-pinned-in-env)).
 - **CPUs:** Docker refuses to start a container whose `cpus` is above the
   host's number of CPUs. On a host with fewer than 4 CPUs, set
   `WORKBENCH_EXECUTOR_CPUS` to the host's number or less. CI does so on small
