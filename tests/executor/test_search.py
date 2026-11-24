@@ -708,6 +708,22 @@ def test_a_run_short_of_its_tables_end_has_null_units(work: Path) -> None:
     assert "units" in part and part["units"] is None
 
 
+def test_a_part_is_sized_by_the_readers_as_the_runner_sends_it(work: Path) -> None:
+    """``part_size`` is the compact JSON of a part as sent, ``units: null`` and ``cut`` included, and its comma."""
+    fx.make_big_table_docx(work / "long-table.docx", rows=300)
+    (work / "pier-log.txt").write_text("x" * 5000 + "\nnext\n", encoding="utf-8")
+    sent = [
+        *read_doc(work, "long-table.docx")["parts"],
+        *read_doc(work, "long-table.docx", "table 1, rows 30-60")["parts"],
+        *read_doc(work, "pier-log.txt", max_chars=3072)["parts"],
+    ]
+    assert {p["units"] is None for p in sent} == {True, False} and {p["cut"] for p in sent} == {True, False}
+    for part in sent:
+        compact = json.dumps(part, ensure_ascii=False, separators=(",", ":")).encode()
+        units = None if part["units"] is None else tuple(part["units"])
+        assert readers.paging.part_size(part["label"], part["text"], units, cut=part["cut"]) == len(compact) + 1
+
+
 def test_a_file_in_a_folder_keeps_its_folder_in_the_path(work: Path) -> None:
     """The virtual path of ``reports/q1.txt`` is below ``/workspace/<chat>/reports``."""
     (work / "reports").mkdir()

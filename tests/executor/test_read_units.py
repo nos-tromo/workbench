@@ -186,9 +186,9 @@ def test_a_part_the_reader_cut_keeps_its_units(tmp_path: Path) -> None:
 
 
 def test_a_part_is_sized_as_it_is_sent() -> None:
-    """The size is the compact JSON with ``units`` (left out when ``None``) and ``cut``, and the comma after it."""
+    """The size is the compact JSON with ``units`` (``null`` when ``None``) and ``cut``, and the comma after it."""
     assert pg.part_size("page 3", "x", (3, 3)) == len('{"label":"page 3","text":"x","units":[3,3],"cut":false}') + 1
-    assert pg.part_size("page 3", "x") == len('{"label":"page 3","text":"x","cut":false}') + 1
+    assert pg.part_size("page 3", "x") == len('{"label":"page 3","text":"x","units":null,"cut":false}') + 1
     # ``true`` is one character shorter than ``false``.
     assert pg.part_size("page 3", "x", cut=True) == pg.part_size("page 3", "x") - 1
 

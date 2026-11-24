@@ -61,16 +61,13 @@ def part_size(label: str, text: str, units: tuple[int, int] | None = None, *, cu
     Args:
         label: The part's label.
         text: The part's text.
-        units: The units it covers; left out when ``None``, as the api's sizing leaves out ``None``.
+        units: The units it covers; sent as ``null`` when ``None``, as the runner sends it.
         cut: Whether it is sent as cut short.
 
     Returns:
         The size in bytes.
     """
-    sent: dict[str, object] = {"label": label, "text": text}
-    if units is not None:
-        sent["units"] = units
-    sent["cut"] = cut
+    sent = {"label": label, "text": text, "units": units, "cut": cut}
     return len(json.dumps(sent, ensure_ascii=False, separators=(",", ":")).encode()) + 1
 
 
