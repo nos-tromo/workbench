@@ -136,6 +136,28 @@ def test_the_count_stops_at_the_cap_and_the_total_does_not(tmp_path: Path) -> No
     assert measure(path, chars_cap=5000) == readers.Measure("text", "line", 100, 5000, False)
 
 
+@pytest.mark.parametrize(
+    ("make", "total"),
+    [
+        (lambda folder: fx.make_xlsx(folder / "quarterly-figures.xlsx", rows=100), 103),
+        (lambda folder: gappy_xlsx(folder / "gappy.xlsx"), 7),
+        (lambda folder: fx.make_ods(folder / "depths.ods"), 2),
+        (lambda folder: fx.make_pptx(folder / "harbour-deck.pptx"), 2),
+        (lambda folder: fx.make_docx(folder / "review.docx"), 5),
+        (lambda folder: fx.make_odt(folder / "survey.odt"), 4),
+    ],
+    ids=["xlsx", "gappy-xlsx", "ods", "pptx", "docx", "odt"],
+)
+def test_a_measure_past_the_cap_still_counts_every_unit(
+    tmp_path: Path, make: Callable[[Path], Path], total: int
+) -> None:
+    """Only the characters stop at the cap: the rows, slides and paragraphs after it are counted all the same."""
+    path = make(tmp_path)
+    assert measure(path).total == total
+    counted = measure(path, chars_cap=10)
+    assert (counted.total, counted.chars, counted.capped) == (total, 10, True)
+
+
 def test_a_line_or_a_cell_a_read_shortens_is_measured_whole(tmp_path: Path, work: Path) -> None:
     """Decisions 5 and 7: the read shows less than the text is, and the measure says how long the text is."""
     path = write(tmp_path / "one-line.txt", b"x" * 50_000)
