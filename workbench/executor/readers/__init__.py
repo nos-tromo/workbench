@@ -184,10 +184,14 @@ class Part:
         label: Where the text is, such as ``page 3``, ``Sheet1!A1:F200``, ``slide 2`` or ``paragraph 12``.
             Passed back as ``part``, it starts a read there.
         text: The text.
+        units: The first and last unit the part covers, from 1: a page, a slide, a block (a paragraph, or a
+            table as one), a sheet row that holds something (numbered through the sheets in order) or a line.
+            ``None`` for a piece of a search, and for a run of a table's rows that does not reach its last row.
     """
 
     label: str
     text: str
+    units: tuple[int, int] | None = None
 
 
 @dataclass

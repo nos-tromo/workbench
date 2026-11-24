@@ -113,7 +113,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         text = _slide_text(slides[number - 1])
         if not text:
             without.append(number)
-        elif not collector.add(f"slide {number}", text):
+        elif not collector.add(f"slide {number}", text, (number, number)):
             break
     return DocumentText(
         kind="pptx",

@@ -26,6 +26,9 @@ MAX_ROW: Final = 1_048_576
 MAX_COLUMN: Final = 16_384
 MAX_SHEETS: Final = 1000
 
+#: The widest unit number a reservation sizes for: a sheet row numbered through every sheet.
+MAX_UNIT: Final = MAX_ROW * MAX_SHEETS
+
 #: Longest sheet name read; Excel's own limit is 31. A reference to a sheet carries its name, and the api's answer
 #: holds a label of at most 300 characters.
 MAX_SHEET_NAME: Final = 100
@@ -52,17 +55,23 @@ def clip(text: str, cap: int = CELL_CAP) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
-def part_size(label: str, text: str) -> int:
+def part_size(label: str, text: str, units: tuple[int, int] | None = None, *, cut: bool = False) -> int:
     """Measure a part as the answer sends it: compact JSON in UTF-8, with the comma that follows it.
 
     Args:
         label: The part's label.
         text: The part's text.
+        units: The units it covers; left out when ``None``, as the api's sizing leaves out ``None``.
+        cut: Whether it is sent as cut short.
 
     Returns:
         The size in bytes.
     """
-    return len(json.dumps({"label": label, "text": text}, ensure_ascii=False, separators=(",", ":")).encode()) + 1
+    sent: dict[str, object] = {"label": label, "text": text}
+    if units is not None:
+        sent["units"] = units
+    sent["cut"] = cut
+    return len(json.dumps(sent, ensure_ascii=False, separators=(",", ":")).encode()) + 1
 
 
 class Collector:
@@ -94,12 +103,13 @@ class Collector:
         """Whether text was left out: parts that did not fit, or one cut short."""
         return self.next_part is not None or self.cut is not None
 
-    def add(self, label: str, text: str) -> bool:
+    def add(self, label: str, text: str, units: tuple[int, int] | None = None) -> bool:
         """Offer the next part.
 
         Args:
             label: The part's label.
             text: The part's text.
+            units: The units it covers.
 
         Returns:
             ``True`` while more parts may be offered; ``False`` once this one was refused, which makes it
@@ -108,25 +118,25 @@ class Collector:
         if self._closed:
             self.next_part = label
             return False
-        cost = part_size(label, text)
+        cost = part_size(label, text, units)
         if cost <= self._left:
-            self.parts.append(Part(label, text))
+            self.parts.append(Part(label, text, units))
             self._left -= cost
             return True
         self._closed = True
         if self.parts:
             self.next_part = label
             return False
-        fitted = self._fit(label, text)
+        fitted = self._fit(label, text, units)
         if fitted is None:
             self.next_part = label
             return False
-        self.parts.append(Part(label, fitted))
+        self.parts.append(Part(label, fitted, units))
         self.cut = label
         return True
 
     def grow(self, label: str, text: str, following: str) -> bool:
-        """Replace the last part with a longer version of it, if the longer one fits.
+        """Replace the last part with a longer version of it, if the longer one fits; it keeps its units.
 
         Args:
             label: The part's new label.
@@ -138,21 +148,22 @@ class Collector:
             and ``following`` is ``next_part``.
         """
         last = self.parts[-1]
-        extra = part_size(label, text) - part_size(last.label, last.text)
+        extra = part_size(label, text, last.units) - part_size(last.label, last.text, last.units)
         if not self._closed and extra <= self._left:
-            self.parts[-1] = Part(label, text)
+            self.parts[-1] = Part(label, text, last.units)
             self._left -= extra
             return True
         self._closed = True
         self.next_part = following
         return False
 
-    def _fit(self, label: str, text: str) -> str | None:
-        """Find the longest start of ``text``, with the cut mark, that fits what is left.
+    def _fit(self, label: str, text: str, units: tuple[int, int] | None) -> str | None:
+        """Find the longest start of ``text``, with the cut mark, that fits what is left, sized as sent cut.
 
         Args:
             label: The part's label.
             text: The part's text.
+            units: The units it covers.
 
         Returns:
             The cut text, or ``None`` if not even the label and the mark fit.
@@ -162,7 +173,7 @@ class Collector:
         while low <= high:
             middle = (low + high) // 2
             candidate = text[:middle] + CUT_MARK
-            if part_size(label, candidate) <= self._left:
+            if part_size(label, candidate, units, cut=True) <= self._left:
                 best, low = candidate, middle + 1
             else:
                 high = middle - 1
@@ -232,6 +243,11 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
     ``table T, rows A-B``, and the first row that does not fit is where to go on (``table T, row R``), so a
     table of any length can be read to its end.
 
+    The units are blocks, numbered as they come: a paragraph is the next block, and a table is the next block
+    at its first row with text, so the blocks are ``total_parts``. A paragraph covers its own block. A table is
+    one unit: only a run of its rows that reaches its last row with text covers the table's block; any other
+    run covers none, so a table paged with ``next_part`` counts once, on the run that ends it.
+
     Args:
         kind: The reader family to report.
         pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``, text ``a | b``) in document order.
@@ -247,7 +263,10 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
     start = _start(part)
     collector = Collector(max_chars)
     paragraphs = 0
-    tables: set[int] = set()
+    blocks = 0
+    tables: dict[int, int] = {}  # a table's number: its block
+    last_rows: dict[int, int] = {}  # a table's number: its last row with text
+    runs: dict[int, tuple[int, int]] = {}  # a run's place in the parts: its table and its last row
     started = start is None
     offering = True
     open_table = 0
@@ -257,16 +276,20 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
         match = _TABLE_ROW.fullmatch(piece.label)
         if match is None:
             paragraphs += 1
+            blocks += 1
             open_table = 0
             if not started:
                 if start is None or start.paragraph is None or piece.label != f"paragraph {start.paragraph}":
                     continue
                 started = True
             if offering:
-                offering = collector.add(piece.label, piece.text)
+                offering = collector.add(piece.label, piece.text, (blocks, blocks))
             continue
         table, row = int(match[1]), int(match[2])
-        tables.add(table)
+        if table not in tables:
+            blocks += 1
+            tables[table] = blocks
+        last_rows[table] = row
         if not started:
             if start is None or start.paragraph is not None or table != start.table or row < start.row:
                 continue
@@ -282,9 +305,14 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
             offering = collector.grow(_run_label(table, first_row, row), f"{last.text}\n{line}", piece.label)
         else:
             open_table, first_row = table, row
-            offering = collector.add(piece.label, line)
+            offering = collector.add(piece.label, line, (tables[table], tables[table]))
+        if offering:
+            runs[len(collector.parts) - 1] = (table, row)
     if not started:
         raise NoSuchPart(f"this document has no such part; it has {paragraphs} paragraphs and {len(tables)} tables")
+    for place, (table, row) in runs.items():
+        if row != last_rows[table]:
+            collector.parts[place].units = None
     return DocumentText(
         kind=kind,
         parts=collector.parts,
@@ -419,6 +447,9 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
     first sheet that is empty is passed over. The workbook is walked once, from the start of the range to its
     end, however many sheets it has.
 
+    The units are the rows that hold something, numbered through the sheets in their order. A range asked for
+    by name gets its first unit from one more walk, :func:`rows_before`, once its own has ended.
+
     Args:
         kind: The reader family to report.
         source: The workbook.
@@ -439,7 +470,7 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
     first = end = 0
     window = RANGE_ROWS
     width = 1
-    left = max_chars - part_size(f"{quote_sheet(sheet)}!A{MAX_ROW}:ZZZ{MAX_ROW}", "")
+    left = max_chars - part_size(f"{quote_sheet(sheet)}!A{MAX_ROW}:ZZZ{MAX_ROW}", "", (MAX_UNIT, MAX_UNIT))
     next_part: str | None = None
     cut = False
     for name, number, row in source.walk(sheet if explicit else None, start, cap=CELL_CAP):
@@ -484,15 +515,45 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
             next_part=next_part,
         )
     label = f"{quote_sheet(current)}!A{first}:{column_letters(width)}{end}"
+    offset = rows_before(source, current, first) if explicit else 0
     return DocumentText(
         kind=kind,
-        parts=[Part(label, "\n".join(lines))],
+        parts=[Part(label, "\n".join(lines), (offset + 1, offset + len(lines)))],
         pages_without_text=[],
         total_parts=len(names),
         truncated=next_part is not None or cut,
         next_part=next_part,
         cut=label if cut else None,
     )
+
+
+def rows_before(source: SheetSource, sheet: str, row: int) -> int:
+    """Count the rows that hold something in the sheets before ``sheet``, and in ``sheet`` before ``row``.
+
+    One walk from the start of the workbook, which stops at the first row of ``sheet`` numbered ``row`` or more, or
+    at the next sheet once ``sheet`` has been reached. Cells are read to one character: only whether a row holds
+    something counts.
+
+    Args:
+        source: The workbook.
+        sheet: A sheet that holds something.
+        row: A row number of that sheet.
+
+    Returns:
+        How many rows come before it, which is the number of the unit before it.
+    """
+    count = 0
+    reached = False
+    for name, number, _ in source.walk(None, 1, cap=1):
+        tick()
+        if name == sheet:
+            if number >= row:
+                break
+            reached = True
+        elif reached:
+            break
+        count += 1
+    return count
 
 
 def cells(source: SheetSource) -> Iterator[Part]:

@@ -103,7 +103,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         text = _page_text(reader, number)
         if not text:
             without.append(number)
-        elif not collector.add(f"page {number}", text):
+        elif not collector.add(f"page {number}", text, (number, number)):
             break
     return DocumentText(
         kind="pdf",

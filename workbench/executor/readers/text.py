@@ -128,7 +128,7 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
         max_chars: The budget in bytes of JSON.
 
     Returns:
-        One part with the lines that fit, and where to continue.
+        One part with the lines that fit, covering their numbers as units, and where to continue.
 
     Raises:
         NoSuchPart: The part is not a line reference, or the line is past the end.
@@ -137,7 +137,7 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
     if total == 0:
         return DocumentText(kind=kind, parts=[], pages_without_text=[], total_parts=0)
     first, last = pg.numbered_window(part, total, "line")
-    left = max_chars - pg.part_size(f"lines {total}-{total}", "")
+    left = max_chars - pg.part_size(f"lines {total}-{total}", "", (total, total))
     taken: list[str] = []
     cut = False
     number = first
@@ -159,7 +159,7 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
     more = end < last
     return DocumentText(
         kind=kind,
-        parts=[Part(label, "\n".join(taken))],
+        parts=[Part(label, "\n".join(taken), (first, end))],
         pages_without_text=[],
         total_parts=total,
         truncated=more or cut,
