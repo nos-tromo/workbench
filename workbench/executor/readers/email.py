@@ -11,7 +11,7 @@ from email.parser import BytesParser
 from pathlib import Path
 from typing import Final
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Measure, Part
 from workbench.executor.readers import html as html_reader
 from workbench.executor.readers import paging as pg
 from workbench.executor.readers import text as txt
@@ -84,6 +84,19 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The lines that fit and where to continue.
     """
     return txt.read_lines("eml", lines_of(path), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the lines of the rendered message, the blank one included, and their characters.
+
+    Args:
+        path: The ``.eml`` file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    return txt.measure_lines("eml", lines_of(path), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

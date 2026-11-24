@@ -14,7 +14,7 @@ from typing import Final
 
 from lxml import etree
 
-from workbench.executor.readers import DocumentText, Part, tick
+from workbench.executor.readers import DocumentText, Measure, Part, tick
 from workbench.executor.readers import paging as pg
 
 _W: Final = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -122,6 +122,19 @@ def units(path: Path) -> Iterator[Part]:
     body = root.find(f"{_W}body")
     if body is not None:
         yield from _walk(body, [0, 0])
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the paragraphs and tables, a table as one, and the characters of a full read.
+
+    Args:
+        path: The ``.docx`` or ``.dotx`` file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    return pg.measure_blocks("docx", units(path), chars_cap=chars_cap)
 
 
 def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:

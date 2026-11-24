@@ -2408,6 +2408,36 @@ async def test_as_root_a_photo_and_a_scan_are_prepared_in_a_slot(root_volume: Pa
 
 
 @pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
+async def test_as_root_a_document_is_measured_in_a_slot(root_volume: Path) -> None:
+    """``measure_file``, the real entry point under production's limits and the filter, counts a Word file and a PDF.
+
+    Each ends ``ok`` with the kind, unit and total of its reader, and the job makes no output file.
+    """
+    scratch = root_volume.parent / "inputs"
+    scratch.mkdir()
+    files = {
+        "review.docx": make_fixtures.make_docx(scratch / "review.docx").read_bytes(),
+        "harbour-report.pdf": make_fixtures.make_pdf(
+            scratch / "harbour-report.pdf", ["First page text\nsecond line", None, "Quay list"]
+        ).read_bytes(),
+    }
+    _chat(root_volume, files)
+    limits = Limits(wall_s=120, cpu_s=120, memory_mb=1536, file_mb=50)
+    want = {"review.docx": ("docx", "paragraph", 5), "harbour-report.pdf": ("pdf", "page", 3)}
+
+    for name in files:
+        request = _request(tool="measure_file", args={"path": name, "budget_s": 100}, input_files=[name], limits=limits)
+
+        answer = await Supervisor(_settings(root_volume)).run_job(request)
+
+        assert answer.status == "ok", (name, answer)
+        assert answer.result is not None
+        assert (answer.result["kind"], answer.result["unit"], answer.result["total"]) == want[name]
+        assert (answer.result["capped"], answer.result["chars"] > 0) == (False, True)
+        assert answer.outputs == []
+
+
+@pytest.mark.skipif(not ROOT_ON_LINUX, reason="switching to slot uids needs root on Linux")
 async def test_as_root_a_clips_artifacts_are_prepared_in_a_slot(root_volume: Path) -> None:
     """``prepare_file`` on a clip, the real entry point under production's limits and the filter, reads its artifacts.
 

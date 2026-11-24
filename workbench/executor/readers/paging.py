@@ -4,7 +4,8 @@ A document is paged in *parts*. A reader offers its parts in order, and a :class
 while they fit; the first that does not fit becomes ``next_part``. Block documents (Word, OpenDocument
 text) page by paragraph and table (:func:`read_blocks`); sheets page by ranges of rows
 (:func:`read_sheets`). All sizes are measured as the JSON the part will be sent in, so a budget in
-characters is a budget in bytes of the answer.
+characters is a budget in bytes of the answer. :func:`measure_blocks` and :func:`measure_sheets` count the same
+documents without paging them.
 """
 
 import json
@@ -13,7 +14,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Final, Protocol
 
-from workbench.executor.readers import DocumentText, NoSuchPart, Part, tick
+from workbench.executor.readers import CharTally, DocumentText, Measure, NoSuchPart, Part, tick
 
 #: Rows in one range of a sheet.
 RANGE_ROWS: Final = 200
@@ -321,6 +322,39 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
     )
 
 
+def measure_blocks(kind: str, pieces: Iterable[Part], *, chars_cap: int) -> Measure:
+    """Count the blocks of a document of paragraphs and tables, and the characters a full read shows.
+
+    The total is what :func:`read_blocks` gives as ``total_parts``: the paragraphs and the tables that have a row.
+    A paragraph is counted as it is, and each row of a table as ``row R: a | b``, as a read shows it; no break between
+    pieces is counted. Counting stops at the cap, the walk goes on to count the blocks.
+
+    Args:
+        kind: The reader family to report.
+        pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``, text ``a | b``) in document order.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    paragraphs = 0
+    tables: set[int] = set()
+    counting = True
+    for piece in pieces:
+        tick()
+        match = _TABLE_ROW.fullmatch(piece.label)
+        if match is None:
+            paragraphs += 1
+            text = piece.text
+        else:
+            tables.add(int(match[1]))
+            text = f"row {match[2]}: {piece.text}"
+        if counting:
+            counting = tally.add(text)
+    return Measure.of(kind, paragraphs + len(tables), tally)
+
+
 def numbered_window(part: str | None, total: int, noun: str) -> tuple[int, int]:
     """Understand a part of a document of numbered pages or slides: ``3``, ``page 3``, ``3-5`` or ``pages 3-5``.
 
@@ -435,6 +469,34 @@ def parse_sheet_ref(part: str | None, names: list[str]) -> tuple[str, int, int |
     return chosen, first, last
 
 
+def _trimmed(row: list[str]) -> list[str]:
+    """Drop the empty cells at the end of a row.
+
+    Args:
+        row: A row's cells, from column A.
+
+    Returns:
+        The cells up to the last one that holds something.
+    """
+    end = len(row)
+    while end and not row[end - 1]:
+        end -= 1
+    return row[:end]
+
+
+def row_line(number: int, row: list[str]) -> str:
+    """Show a row of a sheet as a read does: ``<row>: a | b | c``, the empty cells at its end left out.
+
+    Args:
+        number: The row's number in its sheet.
+        row: Its cells, from column A.
+
+    Returns:
+        The line.
+    """
+    return f"{number}: " + " | ".join(_trimmed(row))
+
+
 def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: int) -> DocumentText:
     """Read one range of rows of a workbook.
 
@@ -484,10 +546,8 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
         elif number >= first + window:
             next_part = f"{quote_sheet(current)}!A{number}:{column_letters(width)}{number + RANGE_ROWS - 1}"
             break
-        shown = list(row)
-        while shown and not shown[-1]:
-            shown.pop()
-        line = f"{number}: " + " | ".join(shown)
+        shown = _trimmed(row)
+        line = row_line(number, shown)
         cost = len(json.dumps(line, ensure_ascii=False).encode()) + 1
         if cost > left:
             if lines:
@@ -522,6 +582,32 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
         next_part=next_part,
         cut=label if cut else None,
     )
+
+
+def measure_sheets(kind: str, source: SheetSource, *, chars_cap: int) -> Measure:
+    """Count the rows of a workbook that hold something, and the characters a full read shows.
+
+    One walk over every sheet with every cell whole, so a cell that a read clips at ``CELL_CAP`` is counted at its
+    full length. The total is every row, counted past the cap; the characters are the lines :func:`row_line` makes,
+    counted to the cap.
+
+    Args:
+        kind: The reader family to report.
+        source: The workbook.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    total = 0
+    counting = True
+    for _, number, row in source.walk(None, 1, cap=None):
+        tick()
+        total += 1
+        if counting:
+            counting = tally.add(row_line(number, row))
+    return Measure.of(kind, total, tally)
 
 
 def rows_before(source: SheetSource, sheet: str, row: int) -> int:

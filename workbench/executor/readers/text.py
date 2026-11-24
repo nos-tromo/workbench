@@ -16,7 +16,7 @@ from typing import Final
 
 from charset_normalizer import from_bytes
 
-from workbench.executor.readers import DocumentText, Part, tick
+from workbench.executor.readers import CharTally, DocumentText, Measure, Part, tick
 from workbench.executor.readers import paging as pg
 
 #: Longest line shown; the rest of a longer line is cut.
@@ -168,6 +168,27 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
     )
 
 
+def measure_lines(kind: str, lines: Sequence[str], *, chars_cap: int) -> Measure:
+    """Count the lines of a document and their characters.
+
+    Each line is counted whole, never as :func:`read_lines` shortens it, and no break between lines is counted.
+
+    Args:
+        kind: The reader family to report.
+        lines: The document's lines.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    for line in lines:
+        tick()
+        if not tally.add(line):
+            break
+    return Measure.of(kind, len(lines), tally)
+
+
 def line_units(lines: Sequence[str]) -> Iterator[Part]:
     """Walk the lines that have text.
 
@@ -207,6 +228,19 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The lines that fit and where to continue.
     """
     return read_lines(_kind(path), split_lines(decode(path.read_bytes())), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the lines of a text file and their characters.
+
+    Args:
+        path: The file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure, of kind ``csv`` or ``text``.
+    """
+    return measure_lines(_kind(path), split_lines(decode(path.read_bytes())), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

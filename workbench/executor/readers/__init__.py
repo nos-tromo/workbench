@@ -1,12 +1,13 @@
-"""Readers for the documents ``read_document`` and ``search_files`` open, run inside the sandboxed job.
+"""Readers for the documents ``read_document``, ``search_files`` and ``measure_file`` open, run in the sandboxed job.
 
 Every reader turns one file into text with a reference for each piece of it (``page 3``,
-``Sheet1!A1:F200``, ``slide 2``, ``paragraph 12``, ``lines 1-80``), in two ways:
+``Sheet1!A1:F200``, ``slide 2``, ``paragraph 12``, ``lines 1-80``), in three ways:
 
 - :func:`read` pages through a document: it starts where ``part`` says and returns whole parts
   until the character budget is used up, then says where to continue (``next_part``);
 - :func:`units` walks the document in the finest pieces it has (a page, a cell, a paragraph, a
-  table row, a line), which is what a search matches against.
+  table row, a line), which is what a search matches against;
+- :func:`measure` counts its units and the characters a full read would show, up to a cap.
 
 A JSON file is read by line, indented (:mod:`~workbench.executor.readers.jsondoc`), so that one written
 on a single line is not cut at the longest line shown; JSON Lines (``.jsonl``, ``.ndjson``) is read as
@@ -32,13 +33,16 @@ from collections.abc import Generator, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, Self, cast
 
 from workbench.executor.timer import TimeLimit, limit_until
+from workbench.renders import READ_UNITS, ReaderKind
 
 __all__ = [
+    "CharTally",
     "DocumentText",
     "Extent",
+    "Measure",
     "NoSuchPart",
     "Part",
     "ReadTimeout",
@@ -47,6 +51,7 @@ __all__ = [
     "check",
     "check_zip",
     "count_pages",
+    "measure",
     "read",
     "set_deadline",
     "sheet_extents",
@@ -218,6 +223,79 @@ class DocumentText:
     cut: str | None = None
 
 
+class CharTally:
+    """Counts characters up to a cap, and says when to stop.
+
+    Attributes:
+        chars: The characters counted, at most the cap.
+        capped: Whether more than the cap was counted.
+    """
+
+    def __init__(self, cap: int) -> None:
+        """Start at nothing.
+
+        Args:
+            cap: The most characters to count.
+        """
+        self._cap = cap
+        self._count = 0
+
+    def add(self, text: str) -> bool:
+        """Count a text.
+
+        Args:
+            text: The text, counted in characters, never in bytes.
+
+        Returns:
+            ``True`` while counting goes on; ``False`` once more than the cap was counted.
+        """
+        self._count += len(text)
+        return self._count <= self._cap
+
+    @property
+    def chars(self) -> int:
+        """The characters counted, at most the cap."""
+        return min(self._count, self._cap)
+
+    @property
+    def capped(self) -> bool:
+        """Whether the text is longer than the cap."""
+        return self._count > self._cap
+
+
+@dataclass(frozen=True)
+class Measure:
+    """How long a document is.
+
+    Attributes:
+        kind: The reader family, as :attr:`DocumentText.kind` names it.
+        unit: What ``total`` counts: ``page``, ``slide``, ``paragraph``, ``row`` or ``line``.
+        total: How many of that unit the document has, counted whole.
+        chars: The characters a full read shows, counted to the cap and no further.
+        capped: Whether the text is longer than the cap, so that ``chars`` is the cap.
+    """
+
+    kind: str
+    unit: str
+    total: int
+    chars: int
+    capped: bool
+
+    @classmethod
+    def of(cls, kind: str, total: int, tally: CharTally) -> Self:
+        """Put a count of units and a tally of characters together.
+
+        Args:
+            kind: The reader family; its unit is the one of ``READ_UNITS``.
+            total: How many units the document has.
+            tally: The characters counted.
+
+        Returns:
+            The measure.
+        """
+        return cls(kind, READ_UNITS[cast(ReaderKind, kind)], total, tally.chars, tally.capped)
+
+
 class _Reader(Protocol):
     """What each reader module offers."""
 
@@ -227,6 +305,10 @@ class _Reader(Protocol):
 
     def units(self, path: Path) -> Iterator[Part]:
         """Walk the document in its finest pieces."""
+        ...
+
+    def measure(self, path: Path, *, chars_cap: int) -> Measure:
+        """Count the document's units and the characters of a full read, up to ``chars_cap``."""
         ...
 
 
@@ -409,6 +491,37 @@ def read(path: Path, *, part: str | None, max_chars: int, file_mb: int = 50) -> 
         try:
             return _reader(family).read(path, part=part, max_chars=max_chars)
         except (UnsupportedFormat, UnreadableFile, NoSuchPart):
+            raise
+        except MemoryError:
+            raise UnreadableFile(TOO_BIG) from None
+        except Exception:
+            raise UnreadableFile(DAMAGED) from None
+
+
+def measure(path: Path, *, chars_cap: int, file_mb: int = 50) -> Measure:
+    """Count a document's units and the characters a full read of it shows, under the same guards as :func:`read`.
+
+    The units are counted whole; the characters are counted only up to ``chars_cap``, so that a document longer than
+    that is not extracted to its end (a PDF's pages after it are not read for their text).
+
+    Args:
+        path: The file; its extension picks the reader.
+        chars_cap: The most characters to count.
+        file_mb: The largest file a job may write, in megabytes; a zip file may unpack to 20 times it.
+
+    Returns:
+        The kind, the unit, the total and the characters.
+
+    Raises:
+        UnsupportedFormat: The type is not readable (``.msg`` included: save it as .eml or PDF).
+        UnreadableFile: The file is encrypted, damaged, truncated, a decompression bomb, or too big to read.
+        ReadTimeout: The deadline (:func:`set_deadline`) passed while counting.
+    """
+    with _backstop():
+        family = _prepare(path, file_mb)
+        try:
+            return _reader(family).measure(path, chars_cap=chars_cap)
+        except (UnsupportedFormat, UnreadableFile):
             raise
         except MemoryError:
             raise UnreadableFile(TOO_BIG) from None

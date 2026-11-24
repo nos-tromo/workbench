@@ -58,6 +58,27 @@ PagedUnit = Literal["page", "slide"]
 #: What a render counts: a page, a slide, or a frame of a clip.
 Unit = Literal["page", "slide", "frame"]
 
+#: What a reader counts in a document: a page, a slide, a paragraph (a table counting as one), a sheet row or a line.
+ReadUnit = Literal["page", "slide", "paragraph", "row", "line"]
+
+#: The families of document the readers handle, as a read names its ``kind``.
+ReaderKind = Literal["pdf", "docx", "xlsx", "csv", "pptx", "odt", "ods", "eml", "html", "json", "text"]
+
+#: The unit each family of document is counted in.
+READ_UNITS: Final[Mapping[ReaderKind, ReadUnit]] = {
+    "pdf": "page",
+    "pptx": "slide",
+    "docx": "paragraph",
+    "odt": "paragraph",
+    "xlsx": "row",
+    "ods": "row",
+    "csv": "line",
+    "eml": "line",
+    "html": "line",
+    "json": "line",
+    "text": "line",
+}
+
 #: Most pixels (120 megapixels) of a source picture the executor decodes; a larger one is refused before it is read.
 SOURCE_MAX_PIXELS: Final = 120_000_000
 

@@ -16,7 +16,15 @@ from typing import Any, Final
 from pypdf import PdfReader
 from pypdf.errors import DependencyError
 
-from workbench.executor.readers import PDF_ENCRYPTED, DocumentText, Part, UnreadableFile, check
+from workbench.executor.readers import (
+    PDF_ENCRYPTED,
+    CharTally,
+    DocumentText,
+    Measure,
+    Part,
+    UnreadableFile,
+    check,
+)
 from workbench.executor.readers import paging as pg
 
 #: Most pages one read looks at, so a long run of scanned pages cannot keep the job busy.
@@ -114,6 +122,31 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         next_part=collector.next_part,
         cut=collector.cut,
     )
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the pages and the characters of their text layer.
+
+    The pages are counted whole. The text is extracted page by page and only until the cap is passed.
+
+    Args:
+        path: The PDF.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+
+    Raises:
+        UnreadableFile: The PDF is encrypted.
+    """
+    reader = _open(path)
+    total = len(reader.pages)
+    tally = CharTally(chars_cap)
+    for number in range(1, total + 1):
+        check()
+        if not tally.add(_page_text(reader, number)):
+            break
+    return Measure.of("pdf", total, tally)
 
 
 def units(path: Path) -> Iterator[Part]:
