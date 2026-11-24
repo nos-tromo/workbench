@@ -1033,7 +1033,7 @@
       "outputSchema": {
         "$defs": {
           "DocumentPart": {
-            "description": "One piece of a document.\n\nAttributes:\n    label: Where the text is, such as ``page 3`` or ``Sheet1!A1:F200``; give it as ``part`` to start there.\n    text: The text.",
+            "description": "One piece of a document.\n\nAttributes:\n    label: Where the text is, such as ``page 3`` or ``Sheet1!A1:F200``; give it as ``part`` to start there.\n    text: The text.\n    units: The first and last unit the part covers, counted from 1, or ``None``.\n    cut: Whether the part's text was cut short.",
             "properties": {
               "label": {
                 "description": "Where the text is; give it as part to start reading there.",
@@ -1045,6 +1045,37 @@
                 "description": "The text.",
                 "title": "Text",
                 "type": "string"
+              },
+              "units": {
+                "anyOf": [
+                  {
+                    "maxItems": 2,
+                    "minItems": 2,
+                    "prefixItems": [
+                      {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      {
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    ],
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The first and last unit this part covers, counted from 1: pages, slides, paragraphs (a table counts as one), sheet rows that hold something (counted through all sheets) or lines; null for rows of a table that stop before its end.",
+                "title": "Units"
+              },
+              "cut": {
+                "default": false,
+                "description": "True if this part's text was cut short; it then ends with ' [cut]'.",
+                "title": "Cut",
+                "type": "boolean"
               }
             },
             "required": [

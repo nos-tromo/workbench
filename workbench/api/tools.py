@@ -30,11 +30,11 @@ entries), so it is an ``error`` event whose criteria name the refusal's code, ne
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Self
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.json_schema import JsonDict
 
 from workbench.api.audit import AuditLog
@@ -289,10 +289,35 @@ class DocumentPart(BaseModel):
     Attributes:
         label: Where the text is, such as ``page 3`` or ``Sheet1!A1:F200``; give it as ``part`` to start there.
         text: The text.
+        units: The first and last unit the part covers, counted from 1, or ``None``.
+        cut: Whether the part's text was cut short.
     """
 
     label: str = Field(max_length=300, description="Where the text is; give it as part to start reading there.")
     text: str = Field(description="The text.")
+    units: tuple[Annotated[int, Field(ge=1)], Annotated[int, Field(ge=1)]] | None = Field(
+        default=None,
+        description=(
+            "The first and last unit this part covers, counted from 1: pages, slides, paragraphs (a table counts "
+            "as one), sheet rows that hold something (counted through all sheets) or lines; null for rows of a "
+            "table that stop before its end."
+        ),
+    )
+    cut: bool = Field(default=False, description="True if this part's text was cut short; it then ends with ' [cut]'.")
+
+    @model_validator(mode="after")
+    def _units_go_forward(self) -> Self:
+        """Refuse units that run backwards.
+
+        Returns:
+            The part, unchanged.
+
+        Raises:
+            ValueError: The first unit is after the last.
+        """
+        if self.units is not None and self.units[0] > self.units[1]:
+            raise ValueError("units run backwards")
+        return self
 
 
 class ShownImage(BaseModel):
@@ -632,7 +657,7 @@ def _cut_part(shell: DocumentRead, part: DocumentPart, limit: int, limit_kb: int
     best: DocumentPart | None = None
     while low <= high:
         middle = (low + high) // 2
-        candidate = DocumentPart(label=part.label, text=part.text[:middle] + _CUT_MARK)
+        candidate = part.model_copy(update={"text": part.text[:middle] + _CUT_MARK, "cut": True})
         if _json_size(_with_paging(shell.model_copy(update={"parts": [candidate]}), limit_kb)) <= limit:
             best, low = candidate, middle + 1
         else:

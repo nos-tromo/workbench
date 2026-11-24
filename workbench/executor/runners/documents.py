@@ -128,8 +128,9 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         ctx: The job's surroundings.
 
     Returns:
-        ``path`` (virtual), ``kind``, ``parts``, ``total_parts``, ``pages_without_text``, ``truncated`` and,
-        when they apply, ``next_part`` and ``hint``; or an ``error`` result.
+        ``path`` (virtual), ``kind``, ``parts`` (each with its ``label``, ``text``, ``units`` as a list or ``None``,
+        and ``cut``), ``total_parts``, ``pages_without_text``, ``truncated`` and, when they apply, ``next_part`` and
+        ``hint``; or an ``error`` result.
     """
     name = protocol.check_input_path(str(args["path"]))
     part = args.get("part")
@@ -159,7 +160,15 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     result: dict[str, Any] = {
         "path": virtual,
         "kind": doc.kind,
-        "parts": [{"label": p.label, "text": p.text} for p in doc.parts],
+        "parts": [
+            {
+                "label": p.label,
+                "text": p.text,
+                "units": None if p.units is None else list(p.units),
+                "cut": p.label == doc.cut,
+            }
+            for p in doc.parts
+        ],
         "total_parts": doc.total_parts,
         "pages_without_text": doc.pages_without_text,
         "truncated": doc.truncated,

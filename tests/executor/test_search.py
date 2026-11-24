@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -621,6 +621,91 @@ def test_read_document_answers_with_the_virtual_path_and_the_parts(work: Path) -
     assert (result["total_parts"], result["pages_without_text"], result["truncated"]) == (5, [], False)
     assert "next_part" not in result
     assert "hint" not in result
+
+
+def test_every_part_of_a_read_says_its_units_and_whether_it_was_cut(work: Path) -> None:
+    """Each part carries the units it covers and whether it was cut short, and nothing else is new."""
+    fx.make_docx(work / "review.docx")
+    parts = read_doc(work, "review.docx")["parts"]
+    assert [(p["label"], p["units"], p["cut"]) for p in parts] == [
+        ("paragraph 1", [1, 1], False),
+        ("paragraph 2", [2, 2], False),
+        ("paragraph 3", [3, 3], False),
+        ("table 1, rows 1-3", [4, 4], False),
+        ("paragraph 4", [5, 5], False),
+    ]
+    assert all(set(p) == {"label", "text", "units", "cut"} for p in parts)
+
+
+def _csv_file(work: Path) -> Path:
+    path = work / "berths.csv"
+    path.write_text("berth,depth\n1,12\n2,9\n", encoding="utf-8")
+    return path
+
+
+def _txt_file(work: Path) -> Path:
+    path = work / "pier-notes.txt"
+    path.write_text("alpha\nbeta\n", encoding="utf-8")
+    return path
+
+
+def _md_file(work: Path) -> Path:
+    path = work / "notes.md"
+    path.write_text("# Pier notes\n\nThe invented quay is *open*.\n", encoding="utf-8")
+    return path
+
+
+def _json_file(work: Path) -> Path:
+    path = work / "berths.json"
+    path.write_text(json.dumps([{"berth": n, "depth": {"metres": n + 8}} for n in range(1, 4)], separators=(",", ":")))
+    return path
+
+
+EVERY_READER: Final = {
+    "pdf": lambda work: fx.make_pdf(work / "harbour-report.pdf", ["Harbour figures 2026", "Quay list"]),
+    "pptx": lambda work: fx.make_pptx(work / "harbour-deck.pptx"),
+    "docx": lambda work: fx.make_docx(work / "review.docx"),
+    "odt": lambda work: fx.make_odt(work / "survey.odt"),
+    "xlsx": lambda work: fx.make_xlsx(work / "figures.xlsx"),
+    "ods": lambda work: fx.make_ods(work / "depths.ods"),
+    "html": lambda work: fx.make_html(work / "notice.html"),
+    "eml": lambda work: fx.make_eml(work / "notice.eml"),
+    "csv": _csv_file,
+    "txt": _txt_file,
+    "md": _md_file,
+    "json": _json_file,
+}
+
+
+@pytest.mark.parametrize("kind", list(EVERY_READER))
+def test_each_reader_gives_every_part_units_and_cut(work: Path, kind: str) -> None:
+    """Whatever the file, each part has both keys: ``units`` a forward pair from 1, ``cut`` false."""
+    path = EVERY_READER[kind](work)
+    parts = read_doc(work, path.name)["parts"]
+    assert parts
+    for part in parts:
+        assert {"units", "cut"} <= set(part)
+        assert isinstance(part["units"], list) and len(part["units"]) == 2
+        first, last = part["units"]
+        assert 1 <= first <= last
+        assert part["cut"] is False
+
+
+def test_a_part_the_reader_cut_says_cut(work: Path) -> None:
+    """The reader's own cut at the answer's budget is marked, and the part still says which line it was."""
+    (work / "pier-log.txt").write_text("x" * 5000 + "\nnext\n", encoding="utf-8")
+    result = read_doc(work, "pier-log.txt", max_chars=3072)
+    (part,) = result["parts"]
+    assert (part["label"], part["units"], part["cut"]) == ("line 1", [1, 1], True)
+    assert part["text"].endswith(" [cut]")
+
+
+def test_a_run_short_of_its_tables_end_has_null_units(work: Path) -> None:
+    """A run of rows that stops before the table's last row counts no unit, and still carries the key."""
+    fx.make_big_table_docx(work / "long-table.docx", rows=300)
+    (part,) = read_doc(work, "long-table.docx", "table 1, rows 30-60")["parts"]
+    assert part["label"] == "table 1, rows 30-60"
+    assert "units" in part and part["units"] is None
 
 
 def test_a_file_in_a_folder_keeps_its_folder_in_the_path(work: Path) -> None:
