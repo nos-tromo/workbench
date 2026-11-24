@@ -430,7 +430,7 @@ async def test_a_workspace_tool_refuses_a_principal_not_confined_to_one_chat(
 def test_ghostwriters_call_holds_its_limits(
     client: TestClient, app: FastAPI, store: Store, fake_executor: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Its wall, its five-second wait and its three slots; the job keeps the wall, the runner leaves the preview 5 s.
+    """Its wall, its five-second wait and its four slots; the job keeps the wall, the runner leaves the preview 5 s.
 
     The CPU limit is the job's wall, never less, so a preview never meets it before the wall.
     """
@@ -440,7 +440,7 @@ def test_ghostwriters_call_holds_its_limits(
     assert result(acall(client, "run_python", {"code": "print(1)"}))["isError"] is False
     fake_executor.payload = None
     assert result(acall(client, "read_document", {"path": f"{CHAT}/q.csv"}))["isError"] is False
-    assert seen == [{"call": CallLimits(120, 5, 3), "previews": True}] * 2
+    assert seen == [{"call": CallLimits(120, 5, 4), "previews": True}] * 2
     python, read = fake_executor.requests
     for req in (python, read):
         assert (req.limits.wall_s, req.limits.cpu_s, req.previews) == (120, 120, True)
@@ -461,7 +461,7 @@ def test_a_lower_caller_wall_is_the_jobs_wall(
     seen = spy_submit(lowered, monkeypatch)
     with TestClient(lowered) as client:
         assert result(acall(client, "run_python", {"code": "print(1)"}))["isError"] is False
-    assert seen == [{"call": CallLimits(30, 5, 3), "previews": True}]
+    assert seen == [{"call": CallLimits(30, 5, 4), "previews": True}]
     (req,) = executor.requests
     assert (req.limits.wall_s, req.limits.cpu_s) == (30, 30)
     assert req.args["budget_s"] == (30 - PREVIEW_RESERVE_S) * 9 // 10 == 22
@@ -470,14 +470,14 @@ def test_a_lower_caller_wall_is_the_jobs_wall(
 def test_ghostwriters_waiting_calls_are_capped_across_many_users(
     settings: Settings, store: Store, audit: AuditLog
 ) -> None:
-    """Ghostwriter's users are pseudonyms each: at its 3 slots, 3 run, 12 wait (3 * 16 // 4), the 16th is refused.
+    """Ghostwriter's users are pseudonyms each: at its 4 slots, 4 run, 16 wait (4 * 20 // 5), the 21st is refused.
 
-    docint's call still runs meanwhile, on the slot of the executor's 4 that Ghostwriter's cap leaves free.
+    docint's call still runs meanwhile, on the slot of the executor's 5 that Ghostwriter's cap leaves free.
     """
     slots = settings.ghostwriter_slots
     waiting = slots * (settings.queue_max // settings.executor_slots)
     calls_in_hand = slots + waiting
-    assert (slots, waiting) == (3, 12)
+    assert (slots, waiting) == (4, 16)
     executor = Scripted(settings.data_dir)
     executor.payload = ran()
     executor.hold = {f"ghostwriter/user-{n}" for n in range(calls_in_hand)}

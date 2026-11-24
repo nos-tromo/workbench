@@ -28,7 +28,7 @@ from tests.api.test_tools_documents import Scripted
 from tests.api.test_tools_views import CLIP_BYTES
 from workbench.api import tools, tools_output, tools_templates
 from workbench.api.audit import AuditLog
-from workbench.api.jobs import CallLimits, JobQueue, Keeper
+from workbench.api.jobs import CallLimits, Gate, JobQueue, Keeper
 from workbench.api.main import create_app
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store
@@ -530,9 +530,10 @@ class CancelledOnReturn(JobQueue):
         *,
         call: CallLimits,
         previews: bool = False,
+        gate: Gate = "user",
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run the job, keep its files, then cancel the task that asked for it."""
-        answer = await super().submit(p, tool, args, input_files, keeper, call=call, previews=previews)
+        answer = await super().submit(p, tool, args, input_files, keeper, call=call, previews=previews, gate=gate)
         caller = asyncio.current_task()
         assert caller is not None
         caller.cancel()

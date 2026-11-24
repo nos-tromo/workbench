@@ -13,7 +13,7 @@ file routes are not tools, so the model cannot call them.
 | Caller | Door | Files | Tools | Wall cap | Running jobs |
 |---|---|---|---|---|---|
 | `docint` | mcp | inline | `DOCINT_WORKBENCH_TOOLS` (`run_python`) | `DOCINT_WORKBENCH_WALL_S` (60) | `DOCINT_WORKBENCH_SLOTS` (2) |
-| `ghostwriter` | mcp, and seven file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (3) |
+| `ghostwriter` | mcp, and seven file routes | workspace | `GHOSTWRITER_WORKBENCH_TOOLS` (the ten) | `GHOSTWRITER_WORKBENCH_WALL_S` (120) | `GHOSTWRITER_WORKBENCH_SLOTS` (4) |
 
 - The door is checked right after the key, before any body is read
   (`workbench/api/auth.py:KeyGate`). docint gets `404` on every path but

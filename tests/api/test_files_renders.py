@@ -1102,7 +1102,7 @@ def test_each_route_waits_for_its_own_turn_on_its_own_gate(
     assert prepare(client, source.virtual_path).status_code == 200
     assert rendition(client, source.virtual_path, 21).status_code == 200
 
-    assert asked == [(120, 120, 3, "prepare"), (120, 5, 3, "user")]
+    assert asked == [(120, 120, 4, "prepare"), (120, 5, 4, "user")]
     assert locked == [SOURCE_LOCK_WAIT_S, SOURCE_LOCK_WAIT_S] == [120, 120]
 
 

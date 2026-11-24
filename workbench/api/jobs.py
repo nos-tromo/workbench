@@ -22,10 +22,11 @@ is sent:
   of its user's turn, so it never takes the user's interactive one; an Office file's conversion and the drawing of
   its pages after it (gate ``conversion``, one turn for both) wait for its caller's conversion gate instead, whether
   an attachment's prepare or a call's on demand runs them, so a picture's or a PDF's prepare never waits behind a
-  conversion, and a caller never converts two files at once. Each of the two gates lets one job of a caller run at a
-  time, over all its users, within the caller's slots and on a global slot; at most ``PREPARE_WAITING_MAX`` of a
-  caller wait at each, counted apart from ``queue_max``, every share and the other gate, and one more is refused at
-  once (``queue_full``).
+  conversion, and a caller never converts two files at once; the measure of a document's length (gate ``measure``)
+  waits for its caller's measure gate, so it never stands in front of a prepare, a conversion or a tool call. Each of
+  the three gates lets one job of a caller run at a time, over all its users, within the caller's slots and on a
+  global slot; at most ``PREPARE_WAITING_MAX`` of a caller wait at each, counted apart from ``queue_max``, every share
+  and the other gates, and one more is refused at once (``queue_full``).
 
 Every refusal is :class:`Busy`, which the MCP door answers as an ``isError`` result with its
 reason and "busy, retry later". A request that is too large for the protocol's line is not a
@@ -121,8 +122,9 @@ _READ_GRACE_S: Final = 300
 Reason = Literal["queue_full", "wait_timeout", "executor_busy"]
 
 #: What a job waits for besides the caller's gate and a slot: its user's own turn, its caller's prepare gate (a
-#: picture's or a PDF's prepare), or its caller's conversion gate (an Office file's conversion and its drawing).
-Gate = Literal["user", "prepare", "conversion"]
+#: picture's or a PDF's prepare), its caller's conversion gate (an Office file's conversion and its drawing), or its
+#: caller's measure gate (the measure of a document's length).
+Gate = Literal["user", "prepare", "conversion", "measure"]
 
 _MIB: Final = 1024 * 1024
 
@@ -146,8 +148,8 @@ SOURCE_LOCK_WAIT_S: Final = 120
 #: attachments across all users behind the one prepare slot; longer would only hold HTTP requests open behind a stuck
 #: queue. It equals Ghostwriter's default wall, so the worst wait is one stuck job.
 PREPARE_QUEUE_WAIT_S: Final = 120
-#: Most prepares of one caller that wait, and most conversions: each gate's line counts against this alone, never
-#: against ``queue_max``, a share or the other gate's line.
+#: Most prepares of one caller that wait, most conversions and most measures: each gate's line counts against this
+#: alone, never against ``queue_max``, a share or another gate's line.
 PREPARE_WAITING_MAX: Final = 32
 
 #: The media type of each output type an inline job gives back, by its suffix, lower-cased.
@@ -209,7 +211,7 @@ class Turn:
     Attributes:
         caller: The caller it was taken for.
         user_id: The user it was taken for, of any of their chats.
-        gate: The user's own turn, or the caller's prepare or conversion gate.
+        gate: The user's own turn, or the caller's prepare, conversion or measure gate.
     """
 
     caller: str
@@ -433,7 +435,7 @@ class ExecutorClient:
 
 
 class _UserGate:
-    """The jobs of one user, or of a caller's prepare or conversion gate: how many may run, and how many calls wait.
+    """The jobs of one user, or of a caller's prepare, conversion or measure gate: how many may run, how many wait.
 
     Attributes:
         running: Held while a job of the user (of the gate) runs.
@@ -445,7 +447,7 @@ class _UserGate:
         """Allow ``size`` jobs at once.
 
         Args:
-            size: ``jobs_per_user``; 1 for a caller's prepare or conversion gate.
+            size: ``jobs_per_user``; 1 for a caller's prepare, conversion or measure gate.
         """
         self.running = asyncio.Semaphore(size)
         self.refs = 0
@@ -683,7 +685,7 @@ def _media_request(source: FileRecord, artifacts: Sequence[DerivedRecord]) -> Me
 
 
 class JobQueue:
-    """Runs jobs in the executor within the global, per-caller, per-user, prepare, conversion and queue limits.
+    """Runs jobs in the executor within the global, per-caller, per-user, prepare, conversion, measure and queue limits.
 
     Attributes:
         metrics: The metrics the queue reports to; ``/metrics`` serves them.
@@ -705,7 +707,7 @@ class JobQueue:
         self._slots = asyncio.Semaphore(settings.executor_slots)
         self._gates: dict[tuple[str, str], _UserGate] = {}
         self._caller_gates: dict[str, _CallerGate] = {}
-        self._shared_gates: dict[tuple[Gate, str], _UserGate] = {}  # a caller's prepare and conversion gates
+        self._shared_gates: dict[tuple[Gate, str], _UserGate] = {}  # a caller's prepare, conversion and measure gates
         self._source_locks: dict[str, _SourceLock] = {}
         self._turns: dict[int, Turn] = {}  # the turns held now, by the id of the object each holder got
         self._turns_running: set[int] = set()  # those of them with a job running
@@ -735,6 +737,7 @@ class JobQueue:
         *,
         call: CallLimits,
         previews: bool = False,
+        gate: Gate = "user",
     ) -> tuple[JobRecord, JobResult, list[FileRecord]]:
         """Run a tool in the executor, when its turn comes, and keep what it makes.
 
@@ -748,6 +751,9 @@ class JobQueue:
             call: The call's wall, wait and caller slots.
             previews: Whether the executor reads a table preview of each csv and xlsx output the job writes. The
                 keeper sees each on its output (``OutputFile.preview``) when it records the answer.
+            gate: ``user`` waits for the user's own turn, as every tool call does; ``measure`` waits for the caller's
+                measure gate instead, so a measure never takes the user's turn nor stands in front of a prepare or a
+                conversion (:meth:`_turn`).
 
         Returns:
             The job record with its final status, the executor's answer and the files the job
@@ -760,8 +766,8 @@ class JobQueue:
             PathError: An input file is not a plain path below the chat folder, there are more
                 than ``MAX_INPUT_FILES`` of them, or the caller, user or chat id is not a safe id.
                 No job record is made for a request refused for its input files.
-            Busy: The queue is full, the user's or the caller's share of it is, the turn did not come in time,
-                or the executor has no free slot or cannot be reached.
+            Busy: The queue or the gate's line is full, the user's or the caller's share of it is, the turn did not
+                come in time, or the executor has no free slot or cannot be reached.
             RequestTooLarge: The request does not fit the protocol's line.
             Exception: What the keeper raised (no output is kept), or what the store raises, such as a failure to
                 settle the job's record. Files the job made are removed again first, and the keeper records each of
@@ -770,7 +776,7 @@ class JobQueue:
         if tool not in TOOLS:
             raise ValueError("unknown tool")
         _check_inputs(input_files)
-        async with self._turn(p, call):
+        async with self._turn(p, call, gate=gate):
             return await self._run(
                 p,
                 tool,
@@ -927,15 +933,15 @@ class JobQueue:
     async def turn(self, p: Principal, *, call: CallLimits, gate: Gate = "user") -> AsyncIterator[Turn]:
         """Hold one turn of a gate for jobs that belong together, such as an Office file's conversion and its renders.
 
-        The turn is taken as a job takes one (:meth:`_turn`): the user's own, or the caller's prepare or conversion
-        gate, then the caller's gate and a global slot. Each job sent with the :class:`Turn` it yields runs in it, one
-        at a time, and takes no turn of its own, so that no other job of the gate comes between them. The holder awaits
-        its jobs inside the context.
+        The turn is taken as a job takes one (:meth:`_turn`): the user's own, or the caller's prepare, conversion or
+        measure gate, then the caller's gate and a global slot. Each job sent with the :class:`Turn` it yields runs in
+        it, one at a time, and takes no turn of its own, so that no other job of the gate comes between them. The
+        holder awaits its jobs inside the context.
 
         Args:
             p: The caller and user; the jobs may be of any of the user's chats.
             call: The call's wait and caller slots. Each job's wall is its own call's.
-            gate: The user's own turn, or the caller's prepare or conversion gate.
+            gate: The user's own turn, or the caller's prepare, conversion or measure gate.
 
         Yields:
             The turn, held until the context ends; a job sent with it after that is refused.
@@ -1037,15 +1043,16 @@ class JobQueue:
     async def _turn(self, p: Principal, call: CallLimits, *, gate: Gate = "user") -> AsyncIterator[None]:
         """Hold the user's turn, the caller's gate and a slot while the job runs; give them back whatever happens.
 
-        A prepare (gate ``prepare``) holds its caller's prepare gate in place of the user's turn, and a conversion (gate
-        ``conversion``) its caller's conversion gate: each a gate of one job, kept by the gate and the caller's name in
-        a dict of its own, so no user id can share it, and neither gate the other. Each still takes the caller's gate,
-        counted within the caller's slots, and a global slot, in that order.
+        A prepare (gate ``prepare``) holds its caller's prepare gate in place of the user's turn, a conversion (gate
+        ``conversion``) its caller's conversion gate, and a measure (gate ``measure``) its caller's measure gate: each a
+        gate of one job, kept by the gate and the caller's name in a dict of its own, so no user id can share it, and
+        no gate another. Each still takes the caller's gate, counted within the caller's slots, and a global slot, in
+        that order.
 
         Args:
             p: The caller and user.
             call: The call's wait and caller slots.
-            gate: The user's own turn, or the caller's prepare or conversion gate.
+            gate: The user's own turn, or the caller's prepare, conversion or measure gate.
 
         Yields:
             Once the job may run.
@@ -1087,7 +1094,7 @@ class JobQueue:
         Args:
             p: The caller and user.
             call: The call's wait and caller slots, for a turn of the job's own.
-            gate: The user's own turn, or the caller's prepare or conversion gate.
+            gate: The user's own turn, or the caller's prepare, conversion or measure gate.
             turn: The turn the holder is inside; ``None`` waits for one of the job's own.
 
         Yields:
@@ -1114,10 +1121,10 @@ class JobQueue:
             self._turns_running.discard(key)
 
     def _shared_gate(self, gate: Gate, caller: str) -> _UserGate:
-        """The prepare or the conversion gate of a caller, made when a job of it comes and none waits or runs.
+        """The prepare, conversion or measure gate of a caller, made when a job of it comes and none waits or runs.
 
         Args:
-            gate: ``prepare`` or ``conversion``.
+            gate: ``prepare``, ``conversion`` or ``measure``.
             caller: The caller's name.
 
         Returns:
@@ -1164,14 +1171,14 @@ class JobQueue:
 
         A call that can start at once does not count as waiting. One that cannot holds a place in the line until it
         starts or gives up (:meth:`_join_line`). The user's turn and the caller's gate come before the slot, so a call
-        that waits for either holds no slot another caller could use. A prepare or a conversion waits for its caller's
-        prepare or conversion gate in place of the user's turn, in the same order.
+        that waits for either holds no slot another caller could use. A prepare, a conversion or a measure waits for its
+        caller's prepare, conversion or measure gate in place of the user's turn, in the same order.
 
         Args:
-            gate: The calling user's gate, or the caller's prepare or conversion gate.
+            gate: The calling user's gate, or the caller's prepare, conversion or measure gate.
             caller_gate: The calling caller's gate; ``None`` for a caller with no cap of its own.
             wait_s: The most seconds to wait.
-            shared: Whether ``gate`` is a caller's prepare or conversion gate.
+            shared: Whether ``gate`` is a caller's prepare, conversion or measure gate.
 
         Raises:
             Busy: ``queue_full`` at once when the call would wait and its line is full (:meth:`_join_line`);
@@ -1203,19 +1210,19 @@ class JobQueue:
     def _join_line(self, gate: _UserGate, caller_gate: _CallerGate | None, *, shared: bool) -> None:
         """Count a call that waits, or refuse it when its line is full.
 
-        A call is counted against ``queue_max``, against its user's share of it and against its caller's. A prepare or
-        a conversion is counted against its gate's ``PREPARE_WAITING_MAX`` alone, so neither fills the queue or a share
-        the users' own calls need, nor the other gate's line, and those never keep it out.
+        A call is counted against ``queue_max``, against its user's share of it and against its caller's. A prepare, a
+        conversion or a measure is counted against its gate's ``PREPARE_WAITING_MAX`` alone, so none of them fills the
+        queue or a share the users' own calls need, nor another gate's line, and those never keep it out.
 
         Args:
-            gate: The calling user's gate, or the caller's prepare or conversion gate.
+            gate: The calling user's gate, or the caller's prepare, conversion or measure gate.
             caller_gate: The calling caller's gate; ``None`` for a caller with no cap of its own.
-            shared: Whether ``gate`` is a caller's prepare or conversion gate.
+            shared: Whether ``gate`` is a caller's prepare, conversion or measure gate.
 
         Raises:
             Busy: ``queue_full``: ``queue_max`` calls wait already, or the user's share (``queue_max //
                 executor_slots``, at least one) or the caller's (its slots times the user's share) is used up; for a
-                prepare or a conversion, ``PREPARE_WAITING_MAX`` of its caller wait at its gate already.
+                prepare, a conversion or a measure, ``PREPARE_WAITING_MAX`` of its caller wait at its gate already.
         """
         if shared:
             if gate.waiting >= PREPARE_WAITING_MAX:
@@ -1237,9 +1244,9 @@ class JobQueue:
         """Give a waiting call's place back, as :meth:`_join_line` counted it.
 
         Args:
-            gate: The calling user's gate, or the caller's prepare or conversion gate.
+            gate: The calling user's gate, or the caller's prepare, conversion or measure gate.
             caller_gate: The calling caller's gate; ``None`` for a caller with no cap of its own.
-            shared: Whether ``gate`` is a caller's prepare or conversion gate.
+            shared: Whether ``gate`` is a caller's prepare, conversion or measure gate.
         """
         gate.waiting -= 1
         if not shared:
@@ -1249,7 +1256,7 @@ class JobQueue:
         self._report_length()
 
     def _report_length(self) -> None:
-        """Report every call that waits, the prepares and conversions among them, as the queue's length."""
+        """Report every call that waits, the prepares, conversions and measures among them, as the queue's length."""
         shared = sum(gate.waiting for gate in self._shared_gates.values())
         self.metrics.queue_length.set(self._waiting + shared)
 

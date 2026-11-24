@@ -83,7 +83,7 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
 - **`executor`** (`workbench/executor/`): a supervisor, root with six
   capabilities, that runs every job touching file content as a fresh process
   under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
-  default 4, run at once), copy-in and copy-out, with limits. The
+  default 5, run at once), copy-in and copy-out, with limits. The
   readers, the search, the templates, the writers, `run_python`, the renders
   of pictures and PDF pages, the conversion of Office files to a PDF and a
   clip's transcript and frames (made from Nextext's two artifacts, never the

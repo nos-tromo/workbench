@@ -297,7 +297,7 @@ def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
 
     assert [caller.name for caller in registry.callers] == ["docint", "ghostwriter"]
     assert row(registry.get("docint")) == ("inline", frozenset({"run_python"}), 60, 2)
-    assert row(registry.get("ghostwriter")) == ("workspace", GHOSTWRITER_TOOLS, 120, 3)
+    assert row(registry.get("ghostwriter")) == ("workspace", GHOSTWRITER_TOOLS, 120, 4)
     assert registry.get("docint").key == DOCINT_KEY
     assert registry.get("ghostwriter").key == GHOSTWRITER_KEY
     assert registry.authenticate("wrong") is None

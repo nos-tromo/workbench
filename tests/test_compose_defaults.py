@@ -25,8 +25,8 @@ DOCKER = ROOT / "docker"
 SPEC_DEFAULTS = {
     "WORKBENCH_RETENTION_DAYS": "7",
     "WORKBENCH_RETENTION_INTERVAL_S": "300",
-    "WORKBENCH_EXECUTOR_SLOTS": "4",
-    "WORKBENCH_QUEUE_MAX": "16",
+    "WORKBENCH_EXECUTOR_SLOTS": "5",
+    "WORKBENCH_QUEUE_MAX": "20",
     "WORKBENCH_JOBS_PER_USER": "1",
     "WORKBENCH_JOB_WALL_S": "120",
     "WORKBENCH_JOB_MEMORY_MB": "1536",
@@ -52,7 +52,7 @@ GHOSTWRITER_DEFAULTS = {
     "GHOSTWRITER_WORKBENCH_KEY": "",
     "GHOSTWRITER_WORKBENCH_TOOLS": TOOLS_LIST,
     "GHOSTWRITER_WORKBENCH_WALL_S": "120",
-    "GHOSTWRITER_WORKBENCH_SLOTS": "3",
+    "GHOSTWRITER_WORKBENCH_SLOTS": "4",
 }
 
 #: The executor supervisor's capabilities (docs/sandbox.md).
@@ -190,11 +190,12 @@ def test_executor_has_no_network_and_only_the_listed_capabilities() -> None:
 def test_executor_memory_cannot_swap_past_its_limit() -> None:
     """Memory plus swap is the memory limit: slots x job memory + 512 MiB, and 64 processes a slot + 64."""
     executor = compose()["services"]["executor"]
-    assert default_of(executor["mem_limit"]) == ("WORKBENCH_EXECUTOR_MEM_LIMIT", "6656m")
+    assert default_of(executor["mem_limit"]) == ("WORKBENCH_EXECUTOR_MEM_LIMIT", "8192m")
     assert executor["memswap_limit"] == executor["mem_limit"]
     slots, job_mb = int(SPEC_DEFAULTS["WORKBENCH_EXECUTOR_SLOTS"]), int(SPEC_DEFAULTS["WORKBENCH_JOB_MEMORY_MB"])
-    assert 6656 == slots * job_mb + 512
-    assert default_of(executor["pids_limit"]) == ("WORKBENCH_EXECUTOR_PIDS_LIMIT", str(slots * 64 + 64))
+    assert 8192 == slots * job_mb + 512
+    assert default_of(executor["pids_limit"]) == ("WORKBENCH_EXECUTOR_PIDS_LIMIT", "384")
+    assert 384 == slots * 64 + 64
     assert default_of(executor["cpus"]) == ("WORKBENCH_EXECUTOR_CPUS", "4")
 
 

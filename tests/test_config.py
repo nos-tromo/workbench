@@ -17,7 +17,7 @@ def test_defaults_match_the_spec() -> None:
     """With only a caller's key set, every limit takes its documented default."""
     s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
     assert (s.retention_days, s.retention_interval_s) == (7, 300)
-    assert (s.executor_slots, s.queue_max) == (4, 16)
+    assert (s.executor_slots, s.queue_max) == (5, 20)
     assert (s.jobs_per_user, s.job_wall_s, s.job_memory_mb) == (1, 120, 1536)
     assert (s.result_max_kb, s.upload_max_mb, s.workspace_max_mb) == (16, 50, 500)
     assert s.data_dir == Path("/data")
@@ -28,7 +28,7 @@ def test_defaults_match_the_spec() -> None:
     assert (s.docint_tools, s.docint_wall_s, s.docint_slots) == (frozenset({"run_python"}), 60, 2)
     assert s.require_purpose == frozenset()
     assert s.ghostwriter_key == A
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 3)
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 4)
 
 
 def test_every_variable_is_read_by_its_exact_name() -> None:
@@ -220,7 +220,7 @@ def test_the_docint_defaults() -> None:
     [
         ("DOCINT_WORKBENCH_WALL_S", "121", "DOCINT_WORKBENCH_WALL_S"),
         ("DOCINT_WORKBENCH_WALL_S", "4", "DOCINT_WORKBENCH_WALL_S"),
-        ("DOCINT_WORKBENCH_SLOTS", "4", "DOCINT_WORKBENCH_SLOTS"),
+        ("DOCINT_WORKBENCH_SLOTS", "5", "DOCINT_WORKBENCH_SLOTS"),
         ("WORKBENCH_EXECUTOR_SLOTS", "2", "DOCINT_WORKBENCH_SLOTS"),
     ],
 )
@@ -273,9 +273,9 @@ def test_the_ghostwriter_key_alone_starts_the_api() -> None:
 
 
 def test_the_ghostwriter_defaults() -> None:
-    """With only Ghostwriter's key set, it may use the ten tools, for 120 seconds, three jobs at once."""
+    """With only Ghostwriter's key set, it may use the ten tools, for 120 seconds, four jobs at once."""
     s = load_settings({"GHOSTWRITER_WORKBENCH_KEY": A}, role="api")
-    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 3)
+    assert (s.ghostwriter_tools, s.ghostwriter_wall_s, s.ghostwriter_slots) == (GHOSTWRITER_TOOLS, 120, 4)
     assert GHOSTWRITER_DEFAULT_TOOLS == GHOSTWRITER_TOOLS
 
 
@@ -296,7 +296,7 @@ def test_no_usable_ghostwriter_key_stops_the_api(env: dict[str, str]) -> None:
     [
         ("GHOSTWRITER_WORKBENCH_WALL_S", "121", "GHOSTWRITER_WORKBENCH_WALL_S"),
         ("GHOSTWRITER_WORKBENCH_WALL_S", "9", "GHOSTWRITER_WORKBENCH_WALL_S"),
-        ("GHOSTWRITER_WORKBENCH_SLOTS", "4", "GHOSTWRITER_WORKBENCH_SLOTS"),
+        ("GHOSTWRITER_WORKBENCH_SLOTS", "5", "GHOSTWRITER_WORKBENCH_SLOTS"),
         ("WORKBENCH_EXECUTOR_SLOTS", "2", "GHOSTWRITER_WORKBENCH_SLOTS"),
     ],
 )
@@ -347,7 +347,7 @@ def test_non_positive_or_non_numeric_values_are_refused(name: str, value: str) -
 @pytest.mark.parametrize(
     ("name", "field", "default"),
     [
-        ("WORKBENCH_EXECUTOR_SLOTS", "executor_slots", 4),
+        ("WORKBENCH_EXECUTOR_SLOTS", "executor_slots", 5),
         ("WORKBENCH_RETENTION_DAYS", "retention_days", 7),
         ("WORKBENCH_JOB_WALL_S", "job_wall_s", 120),
     ],

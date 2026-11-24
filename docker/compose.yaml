@@ -49,8 +49,8 @@ x-hardened: &hardened
 x-settings: &settings
   WORKBENCH_RETENTION_DAYS: ${WORKBENCH_RETENTION_DAYS:-7}
   WORKBENCH_RETENTION_INTERVAL_S: ${WORKBENCH_RETENTION_INTERVAL_S:-300}
-  WORKBENCH_EXECUTOR_SLOTS: ${WORKBENCH_EXECUTOR_SLOTS:-4}
-  WORKBENCH_QUEUE_MAX: ${WORKBENCH_QUEUE_MAX:-16}
+  WORKBENCH_EXECUTOR_SLOTS: ${WORKBENCH_EXECUTOR_SLOTS:-5}
+  WORKBENCH_QUEUE_MAX: ${WORKBENCH_QUEUE_MAX:-20}
   WORKBENCH_JOBS_PER_USER: ${WORKBENCH_JOBS_PER_USER:-1}
   WORKBENCH_JOB_WALL_S: ${WORKBENCH_JOB_WALL_S:-120}
   WORKBENCH_JOB_MEMORY_MB: ${WORKBENCH_JOB_MEMORY_MB:-1536}
@@ -110,7 +110,7 @@ services:
       GHOSTWRITER_WORKBENCH_KEY: ${GHOSTWRITER_WORKBENCH_KEY:-}
       GHOSTWRITER_WORKBENCH_TOOLS: ${GHOSTWRITER_WORKBENCH_TOOLS:-list_files,read_document,search_files,view_file,run_python,inspect_template,fill_template,write_table,write_document,write_presentation}
       GHOSTWRITER_WORKBENCH_WALL_S: ${GHOSTWRITER_WORKBENCH_WALL_S:-120}
-      GHOSTWRITER_WORKBENCH_SLOTS: ${GHOSTWRITER_WORKBENCH_SLOTS:-3}
+      GHOSTWRITER_WORKBENCH_SLOTS: ${GHOSTWRITER_WORKBENCH_SLOTS:-4}
       # Colon-less, so an empty value set in .env requires no purpose.
       AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-query,disclose,combine,modify,collect}
       # Data-protection audit log: the hash-chained events go to the
@@ -203,12 +203,12 @@ services:
       # none outlives its job unattached.
       kernel.shm_rmid_forced: 1
     # R19: slots x 64 processes per job + 64 for the supervisor and its
-    # cleanup helpers.
-    pids_limit: ${WORKBENCH_EXECUTOR_PIDS_LIMIT:-320}
-    # Slots x WORKBENCH_JOB_MEMORY_MB + 512 MiB: 4 x 1536 + 512. Memory and
+    # cleanup helpers: 5 x 64 + 64.
+    pids_limit: ${WORKBENCH_EXECUTOR_PIDS_LIMIT:-384}
+    # Slots x WORKBENCH_JOB_MEMORY_MB + 512 MiB: 5 x 1536 + 512. Memory and
     # swap together are the same limit, so no job swaps past it.
-    mem_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
-    memswap_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-6656m}
+    mem_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-8192m}
+    memswap_limit: ${WORKBENCH_EXECUTOR_MEM_LIMIT:-8192m}
     # Docker refuses a limit above the host's CPUs (.env.example).
     cpus: ${WORKBENCH_EXECUTOR_CPUS:-4}
     environment:
