@@ -1216,7 +1216,7 @@ def test_a_clips_artifacts_are_prepared_read_and_viewed_in_the_sandbox(
     assert len(read["content"]) == 1  # the transcript is text: no image block
     body = read["structuredContent"]
     assert (body["kind"], body["total_parts"], body["pages_without_text"], body["shown"]) == ("transcript", 3, [], [])
-    assert body["parts"] == [{"label": "lines 1-3", "text": TOUR_LINES}]
+    assert body["parts"] == [{"label": "lines 1-3", "text": TOUR_LINES, "units": [1, 3], "cut": False}]
     assert mm.CAMERA_MODEL not in json.dumps(read) and "tour.jsonl" not in json.dumps(read)  # nothing of the artifacts
 
     viewed = mcp_result(

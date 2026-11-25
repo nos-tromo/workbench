@@ -298,6 +298,7 @@ def test_no_usable_ghostwriter_key_stops_the_api(env: dict[str, str]) -> None:
         ("GHOSTWRITER_WORKBENCH_WALL_S", "9", "GHOSTWRITER_WORKBENCH_WALL_S"),
         ("GHOSTWRITER_WORKBENCH_SLOTS", "5", "GHOSTWRITER_WORKBENCH_SLOTS"),
         ("WORKBENCH_EXECUTOR_SLOTS", "2", "GHOSTWRITER_WORKBENCH_SLOTS"),
+        ("WORKBENCH_EXECUTOR_SLOTS", "4", "GHOSTWRITER_WORKBENCH_SLOTS"),  # 4 is not fewer than Ghostwriter's 4
     ],
 )
 def test_the_ghostwriter_rules_stop_the_api_never_the_executor(name: str, value: str, named: str) -> None:

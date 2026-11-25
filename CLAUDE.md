@@ -596,14 +596,28 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   restart; uploading the file again makes a new file, tried afresh.
 - **A measure is remembered the same way, beside the refusals.** `Store.measure_of`
   holds, by the source's id, creation time and size (an LRU of `MEASURES_MAX`), the
-  five counts of a measure or a refusal of it; `POST /files/measure` answers from
-  it with no job and no event. Both `unsupported_format` and `unreadable_file` are
-  remembered at once (the readers decide them by the file at the job's fixed
-  limits, with no `FILE_DECIDED` list), recorded as `error` with `remembered`; a
-  `read_timeout`, a `file_not_found`, a busy executor and a failure never are, so
+  five counts of a measure or the code of a refusal of it; `POST /files/measure`
+  answers from it with no job and no event. Both `unsupported_format` and
+  `unreadable_file` are remembered at once (the readers decide them by the file at
+  the job's fixed limits, with no `FILE_DECIDED` list), recorded as `error` with
+  `remembered`. Only the code is kept, never the reader's text, which can quote a
+  suffix of the file's name (`Path.suffix` is all after the last dot, spaces
+  included): the first answer carries that text, a later one the code's fixed
+  `REFUSED_TEXT`. Any other failure (a `read_timeout`, a `file_not_found`, a busy
+  executor, a job killed, an answer that cannot be read) is never remembered, so
   the next call tries again. A picture or a clip is refused by its name, before any
   job and with no event. It goes with the file, as a refusal does
   (`Store._forget_sources`), and a prepare that went well forgets no measure.
+- **A workbook read that names a `part` walks the workbook once more.**
+  `rows_before` (`workbench/executor/readers/paging.py`) counts the units before the
+  range, from the workbook's start, on every `read_document` that names a `part`,
+  continuations by `next_part` included. A range deep in a large workbook therefore
+  costs more than in 0.9 and sits closer to `read_timeout`: on a synthetic
+  60,000-row workbook (3 sheets), the last range took 9.0 s, of which 5.1 s was
+  the extra walk, against about 3.9 s in 0.9 (one run on a dev machine, not in the
+  executor container). A read with no `part` pays nothing extra. A real fix would
+  have the caller carry the offset, which is a contract change; revisit it only
+  if staging shows workbook `read_timeout`s.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in
