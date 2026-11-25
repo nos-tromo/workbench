@@ -192,9 +192,10 @@ Three more places hold data for a short time:
   the volume. Uploading the file again makes a new file, which is tried afresh.
 - the api's memory, which also remembers the measure of a file's length: its
   five counts (kind, unit, total, characters, whether they stopped at the cap),
-  or the refusal of a file the readers refused for what it is
-  (`unsupported_format`, `unreadable_file`; a run that ran out of time is never
-  kept), by the file's id with its creation time and size
+  or the code of the refusal of a file the readers refused for what it is
+  (`unsupported_format`, `unreadable_file`; never the reader's text, which can
+  quote a suffix of the file's name, and never a run that ran out of time), by
+  the file's id with its creation time and size
   (`workbench/api/store.py:Store.remember_measure`). A later measure of the file
   is answered from it, with no job and no event, and a remembered refusal is
   recorded as `remembered`. Counts only, and nothing is written to the volume.

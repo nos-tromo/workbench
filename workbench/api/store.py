@@ -30,7 +30,7 @@ lock, and :meth:`Store.place_derived` records it and makes it visible under the 
 The store also remembers, in this process alone, how the runner refused a source that cannot be converted or drawn
 (:meth:`Store.remember_refusal`), so that no later call runs that job again; the refusal goes with its source, and with
 a restart. It remembers the same way the measure of a document's length (:meth:`Store.remember_measure`): the five
-counts, or the refusal of a file no reader takes.
+counts, or the code of the refusal of a file no reader takes, never its text.
 """
 
 import dataclasses
@@ -1669,19 +1669,19 @@ class Store:
     def remember_measure(self, source: FileRecord, outcome: Mapping[str, object] | str) -> None:
         """Remember what a measure of a source answered, so that later calls answer it without a job.
 
-        The counts are what the measure found of the file, or a refusal the file alone decides: either is the same
-        for this very file whenever it is asked. A measure that ran out of time, found a busy executor or failed is
-        never given here. It lives in this process, never in the database: a restart forgets it, and so does the
-        source's removal (:meth:`remove`, :meth:`remove_upload`, :meth:`delete_chat`); a source of a chat deleted while
-        its job ran is not remembered at all. A source removed by retention or taken back while its job runs can be,
-        until it is pushed out: its id never comes back. It is kept by the source's id with its creation time and
+        The counts are what the measure found of the file, or the code of a refusal the file alone decides: either is
+        the same for this very file whenever it is asked. A measure that ran out of time, found a busy executor or
+        failed is never given here. It lives in this process, never in the database: a restart forgets it, and so does
+        the source's removal (:meth:`remove`, :meth:`remove_upload`, :meth:`delete_chat`); a source of a chat deleted
+        while its job ran is not remembered at all. A source removed by retention or taken back while its job runs can
+        be, until it is pushed out: its id never comes back. It is kept by the source's id with its creation time and
         size, so no other file inherits it: an upload under the same name is a new record with a new id. Past
         :data:`MEASURES_MAX` the measure asked for least recently is forgotten, and that file is only measured again.
 
         Args:
             source: The file measured.
-            outcome: The five counts of its answer (``kind``, ``unit``, ``total``, ``chars``, ``capped``), or the
-                runner's refusal, its code first, as the caller is told it; neither names a file.
+            outcome: The five counts of its answer (``kind``, ``unit``, ``total``, ``chars``, ``capped``), or the code
+                of the runner's refusal and nothing of its text, which can quote a suffix of the file's name.
         """
         deadline = self._deleted.get((source.caller, source.user_id, source.chat_id))
         deleted = deadline is not None and deadline > self._monotonic()
@@ -1702,7 +1702,7 @@ class Store:
             source: The file.
 
         Returns:
-            The counts, or the refusal as the caller was told it; ``None`` when nothing is remembered, or the cell
+            The counts, or the code of the refusal; ``None`` when nothing is remembered, or the cell
             under its id is of a record of another time or size, which is then forgotten.
         """
         with self._measures_lock:

@@ -10,12 +10,14 @@ it counted.
 - A picture or a clip is no document and has no text to measure: it is refused by its name, with no job and no event
   (:data:`NOT_A_DOCUMENT`).
 - Every answer is the work of one job, recorded (``query`` / ``file.measure``, by the file's id and no count of it)
-  before it goes out. The counts, and a refusal that the file alone decides (``unsupported_format``, and an
-  ``unreadable_file``: the readers' refusals are made by the file at the job's fixed limits), are remembered by the
+  before it goes out. The counts, and the code of a refusal that the file alone decides (``unsupported_format``, and
+  an ``unreadable_file``: the readers' refusals are made by the file at the job's fixed limits), are remembered by the
   store (:meth:`~workbench.api.store.Store.remember_measure`), so a file is measured once: the same call again is
   answered from memory, with no job and no event, and a refusal again is recorded, as the refusal of a prepare is, as
-  an ``error`` with ``remembered``. A run that ran out of time (``read_timeout``), a file that went
-  (``file_not_found``), a busy executor and any failure are never remembered, so the next call tries again.
+  an ``error`` with ``remembered``. The first answer of a refusal carries the reader's text, which can quote a
+  suffix of the file's name; what is kept is the code alone, and a later answer is the code's fixed text
+  (:data:`REFUSED_TEXT`). A run that ran out of time (``read_timeout``), a file that went (``file_not_found``), a
+  busy executor and any failure are never remembered, so the next call tries again.
 - The job runs on the caller's measure gate (:meth:`~workbench.api.jobs.JobQueue.submit`), so that a slow measure never
   stands in front of a prepare, a conversion or a tool call.
 
@@ -39,9 +41,17 @@ from workbench.renders import READ_UNITS, ReaderKind, ReadUnit, kind_of
 #: What a picture or a clip is told: they are not documents, whatever their names.
 NOT_A_DOCUMENT: Final = "unsupported_format: a picture or a clip is not a document and has no text to measure"
 
-#: The runner's codes whose refusals are remembered of a measure, at once: the readers refuse a file by what it is, at
-#: the job's fixed limits. A ``read_timeout``, a ``file_not_found``, a busy executor or a failure is never remembered.
-REMEMBERED: Final = frozenset({"unsupported_format", "unreadable_file"})
+#: What a refusal answered from memory says, by its code: the store keeps the code alone, since the reader's text can
+#: hold a tail of the file's name (``Path.suffix`` is everything after the last dot, spaces included).
+REFUSED_TEXT: Final = {
+    "unsupported_format": "unsupported_format: this type of file cannot be read here",
+    "unreadable_file": "unreadable_file: the file could not be read",
+}
+
+#: The runner's codes whose refusals are remembered of a measure, at once, by the code alone: the readers refuse a file
+#: by what it is, at the job's fixed limits. A ``read_timeout``, a ``file_not_found``, a busy executor or a failure is
+#: never remembered.
+REMEMBERED: Final = frozenset(REFUSED_TEXT)
 
 #: The kinds of file that are no documents, by :func:`~workbench.renders.kind_of`.
 _NOT_DOCUMENTS: Final = frozenset({"image", "media"})
@@ -96,19 +106,19 @@ class Measured(BaseModel):
         return self
 
 
-def _record_remembered(audit: AuditLog, p: Principal, source: FileRecord, detail: str) -> None:
+def _record_remembered(audit: AuditLog, p: Principal, source: FileRecord, code: str) -> None:
     """Record a refusal answered from memory as its job's was: an ``error`` naming the file, by its code.
 
     Args:
         audit: The audit log, bound to the call.
         p: The caller, user and chat of the source.
         source: The file refused.
-        detail: The refusal remembered; its code alone is recorded.
+        code: The code of the refusal remembered.
 
     Raises:
         AuditWriteError: The event could not be written; the refusal must not go out.
     """
-    criteria: dict[str, object] = {"refused": detail.partition(": ")[0], "remembered": True}
+    criteria: dict[str, object] = {"refused": code, "remembered": True}
     audit.record("measure", p, file_ids=[source.id], outcome="error", criteria=criteria)
 
 
@@ -131,7 +141,7 @@ async def measured(
         p: The caller, user and chat of the source.
         source: The file, as the store found it for its owner.
         settings: The api's settings; ``job_wall_s`` gives the runner's time, 3/4 of it.
-        store: The store, which remembers the counts, or the refusal the file decides.
+        store: The store, which remembers the counts, or the code of the refusal the file decides.
         audit: The audit log, bound to the call.
         queue: The app's job queue.
         call: The call's wall, its wait for the measure gate and the caller's slots.
@@ -141,8 +151,9 @@ async def measured(
 
     Raises:
         HTTPException: ``422`` for a picture or a clip (:data:`NOT_A_DOCUMENT`), and for the readers' refusal of the
-            file, word for word; what :func:`~workbench.api.tools._payload` raises for any other failure of the job; a
-            ``500`` for an answer that cannot be read.
+            file: word for word the first time, then the code's :data:`REFUSED_TEXT`; what
+            :func:`~workbench.api.tools._payload` raises for any other failure of the job; a ``500`` for an answer that
+            cannot be read.
         AuditWriteError: The event could not be written; nothing goes out.
         Busy: The gate's line or the queue is full, or no turn or slot came in time.
     """
@@ -151,7 +162,7 @@ async def measured(
     held = store.measure_of(source)
     if isinstance(held, str):
         await run_in_threadpool(_record_remembered, audit, p, source, held)
-        raise HTTPException(status_code=_REFUSED_STATUS, detail=held)
+        raise HTTPException(status_code=_REFUSED_STATUS, detail=REFUSED_TEXT[held])
     if held is not None:
         return _parse(Measured, {**held, "path": source.virtual_path})
     args = {"path": source.name, "budget_s": max(1, settings.job_wall_s * 3 // 4)}
@@ -160,9 +171,10 @@ async def measured(
     await run_in_threadpool(record_answer, audit, "measure", p, [source.id], {}, result, Measured, payload)
     try:
         _payload(result, "file")
-    except HTTPException as refused:
-        if refusal(result) in REMEMBERED:
-            store.remember_measure(source, str(refused.detail))
+    except HTTPException:
+        code = refusal(result)
+        if code is not None and code in REMEMBERED:
+            store.remember_measure(source, code)
         raise
     answer = _parse(Measured, payload)
     store.remember_measure(source, answer.model_dump(mode="json", exclude={"path"}))

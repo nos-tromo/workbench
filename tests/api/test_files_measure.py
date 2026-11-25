@@ -7,6 +7,7 @@ and when, which jobs it makes and on which gate, and what it remembers of a file
 """
 
 import dataclasses
+import io
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -23,7 +24,7 @@ from tests.fixtures import make_images as mi
 from workbench.api.audit import AuditLog
 from workbench.api.jobs import PREPARE_QUEUE_WAIT_S, JobQueue
 from workbench.api.main import create_app
-from workbench.api.measure import NOT_A_DOCUMENT
+from workbench.api.measure import NOT_A_DOCUMENT, REFUSED_TEXT
 from workbench.api.metrics import Metrics
 from workbench.api.store import Store
 from workbench.config import Settings
@@ -195,8 +196,9 @@ def test_a_refusal_is_remembered_and_a_timeout_is_not(
     second = measure(client, ledger.virtual_path)
 
     assert (first.status_code, second.status_code) == (422, 422)
-    assert second.json() == first.json()
     assert first.json()["detail"].startswith("unsupported_format: .xls cannot be read here")
+    assert second.json() == {"detail": REFUSED_TEXT["unsupported_format"]}  # the code's fixed text, not the reader's
+    assert store.measure_of(ledger) == "unsupported_format"  # the code alone is kept
     assert len(executor.requests) == 1
     assert [
         (event["outcome"], event["criteria"]["refused"], event["criteria"].get("remembered"))
@@ -215,6 +217,68 @@ def test_a_refusal_is_remembered_and_a_timeout_is_not(
     assert store.measure_of(notes) is None
     executor.status, executor.payload = "ok", None
     assert counts(measure(client, notes.virtual_path))[2] == 4
+
+
+def test_a_damaged_document_is_refused_again_from_memory_with_one_job(
+    client: TestClient, store: Store, executor: Local, audit_lines: AuditLines
+) -> None:
+    """An ``unreadable_file`` is remembered at once, as an ``unsupported_format`` is: one job, two recorded refusals."""
+    report = put(store, "quarterly-review.docx", b"PK\x03\x04 not really a document", p=PG)
+    first = measure(client, report.virtual_path)
+    second = measure(client, report.virtual_path)
+
+    assert (first.status_code, second.status_code) == (422, 422)
+    assert first.json()["detail"].startswith("unreadable_file: ")
+    assert second.json() == {"detail": REFUSED_TEXT["unreadable_file"]}
+    assert store.measure_of(report) == "unreadable_file"
+    assert len(executor.requests) == 1
+    assert [
+        (event["outcome"], event["criteria"]["refused"], event["criteria"].get("remembered"))
+        for event in events_of(audit_lines)
+    ] == [("error", "unreadable_file", None), ("error", "unreadable_file", True)]
+    assert all(event["target"]["ids"] == [report.id] for event in events_of(audit_lines))
+
+
+def test_what_is_remembered_of_a_refusal_holds_no_part_of_the_name(
+    client: TestClient, store: Store, executor: Local, audit_lines: AuditLines
+) -> None:
+    """A suffix with a dot and spaces is the reader's text on the first answer; the second and the memory hold none."""
+    name = "Q3.Harbour expansion terms"
+    terms = put(store, name, b"Pier\nQuay\n", p=PG)
+    first = measure(client, terms.virtual_path)
+    second = measure(client, terms.virtual_path)
+
+    assert (first.status_code, second.status_code) == (422, 422)
+    assert second.json() == {"detail": REFUSED_TEXT["unsupported_format"]}
+    assert len(executor.requests) == 1
+    for held in (second.text, repr(store.measure_of(terms)), repr(store._measures), json.dumps(events_of(audit_lines))):
+        assert "harbour" not in held.lower() and "expansion" not in held.lower() and "Q3" not in held
+    assert store.measure_of(terms) == "unsupported_format"
+
+
+def test_a_remembered_refusal_that_cannot_be_recorded_is_not_answered(
+    client: TestClient,
+    store: Store,
+    executor: Local,
+    audit_lines: AuditLines,
+    audit_stream: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail closed: a refusal answered from memory goes out only after its ``error`` is written."""
+    ledger = put(store, "ledger.xls", b"\xd0\xcf\x11\xe0" + b"\x00" * 28, p=PG)
+    assert measure(client, ledger.virtual_path).status_code == 422
+    assert store.measure_of(ledger) == "unsupported_format"
+
+    def refuse(_text: str, /) -> int:
+        raise OSError("synthetic audit stream failure")
+
+    monkeypatch.setattr(audit_stream, "write", refuse)
+    r = measure(client, ledger.virtual_path)
+
+    assert (r.status_code, r.json()) == (500, {"detail": "audit unavailable"})
+    assert "cannot be read" not in r.text and REFUSED_TEXT["unsupported_format"] not in r.text
+    assert len(executor.requests) == 1  # no job, either
+    assert len(events_of(audit_lines)) == 1  # and no second event
 
 
 def test_a_file_taken_back_is_forgotten(client: TestClient, store: Store, built: Path) -> None:

@@ -2945,8 +2945,8 @@ def test_no_refusal_is_remembered_of_a_deleted_chat(store: Store, alice: Princip
 
 #: The five counts of a measure, as the route keeps them: everything of its answer but the path.
 COUNTS = {"kind": "pdf", "unit": "page", "total": 3, "chars": 36, "capped": False}
-#: A measure's refusal, as the runner words it.
-NOT_READ = "unsupported_format: .xls cannot be read here; save it as .xlsx or .csv"
+#: A measure's refusal, as the store keeps it: the runner's code and none of its text.
+NOT_READ = "unsupported_format"
 
 
 def test_a_measure_is_remembered_by_file_and_forgotten_with_it(store: Store, alice: Principal) -> None:
