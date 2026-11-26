@@ -55,7 +55,10 @@ spec `docs/superpowers/specs/2026-11-20-ghostwriter-vision-design.md` and its pl
 `docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.8.md`; v0.9.0's
 (a clip's transcript and frames from Nextext's artifacts) is the same spec, deploy's
 `docs/decisions/0009-ghostwriter-sees-images-and-media.md` and its plan
-`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.9.md`.
+`docs/superpowers/plans/2026-11-21-ghostwriter-vision-workbench-v0.9.md`; v0.10.0's
+(a document's length, and the units of a read) are deploy's spec
+`docs/superpowers/specs/2026-11-24-ghostwriter-limit-notices-design.md` and its plan
+`docs/superpowers/plans/2026-11-24-ghostwriter-limit-notices-workbench-v0.10.md`.
 Where they and `docs/` differ, `docs/` describes the code.
 
 ## Planning
@@ -83,7 +86,7 @@ ghostwriter-backend, docint-backend ── agent loop (native tool calls → vll
 - **`executor`** (`workbench/executor/`): a supervisor, root with six
   capabilities, that runs every job touching file content as a fresh process
   under a slot uid (a pool of 16, `20001`…`20016`; `WORKBENCH_EXECUTOR_SLOTS`,
-  default 4, run at once), copy-in and copy-out, with limits. The
+  default 5, run at once), copy-in and copy-out, with limits. The
   readers, the search, the templates, the writers, `run_python`, the renders
   of pictures and PDF pages, the conversion of Office files to a PDF and a
   clip's transcript and frames (made from Nextext's two artifacts, never the
@@ -130,7 +133,10 @@ frame's time and a clip's duration, in the executor and in the answer's checks),
 roles, their types and extensions), `TRANSCRIPT_NAME`, the three hints
 `NOTHING_FOUND`, `NO_SPEECH` and `TRANSCRIPT_UNREADABLE`, `MediaRequest` (the
 artifacts' derived paths, the clip's own never), and the stamps (`stamp`,
-`parse_stamp`, `frame_label`); it imports no imaging library and
+`parse_stamp`, `frame_label`), and what a read counts in: `READ_UNITS`, the
+`ReadUnit` (page, slide, paragraph, row or line) of each `ReaderKind`, which
+the executor's `Measure.of` sets as a measure's unit and the api's `Measured`
+checks it against; it imports no imaging library and
 nothing of LibreOffice). The executor imports nothing of the api, and the api never
 decodes a file: it imports neither `PIL`, `pypdfium2` nor `pi_heif`, and checks
 a render's signature and size alone. A file's facts (`RenderFacts`) are kept in
@@ -163,7 +169,21 @@ same both ways. The goldens hold the listing with the header;
 what the model is told and shown, never what a caller may reach.
 
 - `workbench/api/tools.py`: `list_files`, `search_files`, `run_python`, the
-  models of `read_document`, and the helpers the other tool modules share.
+  models of `read_document`, and the helpers the other tool modules share. Each
+  part of a `read_document` answer carries `units` and `cut`, both always present.
+  `units` is `[first, last]`, 1-based and inclusive, in the unit of the reader
+  (`READ_UNITS`), or `null`; the readers number them in the executor, the runner
+  sends them and the api only validates (`DocumentPart`, which refuses units that
+  run backwards). A table is one unit, and a run of its rows carries it only when
+  the run reaches the table's last row with text, so a table read by `next_part`
+  to its end counts once and one read halfway not at all. A sheet row is a row that
+  holds something, numbered through the sheets in their order, so the parts of a
+  full read join to exactly `1..total` of the measure. A page or a slide without
+  text is in no part and in `pages_without_text`. `cut` is true for a part cut with
+  ` [cut]`, by the reader or by the api's fit (`_cut_part`); a line or a cell the
+  reader shortens with its own caps (`LINE_CAP`, `CELL_CAP`) is not `cut`. The
+  executor sizes a part as it is sent (`paging.part_size` counts both), so the fit
+  does not drop a part the reader filled.
 - `workbench/api/tools_views.py`: `read_document` and `view_file`, the tools that
   show pictures, pages and slides as images (an Office file's too; a deck's are
   `slide N`, `ViewedFile.unit` says which): MCP image blocks for the assistant
@@ -206,7 +226,12 @@ what the model is told and shown, never what a caller may reach.
   layout that takes it (`presentations/deck.py:fitting`), and a title slide's
   only text block is its subtitle (`subtitle_as_meant`).
 - `workbench/api/files.py`: Ghostwriter's file routes (list, upload, taking back
-  an upload not yet sent, `POST /files/derived`, prepare, view, the chat delete).
+  an upload not yet sent, `POST /files/derived`, measure, prepare, view, the chat
+  delete). `POST /files/measure` (`workbench/api/measure.py`) answers a document's
+  length, its units in its reader's terms and the characters of a full read: one
+  `measure_file` job on the caller's measure gate, `query` / `file.measure`, the
+  counts (or a refusal the file decides) remembered by the store, a picture or a
+  clip refused by its name.
   `POST /files/prepare` renders a picture, or the first 20
   pages of a PDF or an Office file, once (idempotent, answered from the rows after
   that; an Office file is converted first and then drawn, two jobs in one turn of
@@ -272,16 +297,34 @@ what the model is told and shown, never what a caller may reach.
   (Nextext gives no duration). A permission error yields a fixed message, never a
   path. A render job (`submit_renders`) keeps its outputs as derived files
   of its source (`Store.register_derived`), never as files of the chat. **The
-  prepare gate and the conversion gate:** a prepare, the render job of a picture or
+  prepare, conversion and measure gates:** a prepare, the render job of a picture or
   a PDF just attached (`gate="prepare"`), waits for its caller's prepare gate in
   place of its user's turn, so it never takes the user's interactive one; an Office
   file's conversion and its drawing, one turn (`gate="conversion"`), wait for its
-  caller's conversion gate, whether a prepare or a call on demand runs them. Each
-  gate runs one job of a caller at a time, over all its users, within the caller's
-  slots, and at most `PREPARE_WAITING_MAX` wait at each, counted apart from the
-  queue and from each other: a picture is prepared while a deck converts, and a
-  caller never converts two files at once. Other renders on the routes and in the
-  tools run on the user's own turn.
+  caller's conversion gate, whether a prepare or a call on demand runs them; a
+  measure, the `measure_file` job of `POST /files/measure` (`gate="measure"`), waits
+  for its caller's measure gate. Each gate runs one job of a caller at a time, over
+  all its users, within the caller's slots, and at most `PREPARE_WAITING_MAX` wait
+  at each, counted apart from the queue and from each other: a picture is prepared
+  while a deck converts and a document is measured, and a caller never converts two
+  files at once. Other renders on the routes and in the tools run on the user's own
+  turn. **Why a measure has a gate of its own:** the conversion gate is not for
+  background work alone (a view or a tool that converts an Office file on demand
+  waits for it, and so does a view of a deck whose background prepare holds the
+  deck's lock while it waits for that gate), so a measure there would stand in front
+  of an interactive call; and a send waits for the prepares of pictures and PDFs, so
+  a slow measure on the prepare gate would hold them up. A notice about a document's
+  length never delays a send. A measure runs within the caller's wall, with 3/4 of
+  it as the readers' budget, as a prepare does, and takes no source lock: it makes no
+  derived file. **A slot of its own, too:** with Ghostwriter's 3 slots, a prepare, a
+  conversion and a measure running at once would take every one, and every tool call
+  would answer `wait_timeout`. So 0.10.0 raises five defaults:
+  `GHOSTWRITER_WORKBENCH_SLOTS` 4 (one is left for the tool calls of all users while
+  the three run), `WORKBENCH_EXECUTOR_SLOTS` 5 (Ghostwriter's slots stay fewer than
+  the executor's, so docint keeps one), `WORKBENCH_QUEUE_MAX` 20 (a user's share,
+  `queue_max // executor_slots`, stays 4), `WORKBENCH_EXECUTOR_MEM_LIMIT` `8192m`
+  (5 × 1536 + 512) and `WORKBENCH_EXECUTOR_PIDS_LIMIT` 384 (5 × 64 + 64). A host
+  that pins a 0.9 value is in `docs/configuration.md` (§ Upgrading from 0.9).
 - `workbench/executor/render/`: what `prepare_file` uses. `images.py` decodes a
   picture (its content decides the format, not its name; at most 120 MP; one HEIF
   decoder thread), brings it to the bounds of a render, to sRGB through its
@@ -349,7 +392,7 @@ checked before any body is read). A trailing slash is a 404 too, never a 307
 **Callers.** `workbench/api/auth.py:CallerRegistry` holds the callers by name,
 key, file form, allowed tools and caps. Two, both coming in through `/mcp`, each
 with a file form: `docint` (inline data, `DOCINT_WORKBENCH_TOOLS`, with its own
-wall cap and running-job cap) and `ghostwriter` (`/mcp` and seven file routes,
+wall cap and running-job cap) and `ghostwriter` (`/mcp` and eight file routes,
 workspace files, the ten tools, its own caps, confined to its chat). The key
 picks the caller; the door answers 404 on any other caller's paths. The api
 starts with either `DOCINT_WORKBENCH_KEY` or `GHOSTWRITER_WORKBENCH_KEY`.
@@ -551,6 +594,30 @@ and Ghostwriter's variables and `AUDIT_REQUIRE_PURPOSE` are in the api's
   `Store.remove_upload`, `Store.delete_chat`; a job of a deleted chat remembers
   nothing) and with a
   restart; uploading the file again makes a new file, tried afresh.
+- **A measure is remembered the same way, beside the refusals.** `Store.measure_of`
+  holds, by the source's id, creation time and size (an LRU of `MEASURES_MAX`), the
+  five counts of a measure or the code of a refusal of it; `POST /files/measure`
+  answers from it with no job and no event. Both `unsupported_format` and
+  `unreadable_file` are remembered at once (the readers decide them by the file at
+  the job's fixed limits, with no `FILE_DECIDED` list), recorded as `error` with
+  `remembered`. Only the code is kept, never the reader's text, which can quote a
+  suffix of the file's name (`Path.suffix` is all after the last dot, spaces
+  included): the first answer carries that text, a later one the code's fixed
+  `REFUSED_TEXT`. Any other failure (a `read_timeout`, a `file_not_found`, a busy
+  executor, a job killed, an answer that cannot be read) is never remembered, so
+  the next call tries again. A picture or a clip is refused by its name, before any
+  job and with no event. It goes with the file, as a refusal does
+  (`Store._forget_sources`), and a prepare that went well forgets no measure.
+- **A workbook read that names a `part` walks the workbook once more.**
+  `rows_before` (`workbench/executor/readers/paging.py`) counts the units before the
+  range, from the workbook's start, on every `read_document` that names a `part`,
+  continuations by `next_part` included. A range deep in a large workbook therefore
+  costs more than in 0.9 and sits closer to `read_timeout`: on a synthetic
+  60,000-row workbook (3 sheets), the last range took 9.0 s, of which 5.1 s was
+  the extra walk, against about 3.9 s in 0.9 (one run on a dev machine, not in the
+  executor container). A read with no `part` pays nothing extra. A real fix would
+  have the caller carry the offset, which is a contract change; revisit it only
+  if staging shows workbook `read_timeout`s.
 - **The executor's healthcheck reads `/proc/net/unix`.** It looks for the
   socket's path with the listening flag `00010000` and never connects. The
   socket file alone is not enough: it outlives a killed supervisor in

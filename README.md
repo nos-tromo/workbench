@@ -13,8 +13,8 @@ trail, by file id; listing files (`list_files` too) is not. Every file is
 deleted 7 days after it was made.
 
 Ghostwriter's backend calls the tools through `/mcp`, with a bearer key, and
-keeps a chat's files on seven file routes (list, upload, take back an upload,
-keep Nextext's artifacts of a clip, prepare, view, delete the chat).
+keeps a chat's files on eight file routes (list, upload, take back an upload,
+keep Nextext's artifacts of a clip, prepare, measure, view, delete the chat).
 docint calls `run_python` through `/mcp`, on data each call brings.
 
 ## Architecture

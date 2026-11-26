@@ -98,6 +98,16 @@ def reading(path: str, *parts: tuple[str, str], **extra: Any) -> dict[str, Any]:
     }
 
 
+def counted(path: str, *parts: tuple[str, str, list[int] | None, bool], **extra: Any) -> dict[str, Any]:
+    """A read runner's answer for ``path`` whose parts say their units and whether they were cut."""
+    return {
+        **reading(path),
+        "parts": [{"label": label, "text": text, "units": units, "cut": cut} for label, text, units, cut in parts],
+        "total_parts": len(parts),
+        **extra,
+    }
+
+
 def read(
     client: TestClient, path: str, part: str | None = None, headers: Headers = HG, strips: int | None = None
 ) -> httpx2.Response:
@@ -136,7 +146,7 @@ def test_read_document_sends_only_the_requested_file(client: TestClient, store: 
     assert answer == {
         "path": f"{CHAT}/review.docx",
         "kind": "docx",
-        "parts": [{"label": "paragraph 1", "text": "Hello"}],
+        "parts": [{"label": "paragraph 1", "text": "Hello", "units": None, "cut": False}],
         "total_parts": 1,
         "pages_without_text": [],
         "shown": [],
@@ -165,6 +175,56 @@ def test_no_part_is_sent_as_none(client: TestClient, store: Store, executor: Scr
     assert [r.args for r in executor.requests] == [{"path": "a.txt", "part": None, "budget_s": 86, "images": True}] * 2
 
 
+def test_units_and_cut_go_out_as_the_runner_gave_them(client: TestClient, store: Store, executor: Scripted) -> None:
+    """Each part keeps its units, ``null`` included, and says whether it was cut: both keys are always there."""
+    put(store, "a.docx", p=PG)
+    executor.payload = counted(
+        "x", ("paragraph 1", "Quay", [1, 1], False), ("table 1, rows 1-30", "row 1: berth", None, False)
+    )
+    body = answered(read(client, f"{CHAT}/a.docx"))
+    assert body["parts"] == [
+        {"label": "paragraph 1", "text": "Quay", "units": [1, 1], "cut": False},
+        {"label": "table 1, rows 1-30", "text": "row 1: berth", "units": None, "cut": False},
+    ]
+
+
+def test_a_part_cut_at_the_result_limit_says_cut_and_keeps_its_units(
+    small: TestClient, store: Store, executor: Scripted
+) -> None:
+    """The api's own cut marks the part ``cut`` and leaves its units, which are what it covers."""
+    put(store, "long.docx", p=PG)
+    executor.payload = counted(
+        "x", ("paragraph 1", "word " * 1000, [1, 1], False), ("paragraph 2", "short", [2, 2], False)
+    )
+    with small:
+        body = answered(read(small, f"{CHAT}/long.docx"))
+    assert sent_size(body) <= 1024
+    (part,) = body["parts"]
+    assert (part["label"], part["units"], part["cut"]) == ("paragraph 1", [1, 1], True)
+    assert part["text"].endswith(" [cut]")
+    assert body["next_part"] == "paragraph 2"
+
+
+def test_an_answer_without_units_reads_as_null_and_not_cut(
+    client: TestClient, store: Store, executor: Scripted
+) -> None:
+    """A runner that sends neither key (before 0.10) is read as no units and not cut."""
+    put(store, "a.docx", p=PG)
+    executor.payload = reading("x", ("paragraph 1", "Quay"))
+    (part,) = answered(read(client, f"{CHAT}/a.docx"))["parts"]
+    assert part["units"] is None and part["cut"] is False
+
+
+@pytest.mark.parametrize("units", [[0, 1], [3, 2], [1], [1, 2, 3]])
+def test_units_that_are_not_a_forward_pair_are_refused(
+    client: TestClient, store: Store, executor: Scripted, units: list[int]
+) -> None:
+    """Units count from 1, as a pair that does not go backwards."""
+    put(store, "a.docx", p=PG)
+    executor.payload = counted("x", ("paragraph 1", "Quay", units, False))
+    assert refusal(read(client, f"{CHAT}/a.docx")) == ("refused", "the tool returned an answer that could not be read")
+
+
 def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store, executor: Scripted) -> None:
     """The file goes to the job as it is; its kind and the indented lines come back as the runner gave them."""
     put(store, "orders.json", b'{"order":"A-0001","qty":2}', p=PG)
@@ -174,7 +234,9 @@ def test_a_json_file_is_read_like_any_document(client: TestClient, store: Store,
     assert req.input_files == ["orders.json"]
     assert req.args == {"path": "orders.json", "part": None, "budget_s": 86, "images": True}
     assert answer["kind"] == "json"
-    assert answer["parts"] == [{"label": "lines 1-4", "text": '{\n  "order": "A-0001",\n  "qty": 2\n}'}]
+    assert answer["parts"] == [
+        {"label": "lines 1-4", "text": '{\n  "order": "A-0001",\n  "qty": 2\n}', "units": None, "cut": False}
+    ]
 
 
 def test_a_file_in_a_folder_runs_in_its_chat_folder_and_another_chats_is_not_found(
@@ -893,6 +955,18 @@ def test_a_scanned_page_comes_back_as_an_image_in_the_same_answer(
     assert structured["hint"].endswith(" Page 2 comes with this answer as an image.")
     assert json.loads(answer["content"][0]["text"]) == structured
     assert local.tools() == ["read_document", "prepare_file"]
+
+
+def test_a_pdf_read_with_its_pictures_keeps_each_pages_units(seeing: TestClient, store: Store, built: Path) -> None:
+    """A page with no text has no units and is shown as an image; the pages with text keep their own."""
+    source = pdf(store, built, "harbour-report.pdf", SCANNED)
+    body = seen(read(seeing, source.virtual_path))["structuredContent"]
+    assert [(p["label"], p["units"], p["cut"]) for p in body["parts"]] == [
+        ("page 1", [1, 1], False),
+        ("page 3", [3, 3], False),
+    ]
+    assert body["pages_without_text"] == [2]
+    assert [s["n"] for s in body["shown"]] == [2]
 
 
 def test_the_window_ends_before_a_page_whose_image_does_not_fit(seeing: TestClient, store: Store, built: Path) -> None:
@@ -1719,16 +1793,17 @@ def test_paging_moves_on_at_the_lowest_result_limit_however_long_the_notes(
 
     Text on pages 1 and 3, scans on 2, 4, 5 and 6, the read cut at page 7, the runner's own hint and paths of many
     lengths: the first part is kept, cut if it must be, so that ``next_part`` is never the page the call began at; the
-    notes may then be shortened. Without the guard, names of about 100 to 150 characters stalled on page 1. (Past
-    that, the path, the hint and four ``shown`` entries alone fill 1 KB, whatever room the notes are given.)
+    notes may then be shortened. Without the guard, names of about 100 to 125 characters stalled on page 1. (Past
+    that, the path, the hint, four ``shown`` entries and the ``units`` and ``cut`` of the part alone fill 1 KB,
+    whatever room the notes are given.)
     """
-    for length in range(20, 152, 3):
+    for length in range(20, 128, 3):
         name = f"harbour-{'q' * length}.pdf"
         source = pdf(store, built, name, ["A", None, "B", None, None, None, "C", "D"])
-        local.scripted["read_document"] = reading(
+        local.scripted["read_document"] = counted(
             "x",
-            ("page 1", "w" * 400),
-            ("page 3", "w" * 400),
+            ("page 1", "w" * 400, [1, 1], False),
+            ("page 3", "w" * 400, [3, 3], False),
             kind="pdf",
             total_parts=8,
             pages_without_text=[2, 4, 5, 6],
@@ -1835,7 +1910,7 @@ def test_a_clip_reads_as_its_transcript(
     assert len(answer["content"]) == 1
     structured = answer["structuredContent"]
     assert (structured["kind"], structured["path"]) == ("transcript", source.virtual_path)
-    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT, "units": [1, 3], "cut": False}]
     assert (structured["total_parts"], structured["pages_without_text"], structured["shown"]) == (3, [], [])
     assert (structured["truncated"], structured["next_part"], structured["hint"]) == (False, None, SEE_THREE)
     assert ".derived" not in json.dumps(answer)
@@ -1860,7 +1935,11 @@ def test_a_clip_reads_the_same_without_the_header(
 
     assert len(blind["content"]) == 1
     structured = blind["structuredContent"]
-    assert structured["parts"] == sighted["structuredContent"]["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert (
+        structured["parts"]
+        == sighted["structuredContent"]["parts"]
+        == [{"label": "lines 1-3", "text": TOUR_TEXT, "units": [1, 3], "cut": False}]
+    )
     assert (structured["kind"], structured["shown"], structured["hint"]) == ("transcript", [], None)
     assert "view_file" not in json.dumps(blind)
     assert sighted["structuredContent"]["hint"] == SEE_THREE
@@ -1924,7 +2003,11 @@ def test_a_cut_transcript_says_so_in_the_read(
     blind = seen(read(seeing, source.virtual_path, headers=HG_TEXT))["structuredContent"]
 
     cut = "The transcript is cut at 01:24: it is longer than workbench keeps."
-    assert sighted["parts"] == blind["parts"] == [{"label": "line 1", "text": TOUR_TEXT.splitlines()[0]}]
+    assert (
+        sighted["parts"]
+        == blind["parts"]
+        == [{"label": "line 1", "text": TOUR_TEXT.splitlines()[0], "units": [1, 1], "cut": False}]
+    )
     assert sighted["hint"] == f"{cut} {SEE_THREE}"
     assert blind["hint"] == cut
 
@@ -1937,7 +2020,7 @@ def test_a_clip_whose_frames_were_refused_says_so_in_the_read(
     assert artifact(seeing, source.virtual_path, "nextext_zip", b"PK\x03\x04" + bytes(40)).status_code == 200
     sighted = seen(read(seeing, source.virtual_path))["structuredContent"]
 
-    assert sighted["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert sighted["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT, "units": [1, 3], "cut": False}]
     assert sighted["hint"] == "The frames could not be read."
 
 
@@ -1968,7 +2051,7 @@ def test_audio_with_speech_reads_without_frames(seeing: TestClient, local: Picky
     memo = tour(seeing, store, built, frames=0, name="voice-memo.m4a")
     structured = seen(read(seeing, memo.virtual_path))["structuredContent"]
 
-    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT, "units": [1, 3], "cut": False}]
     assert structured["hint"] is None
 
 
@@ -2065,7 +2148,7 @@ def test_a_transcript_that_goes_while_the_clip_is_read_is_made_again(
     structured = seen(read(seeing, source.virtual_path))["structuredContent"]
 
     assert len(calls) == 2
-    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT}]
+    assert structured["parts"] == [{"label": "lines 1-3", "text": TOUR_TEXT, "units": [1, 3], "cut": False}]
     assert structured["hint"] == SEE_THREE
 
 

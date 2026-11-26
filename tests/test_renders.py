@@ -160,6 +160,25 @@ def test_every_image_suffix_is_one_kind_of_image() -> None:
         assert renders.kind_of(f"file{suffix}") == "image"
 
 
+def test_each_reader_kind_has_one_unit() -> None:
+    """The eleven kinds a reader names each count one unit, and the five units are the ones a document is counted in."""
+    assert renders.READ_UNITS == {
+        "pdf": "page",
+        "pptx": "slide",
+        "docx": "paragraph",
+        "odt": "paragraph",
+        "xlsx": "row",
+        "ods": "row",
+        "csv": "line",
+        "eml": "line",
+        "html": "line",
+        "json": "line",
+        "text": "line",
+    }
+    assert len(renders.READ_UNITS) == 11
+    assert set(renders.READ_UNITS.values()) == {"page", "slide", "paragraph", "row", "line"}
+
+
 def test_a_render_is_named_by_its_page_and_strip() -> None:
     """A whole page has no strip in its name; a strip names its place of the strips."""
     assert renders.render_name(3, 1, 2, "image/png") == "p0003-s1of2.png"

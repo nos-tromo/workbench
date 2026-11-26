@@ -264,7 +264,7 @@ def test_lifespan_records_the_limits_and_never_the_key(
         "workspace_max_mb": settings.workspace_max_mb,
         "callers": [
             {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
-            {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 3},
+            {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 4},
         ],
         "require_purpose": [],
     }

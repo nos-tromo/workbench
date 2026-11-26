@@ -13,7 +13,7 @@ from typing import Final
 
 from lxml import etree
 
-from workbench.executor.readers import DocumentText, Part, UnreadableFile, check, tick
+from workbench.executor.readers import DocumentText, Measure, Part, UnreadableFile, check, tick
 from workbench.executor.readers import paging as pg
 
 _CONTENT: Final = "content.xml"
@@ -351,6 +351,21 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
     if path.suffix.lower() == ".ods":
         return pg.read_sheets("ods", Sheets(path), part=part, max_chars=max_chars)
     return pg.read_blocks("odt", _text_units(path), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count an ``.odt``'s paragraphs and tables, or an ``.ods``'s rows, and the characters of a full read.
+
+    Args:
+        path: The file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    if path.suffix.lower() == ".ods":
+        return pg.measure_sheets("ods", Sheets(path), chars_cap=chars_cap)
+    return pg.measure_blocks("odt", _text_units(path), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

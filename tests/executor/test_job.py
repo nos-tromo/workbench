@@ -392,6 +392,7 @@ def test_the_registered_runners() -> None:
         "write_presentation",
         "prepare_file",
         "convert_office",
+        "measure_file",
     }
 
 

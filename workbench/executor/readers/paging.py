@@ -4,7 +4,8 @@ A document is paged in *parts*. A reader offers its parts in order, and a :class
 while they fit; the first that does not fit becomes ``next_part``. Block documents (Word, OpenDocument
 text) page by paragraph and table (:func:`read_blocks`); sheets page by ranges of rows
 (:func:`read_sheets`). All sizes are measured as the JSON the part will be sent in, so a budget in
-characters is a budget in bytes of the answer.
+characters is a budget in bytes of the answer. :func:`measure_blocks` and :func:`measure_sheets` count the same
+documents without paging them.
 """
 
 import json
@@ -13,7 +14,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Final, Protocol
 
-from workbench.executor.readers import DocumentText, NoSuchPart, Part, tick
+from workbench.executor.readers import CharTally, DocumentText, Measure, NoSuchPart, Part, tick
 
 #: Rows in one range of a sheet.
 RANGE_ROWS: Final = 200
@@ -25,6 +26,9 @@ CELL_CAP: Final = 300
 MAX_ROW: Final = 1_048_576
 MAX_COLUMN: Final = 16_384
 MAX_SHEETS: Final = 1000
+
+#: The widest unit number a reservation sizes for: a sheet row numbered through every sheet.
+MAX_UNIT: Final = MAX_ROW * MAX_SHEETS
 
 #: Longest sheet name read; Excel's own limit is 31. A reference to a sheet carries its name, and the api's answer
 #: holds a label of at most 300 characters.
@@ -52,17 +56,20 @@ def clip(text: str, cap: int = CELL_CAP) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
-def part_size(label: str, text: str) -> int:
+def part_size(label: str, text: str, units: tuple[int, int] | None = None, *, cut: bool = False) -> int:
     """Measure a part as the answer sends it: compact JSON in UTF-8, with the comma that follows it.
 
     Args:
         label: The part's label.
         text: The part's text.
+        units: The units it covers; sent as ``null`` when ``None``, as the runner sends it.
+        cut: Whether it is sent as cut short.
 
     Returns:
         The size in bytes.
     """
-    return len(json.dumps({"label": label, "text": text}, ensure_ascii=False, separators=(",", ":")).encode()) + 1
+    sent = {"label": label, "text": text, "units": units, "cut": cut}
+    return len(json.dumps(sent, ensure_ascii=False, separators=(",", ":")).encode()) + 1
 
 
 class Collector:
@@ -94,12 +101,13 @@ class Collector:
         """Whether text was left out: parts that did not fit, or one cut short."""
         return self.next_part is not None or self.cut is not None
 
-    def add(self, label: str, text: str) -> bool:
+    def add(self, label: str, text: str, units: tuple[int, int] | None = None) -> bool:
         """Offer the next part.
 
         Args:
             label: The part's label.
             text: The part's text.
+            units: The units it covers.
 
         Returns:
             ``True`` while more parts may be offered; ``False`` once this one was refused, which makes it
@@ -108,25 +116,25 @@ class Collector:
         if self._closed:
             self.next_part = label
             return False
-        cost = part_size(label, text)
+        cost = part_size(label, text, units)
         if cost <= self._left:
-            self.parts.append(Part(label, text))
+            self.parts.append(Part(label, text, units))
             self._left -= cost
             return True
         self._closed = True
         if self.parts:
             self.next_part = label
             return False
-        fitted = self._fit(label, text)
+        fitted = self._fit(label, text, units)
         if fitted is None:
             self.next_part = label
             return False
-        self.parts.append(Part(label, fitted))
+        self.parts.append(Part(label, fitted, units))
         self.cut = label
         return True
 
     def grow(self, label: str, text: str, following: str) -> bool:
-        """Replace the last part with a longer version of it, if the longer one fits.
+        """Replace the last part with a longer version of it, if the longer one fits; it keeps its units.
 
         Args:
             label: The part's new label.
@@ -138,21 +146,22 @@ class Collector:
             and ``following`` is ``next_part``.
         """
         last = self.parts[-1]
-        extra = part_size(label, text) - part_size(last.label, last.text)
+        extra = part_size(label, text, last.units) - part_size(last.label, last.text, last.units)
         if not self._closed and extra <= self._left:
-            self.parts[-1] = Part(label, text)
+            self.parts[-1] = Part(label, text, last.units)
             self._left -= extra
             return True
         self._closed = True
         self.next_part = following
         return False
 
-    def _fit(self, label: str, text: str) -> str | None:
-        """Find the longest start of ``text``, with the cut mark, that fits what is left.
+    def _fit(self, label: str, text: str, units: tuple[int, int] | None) -> str | None:
+        """Find the longest start of ``text``, with the cut mark, that fits what is left, sized as sent cut.
 
         Args:
             label: The part's label.
             text: The part's text.
+            units: The units it covers.
 
         Returns:
             The cut text, or ``None`` if not even the label and the mark fit.
@@ -162,7 +171,7 @@ class Collector:
         while low <= high:
             middle = (low + high) // 2
             candidate = text[:middle] + CUT_MARK
-            if part_size(label, candidate) <= self._left:
+            if part_size(label, candidate, units, cut=True) <= self._left:
                 best, low = candidate, middle + 1
             else:
                 high = middle - 1
@@ -232,6 +241,11 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
     ``table T, rows A-B``, and the first row that does not fit is where to go on (``table T, row R``), so a
     table of any length can be read to its end.
 
+    The units are blocks, numbered as they come: a paragraph is the next block, and a table is the next block
+    at its first row with text, so the blocks are ``total_parts``. A paragraph covers its own block. A table is
+    one unit: only a run of its rows that reaches its last row with text covers the table's block; any other
+    run covers none, so a table paged with ``next_part`` counts once, on the run that ends it.
+
     Args:
         kind: The reader family to report.
         pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``, text ``a | b``) in document order.
@@ -247,7 +261,10 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
     start = _start(part)
     collector = Collector(max_chars)
     paragraphs = 0
-    tables: set[int] = set()
+    blocks = 0
+    tables: dict[int, int] = {}  # a table's number: its block
+    last_rows: dict[int, int] = {}  # a table's number: its last row with text
+    runs: dict[int, tuple[int, int]] = {}  # a run's place in the parts: its table and its last row
     started = start is None
     offering = True
     open_table = 0
@@ -257,16 +274,20 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
         match = _TABLE_ROW.fullmatch(piece.label)
         if match is None:
             paragraphs += 1
+            blocks += 1
             open_table = 0
             if not started:
                 if start is None or start.paragraph is None or piece.label != f"paragraph {start.paragraph}":
                     continue
                 started = True
             if offering:
-                offering = collector.add(piece.label, piece.text)
+                offering = collector.add(piece.label, piece.text, (blocks, blocks))
             continue
         table, row = int(match[1]), int(match[2])
-        tables.add(table)
+        if table not in tables:
+            blocks += 1
+            tables[table] = blocks
+        last_rows[table] = row
         if not started:
             if start is None or start.paragraph is not None or table != start.table or row < start.row:
                 continue
@@ -282,9 +303,14 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
             offering = collector.grow(_run_label(table, first_row, row), f"{last.text}\n{line}", piece.label)
         else:
             open_table, first_row = table, row
-            offering = collector.add(piece.label, line)
+            offering = collector.add(piece.label, line, (tables[table], tables[table]))
+        if offering:
+            runs[len(collector.parts) - 1] = (table, row)
     if not started:
         raise NoSuchPart(f"this document has no such part; it has {paragraphs} paragraphs and {len(tables)} tables")
+    for place, (table, row) in runs.items():
+        if row != last_rows[table]:
+            collector.parts[place].units = None
     return DocumentText(
         kind=kind,
         parts=collector.parts,
@@ -294,6 +320,39 @@ def read_blocks(kind: str, pieces: Iterable[Part], *, part: str | None, max_char
         next_part=collector.next_part,
         cut=collector.cut,
     )
+
+
+def measure_blocks(kind: str, pieces: Iterable[Part], *, chars_cap: int) -> Measure:
+    """Count the blocks of a document of paragraphs and tables, and the characters a full read shows.
+
+    The total is what :func:`read_blocks` gives as ``total_parts``: the paragraphs and the tables that have a row.
+    A paragraph is counted as it is, and each row of a table as ``row R: a | b``, as a read shows it; no break between
+    pieces is counted. Counting stops at the cap, the walk goes on to count the blocks.
+
+    Args:
+        kind: The reader family to report.
+        pieces: Paragraphs (``paragraph N``) and table rows (``table T, row R``, text ``a | b``) in document order.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    paragraphs = 0
+    tables: set[int] = set()
+    counting = True
+    for piece in pieces:
+        tick()
+        match = _TABLE_ROW.fullmatch(piece.label)
+        if match is None:
+            paragraphs += 1
+            text = piece.text
+        else:
+            tables.add(int(match[1]))
+            text = f"row {match[2]}: {piece.text}"
+        if counting:
+            counting = tally.add(text)
+    return Measure.of(kind, paragraphs + len(tables), tally)
 
 
 def numbered_window(part: str | None, total: int, noun: str) -> tuple[int, int]:
@@ -410,6 +469,34 @@ def parse_sheet_ref(part: str | None, names: list[str]) -> tuple[str, int, int |
     return chosen, first, last
 
 
+def _trimmed(row: list[str]) -> list[str]:
+    """Drop the empty cells at the end of a row.
+
+    Args:
+        row: A row's cells, from column A.
+
+    Returns:
+        The cells up to the last one that holds something.
+    """
+    end = len(row)
+    while end and not row[end - 1]:
+        end -= 1
+    return row[:end]
+
+
+def row_line(number: int, row: list[str]) -> str:
+    """Show a row of a sheet as a read does: ``<row>: a | b | c``, the empty cells at its end left out.
+
+    Args:
+        number: The row's number in its sheet.
+        row: Its cells, from column A.
+
+    Returns:
+        The line.
+    """
+    return f"{number}: " + " | ".join(_trimmed(row))
+
+
 def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: int) -> DocumentText:
     """Read one range of rows of a workbook.
 
@@ -418,6 +505,9 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
     with the cells from column A; the label gives the range, such as ``Sheet1!A1:F200``. With no part, a
     first sheet that is empty is passed over. The workbook is walked once, from the start of the range to its
     end, however many sheets it has.
+
+    The units are the rows that hold something, numbered through the sheets in their order. A range asked for
+    by name gets its first unit from one more walk, :func:`rows_before`, once its own has ended.
 
     Args:
         kind: The reader family to report.
@@ -439,7 +529,7 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
     first = end = 0
     window = RANGE_ROWS
     width = 1
-    left = max_chars - part_size(f"{quote_sheet(sheet)}!A{MAX_ROW}:ZZZ{MAX_ROW}", "")
+    left = max_chars - part_size(f"{quote_sheet(sheet)}!A{MAX_ROW}:ZZZ{MAX_ROW}", "", (MAX_UNIT, MAX_UNIT))
     next_part: str | None = None
     cut = False
     for name, number, row in source.walk(sheet if explicit else None, start, cap=CELL_CAP):
@@ -456,10 +546,8 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
         elif number >= first + window:
             next_part = f"{quote_sheet(current)}!A{number}:{column_letters(width)}{number + RANGE_ROWS - 1}"
             break
-        shown = list(row)
-        while shown and not shown[-1]:
-            shown.pop()
-        line = f"{number}: " + " | ".join(shown)
+        shown = _trimmed(row)
+        line = row_line(number, shown)
         cost = len(json.dumps(line, ensure_ascii=False).encode()) + 1
         if cost > left:
             if lines:
@@ -484,15 +572,71 @@ def read_sheets(kind: str, source: SheetSource, *, part: str | None, max_chars: 
             next_part=next_part,
         )
     label = f"{quote_sheet(current)}!A{first}:{column_letters(width)}{end}"
+    offset = rows_before(source, current, first) if explicit else 0
     return DocumentText(
         kind=kind,
-        parts=[Part(label, "\n".join(lines))],
+        parts=[Part(label, "\n".join(lines), (offset + 1, offset + len(lines)))],
         pages_without_text=[],
         total_parts=len(names),
         truncated=next_part is not None or cut,
         next_part=next_part,
         cut=label if cut else None,
     )
+
+
+def measure_sheets(kind: str, source: SheetSource, *, chars_cap: int) -> Measure:
+    """Count the rows of a workbook that hold something, and the characters a full read shows.
+
+    One walk over every sheet with every cell whole, so a cell that a read clips at ``CELL_CAP`` is counted at its
+    full length. The total is every row, counted past the cap; the characters are the lines :func:`row_line` makes,
+    counted to the cap.
+
+    Args:
+        kind: The reader family to report.
+        source: The workbook.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    total = 0
+    counting = True
+    for _, number, row in source.walk(None, 1, cap=None):
+        tick()
+        total += 1
+        if counting:
+            counting = tally.add(row_line(number, row))
+    return Measure.of(kind, total, tally)
+
+
+def rows_before(source: SheetSource, sheet: str, row: int) -> int:
+    """Count the rows that hold something in the sheets before ``sheet``, and in ``sheet`` before ``row``.
+
+    One walk from the start of the workbook, which stops at the first row of ``sheet`` numbered ``row`` or more, or
+    at the next sheet once ``sheet`` has been reached. Cells are read to one character: only whether a row holds
+    something counts.
+
+    Args:
+        source: The workbook.
+        sheet: A sheet that holds something.
+        row: A row number of that sheet.
+
+    Returns:
+        How many rows come before it, which is the number of the unit before it.
+    """
+    count = 0
+    reached = False
+    for name, number, _ in source.walk(None, 1, cap=1):
+        tick()
+        if name == sheet:
+            if number >= row:
+                break
+            reached = True
+        elif reached:
+            break
+        count += 1
+    return count
 
 
 def cells(source: SheetSource) -> Iterator[Part]:

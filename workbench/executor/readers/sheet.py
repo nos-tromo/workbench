@@ -22,7 +22,7 @@ from openpyxl.reader.excel import _find_workbook_part
 from openpyxl.xml.constants import ARC_CONTENT_TYPES, SHARED_STRINGS, SHEET_MAIN_NS
 from openpyxl.xml.functions import fromstring
 
-from workbench.executor.readers import DocumentText, Part, UnreadableFile, check, tick
+from workbench.executor.readers import DocumentText, Measure, Part, UnreadableFile, check, tick
 from workbench.executor.readers import paging as pg
 
 _WHITESPACE = re.compile(r"[\r\n\t]+")
@@ -482,6 +482,20 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
     """
     with closing(Workbook(path)) as book:
         return pg.read_sheets("xlsx", book, part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the rows that hold something, through every sheet, and the characters of a full read.
+
+    Args:
+        path: The ``.xlsx`` or ``.xlsm`` file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    with closing(Workbook(path)) as book:
+        return pg.measure_sheets("xlsx", book, chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

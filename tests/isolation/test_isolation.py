@@ -46,7 +46,7 @@ MIB = 1024 * 1024
 CAPABILITIES = {"SETUID", "SETGID", "CHOWN", "FOWNER", "DAC_OVERRIDE", "KILL"}
 # The bounding set of those six: CHOWN 0, DAC_OVERRIDE 1, FOWNER 3, KILL 5, SETGID 6, SETUID 7.
 CAPABILITY_MASK = f"{(1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7):016x}"
-PIDS_LIMIT = 320  # R19: 4 slots x 64 processes + 64 for the supervisor and its helpers
+PIDS_LIMIT = 384  # R19: 5 slots x 64 processes + 64 for the supervisor and its helpers
 SLOT_UIDS = range(20001, 20017)
 API_UID = 10001
 
@@ -112,7 +112,7 @@ def test_executor_is_isolated_by_configuration(executor: str) -> None:
     info = inspect(executor)
     host = info["HostConfig"]
     env = environment(info)
-    slots = int(env.get("WORKBENCH_EXECUTOR_SLOTS", "4"))
+    slots = int(env.get("WORKBENCH_EXECUTOR_SLOTS", "5"))
     job_memory_mb = int(env.get("WORKBENCH_JOB_MEMORY_MB", "1536"))
 
     assert host["NetworkMode"] == "none"
@@ -1216,7 +1216,7 @@ def test_a_clips_artifacts_are_prepared_read_and_viewed_in_the_sandbox(
     assert len(read["content"]) == 1  # the transcript is text: no image block
     body = read["structuredContent"]
     assert (body["kind"], body["total_parts"], body["pages_without_text"], body["shown"]) == ("transcript", 3, [], [])
-    assert body["parts"] == [{"label": "lines 1-3", "text": TOUR_LINES}]
+    assert body["parts"] == [{"label": "lines 1-3", "text": TOUR_LINES, "units": [1, 3], "cut": False}]
     assert mm.CAMERA_MODEL not in json.dumps(read) and "tour.jsonl" not in json.dumps(read)  # nothing of the artifacts
 
     viewed = mcp_result(

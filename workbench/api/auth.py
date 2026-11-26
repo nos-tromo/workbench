@@ -59,8 +59,13 @@ PREPARE_PATH: Final = "/files/prepare"
 #: The route that keeps Nextext's artifacts of a clip as derived files of it, a confined caller's alone.
 DERIVED_PATH: Final = "/files/derived"
 
+#: The measure of a document's length in its reader's units, a confined caller's alone.
+MEASURE_PATH: Final = "/files/measure"
+
 #: The file routes a confined caller reaches besides the MCP door.
-FILE_PATHS: Final = frozenset({"/files/upload", "/files/view", "/files/list", PREPARE_PATH, CHAT_PATH, DERIVED_PATH})
+FILE_PATHS: Final = frozenset(
+    {"/files/upload", "/files/view", "/files/list", PREPARE_PATH, MEASURE_PATH, CHAT_PATH, DERIVED_PATH}
+)
 
 #: The header a caller sends on the MCP door to say it takes images (:func:`accepts_images`), in lower case.
 ACCEPT_IMAGES: Final = "x-accept-images"

@@ -63,7 +63,7 @@ cover.
 
 ### The uid pool and the slot lifecycle
 
-The executor runs `WORKBENCH_EXECUTOR_SLOTS` jobs at once (4 by default, at
+The executor runs `WORKBENCH_EXECUTOR_SLOTS` jobs at once (5 by default, at
 most 16). The slots are numbered from 0, as the supervisor's log names them
 ("slot 0 retired"). Slot `i` runs as uid and gid `20001 + i`, which is the
 image's user `slot<i+1>`: slot 0 is user `slot1`, uid `20001`, and slot 15 is
@@ -297,10 +297,10 @@ For the container (`docker/compose.yaml`, see
 [configuration.md](configuration.md#the-executor-container)):
 
 - `cpus`: `WORKBENCH_EXECUTOR_CPUS` (4), every job together;
-- `pids_limit`: `WORKBENCH_EXECUTOR_PIDS_LIMIT` (320): 64 per slot plus 64
+- `pids_limit`: `WORKBENCH_EXECUTOR_PIDS_LIMIT` (384): 64 per slot plus 64
   for the supervisor and its cleanup helpers;
 - `mem_limit` and `memswap_limit`, the same value:
-  `WORKBENCH_EXECUTOR_MEM_LIMIT` (6656 MiB): every slot's job memory plus
+  `WORKBENCH_EXECUTOR_MEM_LIMIT` (8192 MiB): every slot's job memory plus
   512 MiB for the supervisor. Memory and swap together are that one limit, so
   no job swaps past it. The watchdog holds each job to its share; what a job
   takes between two of its measures, and the kernel memory no measure counts

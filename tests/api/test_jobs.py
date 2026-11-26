@@ -120,6 +120,8 @@ class FakeClient(ExecutorClient):
         running: Jobs in flight now.
         peak: The most jobs in flight at once.
         gate: While set, a job that ``hold`` marks does not finish until the test sets it.
+        apart: An event of its own by caller and user (``caller/user``): a job of theirs does not finish until the
+            test sets that event, whatever ``hold`` and ``gate`` say, so a test lets one job go and keeps the others.
         previews: A preview, as the arguments of ``TablePreview``, by the name of the output that has it; a job that
             asked for previews (``req.previews``) gets each staged output's.
         answer: The runner's answer it gives, such as a render answer; ``None`` for ``{"answer": 42}``.
@@ -138,6 +140,7 @@ class FakeClient(ExecutorClient):
         self.peak = 0
         self.gate = asyncio.Event()
         self.hold: set[str] = set()
+        self.apart: dict[str, asyncio.Event] = {}
         self.files: dict[str, bytes] = {}
         self.previews: dict[str, dict[str, Any]] = {}
         self.status = "ok"
@@ -158,7 +161,10 @@ class FakeClient(ExecutorClient):
         self.running += 1
         self.peak = max(self.peak, self.running)
         try:
-            if req.caller + "/" + req.user_id in self.hold:
+            key = req.caller + "/" + req.user_id
+            if key in self.apart:
+                await self.apart[key].wait()
+            elif key in self.hold:
                 await self.gate.wait()
             elif self.delay:
                 await asyncio.sleep(self.delay)
@@ -471,7 +477,7 @@ async def test_the_users_share_of_the_queue_is_at_least_one(
 async def test_the_default_share_is_four_waiting_calls(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """16 places over 4 slots: one running and four waiting calls of a user, and the sixth is refused."""
+    """20 places over 5 slots: one running and four waiting calls of a user, and the sixth is refused."""
     executor.hold = {"ghostwriter/user-a"}
     queue = queue_for(settings, executor, store, metrics)
     running = asyncio.create_task(queue.submit(user("user-a"), "run_python", ARGS, [], call=CALL))
@@ -2139,8 +2145,8 @@ async def test_inline_data_past_the_line_is_too_large_and_not_sent(
 async def test_a_call_without_caller_limits_is_never_capped(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Docint's gate holds docint alone: four users of a call without limits run at once while docint's wait."""
-    queue = queue_for(settings, executor, store, metrics)
+    """Docint's gate holds docint alone: four users of a call without limits take all four slots while docint's wait."""
+    queue = queue_for(settings, executor, store, metrics, executor_slots=4)
     await run_inline(queue, Takes(settings))
     executor.hold = {f"ghostwriter/user-{n}" for n in range(4)}
     others = [asyncio.create_task(queue.submit(user(f"user-{n}"), "run_python", ARGS, [], call=CALL)) for n in range(4)]
@@ -2290,7 +2296,7 @@ async def test_prepare_counts_within_the_callers_slots(
 async def test_waiting_prepares_do_not_fill_the_queue(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """32 prepares of one user wait, past the queue's 16 places, the user's 4 and the caller's 12; the 33rd is full.
+    """32 prepares of one user wait, past the queue's 20 places, the user's 4 and the caller's 12; the 33rd is full.
 
     Meanwhile another user's interactive call that must wait is still let into the queue, and runs.
     """
@@ -3090,17 +3096,16 @@ async def test_one_conversion_of_a_caller_runs_at_a_time_on_demand_or_not(
 async def test_a_tool_call_gets_a_slot_beside_a_conversion_and_a_prepare(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """Ghostwriter's default slots, 3: a conversion and a picture's prepare run, and a third user's call still runs.
+    """At 3 slots, a pin of the default before 0.10.0: a conversion and a picture's prepare run, and a third call too.
 
     They all count within the caller's slots; one more call of Ghostwriter's waits for one of them.
     """
-    assert settings.ghostwriter_slots == 3
     a, b = user("user-a"), Principal("ghostwriter", "user-b", "chat-1")
     source, picture = deck(store, a), scan(store, b)
     converts(executor)
     rendered(executor, page(1))
     executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b", "ghostwriter/user-c", "ghostwriter/user-d"}
-    call = ghostwriter(settings)
+    call = CallLimits(wall_s=120, wait_s=60, slots=3)
     queue = queue_for(settings, executor, store, metrics)
     converting = asyncio.create_task(office_prepare(queue, a, source, call))
     preparing = asyncio.create_task(prepare(queue, b, picture, call=call))
@@ -3118,7 +3123,7 @@ async def test_a_tool_call_gets_a_slot_beside_a_conversion_and_a_prepare(
 async def test_waiting_conversions_are_counted_apart_from_the_queue_and_the_prepares(
     settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
 ) -> None:
-    """32 conversions and 32 prepares of one user wait, past the queue's 16 places and the user's 4; a 33rd is full.
+    """32 conversions and 32 prepares of one user wait, past the queue's 20 places and the user's 4; a 33rd is full.
 
     Each line is counted on its own: one more of either is refused at once (``queue_full``).
     """
@@ -3502,3 +3507,160 @@ async def test_what_a_clips_job_kept_is_removed_when_its_record_fails_and_the_ar
     assert [rec.role for rec in store.derived_of(source)] == ["nextext_jsonl", "nextext_zip"]
     folder = _chat_folder(settings, me) / ".derived" / source.id
     assert sorted(each.name for each in folder.iterdir()) == sorted(rec.name for rec in held)
+
+
+# --- version 0.10: the measure gate, a caller's fourth, and a slot of its own ---------------------------------------
+
+#: The document the measures of these tests name; the queue never opens it, and the fake executor answers for it.
+MEASURED = "harbour-report.pdf"
+
+
+async def measure(queue: JobQueue, p: Principal, call: CallLimits) -> tuple[JobRecord, JobResult, list[FileRecord]]:
+    """Measure a document as the measure route does: one job of one input and no output, on the measure gate.
+
+    The gates never look at the tool, so ``read_document`` stands in for the measure's own runner.
+    """
+    return await queue.submit(p, "read_document", {"path": MEASURED}, [MEASURED], call=call, gate="measure")
+
+
+def measures(executor: FakeClient) -> list[str]:
+    """The users whose measures the executor was sent, in the order it was sent them."""
+    return [req.user_id for req in executor.requests if req.tool == "read_document"]
+
+
+def draws(executor: FakeClient) -> None:
+    """Script the render jobs alone, one page each, so that the measures and the tool calls answer as any job does."""
+    executor.scripts["prepare_file"] = ({**FACTS, "renders": [page(1)]}, {page(1)["name"]: JPEG})
+
+
+async def test_a_measure_runs_beside_a_prepare_a_conversion_and_a_tool_call(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """Ghostwriter's default 4 slots of the executor's 5: a conversion, a prepare, a measure and a tool call all run.
+
+    None of them waits. A second measure waits in the measure gate's line, also once a tool call has given a caller
+    slot back, and runs once the first measure is let go.
+    """
+    assert (settings.executor_slots, settings.ghostwriter_slots) == (5, 4)
+    a, b, c, d, e, f = (user(f"user-{name}") for name in "abcdef")
+    source, picture = deck(store, c), scan(store, d)
+    converts(executor)
+    draws(executor)
+    first, tool_done = asyncio.Event(), asyncio.Event()
+    executor.hold = {"ghostwriter/user-c", "ghostwriter/user-d"}
+    executor.apart = {"ghostwriter/user-a": first, "ghostwriter/user-b": tool_done}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    converting = asyncio.create_task(office_prepare(queue, c, source, call))
+    preparing = asyncio.create_task(prepare(queue, d, picture, call=call))
+    measuring = asyncio.create_task(measure(queue, a, call))
+    await until(lambda: executor.running == 3)
+    tool_call = asyncio.create_task(queue.submit(b, "run_python", ARGS, [], call=call))
+    await until(lambda: executor.running == 4)  # none of the four waits for another: each is held until let go
+    running = sorted(req.tool for req in executor.requests)
+    assert running == ["convert_office", "prepare_file", "read_document", "run_python"]
+    assert sample(metrics, "workbench_queue_length") == 0
+
+    second = asyncio.create_task(measure(queue, e, call))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    tool_done.set()
+    await tool_call
+    _, result, _ = await asyncio.wait_for(queue.submit(f, "run_python", ARGS, [], call=call), scaled(2))
+    assert result.status == "ok"  # a caller slot and a global slot were free, and the second measure did not take them
+    assert (measures(executor), sample(metrics, "workbench_queue_length")) == (["user-a"], 1)
+    first.set()
+    await asyncio.gather(measuring, second)
+    assert measures(executor) == ["user-a", "user-e"]
+    assert executor.running == 2  # the conversion and the prepare still run
+    executor.gate.set()
+    await asyncio.gather(converting, preparing)
+    assert executor.peak == 4
+    assert (queue.tracked_users, sample(metrics, "workbench_queue_length")) == (0, 0)
+
+
+async def test_a_prepare_and_a_tool_call_never_wait_for_a_measure(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """A measure holds neither the prepare gate nor its user's turn: that user's prepare and tool call start at once.
+
+    One job per user, the default: the three run side by side, and none of them waits.
+    """
+    assert settings.jobs_per_user == 1
+    me = user("user-a")
+    picture = scan(store, me)
+    draws(executor)
+    executor.hold = {"ghostwriter/user-a"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    measuring = asyncio.create_task(measure(queue, me, call))
+    await until(lambda: executor.running == 1)
+    preparing = asyncio.create_task(prepare(queue, me, picture, call=call))
+    await until(lambda: executor.running == 2)
+    tool_call = asyncio.create_task(queue.submit(me, "run_python", ARGS, [], call=call))
+    await until(lambda: executor.running == 3)
+    assert [req.tool for req in executor.requests] == ["read_document", "prepare_file", "run_python"]
+    assert sample(metrics, "workbench_queue_length") == 0
+    executor.gate.set()
+    done = await asyncio.gather(measuring, preparing, tool_call)
+    assert {result.status for _, result, _ in done} == {"ok"}
+    assert queue.tracked_users == 0
+
+
+async def test_measures_wait_in_a_line_of_their_own(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """One measure runs and 32 wait, past the queue's 20 places and the user's 4; a 33rd is refused at once.
+
+    That line is the measure gate's alone: meanwhile a prepare and another user's tool call are admitted and run, and
+    the queue's length counts the 32.
+    """
+    assert (settings.queue_max, settings.queue_max // settings.executor_slots, PREPARE_WAITING_MAX) == (20, 4, 32)
+    me, b, c = user("user-a"), user("user-b"), user("user-c")
+    picture = scan(store, b)
+    draws(executor)
+    executor.hold = {"ghostwriter/user-a"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    running = asyncio.create_task(measure(queue, me, call))
+    await until(lambda: executor.running == 1)
+    waiting = [asyncio.create_task(measure(queue, me, call)) for _ in range(PREPARE_WAITING_MAX)]
+    await until(lambda: sample(metrics, "workbench_queue_length") == PREPARE_WAITING_MAX)
+    async with asyncio.timeout(0.5):
+        with pytest.raises(Busy) as refused:
+            await measure(queue, me, call)
+    assert refused.value.reason == "queue_full"
+
+    _, prepared, kept = await asyncio.wait_for(prepare(queue, b, picture, call=call), scaled(2))
+    _, called, _ = await asyncio.wait_for(queue.submit(c, "run_python", ARGS, [], call=call), scaled(2))
+    assert (prepared.status, len(kept), called.status) == ("ok", 1, "ok")
+    assert sample(metrics, "workbench_queue_length") == PREPARE_WAITING_MAX
+    assert sample(metrics, "workbench_job_refusals_total", reason="queue_full") == 1
+    executor.gate.set()
+    done = await asyncio.gather(running, *waiting)
+    assert {result.status for _, result, _ in done} == {"ok"}
+    assert measures(executor) == ["user-a"] * (PREPARE_WAITING_MAX + 1)
+    assert (queue.tracked_users, sample(metrics, "workbench_queue_length")) == (0, 0)
+
+
+async def test_one_measure_of_a_caller_runs_at_a_time(
+    settings: Settings, store: Store, executor: FakeClient, metrics: Metrics
+) -> None:
+    """The measure gate is the caller's, so no user id shares it: user B's measure starts only after user A's ends.
+
+    It waits for that gate alone: a tool call sent after it finds a caller slot and a global slot free, and runs.
+    """
+    a, b, c = user("user-a"), user("user-b"), user("user-c")
+    executor.hold = {"ghostwriter/user-a", "ghostwriter/user-b"}
+    call = ghostwriter(settings)
+    queue = queue_for(settings, executor, store, metrics)
+    first = asyncio.create_task(measure(queue, a, call))
+    await until(lambda: executor.running == 1)
+    second = asyncio.create_task(measure(queue, b, call))
+    await until(lambda: sample(metrics, "workbench_queue_length") == 1)
+    _, result, _ = await asyncio.wait_for(queue.submit(c, "run_python", ARGS, [], call=call), scaled(2))
+    assert result.status == "ok"
+    assert (measures(executor), executor.running, sample(metrics, "workbench_queue_length")) == (["user-a"], 1, 1)
+    executor.gate.set()
+    await asyncio.gather(first, second)
+    assert measures(executor) == ["user-a", "user-b"]
+    assert (queue.tracked_users, sample(metrics, "workbench_queue_length")) == (0, 0)

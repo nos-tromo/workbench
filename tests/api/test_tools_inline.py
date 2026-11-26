@@ -623,7 +623,7 @@ def test_config_audit_lists_the_callers_and_the_purpose_rule(
     (config,) = [e for e in audit_lines() if e["operation"] == "config.audit"]
     assert config["criteria"]["callers"] == [
         {"name": "docint", "door": "mcp", "tools": ["run_python"], "wall_s": 60, "slots": 2},
-        {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 3},
+        {"name": "ghostwriter", "door": "mcp", "tools": sorted(GHOSTWRITER_TOOLS), "wall_s": 120, "slots": 4},
     ]
     assert config["criteria"]["require_purpose"] == ["combine", "disclose", "query"]
     raw = json.dumps(audit_lines())

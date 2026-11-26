@@ -5,7 +5,7 @@ from typing import Any
 
 from workbench.executor.context import JobContext
 from workbench.executor.runners.convert import convert_office
-from workbench.executor.runners.documents import read_document, search_files
+from workbench.executor.runners.documents import measure_file, read_document, search_files
 from workbench.executor.runners.outputs import write_document, write_table
 from workbench.executor.runners.presentations import write_presentation
 from workbench.executor.runners.python import run_python
@@ -40,4 +40,5 @@ RUNNERS: dict[str, Callable[[dict[str, Any], JobContext], dict[str, Any]]] = {
     "write_presentation": write_presentation,
     "prepare_file": prepare_file,
     "convert_office": convert_office,
+    "measure_file": measure_file,
 }

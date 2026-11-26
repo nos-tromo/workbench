@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
-from workbench.executor.readers import DocumentText, Part
+from workbench.executor.readers import DocumentText, Measure, Part
 from workbench.executor.readers import text as txt
 
 #: Writes what ``json.dumps(value, indent=2, ensure_ascii=False)`` does, piece by piece.
@@ -61,6 +61,19 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The lines that fit and where to continue.
     """
     return txt.read_lines("json", _lines(path), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the lines of a JSON file as :func:`read` shows them, and their characters.
+
+    Args:
+        path: The file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    return txt.measure_lines("json", _lines(path), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

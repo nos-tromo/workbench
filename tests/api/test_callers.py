@@ -116,11 +116,13 @@ def test_the_door_answers_before_any_body_is_read(settings: Settings, key: str, 
     [
         (GHOSTWRITER_KEY, "/files/upload", True),
         (GHOSTWRITER_KEY, "/files/prepare", True),
+        (GHOSTWRITER_KEY, "/files/measure", True),
         (GHOSTWRITER_KEY, "/files/derived", True),
         (GHOSTWRITER_KEY, "/files/other", False),
         (GHOSTWRITER_KEY, "/nowhere", False),
         (DOCINT_KEY, "/files/chat", False),
         (DOCINT_KEY, "/files/prepare", False),
+        (DOCINT_KEY, "/files/measure", False),
         (DOCINT_KEY, "/files/derived", False),
     ],
 )
@@ -264,6 +266,7 @@ def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: s
                 "/mcp",
                 "/files/upload",
                 "/files/prepare",
+                "/files/measure",
                 "/files/view",
                 "/files/list",
                 "/files/chat",
@@ -277,11 +280,12 @@ def test_door_allows_a_caller_with_inline_data_mcp_alone(caller: Caller, path: s
         (DOCINT, "/files/chat", False),
         (DOCINT, "/files/upload", False),
         (DOCINT, "/files/prepare", False),
+        (DOCINT, "/files/measure", False),
         (DOCINT, "/files/derived", False),
     ],
 )
-def test_door_allows_the_ghostwriter_its_door_and_six_file_paths(caller: Caller, path: str, allowed: bool) -> None:
-    """Ghostwriter has ``/mcp`` and the six file paths; the chat delete is no other caller's."""
+def test_door_allows_the_ghostwriter_its_door_and_seven_file_paths(caller: Caller, path: str, allowed: bool) -> None:
+    """Ghostwriter has ``/mcp`` and the seven file paths; the chat delete is no other caller's."""
     assert door_allows(caller, path) is allowed
 
 
@@ -297,7 +301,7 @@ def test_the_registry_holds_a_row_per_key(settings: Settings) -> None:
 
     assert [caller.name for caller in registry.callers] == ["docint", "ghostwriter"]
     assert row(registry.get("docint")) == ("inline", frozenset({"run_python"}), 60, 2)
-    assert row(registry.get("ghostwriter")) == ("workspace", GHOSTWRITER_TOOLS, 120, 3)
+    assert row(registry.get("ghostwriter")) == ("workspace", GHOSTWRITER_TOOLS, 120, 4)
     assert registry.get("docint").key == DOCINT_KEY
     assert registry.get("ghostwriter").key == GHOSTWRITER_KEY
     assert registry.authenticate("wrong") is None

@@ -16,7 +16,7 @@ from typing import Final
 
 from charset_normalizer import from_bytes
 
-from workbench.executor.readers import DocumentText, Part, tick
+from workbench.executor.readers import CharTally, DocumentText, Measure, Part, tick
 from workbench.executor.readers import paging as pg
 
 #: Longest line shown; the rest of a longer line is cut.
@@ -128,7 +128,7 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
         max_chars: The budget in bytes of JSON.
 
     Returns:
-        One part with the lines that fit, and where to continue.
+        One part with the lines that fit, covering their numbers as units, and where to continue.
 
     Raises:
         NoSuchPart: The part is not a line reference, or the line is past the end.
@@ -137,7 +137,7 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
     if total == 0:
         return DocumentText(kind=kind, parts=[], pages_without_text=[], total_parts=0)
     first, last = pg.numbered_window(part, total, "line")
-    left = max_chars - pg.part_size(f"lines {total}-{total}", "")
+    left = max_chars - pg.part_size(f"lines {total}-{total}", "", (total, total))
     taken: list[str] = []
     cut = False
     number = first
@@ -159,13 +159,34 @@ def read_lines(kind: str, lines: Sequence[str], *, part: str | None, max_chars: 
     more = end < last
     return DocumentText(
         kind=kind,
-        parts=[Part(label, "\n".join(taken))],
+        parts=[Part(label, "\n".join(taken), (first, end))],
         pages_without_text=[],
         total_parts=total,
         truncated=more or cut,
         next_part=f"line {end + 1}" if more else None,
         cut=label if cut else None,
     )
+
+
+def measure_lines(kind: str, lines: Sequence[str], *, chars_cap: int) -> Measure:
+    """Count the lines of a document and their characters.
+
+    Each line is counted whole, never as :func:`read_lines` shortens it, and no break between lines is counted.
+
+    Args:
+        kind: The reader family to report.
+        lines: The document's lines.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    tally = CharTally(chars_cap)
+    for line in lines:
+        tick()
+        if not tally.add(line):
+            break
+    return Measure.of(kind, len(lines), tally)
 
 
 def line_units(lines: Sequence[str]) -> Iterator[Part]:
@@ -207,6 +228,19 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The lines that fit and where to continue.
     """
     return read_lines(_kind(path), split_lines(decode(path.read_bytes())), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the lines of a text file and their characters.
+
+    Args:
+        path: The file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure, of kind ``csv`` or ``text``.
+    """
+    return measure_lines(_kind(path), split_lines(decode(path.read_bytes())), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

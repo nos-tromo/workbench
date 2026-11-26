@@ -7,7 +7,7 @@ from typing import Final
 from bs4 import BeautifulSoup, NavigableString, Tag
 from bs4.element import PageElement
 
-from workbench.executor.readers import DocumentText, Part, tick
+from workbench.executor.readers import DocumentText, Measure, Part, tick
 from workbench.executor.readers import text as txt
 
 _BLOCKS: Final = frozenset(
@@ -94,6 +94,19 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         The lines that fit and where to continue.
     """
     return txt.read_lines("html", html_to_lines(path.read_bytes()), part=part, max_chars=max_chars)
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the lines of a page's text and their characters.
+
+    Args:
+        path: The file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    return txt.measure_lines("html", html_to_lines(path.read_bytes()), chars_cap=chars_cap)
 
 
 def units(path: Path) -> Iterator[Part]:

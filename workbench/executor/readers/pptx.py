@@ -12,7 +12,7 @@ from typing import Any, Final
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-from workbench.executor.readers import DocumentText, Part, UnsupportedFormat, check, ooxml
+from workbench.executor.readers import CharTally, DocumentText, Measure, Part, UnsupportedFormat, check, ooxml
 from workbench.executor.readers import paging as pg
 
 #: Most slides one read looks at.
@@ -113,7 +113,7 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         text = _slide_text(slides[number - 1])
         if not text:
             without.append(number)
-        elif not collector.add(f"slide {number}", text):
+        elif not collector.add(f"slide {number}", text, (number, number)):
             break
     return DocumentText(
         kind="pptx",
@@ -124,6 +124,27 @@ def read(path: Path, *, part: str | None, max_chars: int) -> DocumentText:
         next_part=collector.next_part,
         cut=collector.cut,
     )
+
+
+def measure(path: Path, *, chars_cap: int) -> Measure:
+    """Count the slides and the characters of their text and notes.
+
+    The slides are counted whole. The text is taken slide by slide and only until the cap is passed.
+
+    Args:
+        path: The ``.pptx`` or ``.potx`` file.
+        chars_cap: The most characters to count.
+
+    Returns:
+        The measure.
+    """
+    slides = list(open_presentation(path).slides)
+    tally = CharTally(chars_cap)
+    for slide in slides:
+        check()
+        if not tally.add(_slide_text(slide)):
+            break
+    return Measure.of("pptx", len(slides), tally)
 
 
 def units(path: Path) -> Iterator[Part]:

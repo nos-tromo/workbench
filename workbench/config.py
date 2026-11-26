@@ -44,9 +44,10 @@ GHOSTWRITER_DEFAULT_TOOLS: Final = frozenset(
     }
 )
 GHOSTWRITER_DEFAULT_WALL_S: Final = 120
-#: Three: a picture's or a PDF's prepare takes one, an Office file's conversion another (their gates run apart), and
-#: one is left for the tool calls of all Ghostwriter's users; still fewer than the executor's default 4.
-GHOSTWRITER_DEFAULT_SLOTS: Final = 3
+#: Four: a picture's or a PDF's prepare takes one, an Office file's conversion another, a document's measure a third
+#: (their gates run apart), and one is left for the tool calls of all Ghostwriter's users; still fewer than the
+#: executor's default 5, so docint keeps a running slot.
+GHOSTWRITER_DEFAULT_SLOTS: Final = 4
 
 #: The least wall time Ghostwriter's jobs may be given, so the previews keep their time within it.
 MIN_GHOSTWRITER_WALL_S: Final = 10
@@ -216,7 +217,7 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
     Raises:
         ConfigError: A value is missing, malformed or out of range. The message names the variable.
     """
-    slots = _positive_int(env, "WORKBENCH_EXECUTOR_SLOTS", 4)
+    slots = _positive_int(env, "WORKBENCH_EXECUTOR_SLOTS", 5)
     if slots > UID_POOL_SIZE:
         raise ConfigError(f"WORKBENCH_EXECUTOR_SLOTS must be at most {UID_POOL_SIZE}, the size of the uid pool")
     result_max_kb = _positive_int(env, "WORKBENCH_RESULT_MAX_KB", 16)
@@ -261,7 +262,7 @@ def load_settings(env: Mapping[str, str], *, role: Literal["api", "executor"]) -
         retention_days=_positive_int(env, "WORKBENCH_RETENTION_DAYS", 7),
         retention_interval_s=_positive_int(env, "WORKBENCH_RETENTION_INTERVAL_S", 300),
         executor_slots=slots,
-        queue_max=_positive_int(env, "WORKBENCH_QUEUE_MAX", 16),
+        queue_max=_positive_int(env, "WORKBENCH_QUEUE_MAX", 20),
         jobs_per_user=_positive_int(env, "WORKBENCH_JOBS_PER_USER", 1),
         job_wall_s=job_wall_s,
         job_memory_mb=_positive_int(env, "WORKBENCH_JOB_MEMORY_MB", 1536),

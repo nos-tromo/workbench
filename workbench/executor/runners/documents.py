@@ -1,4 +1,4 @@
-"""The runners of ``read_document`` and ``search_files``, which read the chat's files inside the sandboxed job.
+"""The runners of ``read_document``, ``search_files`` and ``measure_file``, which read the chat's files inside the job.
 
 The job's working folder is the chat folder: the input files are in it under the paths the api gave,
 relative to it. The runners answer in the model's terms, so every path in an answer is the virtual
@@ -44,6 +44,11 @@ _READ_BUDGET_S: Final = 60.0
 
 #: One file may use this share of a search's time; a file that takes longer is given up on and named.
 FILE_SHARE: Final = 3
+
+#: The most characters a measure counts: about 670,000 tokens at 3 characters a token, over three times any prompt a
+#: caller builds, and a PDF's text is no longer extracted after about a thousand dense pages. Read when a measure
+#: runs, not when the module loads.
+MEASURE_CHARS_CAP: Final = 2_000_000
 
 
 class RegexTimeout(TimeLimit):
@@ -128,8 +133,9 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         ctx: The job's surroundings.
 
     Returns:
-        ``path`` (virtual), ``kind``, ``parts``, ``total_parts``, ``pages_without_text``, ``truncated`` and,
-        when they apply, ``next_part`` and ``hint``; or an ``error`` result.
+        ``path`` (virtual), ``kind``, ``parts`` (each with its ``label``, ``text``, ``units`` as a list or ``None``,
+        and ``cut``), ``total_parts``, ``pages_without_text``, ``truncated`` and, when they apply, ``next_part`` and
+        ``hint``; or an ``error`` result.
     """
     name = protocol.check_input_path(str(args["path"]))
     part = args.get("part")
@@ -159,7 +165,15 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     result: dict[str, Any] = {
         "path": virtual,
         "kind": doc.kind,
-        "parts": [{"label": p.label, "text": p.text} for p in doc.parts],
+        "parts": [
+            {
+                "label": p.label,
+                "text": p.text,
+                "units": None if p.units is None else list(p.units),
+                "cut": p.label == doc.cut,
+            }
+            for p in doc.parts
+        ],
         "total_parts": doc.total_parts,
         "pages_without_text": doc.pages_without_text,
         "truncated": doc.truncated,
@@ -170,6 +184,44 @@ def read_document(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     if hint is not None:
         result["hint"] = hint
     return result
+
+
+def measure_file(args: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
+    """Count the units of one file of the chat and the characters a full read of it shows.
+
+    Args:
+        args: ``path``, relative to the chat folder, and ``budget_s``, the seconds after which counting stops.
+        ctx: The job's surroundings.
+
+    Returns:
+        ``path`` (virtual), ``kind``, ``unit``, ``total``, ``chars`` (counted to ``MEASURE_CHARS_CAP``) and
+        ``capped``; or an ``error`` result.
+    """
+    name = protocol.check_input_path(str(args["path"]))
+    virtual = f"/workspace/{ctx.chat_id}/{name}"
+    real = ctx.work_dir / name
+    if name.split("/")[0] == "out" or not real.is_file():
+        return error("file_not_found", f"{virtual} is not in this conversation's workspace")
+    budget = float(args.get("budget_s", _READ_BUDGET_S))
+    readers.set_deadline(time.monotonic() + budget)
+    try:
+        counted = readers.measure(real, chars_cap=MEASURE_CHARS_CAP, file_mb=ctx.file_mb)
+    except readers.UnsupportedFormat as exc:
+        return error("unsupported_format", str(exc))
+    except readers.UnreadableFile as exc:
+        return error("unreadable_file", str(exc))
+    except readers.ReadTimeout:
+        return error("read_timeout", f"reading the file took longer than {budget:g} s; it is too large or too complex")
+    finally:
+        readers.set_deadline(None)
+    return {
+        "path": virtual,
+        "kind": counted.kind,
+        "unit": counted.unit,
+        "total": counted.total,
+        "chars": counted.chars,
+        "capped": counted.capped,
+    }
 
 
 def snippet(text: str, match: re.Match[str]) -> str:
